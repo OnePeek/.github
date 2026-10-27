@@ -1,0 +1,49 @@
+# Shared: Python checks (ruff lint and format, pytest). Called by Python repos.
+name: python-checks
+
+on:
+  workflow_call:
+    inputs:
+      full:
+        description: "true on pull requests into release: also run the slower suites."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  RUFF_VERSION: 0.17.1
+  PYTEST_VERSION: 9.1.1
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+
+      - name: Lint
+        run: uvx "ruff@${RUFF_VERSION}" check .
+
+      - name: Format
+        run: uvx "ruff@${RUFF_VERSION}" format --check .
+
+      - name: Unit tests
+        run: |
+          # Until a repo has tests, pytest reports "no tests collected" (exit 5): treat that as a pass.
+          set +e
+          uv run --with "pytest==${PYTEST_VERSION}" pytest -q
+          code=$?
+          if [ "$code" -eq 5 ]; then echo "No tests yet."; exit 0; fi
+          exit "$code"
+
+      - name: Slower suites (release only)
+        if: inputs.full
+        run: echo "Integration, contract and image smoke tests are added with the first service code (TRD §8.15)."

@@ -13,4 +13,6 @@
 - [ ] `docs-version.txt` moved if contracts changed
 - [ ] No secrets and no personal data in code, tests, fixtures or logs
 - [ ] Tests and CI gates pass
-- [ ] Infrastructure or security change: second approver named
+- [ ] Title follows Conventional Commits (`feat:`, `fix:`, `chore:` …), targeting `dev` (or `release` for a release)
+- [ ] New paid resource or service: monthly cost stated
+- [ ] Terraform plan deletes or replaces a network, security, data or key resource: founder's go-ahead given
