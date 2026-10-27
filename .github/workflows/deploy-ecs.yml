@@ -1,0 +1,164 @@
+# Shared: build an image, push it to ECR, run migrations if asked, roll one ECS service and check it
+# is ready (branching-and-delivery standard §5; onepeek-docs trd/lld/preprod-runtime.md §6).
+# Called by each app repo's release.yml on a merge into release. Nobody deploys from a laptop.
+#
+# A re-run of the same commit re-deploys the image already pushed (ECR tags are immutable), so
+# rollback is re-running the release workflow for an earlier version tag.
+name: deploy-ecs
+
+on:
+  workflow_call:
+    inputs:
+      role-to-assume:
+        description: The repo's deploy role (onepeek-infra modules/deploy-roles); trusted only from release.
+        required: true
+        type: string
+      environment:
+        description: Environment; resources are named onepeek-<environment>.
+        type: string
+        default: preprod
+      aws-region:
+        type: string
+        default: ap-south-1
+      image:
+        description: ECR repository under onepeek-<environment>/, e.g. backend.
+        required: true
+        type: string
+      service:
+        description: ECS service to roll; its task family is onepeek-<environment>-<service>.
+        required: true
+        type: string
+      migrate-task:
+        description: One-off task to run on the new image before rolling the service, e.g. front-migrate. Empty for none.
+        type: string
+        default: ""
+      ready-url:
+        description: Called after the deploy; the run fails unless it answers 2xx.
+        required: true
+        type: string
+      context:
+        description: Folder with the Dockerfile.
+        type: string
+        default: .
+    outputs:
+      image:
+        description: The image that was deployed.
+        value: ${{ jobs.deploy.outputs.image }}
+
+permissions: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.image.outputs.uri }}
+    env:
+      NAME: onepeek-${{ inputs.environment }}
+      AWS_REGION: ${{ inputs.aws-region }}
+      IMAGE: ${{ inputs.image }}
+      SERVICE: ${{ inputs.service }}
+      MIGRATE_TASK: ${{ inputs.migrate-task }}
+      READY_URL: ${{ inputs.ready-url }}
+      CONTEXT: ${{ inputs.context }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Image name
+        id: image
+        run: |
+          account=$(aws sts get-caller-identity --query Account --output text)
+          registry="${account}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "registry=${registry}" >> "$GITHUB_OUTPUT"
+          echo "uri=${registry}/${NAME}/${IMAGE}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Is this commit's image already pushed?
+        id: existing
+        run: |
+          if aws ecr describe-images --repository-name "${NAME}/${IMAGE}" --image-ids "imageTag=${GITHUB_SHA}" >/dev/null 2>&1; then
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+            echo "Image for ${GITHUB_SHA} already in ECR; re-deploying it."
+          fi
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        if: steps.existing.outputs.pushed != 'true'
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: steps.existing.outputs.pushed != 'true'
+
+      - name: Build the ARM64 image and push it
+        if: steps.existing.outputs.pushed != 'true'
+        env:
+          REGISTRY: ${{ steps.image.outputs.registry }}
+          URI: ${{ steps.image.outputs.uri }}
+        run: |
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${REGISTRY}"
+          docker buildx build --platform linux/arm64 --provenance=false --tag "${URI}" --push "${CONTEXT}"
+
+      - name: Run the one-off task, then roll the service
+        env:
+          URI: ${{ steps.image.outputs.uri }}
+        run: |
+          # A new revision of a task family, copied from its latest revision with only the image
+          # changed, so settings Terraform changed since the last release are kept.
+          register() {
+            aws ecs describe-task-definition --task-definition "$1" --query taskDefinition --output json \
+              | jq --arg image "${URI}" '.containerDefinitions[0].image = $image
+                  | {family, taskRoleArn, executionRoleArn, networkMode, containerDefinitions,
+                     volumes, placementConstraints, requiresCompatibilities, cpu, memory}
+                  | with_entries(select(.value != null))' > taskdef.json
+            aws ecs register-task-definition --cli-input-json file://taskdef.json \
+              --query taskDefinition.taskDefinitionArn --output text
+          }
+
+          if [ -n "${MIGRATE_TASK}" ]; then
+            arn=$(register "${NAME}-${MIGRATE_TASK}")
+            task=$(aws ecs run-task --cluster "${NAME}" --launch-type EC2 --task-definition "${arn}" \
+              --started-by "release-${GITHUB_SHA::12}" --query 'tasks[0].taskArn' --output text)
+            echo "Started ${MIGRATE_TASK} (${task##*/}); waiting for it to finish."
+            aws ecs wait tasks-stopped --cluster "${NAME}" --tasks "${task}"
+            code=$(aws ecs describe-tasks --cluster "${NAME}" --tasks "${task}" \
+              --query 'tasks[0].containers[0].exitCode' --output text)
+            if [ "${code}" != "0" ]; then
+              reason=$(aws ecs describe-tasks --cluster "${NAME}" --tasks "${task}" --query 'tasks[0].stoppedReason' --output text)
+              echo "::error::${MIGRATE_TASK} exited with ${code} (${reason}). The running version is untouched."
+              aws logs get-log-events --log-group-name "/onepeek/${NAME}/containers" \
+                --log-stream-name "${MIGRATE_TASK}/${MIGRATE_TASK}/${task##*/}" --limit 50 \
+                --query 'events[].message' --output text || true
+              exit 1
+            fi
+          fi
+
+          arn=$(register "${NAME}-${SERVICE}")
+          aws ecs update-service --cluster "${NAME}" --service "${SERVICE}" --task-definition "${arn}" >/dev/null
+          echo "Deploying ${arn##*/}; waiting until ${SERVICE} is stable."
+          if ! aws ecs wait services-stable --cluster "${NAME}" --services "${SERVICE}"; then
+            aws ecs describe-services --cluster "${NAME}" --services "${SERVICE}" \
+              --query 'services[0].events[:10].message' --output text
+            echo "::error::${SERVICE} did not become stable."
+            exit 1
+          fi
+
+      - name: Check the new version is ready
+        run: |
+          for _ in $(seq 1 20); do
+            if curl --fail --silent --show-error --max-time 10 "${READY_URL}" >/dev/null; then
+              echo "Ready: ${READY_URL}"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::${READY_URL} did not answer 2xx within 5 minutes."
+          exit 1
