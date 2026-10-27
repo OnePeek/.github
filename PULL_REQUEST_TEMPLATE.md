@@ -5,6 +5,9 @@
 ## Docs
 <!-- Link the onepeek-docs pull request or commit this implements (engineering standards §1). Write "none" only for a bug fix that changes no documented behaviour. -->
 
+## Implements
+<!-- Code pull requests (spec-to-code standard): the LLD (`onepeek-docs/trd/lld/<unit>.md`) and the onepeek-docs commit pinned in `docs-version.txt`. Docs pull requests that change trd/, decisions/ or architecture/: "architecture map republished". Bug fixes with no documented change: "none". -->
+
 ## Docs read
 <!-- Mandatory (code-guidelines §1): this repo's AGENTS.md and docs/ guide, onepeek-docs/standards/code-guidelines.md, and the spec sections for this change. -->
 
@@ -12,7 +15,7 @@
 <!-- Commands and results. Say so plainly if something failed or was skipped. -->
 
 ## Checklist
-- [ ] Docs first: the PRD, TRD or contract change is merged, or none is needed
+- [ ] Docs first: the LLD, contracts and any PRD/TRD/HLD updates are merged, or none is needed (spec-to-code)
 - [ ] Follows `code-guidelines.md` and this repo's guide: layers, no hard-coded values, typed inputs, tests
 - [ ] `docs-version.txt` moved if contracts changed
 - [ ] No secrets and no personal data in code, tests, fixtures or logs
