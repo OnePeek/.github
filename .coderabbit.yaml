@@ -50,10 +50,11 @@ knowledge_base:
     filePatterns:
       - "**/AGENTS.md"
       - "onepeek-docs:standards/*.md"
+      - "onepeek-docs:architecture/hld/*.md"
   learnings:
     scope: "auto"
   pull_requests:
     scope: "auto"
   linked_repositories:
     - repository: "OnePeek/onepeek-docs"
-      instructions: "The source of truth: founder decisions, the PRD, the TRD, contracts and standards. Check changes against them."
+      instructions: "The source of truth: founder decisions, the technical HLD (architecture/hld/), the LLDs (architecture/lld/), the PRD, the TRD, contracts and standards. Code must implement its LLD exactly: flag anything the LLD does not say, and any break of an HLD rule."

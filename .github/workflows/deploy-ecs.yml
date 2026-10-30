@@ -1,5 +1,5 @@
 # Shared: build an image, push it to ECR, run migrations if asked, roll one ECS service and check it
-# is ready (branching-and-delivery standard §5; onepeek-docs trd/lld/preprod-runtime.md §6).
+# is ready (branching-and-delivery standard §5; onepeek-docs architecture/lld/preprod-runtime.md §6).
 # Called by each app repo's release.yml on a merge into release. Nobody deploys from a laptop.
 #
 # A re-run of the same commit re-deploys the image already pushed (ECR tags are immutable), so
