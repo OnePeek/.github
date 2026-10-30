@@ -6,7 +6,7 @@
 <!-- Link the onepeek-docs pull request or commit this implements (engineering standards §1). Write "none" only for a bug fix that changes no documented behaviour. -->
 
 ## Implements
-<!-- Code pull requests (spec-to-code standard): the LLD (`onepeek-docs/trd/lld/<unit>.md`) and the onepeek-docs commit pinned in `docs-version.txt`. Docs pull requests that change trd/, decisions/ or architecture/: "architecture map republished". Bug fixes with no documented change: "none". -->
+<!-- Code pull requests (spec-to-code standard): the LLD (`onepeek-docs/architecture/lld/<area>/<unit>.md`) and the onepeek-docs commit pinned in `docs-version.txt`. Docs pull requests that change trd/, decisions/ or architecture/: "architecture map republished". Bug fixes with no documented change: "none". -->
 
 ## Docs read
 <!-- Mandatory (code-guidelines §1): this repo's AGENTS.md and docs/ guide, onepeek-docs/standards/code-guidelines.md, and the spec sections for this change. -->
