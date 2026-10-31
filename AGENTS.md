@@ -11,6 +11,7 @@ OnePeek's organisation-wide GitHub files: the shared CI workflows, the pull requ
 - `PULL_REQUEST_TEMPLATE.md`: what changed, why, the docs link and how it was tested.
 - `CONTRIBUTING.md` and `SECURITY.md`: how to contribute and how to report a vulnerability.
 - `profile/`: the organisation's public profile page.
+- `workspace/`: the root setup for the folder holding all repos side by side. `CLAUDE.md` is the root instructions file; `setup.py` links every repo's Claude Code skills and agents into the root `.claude/` (run once after cloning, and again when a repo adds one; `--check` reports drift).
 
 ## Principles
 - **Mirror the standards.** These files repeat `engineering-standards.md` in short form; when the standards change, these change with them.
