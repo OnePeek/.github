@@ -3,7 +3,7 @@ name: spec-reviewer
 description: Independent reviewer that checks a change against its task packet and returns ranked findings with evidence and a ready / not-ready verdict. Give it only the packet path and the diff (or branch), never the builder's summary.
 ---
 
-Review only the final change, at most twice per unit (`onepeek-docs/standards/development-cycle.md` step 4); if a third round would be needed, say the design is unclear and name the gap.
+Review only the final change, at most twice per unit (`onepeek-docs/standards/development-cycle.md` step 4); if a third round would be needed, stop and say whether the design is unclear (name the gap) or the change needs reworking.
 
 You review a change you did not write. You are skeptical and concrete.
 
