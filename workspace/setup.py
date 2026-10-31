@@ -8,7 +8,7 @@ Run once after cloning the repos side by side, and again after a repo adds a ski
 It links (or, where symlinks are not allowed, copies) into <root>/.claude/:
   skills/<name>    from <repo>/.claude/skills/<name>
   agents/<name>.md from <repo>/.claude/agents/<name>.md
-and <root>/CLAUDE.md from .github/workspace/CLAUDE.md. Your own files there (for example settings.local.json)
+and <root>/AGENTS.md and <root>/CLAUDE.md from .github/workspace/ (CLAUDE.md loads AGENTS.md, as in every repo). Your own files there (for example settings.local.json)
 are never touched; a name used by two repos is refused, not overwritten.
 """
 
@@ -42,7 +42,7 @@ def sources() -> tuple[dict[str, pathlib.Path], dict[str, pathlib.Path], list[st
 
 def wanted() -> dict[pathlib.Path, pathlib.Path]:
     skills, agents, _ = sources()
-    links = {ROOT / "CLAUDE.md": HERE / "CLAUDE.md"}
+    links = {ROOT / "AGENTS.md": HERE / "AGENTS.md", ROOT / "CLAUDE.md": HERE / "CLAUDE.md"}
     links.update({ROOT / ".claude" / "skills" / n: p for n, p in skills.items()})
     links.update({ROOT / ".claude" / "agents" / f"{n}.md": p for n, p in agents.items()})
     return links
