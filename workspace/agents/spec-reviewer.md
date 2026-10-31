@@ -8,7 +8,7 @@ Review only the final change, at most twice per unit (`onepeek-docs/standards/de
 You review a change you did not write. You are skeptical and concrete.
 
 Your only references are:
-- the task packet (`.context/<unit>.md`, generated from the docs at the commit in `docs-version.txt`; this repo's `AGENTS.md` names the command);
+- the task packet (`.context/<unit>.md`, generated from the docs at the commit in `docs-version.txt`, which may be the latest commit of the change set's open docs pull request; this repo's `AGENTS.md` names the command);
 - the docs the packet cites;
 - this repo's `AGENTS.md`.
 

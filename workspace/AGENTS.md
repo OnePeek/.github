@@ -5,11 +5,21 @@ This folder holds the OnePeek repositories side by side. It is not itself a repo
 ## Before any task
 1. **Find the repo the task belongs to,** then read that repo's `AGENTS.md` and follow it. For example, backend work means `backend-service/AGENTS.md`. Each repo's rules apply to every file in it.
 2. **The docs are the source of truth:** `onepeek-docs`. Start with its `standards/spec-to-code.md` and `standards/repo-map.md`.
-3. **Building or changing code** follows `onepeek-docs/standards/spec-to-code.md` §6 (task packet, build, gates, independent review, pull request), **one stage at a time** (`standards/development-cycle.md`): start only when everything the unit depends on is finished, close every design gap before building, at most two review rounds.
+3. **Building or changing code** follows `onepeek-docs/standards/spec-to-code.md` §6 (task packet, build, gates, independent review, pull request), **one stage at a time** (`standards/development-cycle.md`): start only when everything the unit depends on is finished, close every design gap before building, at most two review rounds. A unit ships as **one change set** (`standards/development-cycle.md` §2a, decision 136): one docs pull request plus one pull request per code repo it touches, all kept open, with gaps and review fixes added as commits to them, then merged together, docs first (merge commit), then code (squash into `dev`).
    - The skills are linked into this folder by `setup.py`. The shared ones are written once in `.github/workspace/skills/` and synced into each repo: `build-from-lld`, `review-spec` and `fix-docs-gap`. The repo-specific ones are `build-module` (backend) and `refine-lld` (docs).
    - So are the agents: `builder` and `spec-reviewer` (shared), and `module-builder` (backend).
    - A packet for any repo: `python3 ../.github/workspace/packet.py <unit>` from inside that repo (the backend also has `uv run app context`).
 4. **For work in one repo,** starting your tool inside that repo loads its rules from the first message. Use this root for work that spans repos.
+
+## Running agents (AI tools)
+How AI agents are run, so work is fast and token use stays low (founder, 2026-11-01).
+1. **Gap check first.** Before a build, a short read-only pass over the task packet lists every gap. All of them are closed on the change set's docs pull request before the builder starts, so the build runs straight through.
+2. **Size by scope.** Each task is one coherent slice that fits in one run. The time limit (about 25 minutes) is a safety net against a stuck agent, not a way to split work.
+3. **The right model for the job.** Mechanical, well-specified work (restyling to tokens, wiring to a decided design, test fixes, syncing docs) runs on Sonnet. Design-heavy builds and every independent review run on Opus.
+4. **One agent per repo lane, resumed.** Follow-ups in the same repo (the next slice, review fixes, a closed gap) resume that lane's agent so it keeps its context. Start it fresh when its context passes about 150k tokens or the work moves to an unrelated area. Reviewers start fresh for round 1 and are resumed for round 2.
+5. **At most two lanes at once**, on non-overlapping repos. The coordinator does docs and design decisions itself rather than briefing an agent.
+6. **Gates once.** While iterating, run only the tests for the code being changed; run the full gates (and slow ones such as Docker-based Terraform tests) once before review.
+7. **Short reports.** A builder reports: files changed, the last line of each gate, gaps found, what is left. A reviewer reports ranked findings with `file:line` and a verdict. No narrative.
 
 ## Never
 - Commit, push, merge, release or deploy without an explicit instruction from a person.

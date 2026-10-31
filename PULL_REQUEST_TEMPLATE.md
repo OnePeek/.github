@@ -1,6 +1,9 @@
 ## Unit and step
 <!-- onepeek-docs/standards/development-cycle.md: the unit (module, platform part, client piece, infra part), its step (2 design ready, 3 build, 5 ship), and confirmation that everything it depends on is finished. -->
 
+## Change set
+<!-- onepeek-docs/standards/development-cycle.md §2a: the unit's docs pull request and the pull request in every other repo it touches. They merge together: docs first (merge commit), then code. "Set of one" if this is the only one. -->
+
 ## What changed
 
 ## Why
@@ -18,9 +21,9 @@
 <!-- Commands and results. Say so plainly if something failed or was skipped. -->
 
 ## Checklist
-- [ ] Docs first: the LLD, contracts and any PRD/TRD/HLD updates are merged, or none is needed (spec-to-code)
+- [ ] Docs first: the LLD, contracts and any PRD/TRD/HLD updates are committed on the change set's docs pull request, which merges first (development-cycle §2a), or none is needed
 - [ ] Follows `code-guidelines.md` and this repo's guide: layers, no hard-coded values, typed inputs, tests
-- [ ] `docs-version.txt` moved if contracts changed
+- [ ] `docs-version.txt` points at the docs pull request's latest commit (or its merge on `main`)
 - [ ] No secrets and no personal data in code, tests, fixtures or logs
 - [ ] Tests and CI gates pass
 - [ ] Title follows Conventional Commits (`feat:`, `fix:`, `chore:` …), targeting `dev` (or `release` for a release)
