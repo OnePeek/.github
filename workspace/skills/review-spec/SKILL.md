@@ -10,9 +10,9 @@ description: Independently review a change against its spec (the task packet fro
 ## Run it
 Start the `spec-reviewer` agent with two things:
 - **The packet:** `.context/<unit>.md`. If it is missing, generate it with this repo's packet command, given in its `AGENTS.md`. In `backend-service` that is `uv run app context <unit> --out .context/<unit>.md`; elsewhere it is `python3 ../onepeek-docs/tools/context.py <unit> --out .context/<unit>.md`, run against the docs commit in `docs-version.txt`.
-- **The diff:** `git diff dev...HEAD`, or a branch name.
+- **The diff:** `git diff dev...HEAD`, or a branch name. For a change set that spans repos, give it every repo's diff and the docs pull request's diff (`development-cycle.md` §2a), so the set is reviewed as one.
 
-Then wait for its report and act on every blocking and should-fix finding. Review the **final** change only, and at most twice (`onepeek-docs/standards/development-cycle.md` step 4); if a third would be needed, stop and report whether the design is unclear or the change needs reworking.
+Then wait for its report and act on every blocking and should-fix finding: a design answer is a commit on the change set's docs pull request, a code fix a commit on that repo's pull request; never a new pull request. Review the **final** change only, and at most twice (`onepeek-docs/standards/development-cycle.md` step 4); if a third would be needed, stop and report whether the design is unclear or the change needs reworking.
 
 ## What the reviewer checks (the `spec-reviewer` agent holds the full list)
 1. **Traceability.** Every requirement in the packet is implemented, and every line of code traces to a packet section. Anything that does not trace is drift.
