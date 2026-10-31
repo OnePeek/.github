@@ -4,6 +4,11 @@ Run once after cloning the repos side by side, and again after a repo adds a ski
 
     python3 .github/workspace/setup.py            # from the workspace root (the folder holding the repos)
     python3 .github/workspace/setup.py --check    # report what is missing or stale; exit 1 if anything is
+    python3 .github/workspace/setup.py --sync-repos   # copy the shared skills and agents into every code repo
+
+Shared skills and agents (review-spec, fix-docs-gap, spec-reviewer) are written once, in .github/workspace/skills and
+.github/workspace/agents. `--sync-repos` copies them into each repo in SYNC_REPOS with a "synced" note after the front
+matter; `--check` also fails when a repo's copy differs from the shared one (edit the shared copy, then re-sync).
 
 It links (or, where symlinks are not allowed, copies) into <root>/.claude/:
   skills/<name>    from <repo>/.claude/skills/<name>
@@ -21,19 +26,78 @@ import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parents[1]  # <root>/.github/workspace → <root>
+SHARED_SKILLS = HERE / "skills"
+SHARED_AGENTS = HERE / "agents"
+# Which shared skills and agents each repo carries. backend-service has its own builder (build-module,
+# module-builder); marketing-website has no LLD, so only the docs-first skill applies.
+_ALL = ("review-spec", "fix-docs-gap", "build-from-lld", "spec-reviewer", "builder")
+SYNC_REPOS: dict[str, tuple[str, ...]] = {
+    "backend-service": ("review-spec", "fix-docs-gap", "spec-reviewer"),
+    "onepeek-infra": _ALL,
+    "onepeek-web": _ALL,
+    "onepeek-design-system": _ALL,
+    "browser-extension": _ALL,
+    "plugin-owl": _ALL,
+    "mcp-athena": _ALL,
+    "marketing-website": ("fix-docs-gap",),
+}
+NOTE = "<!-- Synced from OnePeek/.github workspace/{kind}/{name} by setup.py --sync-repos. Edit it there, not here. -->\n"
+
+
+def shared(names: tuple[str, ...]) -> dict[pathlib.Path, str]:
+    """Relative path inside a repo's .claude/ → the text it must hold, for the named shared skills and agents."""
+    out: dict[pathlib.Path, str] = {}
+    for s in sorted(SHARED_SKILLS.glob("*/SKILL.md")):
+        if s.parent.name in names:
+            out[pathlib.Path("skills") / s.parent.name / "SKILL.md"] = with_note(s.read_text(), "skills", s.parent.name)
+    for a in sorted(SHARED_AGENTS.glob("*.md")):
+        if a.stem in names:
+            out[pathlib.Path("agents") / a.name] = with_note(a.read_text(), "agents", a.name)
+    return out
+
+
+def with_note(text: str, kind: str, name: str) -> str:
+    """Insert the synced note right after the front matter (Claude Code reads the front matter first)."""
+    end = text.index("\n---\n", 4) + 5
+    return text[:end] + NOTE.format(kind=kind, name=name) + text[end:]
+
+
+def sync_problems(write: bool) -> list[str]:
+    problems: list[str] = []
+    for repo, names in SYNC_REPOS.items():
+        base = ROOT / repo / ".claude"
+        if not (ROOT / repo / ".git").exists():
+            problems.append(f"{repo}: not cloned beside .github")
+            continue
+        for rel, text in shared(names).items():
+            dst = base / rel
+            if dst.exists() and dst.read_text() == text:
+                continue
+            if write:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_text(text)
+                print(f"synced   {repo}/.claude/{rel}")
+            else:
+                problems.append(f"{repo}/.claude/{rel}: {'differs from' if dst.exists() else 'missing'} the shared copy")
+    return problems
 
 
 def sources() -> tuple[dict[str, pathlib.Path], dict[str, pathlib.Path], list[str]]:
-    skills: dict[str, pathlib.Path] = {}
-    agents: dict[str, pathlib.Path] = {}
+    skills: dict[str, pathlib.Path] = {s.parent.name: s.parent for s in SHARED_SKILLS.glob("*/SKILL.md")}
+    agents: dict[str, pathlib.Path] = {a.stem: a for a in SHARED_AGENTS.glob("*.md")}
+    shared_names = set(skills) | set(agents)
     clashes: list[str] = []
     for repo in sorted(p for p in ROOT.iterdir() if p.is_dir() and (p / ".git").exists()):
         for s in sorted((repo / ".claude" / "skills").glob("*/SKILL.md")):
             name = s.parent.name
+            if name in shared_names:
+                continue  # a synced copy of a shared skill: the root links the shared original
             if name in skills:
                 clashes.append(f"skill {name}: in {skills[name].parent.parent.parent.name} and {repo.name}")
             skills.setdefault(name, s.parent)
         for a in sorted((repo / ".claude" / "agents").glob("*.md")):
+            if a.stem in shared_names:
+                continue
             if a.stem in agents:
                 clashes.append(f"agent {a.stem}: in {agents[a.stem].parent.parent.parent.name} and {repo.name}")
             agents.setdefault(a.stem, a)
@@ -93,7 +157,13 @@ def stale() -> list[pathlib.Path]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--check", action="store_true", help="report only; exit 1 if anything is missing or stale")
+    ap.add_argument("--sync-repos", action="store_true", help="copy the shared skills and agents into every code repo")
     a = ap.parse_args()
+    if a.sync_repos:
+        problems = sync_problems(write=True)
+        for p in problems:
+            print(p)
+        return 1 if problems else 0
     _, _, clashes = sources()
     for c in clashes:
         print(f"CLASH {c}: rename one; only the first is linked")
@@ -104,7 +174,10 @@ def main() -> int:
             print(f"missing {d.relative_to(ROOT)}")
         for p in old:
             print(f"stale   {p.relative_to(ROOT)}")
-        ok = not missing and not old and not clashes
+        drift = sync_problems(write=False)
+        for d in drift:
+            print(f"drift   {d}")
+        ok = not missing and not old and not clashes and not drift
         print("WORKSPACE OK" if ok else "WORKSPACE NEEDS setup.py")
         return 0 if ok else 1
     for p in old:  # a skill or agent its repo removed
