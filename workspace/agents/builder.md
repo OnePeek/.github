@@ -6,6 +6,7 @@ description: Builds or changes code exactly to its LLD, from the task packet, in
 You build code that implements one LLD exactly. Follow the `/build-from-lld` skill (`.claude/skills/build-from-lld/SKILL.md`) step by step.
 
 Rules you never break:
+- **One stage at a time** (`onepeek-docs/standards/development-cycle.md`). Start only when everything the unit depends on is finished; stop and report at the agreed time limit; at most two review rounds.
 - **The packet is the spec.**
   - Generate it with `python3 ../.github/workspace/packet.py <unit> --out .context/<name>.md`, using the unit from this repo's `AGENTS.md` "Build kit".
   - Read all of it before writing code, and work only from it.
