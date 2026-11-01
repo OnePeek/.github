@@ -1,0 +1,790 @@
+# Shared release workflow (onepeek-docs architecture/lld/infra/delivery-pipelines.md UC-DEL-001, UC-DEL-005, §5).
+# Called by backend-service and onepeek-web on a push to release. The caller only passes inputs. Jobs, in order:
+# version, build, scan, sbom-sign, record-digest, migrate, assets, rollout, register-one-offs, smoke, watch,
+# rollback (only on failure), tag-notify, api-client. Nobody deploys from a laptop.
+#
+# Provisional (delivery-pipelines §16 "Decided before building"): ARM64 images are built with QEMU on GitHub's
+# standard runners (Q1); team notices go to the release page and its email notifications (Q2).
+# `dry-run: true` (§15) renders every task definition and checks every signature, and changes nothing.
+name: release-ecs
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Environment; resources are named onepeek-<environment>.
+        type: string
+        required: true
+      image:
+        description: The main image, backend or web.
+        type: string
+        required: true
+      extra-images:
+        description: Further images built in the same run (sandbox). Empty until the sandbox image exists.
+        type: string
+        default: ""
+      migrate:
+        description: Run the migrate task before the rollout (backend only).
+        type: boolean
+        default: false
+      assets:
+        description: Copy the web build's assets to the web-assets bucket before the rollout (web only, UC-DEL-005).
+        type: boolean
+        default: false
+      domain:
+        description: The environment's public host name, for the smoke checks.
+        type: string
+        required: true
+      infra-ref:
+        description: The onepeek-infra commit whose services file is rolled out (mirrors infra-version.txt).
+        type: string
+        required: true
+      role-to-assume:
+        description: The repo's deploy role (onepeek-<env>-deploy-<repo>).
+        type: string
+        required: true
+      signing-key:
+        description: The cosign key reference, for example awskms:///alias/onepeek-preprod-image-signing.
+        type: string
+        required: true
+      dry-run:
+        description: Render every task definition and verify every signature; register, run, update and tag nothing.
+        type: boolean
+        default: false
+    secrets:
+      app-private-key:
+        description: Private key of the GitHub App that reads onepeek-infra and the @onepeek packages (delivery-pipelines §10).
+        required: true
+
+permissions: {}
+
+env:
+  AWS_REGION: ap-south-1
+  AWS_DEFAULT_REGION: ap-south-1
+  NAME: onepeek-${{ inputs.environment }}
+  ENVIRONMENT: ${{ inputs.environment }}
+  VERSION_FILE: .release-please-manifest.json
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      images: ${{ steps.v.outputs.images }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          fetch-tags: true
+      - name: Read the version and refuse a version already released
+        id: v
+        env:
+          IMAGE: ${{ inputs.image }}
+          EXTRA: ${{ inputs.extra-images }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          version=$(python3 -c "import json;print(json.load(open('${VERSION_FILE}'))['.'])")
+          if [ -z "${version}" ]; then echo "::error::No version in ${VERSION_FILE}."; exit 1; fi
+          if [ "${DRY_RUN}" != "true" ] && git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+            echo "::error::Version ${version} is already released (tag v${version} exists). Merge the release-please pull request first."
+            exit 1
+          fi
+          images=$(python3 -c "import json,os;print(json.dumps([os.environ['IMAGE']]+[x for x in os.environ['EXTRA'].replace(',',' ').split() if x]))")
+          { echo "version=${version}"; echo "images=${images}"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: true
+      matrix:
+        image: ${{ fromJSON(needs.version.outputs.images) }}
+    outputs:
+      built: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Token for the @onepeek packages (web build only)
+        id: app
+        if: ${{ matrix.image == inputs.image && inputs.image == 'web' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.ONEPEEK_CI_APP_ID }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: onepeek-design-system,backend-service
+          permission-packages: read
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build for ARM64 and push v<version> and sha-<12>
+        id: push
+        env:
+          IMAGE: ${{ matrix.image }}
+          MAIN: ${{ inputs.image }}
+          VERSION: ${{ needs.version.outputs.version }}
+          NPM_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          if [ "${IMAGE}" != "${MAIN}" ]; then
+            echo "::error::No Dockerfile location is defined for the extra image '${IMAGE}' (delivery-pipelines §16: the sandbox image waits for document parsing)."
+            exit 1
+          fi
+          registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
+          repo="${registry}/${NAME}/${IMAGE}"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${registry}"
+          # Both tags are immutable in ECR. The ':buildcache' tag cannot be written twice in an immutable repository,
+          # so the cache is read always and written best effort (ignore-error); see the gap noted in the pull request.
+          args=(--platform linux/arm64 --provenance=false
+            --label "org.opencontainers.image.version=${VERSION}" --label "org.opencontainers.image.revision=${GITHUB_SHA}"
+            --cache-from "type=registry,ref=${repo}:buildcache"
+            --cache-to "type=registry,ref=${repo}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"
+            --tag "${repo}:v${VERSION}" --tag "${repo}:sha-${GITHUB_SHA::12}"
+            --metadata-file meta.json --push)
+          if [ -n "${NPM_TOKEN}" ]; then
+            args+=(--secret id=npm_token,env=NPM_TOKEN)   # a BuildKit secret, never a build argument or layer
+          fi
+          docker buildx build "${args[@]}" .
+          digest=$(python3 -c "import json;print(json.load(open('meta.json'))['containerimage.digest'])")
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "${IMAGE}=${digest}" > "digest-${IMAGE}.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.image }}
+          path: digest-${{ matrix.image }}.txt
+          retention-days: 1
+
+  scan:
+    needs: [version, build]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        image: ${{ fromJSON(needs.version.outputs.images) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: digest-${{ matrix.image }}
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - name: Registry login for the scanner
+        id: login
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
+          digest=$(cut -d= -f2 "digest-${IMAGE}.txt")
+          echo "ref=${registry}/${NAME}/${IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
+          password=$(aws ecr get-login-password)
+          echo "::add-mask::${password}"
+          { echo "TRIVY_USERNAME=AWS"; echo "TRIVY_PASSWORD=${password}"; } >> "$GITHUB_ENV"
+      - name: Trivy, a critical finding blocks (DP5). Waivers only in .trivyignore.yaml, with a reason and an expiry date
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.login.outputs.ref }}
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: false
+          trivyignores: .trivyignore.yaml
+          version: v0.76.1
+        env:
+          TRIVY_PLATFORM: linux/arm64
+
+  sbom-sign:
+    needs: [version, build, scan]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        image: ${{ fromJSON(needs.version.outputs.images) }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: digest-${{ matrix.image }}
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.5
+      - name: Syft SPDX SBOM, then sign and attest (no public transparency log; OCI 1.1 referrers)
+        env:
+          IMAGE: ${{ matrix.image }}
+          SIGNING_KEY: ${{ inputs.signing-key }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
+          digest=$(cut -d= -f2 "digest-${IMAGE}.txt")
+          ref="${registry}/${NAME}/${IMAGE}@${digest}"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${registry}"
+          curl -sSfL -o syft.tgz "https://github.com/anchore/syft/releases/download/v1.55.0/syft_1.55.0_linux_amd64.tar.gz"
+          curl -sSfL -o syft.checksums "https://github.com/anchore/syft/releases/download/v1.55.0/syft_1.55.0_checksums.txt"
+          grep " syft_1.55.0_linux_amd64.tar.gz$" syft.checksums | sed 's/  / /' | awk '{print $1"  syft.tgz"}' | sha256sum -c -
+          tar -xzf syft.tgz syft
+          ./syft "registry:${ref}" -o spdx-json=sbom.spdx.json
+          cosign sign --yes --tlog-upload=false --registry-referrers-mode=oci-1-1 --key "${SIGNING_KEY}" "${ref}"
+          cosign attest --yes --tlog-upload=false --registry-referrers-mode=oci-1-1 --type spdxjson \
+            --predicate sbom.spdx.json --key "${SIGNING_KEY}" "${ref}"
+          aws ssm put-parameter --name "/onepeek/${ENVIRONMENT}/release/${IMAGE}/digest" --type String --overwrite --value "${digest}" >/dev/null
+          aws ssm put-parameter --name "/onepeek/${ENVIRONMENT}/release/${IMAGE}/version" --type String --overwrite --value "${VERSION}" >/dev/null
+          mv sbom.spdx.json "sbom-${IMAGE}.spdx.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-${{ matrix.image }}
+          path: sbom-${{ matrix.image }}.spdx.json
+          retention-days: 7
+
+  record-digest:
+    # Step 4b. Reads back the signed digest that step 4 recorded in SSM and checks its signature. Every later job
+    # uses these digests; in a dry run they are simply the digests of the latest release. Nothing is registered here:
+    # db-bootstrap and db-rotate are registered only by ci-apply (UC-DEL-007; IAM-SEC-4).
+    needs: [version, build, scan, sbom-sign]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      digests: ${{ steps.read.outputs.digests }}
+      registry: ${{ steps.read.outputs.registry }}
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.5
+      - name: Read the recorded digests and verify each signature
+        id: read
+        env:
+          IMAGES: ${{ needs.version.outputs.images }}
+          MAIN_IMAGE: ${{ inputs.image }}
+          SIGNING_KEY: ${{ inputs.signing-key }}
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${registry}"
+          digests='{}'
+          for image in $(echo "${IMAGES}" | python3 -c "import json,sys;print(' '.join(json.load(sys.stdin)))"); do
+            digest=$(aws ssm get-parameter --name "/onepeek/${ENVIRONMENT}/release/${image}/digest" --query Parameter.Value --output text)
+            recorded=$(aws ssm get-parameter --name "/onepeek/${ENVIRONMENT}/release/${image}/version" --query Parameter.Value --output text)
+            if [ "${DRY_RUN}" != "true" ] && [ "${recorded}" != "${RELEASE_VERSION}" ]; then
+              echo "::error::${image}: SSM records version ${recorded}, this release is ${RELEASE_VERSION}."; exit 1
+            fi
+            cosign verify --experimental-oci11 --insecure-ignore-tlog=true --key "${SIGNING_KEY}" "${registry}/${NAME}/${image}@${digest}" >/dev/null
+            digests=$(echo "${digests}" | python3 -c "import json,sys;d=json.load(sys.stdin);d['${image}']='${digest}';print(json.dumps(d))")
+          done
+          version="${RELEASE_VERSION}"
+          if [ "${DRY_RUN}" = "true" ]; then version=$(aws ssm get-parameter --name "/onepeek/${ENVIRONMENT}/release/${MAIN_IMAGE}/version" --query Parameter.Value --output text); fi
+          { echo "digests=${digests}"; echo "registry=${registry}"; echo "version=${version}"; } >> "$GITHUB_OUTPUT"
+
+  migrate:
+    needs: [version, record-digest]
+    if: ${{ !cancelled() && needs.record-digest.result == 'success' && inputs.migrate }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.5
+      - name: Verify, render, register and run the migrate task (the running version is untouched on failure)
+        env:
+          IMAGE_REF: ${{ needs.record-digest.outputs.registry }}/onepeek-${{ inputs.environment }}/${{ inputs.image }}@${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
+          SIGNING_KEY: ${{ inputs.signing-key }}
+          VERSION: ${{ needs.version.outputs.version }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          # --- render-taskdef begin (identical in release-ecs.yml and operate.yml; checked by scripts/check_service_list.py) ---
+          render() {  # render <service> -> task definition JSON on stdout
+            aws s3 cp "s3://${NAME}-deploy/taskdef/$1.json" - \
+              | IMAGE_REF="${IMAGE_REF}" VERSION="${VERSION}" RUN_ID="${GITHUB_RUN_ID}" python3 -c '
+          import json, os, re, sys
+          text = sys.stdin.read()
+          text = text.replace("__IMAGE__", os.environ["IMAGE_REF"])
+          left = sorted(set(re.findall(r"__[A-Z0-9_]+__", text)))
+          if left:
+              sys.exit("placeholders left in the template: " + ", ".join(left))
+          doc = json.loads(text)
+          doc["tags"] = [{"key": "version", "value": os.environ["VERSION"]}, {"key": "release-run", "value": os.environ["RUN_ID"]}]
+          print(json.dumps(doc))'
+          }
+          # --- render-taskdef end ---
+          cosign verify --experimental-oci11 --insecure-ignore-tlog=true --key "${SIGNING_KEY}" "${IMAGE_REF}" >/dev/null
+          render migrate > migrate.json
+          if [ "${DRY_RUN}" = "true" ]; then echo "Dry run: migrate renders and its signature verifies."; exit 0; fi
+          arn=$(aws ecs register-task-definition --cli-input-json file://migrate.json --query taskDefinition.taskDefinitionArn --output text)
+          task=$(aws ecs run-task --cluster "${NAME}" --task-definition "${arn}" --started-by "release-${GITHUB_RUN_ID}" \
+            --query 'tasks[0].taskArn' --output text)
+          echo "Started migrate (${task##*/}); waiting."
+          aws ecs wait tasks-stopped --cluster "${NAME}" --tasks "${task}"
+          code=$(aws ecs describe-tasks --cluster "${NAME}" --tasks "${task}" --query 'tasks[0].containers[0].exitCode' --output text)
+          if [ "${code}" != "0" ]; then
+            if [ "${code}" = "3" ]; then
+              echo "::error::migrate exited 3 (login_missing_run_bootstrap). Run the infra release or bootstrap.yml that creates the login, then re-run (aws-stack §8.2)."
+            else
+              echo "::error::migrate exited ${code}. The running version is untouched."
+            fi
+            aws logs get-log-events --log-group-name "/onepeek/${NAME}/app/migrate" --log-stream-name "migrate/migrate/${task##*/}" \
+              --limit 200 --query 'events[].message' --output text || true
+            exit 1
+          fi
+
+  assets:
+    # UC-DEL-005: between sbom-sign and rollout. The files are the exact bytes of the built image.
+    needs: [version, record-digest]
+    if: ${{ !cancelled() && needs.record-digest.result == 'success' && inputs.assets }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - name: Copy /app/dist/assets to web-assets/<version>/ (never overwrite) and prune old folders
+        env:
+          IMAGE_REF: ${{ needs.record-digest.outputs.registry }}/onepeek-${{ inputs.environment }}/${{ inputs.image }}@${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
+          REGISTRY: ${{ needs.record-digest.outputs.registry }}
+          VERSION: ${{ needs.version.outputs.version }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          bucket="${NAME}-web-assets"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${REGISTRY}"
+          docker pull --platform linux/arm64 "${IMAGE_REF}" >/dev/null
+          id=$(docker create --platform linux/arm64 "${IMAGE_REF}")
+          docker cp "${id}:/app/dist/assets" ./assets-out
+          docker rm "${id}" >/dev/null
+          if [ "${DRY_RUN}" = "true" ]; then echo "Dry run: $(find assets-out -type f | wc -l) asset files extracted; nothing uploaded."; exit 0; fi
+          if [ -n "$(aws s3api list-objects-v2 --bucket "${bucket}" --prefix "${VERSION}/" --max-keys 1 --query 'Contents[0].Key' --output text | grep -v '^None$' || true)" ]; then
+            echo "web-assets/${VERSION}/ already exists; assets are never overwritten (a re-run is a no-op)."
+          else
+            aws s3 sync ./assets-out "s3://${bucket}/${VERSION}/" --cache-control "public, max-age=31536000, immutable" --only-show-errors
+          fi
+          # Delete folders that are both beyond the last 10 versions and older than 90 days.
+          python3 - <<'PY'
+          import datetime, json, os, subprocess
+          bucket = os.environ["NAME"] + "-web-assets"
+          out = subprocess.run(["aws", "s3api", "list-objects-v2", "--bucket", bucket, "--output", "json"],
+                               check=True, capture_output=True, text=True).stdout
+          objects = (json.loads(out) or {}).get("Contents", []) if out.strip() not in ("", "null") else []
+          folders = {}
+          for o in objects:
+              folder = o["Key"].split("/", 1)[0]
+              when = datetime.datetime.fromisoformat(o["LastModified"].replace("Z", "+00:00"))
+              folders[folder] = max(folders.get(folder, when), when)
+          newest_first = sorted(folders, key=lambda f: folders[f], reverse=True)
+          cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=90)
+          for folder in newest_first[10:]:
+              if folders[folder] < cutoff:
+                  subprocess.run(["aws", "s3", "rm", "s3://%s/%s/" % (bucket, folder), "--recursive", "--only-show-errors"], check=True)
+                  print("Deleted old assets folder", folder)
+          PY
+
+  rollout:
+    needs: [version, record-digest, migrate, assets]
+    if: ${{ !cancelled() && needs.record-digest.result == 'success' && !contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      previous: ${{ steps.previous.outputs.previous }}
+      services: ${{ steps.services.outputs.services }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Token to read onepeek-infra
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.ONEPEEK_CI_APP_ID }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: onepeek-infra
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/onepeek-infra
+          ref: ${{ inputs.infra-ref }}
+          token: ${{ steps.app.outputs.token }}
+          path: _infra
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.5
+      - name: The services this image rolls (services file at the pinned infra commit)
+        id: services
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          import yaml
+          doc = yaml.safe_load(open("_infra/config/services.%s.yaml" % os.environ["ENVIRONMENT"]))
+          defaults = doc.get("defaults", {})
+          rolled = {"request", "connection", "event", "job", "workflow", "schedule"}
+          names = []
+          for name, svc in doc["services"].items():
+              if svc.get("image", defaults.get("image")) == os.environ["IMAGE"] and rolled & set(svc.get("triggers", [])):
+                  names.append(name)
+          print("services=" + json.dumps(names))
+          PY
+      - name: E7. The services file must only name services the image can run (backend only)
+        if: ${{ inputs.image == 'backend' }}
+        env:
+          IMAGE_REF: ${{ needs.record-digest.outputs.registry }}/onepeek-${{ inputs.environment }}/${{ inputs.image }}@${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
+          SERVICES: ${{ steps.services.outputs.services }}
+          REGISTRY: ${{ needs.record-digest.outputs.registry }}
+        run: |
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${REGISTRY}"
+          docker pull --platform linux/arm64 "${IMAGE_REF}" >/dev/null
+          listed=$(docker run --rm --platform linux/arm64 "${IMAGE_REF}" --list)
+          LISTED="${listed}" python3 -c "
+          import json, os
+          can = set(json.loads(os.environ['LISTED'])['services'])
+          missing = [s for s in json.loads(os.environ['SERVICES']) if s.replace('-', '_') not in can and s not in can]
+          if missing:
+              raise SystemExit('The services file names services this image cannot run: ' + ', '.join(missing))"
+      - name: The gateway routes (backend only, additive within a release; the gateway reloads within 30 s)
+        if: ${{ inputs.image == 'backend' && !inputs.dry-run }}
+        env:
+          INFRA_REF: ${{ inputs.infra-ref }}
+        run: |
+          # `app api routes` reads the services file through infra-version.txt and the sibling folder onepeek-infra.
+          echo "onepeek-infra@${INFRA_REF}" > infra-version.txt
+          mv _infra ../onepeek-infra
+          python3 -m pip install --quiet uv==0.9.7
+          uv run --frozen --no-dev app api routes --env "${ENVIRONMENT}" --out gateway-routes.json
+          aws s3 cp gateway-routes.json "s3://${NAME}-deploy/gateway-routes.json" --only-show-errors
+          mv ../onepeek-infra _infra
+      - name: Record every service's current task definition (for the rollback)
+        id: previous
+        env:
+          SERVICES: ${{ steps.services.outputs.services }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, subprocess
+          prev = {}
+          for svc in json.loads(os.environ["SERVICES"]):
+              out = subprocess.run(["aws", "ecs", "describe-services", "--cluster", os.environ["NAME"], "--services", svc,
+                                    "--query", "services[0].taskDefinition", "--output", "text"], check=True, capture_output=True, text=True).stdout.strip()
+              prev[svc] = out
+          print("previous=" + json.dumps(prev))
+          PY
+      - name: Verify, render, register and update every service in parallel, then wait for stable (15 minutes)
+        env:
+          IMAGE_REF: ${{ needs.record-digest.outputs.registry }}/onepeek-${{ inputs.environment }}/${{ inputs.image }}@${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
+          SIGNING_KEY: ${{ inputs.signing-key }}
+          VERSION: ${{ needs.version.outputs.version }}
+          SERVICES: ${{ steps.services.outputs.services }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          # --- render-taskdef begin (identical in release-ecs.yml and operate.yml; checked by scripts/check_service_list.py) ---
+          render() {  # render <service> -> task definition JSON on stdout
+            aws s3 cp "s3://${NAME}-deploy/taskdef/$1.json" - \
+              | IMAGE_REF="${IMAGE_REF}" VERSION="${VERSION}" RUN_ID="${GITHUB_RUN_ID}" python3 -c '
+          import json, os, re, sys
+          text = sys.stdin.read()
+          text = text.replace("__IMAGE__", os.environ["IMAGE_REF"])
+          left = sorted(set(re.findall(r"__[A-Z0-9_]+__", text)))
+          if left:
+              sys.exit("placeholders left in the template: " + ", ".join(left))
+          doc = json.loads(text)
+          doc["tags"] = [{"key": "version", "value": os.environ["VERSION"]}, {"key": "release-run", "value": os.environ["RUN_ID"]}]
+          print(json.dumps(doc))'
+          }
+          # --- render-taskdef end ---
+          cosign verify --experimental-oci11 --insecure-ignore-tlog=true --key "${SIGNING_KEY}" "${IMAGE_REF}" >/dev/null
+          services=$(echo "${SERVICES}" | python3 -c "import json,sys;print(' '.join(json.load(sys.stdin)))")
+          for svc in ${services}; do render "${svc}" > "td-${svc}.json"; done
+          if [ "${DRY_RUN}" = "true" ]; then echo "Dry run: rendered $(echo ${services} | wc -w) task definitions; signature verified."; exit 0; fi
+          for svc in ${services}; do
+            arn=$(aws ecs register-task-definition --cli-input-json "file://td-${svc}.json" --query taskDefinition.taskDefinitionArn --output text)
+            aws ecs update-service --cluster "${NAME}" --service "${svc}" --task-definition "${arn}" >/dev/null
+            echo "${svc} -> ${arn##*/}"
+          done
+          # shellcheck disable=SC2086
+          if ! aws ecs wait services-stable --cluster "${NAME}" --services ${services}; then
+            echo "::error::A service did not become stable (the ECS circuit breaker has rolled it back)."; exit 1
+          fi
+      - name: Lambda sandbox functions, new version, move the live alias (only when sandbox is released)
+        if: ${{ !inputs.dry-run && contains(inputs.extra-images, 'sandbox') }}
+        env:
+          SANDBOX_REF: ${{ needs.record-digest.outputs.registry }}/onepeek-${{ inputs.environment }}/sandbox@${{ fromJSON(needs.record-digest.outputs.digests).sandbox }}
+        run: |
+          for fn in parse fetch; do
+            aws lambda update-function-code --function-name "${NAME}-sandbox-${fn}" \
+              --image-uri "${SANDBOX_REF}" >/dev/null
+            aws lambda wait function-updated --function-name "${NAME}-sandbox-${fn}"
+            ver=$(aws lambda publish-version --function-name "${NAME}-sandbox-${fn}" --query Version --output text)
+            aws lambda update-alias --function-name "${NAME}-sandbox-${fn}" --name live --function-version "${ver}" >/dev/null
+          done
+
+  register-one-offs:
+    # 6b. The ops family only. Nothing is run. migrate is registered in its own job; db-bootstrap and db-rotate only by ci-apply.
+    needs: [version, record-digest, rollout]
+    if: ${{ !cancelled() && needs.rollout.result == 'success' && inputs.image == 'backend' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.5
+      - name: Verify, render, check the launch settings, register ops and record its revision
+        env:
+          IMAGE_REF: ${{ needs.record-digest.outputs.registry }}/onepeek-${{ inputs.environment }}/${{ inputs.image }}@${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
+          SIGNING_KEY: ${{ inputs.signing-key }}
+          VERSION: ${{ needs.version.outputs.version }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          # --- render-taskdef begin (identical in release-ecs.yml and operate.yml; checked by scripts/check_service_list.py) ---
+          render() {  # render <service> -> task definition JSON on stdout
+            aws s3 cp "s3://${NAME}-deploy/taskdef/$1.json" - \
+              | IMAGE_REF="${IMAGE_REF}" VERSION="${VERSION}" RUN_ID="${GITHUB_RUN_ID}" python3 -c '
+          import json, os, re, sys
+          text = sys.stdin.read()
+          text = text.replace("__IMAGE__", os.environ["IMAGE_REF"])
+          left = sorted(set(re.findall(r"__[A-Z0-9_]+__", text)))
+          if left:
+              sys.exit("placeholders left in the template: " + ", ".join(left))
+          doc = json.loads(text)
+          doc["tags"] = [{"key": "version", "value": os.environ["VERSION"]}, {"key": "release-run", "value": os.environ["RUN_ID"]}]
+          print(json.dumps(doc))'
+          }
+          # --- render-taskdef end ---
+          cosign verify --experimental-oci11 --insecure-ignore-tlog=true --key "${SIGNING_KEY}" "${IMAGE_REF}" >/dev/null
+          aws s3api head-object --bucket "${NAME}-deploy" --key run/ops.json >/dev/null   # its launch settings exist
+          render ops > ops.json
+          if [ "${DRY_RUN}" = "true" ]; then echo "Dry run: ops renders and its launch settings exist."; exit 0; fi
+          arn=$(aws ecs register-task-definition --cli-input-json file://ops.json --query taskDefinition.taskDefinitionArn --output text)
+          aws ssm put-parameter --name "/onepeek/${ENVIRONMENT}/release/backend/one_off/ops" --type String --overwrite --value "${arn}" >/dev/null
+          echo "Registered ${arn##*/} (not run)."
+
+  smoke:
+    needs: [version, record-digest, rollout, register-one-offs]
+    if: ${{ !cancelled() && !inputs.dry-run && needs.rollout.result == 'success' && !contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - name: The edge answers, and every service runs this release's image digest
+        env:
+          DOMAIN: ${{ inputs.domain }}
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
+          SERVICES: ${{ needs.rollout.outputs.services }}
+        run: |
+          if [ "${IMAGE}" = "backend" ]; then paths="/api/status"; else paths="/"; fi
+          for p in ${paths}; do
+            curl --fail --silent --show-error --max-time 10 --retry 6 --retry-delay 10 --retry-all-errors "https://${DOMAIN}${p}" >/dev/null
+          done
+          for svc in $(echo "${SERVICES}" | python3 -c "import json,sys;print(' '.join(json.load(sys.stdin)))"); do
+            td=$(aws ecs describe-services --cluster "${NAME}" --services "${svc}" --query 'services[0].taskDefinition' --output text)
+            image=$(aws ecs describe-task-definition --task-definition "${td}" --query 'taskDefinition.containerDefinitions[0].image' --output text)
+            case "${image}" in *"@${DIGEST}") ;; *) echo "::error::${svc} runs ${image}, not digest ${DIGEST}."; exit 1;; esac
+          done
+
+  watch:
+    needs: [version, rollout, smoke]
+    if: ${{ !cancelled() && needs.smoke.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - name: 10 minutes after stable, poll the deploy alarms every 30 s
+        run: |
+          end=$((SECONDS + 600))
+          while [ "${SECONDS}" -lt "${end}" ]; do
+            alarms=$(aws cloudwatch describe-alarms --alarm-name-prefix "${NAME}-deploy-" --state-value ALARM --query 'MetricAlarms[].AlarmName' --output text)
+            if [ -n "${alarms}" ]; then echo "::error::Deploy alarms firing: ${alarms}"; exit 1; fi
+            sleep 30
+          done
+          echo "No deploy alarm in 10 minutes."
+
+  rollback:
+    needs: [version, record-digest, rollout, register-one-offs, smoke, watch]
+    if: ${{ always() && !inputs.dry-run && (needs.rollout.result == 'failure' || needs.register-one-offs.result == 'failure' || needs.smoke.result == 'failure' || needs.watch.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - name: Put every service back on the revision recorded before the rollout (versions stay aligned, E2/E3)
+        env:
+          PREVIOUS: ${{ needs.rollout.outputs.previous }}
+          HAS_SANDBOX: ${{ contains(inputs.extra-images, 'sandbox') && 'yes' || '' }}
+        run: |
+          if [ -z "${PREVIOUS}" ]; then echo "Nothing was recorded; the rollout never started."; exit 0; fi
+          services=$(echo "${PREVIOUS}" | python3 -c "import json,sys;print(' '.join(json.load(sys.stdin)))")
+          for svc in ${services}; do
+            td=$(echo "${PREVIOUS}" | python3 -c "import json,sys;print(json.load(sys.stdin)['${svc}'])")
+            aws ecs update-service --cluster "${NAME}" --service "${svc}" --task-definition "${td}" >/dev/null
+          done
+          # shellcheck disable=SC2086
+          aws ecs wait services-stable --cluster "${NAME}" --services ${services}
+          if [ -n "${HAS_SANDBOX}" ]; then
+            for fn in parse fetch; do
+              prev=$(aws lambda list-versions-by-function --function-name "${NAME}-sandbox-${fn}" --query 'Versions[-2].Version' --output text)
+              aws lambda update-alias --function-name "${NAME}-sandbox-${fn}" --name live --function-version "${prev}" >/dev/null
+            done
+          fi
+      - name: Open an issue naming the failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh issue create --repo "${GITHUB_REPOSITORY}" --title "Release v${VERSION} to ${ENVIRONMENT} rolled back" \
+            --body "The release failed and every service was put back. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+  tag-notify:
+    needs: [version, record-digest, rollout, smoke, watch]
+    if: ${{ !cancelled() && !inputs.dry-run && needs.watch.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      deployments: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sbom-*
+          merge-multiple: true
+      - name: Tag, GitHub release with the SBOMs, deployment record
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+          DIGESTS: ${{ needs.record-digest.outputs.digests }}
+          SERVICES: ${{ needs.rollout.outputs.services }}
+        run: |
+          notes="Version ${VERSION} on ${ENVIRONMENT}. Services: ${SERVICES}. Digests: ${DIGESTS}. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh release create "v${VERSION}" sbom-*.spdx.json --target "${GITHUB_SHA}" --title "v${VERSION}" --generate-notes --notes "${notes}"
+          id=$(gh api "repos/${GITHUB_REPOSITORY}/deployments" -f ref="${GITHUB_SHA}" -f environment="${ENVIRONMENT}" \
+            -F auto_merge=false -F required_contexts[]= -f description="v${VERSION}" --jq .id)
+          gh api "repos/${GITHUB_REPOSITORY}/deployments/${id}/statuses" -f state=success -f description="v${VERSION} released and watched" >/dev/null
+          # The team notice (version, services, result, duration) is the release page: GitHub emails everyone watching releases (Q2, provisional).
+          echo "${notes}" >> "$GITHUB_STEP_SUMMARY"
+
+  api-client:
+    # Backend only: publish @onepeek/api-client, generated from the committed OpenAPI file, to GitHub Packages.
+    needs: [version, tag-notify]
+    if: ${{ !cancelled() && !inputs.dry-run && inputs.image == 'backend' && needs.tag-notify.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: clients/typescript/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: clients/typescript/.node-version
+          cache: pnpm
+          cache-dependency-path: clients/typescript/pnpm-lock.yaml
+      - name: Install, generate and build
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm generate
+          pnpm build
+      - name: Publish under latest
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          npm pkg set version="${VERSION}"
+          pnpm publish --tag latest --no-git-checks --access restricted
