@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  packages: read # installs @onepeek/* from GitHub Packages (onepeek-web.md §16); callers must grant it too
 
 jobs:
   checks:
@@ -37,6 +38,8 @@ jobs:
 
       - name: Install
         if: steps.lock.outputs.present == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # read by the committed .npmrc for npm.pkg.github.com
         run: pnpm install --frozen-lockfile
 
       - name: Lint, types, tests, format
