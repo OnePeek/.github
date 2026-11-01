@@ -172,11 +172,14 @@ jobs:
               | IMAGE_REF="${IMAGE_REF}" VERSION="${VERSION}" RUN_ID="${GITHUB_RUN_ID}" python3 -c '
           import json, os, re, sys
           text = sys.stdin.read()
-          text = text.replace("__IMAGE__", os.environ["IMAGE_REF"])
           left = sorted(set(re.findall(r"__[A-Z0-9_]+__", text)))
           if left:
               sys.exit("placeholders left in the template: " + ", ".join(left))
           doc = json.loads(text)
+          containers = doc["containerDefinitions"]
+          if len(containers) != 1:
+              sys.exit("a task template holds exactly one container")
+          containers[0]["image"] = os.environ["IMAGE_REF"]
           doc["tags"] = [{"key": "version", "value": os.environ["VERSION"]}, {"key": "release-run", "value": os.environ["RUN_ID"]}]
           print(json.dumps(doc))'
           }
