@@ -6,6 +6,8 @@
 # Provisional (delivery-pipelines §16 "Decided before building"): ARM64 images are built with QEMU on GitHub's
 # standard runners (Q1); team notices go to the release page and its email notifications (Q2).
 # `dry-run: true` (§15) renders every task definition and checks every signature, and changes nothing.
+# `record-only: true` (aws-stack §16 "Release order") builds, scans, signs and records the digest, then stops with success:
+# no migrate, assets, rollout, one-off registration, smoke, watch, tag or package. Used for the first release of a new environment.
 name: release-ecs
 
 on:
@@ -45,6 +47,10 @@ on:
         required: true
       dry-run:
         description: Render every task definition and verify every signature; register, run, update and tag nothing.
+        type: boolean
+        default: false
+      record-only:
+        description: Build, scan, sign and record the digest, then stop with success (aws-stack §16 "Release order", the first backend and web releases).
         type: boolean
         default: false
     secrets:
@@ -198,6 +204,10 @@ jobs:
           password=$(aws ecr get-login-password)
           echo "::add-mask::${password}"
           { echo "TRIVY_USERNAME=AWS"; echo "TRIVY_PASSWORD=${password}"; } >> "$GITHUB_ENV"
+      - name: The waiver file, only if the repository has one
+        id: waiver
+        run: |
+          if [ -f .trivyignore.yaml ]; then echo "file=.trivyignore.yaml" >> "$GITHUB_OUTPUT"; else echo "file=" >> "$GITHUB_OUTPUT"; fi
       - name: Trivy, a critical finding blocks (DP5). Waivers only in .trivyignore.yaml, with a reason and an expiry date
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -205,7 +215,7 @@ jobs:
           severity: CRITICAL
           exit-code: "1"
           ignore-unfixed: false
-          trivyignores: .trivyignore.yaml
+          trivyignores: ${{ steps.waiver.outputs.file }}
           version: v0.76.1
         env:
           TRIVY_PLATFORM: linux/arm64
@@ -292,6 +302,7 @@ jobs:
           SIGNING_KEY: ${{ inputs.signing-key }}
           RELEASE_VERSION: ${{ needs.version.outputs.version }}
           DRY_RUN: ${{ inputs.dry-run }}
+          RECORD_ONLY: ${{ inputs.record-only }}
         run: |
           registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
           aws ecr get-login-password | docker login --username AWS --password-stdin "${registry}"
@@ -308,10 +319,11 @@ jobs:
           version="${RELEASE_VERSION}"
           if [ "${DRY_RUN}" = "true" ]; then version=$(aws ssm get-parameter --name "/onepeek/${ENVIRONMENT}/release/${MAIN_IMAGE}/version" --query Parameter.Value --output text); fi
           { echo "digests=${digests}"; echo "registry=${registry}"; echo "version=${version}"; } >> "$GITHUB_OUTPUT"
+          if [ "${RECORD_ONLY}" = "true" ]; then echo "Record only: ${MAIN_IMAGE} ${version} signed and recorded as ${digests}. Nothing was rolled out." >> "$GITHUB_STEP_SUMMARY"; fi
 
   migrate:
     needs: [version, record-digest]
-    if: ${{ !cancelled() && needs.record-digest.result == 'success' && inputs.migrate }}
+    if: ${{ !cancelled() && needs.record-digest.result == 'success' && inputs.migrate && !inputs.record-only }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -357,21 +369,28 @@ jobs:
           echo "Started migrate (${task##*/}); waiting."
           aws ecs wait tasks-stopped --cluster "${NAME}" --tasks "${task}"
           code=$(aws ecs describe-tasks --cluster "${NAME}" --tasks "${task}" --query 'tasks[0].containers[0].exitCode' --output text)
+          if [ "${code}" = "None" ]; then   # the container never ran (image pull, placement, role): no exit code exists
+            code="none (the container did not run)"
+          fi
           if [ "${code}" != "0" ]; then
             if [ "${code}" = "3" ]; then
               echo "::error::migrate exited 3 (login_missing_run_bootstrap). Run the infra release or bootstrap.yml that creates the login, then re-run (aws-stack §8.2)."
             else
               echo "::error::migrate exited ${code}. The running version is untouched."
             fi
-            aws logs get-log-events --log-group-name "/onepeek/${NAME}/app/migrate" --log-stream-name "migrate/migrate/${task##*/}" \
-              --limit 200 --query 'events[].message' --output text || true
+            # migrate logs with the node's json-file driver (aws-stack §16: no awslogs for services), shipped by the collector to
+            # /onepeek/<env>/app/migrate, which this role cannot read. So report what ECS itself knows, plainly.
+            echo "migrate task ${task##*/}: exit code ${code}"
+            aws ecs describe-tasks --cluster "${NAME}" --tasks "${task}" \
+              --query 'tasks[0].{stopCode:stopCode,stoppedReason:stoppedReason,containerReason:containers[0].reason,lastStatus:lastStatus}' --output json
+            echo "Its output is in the collector's log group /onepeek/${ENVIRONMENT}/app/migrate (Grafana), not readable from this job."
             exit 1
           fi
 
   assets:
     # UC-DEL-005: between sbom-sign and rollout. The files are the exact bytes of the built image.
     needs: [version, record-digest]
-    if: ${{ !cancelled() && needs.record-digest.result == 'success' && inputs.assets }}
+    if: ${{ !cancelled() && needs.record-digest.result == 'success' && inputs.assets && !inputs.record-only }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -400,7 +419,8 @@ jobs:
           if [ -n "$(aws s3api list-objects-v2 --bucket "${bucket}" --prefix "${VERSION}/" --max-keys 1 --query 'Contents[0].Key' --output text | grep -v '^None$' || true)" ]; then
             echo "web-assets/${VERSION}/ already exists; assets are never overwritten (a re-run is a no-op)."
           else
-            aws s3 sync ./assets-out "s3://${bucket}/${VERSION}/" --cache-control "public, max-age=31536000, immutable" --only-show-errors
+            aws s3 sync ./assets-out "s3://${bucket}/${VERSION}/" --cache-control "public, max-age=31536000, immutable" \
+              --sse aws:kms --sse-kms-key-id "alias/${NAME}-storage" --only-show-errors
           fi
           # Delete folders that are both beyond the last 10 versions and older than 90 days.
           python3 - <<'PY'
@@ -424,7 +444,7 @@ jobs:
 
   rollout:
     needs: [version, record-digest, migrate, assets]
-    if: ${{ !cancelled() && needs.record-digest.result == 'success' && !contains(needs.*.result, 'failure') }}
+    if: ${{ !cancelled() && needs.record-digest.result == 'success' && !inputs.record-only && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -461,6 +481,15 @@ jobs:
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v2.6.5
+      - name: Pinned tools (PyYAML for the services file, uv for the gateway routes) in a virtual environment
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/tools"
+          "${RUNNER_TEMP}/tools/bin/pip" install --quiet pyyaml==6.0.3 uv==0.9.7
+          echo "${RUNNER_TEMP}/tools/bin" >> "$GITHUB_PATH"
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        if: ${{ inputs.image == 'backend' }}
+        with:
+          platforms: arm64
       - name: The services this image rolls (services file at the pinned infra commit)
         id: services
         env:
@@ -499,9 +528,9 @@ jobs:
         run: |
           # `app api routes` reads the services file through the repo's own infra-version.txt and the sibling folder onepeek-infra.
           mv _infra ../onepeek-infra
-          python3 -m pip install --quiet uv==0.9.7
           uv run --frozen --no-dev app api routes --env "${ENVIRONMENT}" --out gateway-routes.json
-          aws s3 cp gateway-routes.json "s3://${NAME}-deploy/gateway-routes.json" --only-show-errors
+          aws s3 cp gateway-routes.json "s3://${NAME}-deploy/gateway-routes.json" \
+            --sse aws:kms --sse-kms-key-id "alias/${NAME}-storage" --only-show-errors
           mv ../onepeek-infra _infra
       - name: Record every service's current task definition (for the rollback)
         id: previous
@@ -569,7 +598,7 @@ jobs:
   register-one-offs:
     # 6b. The ops family only. Nothing is run. migrate is registered in its own job; db-bootstrap and db-rotate only by ci-apply.
     needs: [version, record-digest, rollout]
-    if: ${{ !cancelled() && needs.rollout.result == 'success' && inputs.image == 'backend' }}
+    if: ${{ !cancelled() && !inputs.record-only && needs.rollout.result == 'success' && inputs.image == 'backend' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -584,6 +613,10 @@ jobs:
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v2.6.5
+      - name: Pinned PyYAML in a virtual environment
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/tools"
+          "${RUNNER_TEMP}/tools/bin/pip" install --quiet pyyaml==6.0.3
       - name: Verify, render, check the launch settings, register ops and record its revision
         env:
           IMAGE_REF: ${{ needs.record-digest.outputs.registry }}/onepeek-${{ inputs.environment }}/${{ inputs.image }}@${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
@@ -607,7 +640,13 @@ jobs:
           }
           # --- render-taskdef end ---
           cosign verify --experimental-oci11 --insecure-ignore-tlog=true --key "${SIGNING_KEY}" "${IMAGE_REF}" >/dev/null
-          aws s3api head-object --bucket "${NAME}-deploy" --key run/ops.json >/dev/null   # its launch settings exist
+          # ops exists only when the services file names it (aws-stack §16 first preprod run: ops is out until built).
+          aws s3 cp "s3://${NAME}-deploy/services.${ENVIRONMENT}.yaml" services.yaml --only-show-errors
+          if ! "${RUNNER_TEMP}/tools/bin/python3" -c "import sys,yaml;sys.exit(0 if 'ops' in (yaml.safe_load(open('services.yaml')).get('services') or {}) else 1)"; then
+            echo "ops is not in the services file; nothing to register."; exit 0
+          fi
+          # Read the file instead of head-object: this role has GetObject on run/* but no ListBucket, so head-object on a missing key says 403.
+          aws s3 cp "s3://${NAME}-deploy/run/ops.json" run-ops.json --only-show-errors   # its launch settings exist
           render ops > ops.json
           if [ "${DRY_RUN}" = "true" ]; then echo "Dry run: ops renders and its launch settings exist."; exit 0; fi
           arn=$(aws ecs register-task-definition --cli-input-json file://ops.json --query taskDefinition.taskDefinitionArn --output text)
