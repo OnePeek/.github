@@ -16,7 +16,7 @@ on:
         description: A long-running service, or all of them
         type: choice
         # service-list begin
-        options: [all, api, api-critical, socket, worker, scheduler, mcp, web]
+        options: [all, api, api-critical, worker, scheduler, web]
         # service-list end
         required: true
       environment:

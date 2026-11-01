@@ -52,9 +52,12 @@ on:
         type: boolean
         default: false
     secrets:
-      app-private-key:
-        description: Private key of the GitHub App that reads onepeek-infra and the @onepeek packages (delivery-pipelines §10).
+      INFRA_READ_TOKEN:
+        description: Fine-grained token with Contents read on onepeek-infra (provisional; replaces the GitHub App of delivery-pipelines §10 until its package access is proven, aws-stack §16 first preprod run).
         required: true
+      NPM_READ_TOKEN:
+        description: Classic token with read:packages for the @onepeek packages (web build only; provisional, same reason).
+        required: false
 
 permissions: {}
 
@@ -114,16 +117,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Token for the @onepeek packages (web build only)
-        id: app
-        if: ${{ matrix.image == inputs.image && inputs.image == 'web' }}
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: ${{ vars.ONEPEEK_CI_APP_ID }}
-          private-key: ${{ secrets.app-private-key }}
-          owner: ${{ github.repository_owner }}
-          repositories: onepeek-design-system,backend-service
-          permission-packages: read
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ inputs.role-to-assume }}
@@ -139,7 +132,7 @@ jobs:
           IMAGE: ${{ matrix.image }}
           MAIN: ${{ inputs.image }}
           VERSION: ${{ needs.version.outputs.version }}
-          NPM_TOKEN: ${{ steps.app.outputs.token }}
+          NPM_TOKEN: ${{ secrets.NPM_READ_TOKEN }}
         run: |
           if [ "${IMAGE}" != "${MAIN}" ]; then
             echo "::error::No Dockerfile location is defined for the extra image '${IMAGE}' (delivery-pipelines §16: the sandbox image waits for document parsing)."
@@ -442,20 +435,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Token to read onepeek-infra
-        id: app
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: ${{ vars.ONEPEEK_CI_APP_ID }}
-          private-key: ${{ secrets.app-private-key }}
-          owner: ${{ github.repository_owner }}
-          repositories: onepeek-infra
-          permission-contents: read
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.repository_owner }}/onepeek-infra
           ref: ${{ inputs.infra-ref }}
-          token: ${{ steps.app.outputs.token }}
+          token: ${{ secrets.INFRA_READ_TOKEN }}
           path: _infra
           persist-credentials: false
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
@@ -643,7 +627,7 @@ jobs:
           DIGEST: ${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
           SERVICES: ${{ needs.rollout.outputs.services }}
         run: |
-          if [ "${IMAGE}" = "backend" ]; then paths="/api/status"; else paths="/"; fi
+          if [ "${IMAGE}" = "backend" ]; then paths="/api/status"; else paths="/sign-in"; fi
           for p in ${paths}; do
             curl --fail --silent --show-error --max-time 10 --retry 6 --retry-delay 10 --retry-all-errors "https://${DOMAIN}${p}" >/dev/null
           done
