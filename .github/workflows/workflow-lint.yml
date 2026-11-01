@@ -35,3 +35,45 @@ jobs:
 
   secrets:
     uses: ./.github/workflows/secret-scan.yml
+
+  zizmor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Security lint of the workflows
+        run: pip install --quiet zizmor==1.31.1 && zizmor --no-progress --min-severity medium .github/workflows
+
+  service-list:
+    # operate.yml's service choices must equal the services file; the render function must match release-ecs.yml.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Token to read onepeek-infra
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.ONEPEEK_CI_APP_ID }}
+          private-key: ${{ secrets.ONEPEEK_CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: onepeek-infra
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/onepeek-infra
+          ref: dev
+          token: ${{ steps.app.outputs.token }}
+          path: _infra
+          persist-credentials: false
+      - name: Tests, then the drift check
+        run: |
+          pip install --quiet pyyaml==6.0.3
+          python -m unittest discover -s scripts -p 'test_*.py'
+          python scripts/check_service_list.py --services-file _infra/config/services.preprod.yaml
