@@ -178,7 +178,7 @@ jobs:
             web) args+=(--build-arg "RELEASE=${VERSION}") ;;
           esac
           if [ -n "${NPM_TOKEN}" ]; then
-            args+=(--secret id=npm_token,env=NPM_TOKEN)   # a BuildKit secret, never a build argument or layer
+            args+=(--secret "id=npm_token,env=NPM_TOKEN")   # a BuildKit secret, never a build argument or layer
           fi
           docker buildx build "${args[@]}" .
           digest=$(python3 -c "import json;print(json.load(open('meta.json'))['containerimage.digest'])")
@@ -608,7 +608,7 @@ jobs:
           cosign verify --experimental-oci11 --insecure-ignore-tlog=true --key "${SIGNING_KEY}" "${IMAGE_REF}" >/dev/null
           services=$(echo "${SERVICES}" | python3 -c "import json,sys;print(' '.join(json.load(sys.stdin)))")
           for svc in ${services}; do render "${svc}" > "td-${svc}.json"; done
-          if [ "${DRY_RUN}" = "true" ]; then echo "Dry run: rendered $(echo ${services} | wc -w) task definitions; signature verified."; exit 0; fi
+          if [ "${DRY_RUN}" = "true" ]; then echo "Dry run: rendered $(echo "${services}" | wc -w) task definitions; signature verified."; exit 0; fi
           for svc in ${services}; do
             arn=$(aws ecs register-task-definition --cli-input-json "file://td-${svc}.json" --query taskDefinition.taskDefinitionArn --output text)
             aws ecs update-service --cluster "${NAME}" --service "${svc}" --task-definition "${arn}" >/dev/null

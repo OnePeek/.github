@@ -52,28 +52,26 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+    env:
+      HAS_INFRA_TOKEN: ${{ secrets.INFRA_READ_TOKEN != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Token to read onepeek-infra
-        id: app
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: ${{ vars.ONEPEEK_CI_APP_ID }}
-          private-key: ${{ secrets.ONEPEEK_CI_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: onepeek-infra
-          permission-contents: read
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ env.HAS_INFRA_TOKEN == 'true' }}
         with:
           repository: ${{ github.repository_owner }}/onepeek-infra
           ref: dev
-          token: ${{ steps.app.outputs.token }}
+          token: ${{ secrets.INFRA_READ_TOKEN }}
           path: _infra
           persist-credentials: false
       - name: Tests, then the drift check
         run: |
           pip install --quiet pyyaml==6.0.3
           python -m unittest discover -s scripts -p 'test_*.py'
+          if [ "${HAS_INFRA_TOKEN}" != "true" ]; then
+            echo "::warning::INFRA_READ_TOKEN is not set in this repo: the drift check against the services file did not run."
+            exit 0
+          fi
           python scripts/check_service_list.py --services-file _infra/config/services.preprod.yaml
