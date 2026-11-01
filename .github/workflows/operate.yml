@@ -57,6 +57,7 @@ on:
 permissions: {}
 
 env:
+  COSIGN_EXPERIMENTAL: "1" # required by the OCI 1.1 referrers mode (delivery-pipelines §5)
   AWS_REGION: ap-south-1
   AWS_DEFAULT_REGION: ap-south-1
   ENVIRONMENT: ${{ inputs.environment }}
