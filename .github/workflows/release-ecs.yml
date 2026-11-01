@@ -35,10 +35,6 @@ on:
         description: The environment's public host name, for the smoke checks.
         type: string
         required: true
-      infra-ref:
-        description: The onepeek-infra commit whose services file is rolled out (mirrors infra-version.txt).
-        type: string
-        required: true
       role-to-assume:
         description: The repo's deploy role (onepeek-<env>-deploy-<repo>).
         type: string
@@ -149,6 +145,12 @@ jobs:
             --cache-to "type=registry,ref=${repo}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"
             --tag "${repo}:v${VERSION}" --tag "${repo}:sha-${GITHUB_SHA::12}"
             --metadata-file meta.json --push)
+          # Baked into the image, never a start-up variable (aws-stack §16 "Image commit"): the backend's
+          # ONEPEEK_COMMIT, VERSION and REVISION; the web image's RELEASE (its WEB_RELEASE).
+          case "${IMAGE}" in
+            backend) args+=(--build-arg "ONEPEEK_COMMIT=${GITHUB_SHA}" --build-arg "VERSION=${VERSION}" --build-arg "REVISION=${GITHUB_SHA}") ;;
+            web) args+=(--build-arg "RELEASE=${VERSION}") ;;
+          esac
           if [ -n "${NPM_TOKEN}" ]; then
             args+=(--secret id=npm_token,env=NPM_TOKEN)   # a BuildKit secret, never a build argument or layer
           fi
@@ -435,10 +437,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: The onepeek-infra commit pinned by this repo's infra-version.txt (the one source of the pin)
+        id: pin
+        run: |
+          ref=$(sed -n 's/^onepeek-infra@\([0-9a-f]\{40\}\)$/\1/p' infra-version.txt | head -n 1)
+          if [ -z "${ref}" ]; then
+            echo "::error::infra-version.txt must hold a line 'onepeek-infra@<40-hex commit>' (aws-stack §16 Infra pin)."
+            exit 1
+          fi
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.repository_owner }}/onepeek-infra
-          ref: ${{ inputs.infra-ref }}
+          ref: ${{ steps.pin.outputs.ref }}
           token: ${{ secrets.INFRA_READ_TOKEN }}
           path: _infra
           persist-credentials: false
@@ -485,11 +496,8 @@ jobs:
               raise SystemExit('The services file names services this image cannot run: ' + ', '.join(missing))"
       - name: The gateway routes (backend only, additive within a release; the gateway reloads within 30 s)
         if: ${{ inputs.image == 'backend' && !inputs.dry-run }}
-        env:
-          INFRA_REF: ${{ inputs.infra-ref }}
         run: |
-          # `app api routes` reads the services file through infra-version.txt and the sibling folder onepeek-infra.
-          echo "onepeek-infra@${INFRA_REF}" > infra-version.txt
+          # `app api routes` reads the services file through the repo's own infra-version.txt and the sibling folder onepeek-infra.
           mv _infra ../onepeek-infra
           python3 -m pip install --quiet uv==0.9.7
           uv run --frozen --no-dev app api routes --env "${ENVIRONMENT}" --out gateway-routes.json
