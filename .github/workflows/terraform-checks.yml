@@ -27,7 +27,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0 # the test selection diffs against origin/<base branch>
           persist-credentials: false
+
+      - name: Test selection script
+        # The shared selection logic (scripts/tf_test_selection.py in OnePeek/.github, public), as the repo's other checks fetch it.
+        run: git clone --quiet --depth 1 --branch main https://github.com/OnePeek/.github.git "${RUNNER_TEMP}/onepeek-shared"
 
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
@@ -60,20 +65,17 @@ jobs:
             terraform -chdir="${root}" validate
           done
 
-      - name: Terraform tests (every module or root with a *.tftest.hcl)
+      - name: Terraform tests (a module or root with a *.tftest.hcl)
         # Registry provider downloads only; no backend, no cloud credentials.
+        # Pull requests into dev run only the suites the change reaches (scripts/tf_test_selection.py); release pull
+        # requests, pushes and the schedule run them all.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
-          # A suite's module is the folder above its tests/ folder (any depth under tests/), else its own folder.
-          dirs=$(find . -name '*.tftest.hcl' -not -path '*/.terraform/*' -print0 | while IFS= read -r -d '' f; do
-            d=$(dirname "$f")
-            case "$d" in
-              */tests/*) d=${d%%/tests/*} ;;
-              */tests) d=${d%/tests} ;;
-            esac
-            printf '%s\n' "$d"
-          done | sort -u)
-          if [ -z "${dirs}" ]; then echo "::error::no *.tftest.hcl found: this check would test nothing"; exit 1; fi
+          dirs=$(python3 "${RUNNER_TEMP}/onepeek-shared/scripts/tf_test_selection.py" --event "${EVENT_NAME}" --base-ref "${BASE_REF}" --diff-against "origin/${BASE_REF}")
+          if [ -z "${dirs}" ]; then echo "No suite is reached by this change; terraform test skipped."; exit 0; fi
           while IFS= read -r d; do
             echo "== ${d}"
             terraform -chdir="${d}" init -backend=false -input=false
