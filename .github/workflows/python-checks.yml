@@ -5,7 +5,7 @@ on:
   workflow_call:
     inputs:
       full:
-        description: "Accepted for callers; the release-only slower suites were removed, so it changes nothing."
+        description: "true on release pull requests and nightly: the whole suite. false (pull requests into dev): the fast unit tests only, without the tests marked integration (decision 152)."
         type: boolean
         default: false
 
@@ -37,4 +37,12 @@ jobs:
 
       - name: Unit tests
         # No tests collected (pytest exit code 5) fails: a repo with no tests has no passing check.
-        run: uv run --with "pytest==${PYTEST_VERSION}" pytest -q
+        # Fast tier: stop at the first failure and leave out integration tests; the full suite runs when `full` is true.
+        env:
+          FULL: ${{ inputs.full }}
+        run: |
+          if [ "$FULL" = "true" ]; then
+            uv run --with "pytest==${PYTEST_VERSION}" pytest -q
+          else
+            uv run --with "pytest==${PYTEST_VERSION}" pytest -q -x -m "not integration"
+          fi
