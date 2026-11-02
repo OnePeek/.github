@@ -1,5 +1,6 @@
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -46,6 +47,13 @@ class Select(unittest.TestCase):
 
     def test_no_stack_suite_means_no_stack_run(self):
         self.assertEqual(t.select(["bootstrap"], ["scripts/up.py"], "pull_request", "dev"), [])
+
+
+class Embedded(unittest.TestCase):
+    def test_workflow_embeds_the_script_verbatim(self):
+        wf = (Path(__file__).parent.parent / ".github/workflows/terraform-checks.yml").read_text()
+        body = wf.split("<<'PY'\n", 1)[1].split("          PY\n", 1)[0]
+        self.assertEqual(textwrap.dedent(body), (Path(__file__).parent / "tf_test_selection.py").read_text())
 
 
 class Cli(unittest.TestCase):
