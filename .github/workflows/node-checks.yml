@@ -8,6 +8,10 @@ on:
         description: "true on pull requests into release: also run the production build."
         type: boolean
         default: false
+      affected:
+        description: "true on pull requests into dev: run `pnpm run test:changed` (vitest --changed against the base branch) instead of the whole test suite. Ignored when `full` is true or the repo has no such script (decision 152)."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -21,6 +25,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: ${{ inputs.affected && 0 || 1 }} # affected tests diff against origin/<base>
 
       - name: Lockfile present
         run: |
@@ -38,12 +43,24 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # read by the committed .npmrc for npm.pkg.github.com
         run: pnpm install --frozen-lockfile
 
-      - name: Lint, types, tests, format
+      - name: Lint, types, format
         run: |
           pnpm run lint
           pnpm run typecheck
-          pnpm run test
           pnpm run format:check
+
+      - name: Tests
+        env:
+          FULL: ${{ inputs.full }}
+          AFFECTED: ${{ inputs.affected }}
+          BASE: ${{ github.base_ref }} # origin/<base> comes from the full-history checkout above
+        run: |
+          if [ "$FULL" != "true" ] && [ "$AFFECTED" = "true" ] && [ -n "$BASE" ] \
+             && node -e 'process.exit(require("./package.json").scripts?.["test:changed"] ? 0 : 1)'; then
+            pnpm run test:changed
+          else
+            pnpm run test
+          fi
 
       - name: Production build (release only)
         if: inputs.full

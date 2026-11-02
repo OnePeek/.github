@@ -14,7 +14,8 @@ It links (or, where symlinks are not allowed, copies) into <root>/.claude/:
   skills/<name>    from <repo>/.claude/skills/<name>
   agents/<name>.md from <repo>/.claude/agents/<name>.md
 and <root>/AGENTS.md and <root>/CLAUDE.md from .github/workspace/ (CLAUDE.md loads AGENTS.md, as in every repo). It then runs `lefthook install` in every sibling folder that is a git clone with a lefthook.yml (or says how to install lefthook). Your own files there (for example settings.local.json)
-are never touched; a name used by two repos is refused, not overwritten.
+are never touched; a name used by two repos is refused, not overwritten. It ends by printing the local hygiene hints: the weekly
+Docker build-cache prune and the shared Terraform provider cache (TF_PLUGIN_CACHE_DIR).
 """
 
 from __future__ import annotations
@@ -178,6 +179,15 @@ def install_hooks() -> int:
     return 1 if failed else 0
 
 
+def print_hygiene_hints() -> None:
+    """Disk and speed hints for laptops and agents (branching-and-delivery standard §4, decision 152). Prints only."""
+    print("\nLocal hygiene (decision 152):")
+    print("  weekly, free Docker build cache:  docker builder prune --filter until=168h")
+    print("  one Terraform provider cache for every folder (add to ~/.zshrc or ~/.bashrc):")
+    print('    export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"; mkdir -p "$TF_PLUGIN_CACHE_DIR"')
+    print("  agents keep at most one scratch copy (worktree) and remove it and its caches when they finish.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--check", action="store_true", help="report only; exit 1 if anything is missing or stale")
@@ -213,6 +223,7 @@ def main() -> int:
     for dst, src in sorted(want.items()):
         print(f"{place(dst, src):8} {dst.relative_to(ROOT)} -> {src.relative_to(ROOT)}")
     hooks = install_hooks()
+    print_hygiene_hints()
     return 1 if clashes or hooks else 0
 
 
