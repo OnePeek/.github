@@ -7,7 +7,7 @@ OnePeek's organisation-wide GitHub files: the shared CI workflows, the pull requ
 - If the docs are silent, unclear or disagree with these files, don't guess: ask, or open a docs pull request.
 
 ## Layout
-- `.github/workflows/`: shared reusable workflows (`secret-scan`, `python-checks`, `node-checks`, `terraform-checks`, `release-tag`) that every repo calls as `OnePeek/.github/.github/workflows/<name>.yml@<commit SHA>`. Every action is pinned to a commit SHA; downloaded tools are pinned and checksum-verified. Rules: `onepeek-docs/standards/branching-and-delivery.md`.
+- `.github/workflows/`: shared reusable workflows (`secret-scan`, `python-checks`, `node-checks`, `terraform-checks`, `release-tag`, and `contract`, the contract between repos of decision 153) that every repo calls as `OnePeek/.github/.github/workflows/<name>.yml@<commit SHA>`. Every action is pinned to a commit SHA; downloaded tools are pinned and checksum-verified. Rules: `onepeek-docs/standards/branching-and-delivery.md`.
 - `PULL_REQUEST_TEMPLATE.md`: what changed, why, the docs link and how it was tested.
 - `CONTRIBUTING.md` and `SECURITY.md`: how to contribute and how to report a vulnerability.
 - `profile/`: the organisation's public profile page.

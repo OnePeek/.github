@@ -370,5 +370,40 @@ class DbBootstrapRoleGuard(unittest.TestCase):
         self.assertEqual(self.guard("", dry="true").returncode, 0)
 
 
+SERVICES_FILE = """version: 1
+defaults: {image: backend}
+services:
+  api: {triggers: [request]}
+  worker: {triggers: [event, job]}
+  ops: {triggers: []}
+  web: {image: web, triggers: [request]}
+"""
+
+
+class OneServicesFile(unittest.TestCase):
+    """Decision 153; delivery-pipelines §13 "Services file a release uses": the copy infra's last apply published."""
+
+    def services(self, image: str):
+        aws = f"""case "$*" in *"s3 cp s3://onepeek-preprod-deploy/services.preprod.yaml services.yaml"*) printf '%s' '{SERVICES_FILE}' > services.yaml;; esac"""
+        out, calls, output = run_step(step("rollout", "The services file's services for this image"), aws, {"IMAGE": image})
+        return out, calls, dict(line.split("=", 1) for line in output.splitlines())
+
+    def test_e7_reads_the_published_copy_in_the_deploy_bucket(self):
+        out, calls, output = self.services("backend")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("aws s3 cp s3://onepeek-preprod-deploy/services.preprod.yaml services.yaml", calls)
+        self.assertEqual(json.loads(output["services"]), ["api", "worker"])
+        self.assertEqual(json.loads(self.services("web")[2]["services"]), ["web"])
+
+    def test_the_gateway_routes_read_the_same_file(self):
+        self.assertIn("app api routes --env \"${ENVIRONMENT}\" --services-file services.yaml", step("rollout", "The gateway routes"))
+
+    def test_no_infra_pin_and_no_infra_checkout_in_the_rollout(self):
+        self.assertNotIn("infra-version.txt", TEXT)
+        steps = RELEASE["jobs"]["rollout"]["steps"]
+        self.assertFalse([s for s in steps if "onepeek-infra" in str(s.get("with", {}).get("repository", ""))])
+        self.assertNotIn("_infra", json.dumps(steps))
+
+
 if __name__ == "__main__":
     unittest.main()

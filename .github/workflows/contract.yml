@@ -1,0 +1,108 @@
+# Shared: the contract between repos on every pull request (onepeek-docs decisions/founder-decisions.md decision 153;
+# architecture/lld/infra/delivery-pipelines.md §6.1 row "contract between repos"; aws-stack.md §16 "Merge order and pins").
+# Called by backend-service, onepeek-web and onepeek-infra on pull requests into dev and release. Real code against real
+# files: the backend's `app check services` and settings loader against infra's config/services.<env>.yaml and published
+# settings, and web's start-up loader against the same settings. The calling repo is taken at the pull request; the other
+# repos at dev for a pull request into dev and at release for a release pull request, so what is checked is what ships
+# together. The checks themselves live in one place, onepeek-infra's scripts/contract.py.
+name: contract
+
+on:
+  workflow_call:
+    inputs:
+      role:
+        description: The calling repo, backend, web or infra.
+        type: string
+        required: true
+      base_ref:
+        description: The pull request's base branch, dev or release (github.base_ref).
+        type: string
+        required: true
+    secrets:
+      ORG_READ_TOKEN:
+        description: Fine-grained token with Contents read on backend-service, onepeek-web and onepeek-infra.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: The other repos' branch (dev for a pull request into dev, release for a release pull request)
+        id: ref
+        env:
+          ROLE: ${{ inputs.role }}
+          BASE_REF: ${{ inputs.base_ref }}
+        run: |
+          case "${ROLE}" in backend|web|infra) ;; *) echo "::error::role must be backend, web or infra, not '${ROLE}'."; exit 1 ;; esac
+          case "${BASE_REF}" in dev|release) ;; *) echo "::error::base_ref must be dev or release, not '${BASE_REF}'."; exit 1 ;; esac
+          echo "other=${BASE_REF}" >> "$GITHUB_OUTPUT"
+
+      - name: This pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: _${{ inputs.role }}
+          persist-credentials: false
+
+      - name: onepeek-infra at the other branch
+        if: ${{ inputs.role != 'infra' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/onepeek-infra
+          ref: ${{ steps.ref.outputs.other }}
+          token: ${{ secrets.ORG_READ_TOKEN }}
+          path: _infra
+          persist-credentials: false
+
+      - name: backend-service at the other branch
+        if: ${{ inputs.role == 'infra' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/backend-service
+          ref: ${{ steps.ref.outputs.other }}
+          token: ${{ secrets.ORG_READ_TOKEN }}
+          path: _backend
+          persist-credentials: false
+
+      - name: onepeek-web at the other branch
+        if: ${{ inputs.role == 'infra' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/onepeek-web
+          ref: ${{ steps.ref.outputs.other }}
+          token: ${{ secrets.ORG_READ_TOKEN }}
+          path: _web
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: The backend's own environment (its real validator and settings loader)
+        if: ${{ inputs.role != 'web' }}
+        run: uv sync --directory _backend --frozen --quiet
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: ${{ inputs.role != 'backend' }}
+        with:
+          node-version-file: _web/.node-version
+
+      - name: The contract logic's own tests (onepeek-infra pull requests)
+        if: ${{ inputs.role == 'infra' }}
+        working-directory: _infra
+        run: uvx --with pyyaml==6.0.3 python -m unittest scripts/test_contract.py
+
+      - name: The contract between repos
+        env:
+          ROLE: ${{ inputs.role }}
+        run: |
+          # No AWS credentials or settings from the runner reach the loaders.
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE AWS_REGION AWS_DEFAULT_REGION
+          export AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_CONFIG_FILE=/dev/null
+          case "${ROLE}" in
+            backend) sides=(--backend _backend) ;;
+            web) sides=(--web _web) ;;
+            infra) sides=(--backend _backend --web _web) ;;
+          esac
+          uvx --with pyyaml==6.0.3 python _infra/scripts/contract.py --infra _infra "${sides[@]}"
