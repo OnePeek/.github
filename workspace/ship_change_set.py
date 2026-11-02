@@ -35,12 +35,20 @@ TAG_TIMEOUT_S = 10 * 60
 POLL_S = 20
 
 
+def run(cmd: list[str]) -> str:
+    """Run a command; on failure stop with its own error text, not a bare traceback."""
+    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if r.returncode != 0:
+        raise SystemExit(f"STOP: `{' '.join(cmd[:4])} ...` failed: {(r.stderr or r.stdout).strip()[:500]}")
+    return r.stdout
+
+
 def gh(*args: str) -> str:
-    return subprocess.run(["gh", *args], check=True, capture_output=True, text=True).stdout
+    return run(["gh", *args])
 
 
 def git(cwd: pathlib.Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout
+    return run(["git", "-C", str(cwd), *args])
 
 
 def say(msg: str) -> None:
@@ -63,14 +71,22 @@ def pr_info(repo: str, n: int) -> dict:
                          "state,baseRefName,headRefName,headRefOid,mergeCommit,isDraft,mergeable"))
 
 
+def read_checks(repo: str, n: int, required: bool) -> list[dict]:
+    """`gh pr checks` exits non-zero while checks are pending or failed but still prints them; an empty result is
+    only taken from its own "no ... checks reported" message, and any other failure stops the run."""
+    cmd = ["gh", "pr", "checks", str(n), "-R", f"{ORG}/{repo}", "--json", "name,bucket,link"]
+    r = subprocess.run([*cmd, *(["--required"] if required else [])], capture_output=True, text=True, check=False)
+    if r.stdout.strip().startswith("["):
+        return json.loads(r.stdout)
+    if re.search(r"no (required )?checks reported", r.stderr + r.stdout):
+        return []
+    raise SystemExit(f"STOP {repo}#{n}: could not read checks: {(r.stderr or r.stdout).strip()[:300]}")
+
+
 def checks(repo: str, n: int) -> list[dict]:
-    """Required checks; if the branch has no required checks, every check except AI review."""
-    def read(required: bool) -> list[dict]:
-        args = ["pr", "checks", str(n), "-R", f"{ORG}/{repo}", "--json", "name,bucket,link"]
-        r = subprocess.run(["gh", *args, *(["--required"] if required else [])], capture_output=True, text=True, check=False)
-        return json.loads(r.stdout) if r.stdout.strip().startswith("[") else []
-    got = read(True)
-    return got or [c for c in read(False) if c["name"] != "CodeRabbit"]
+    """The branch's required checks. A branch with none required (no protection yet) waits on every check except
+    the AI review instead, so nothing merges unchecked; the skill documents this."""
+    return read_checks(repo, n, True) or [c for c in read_checks(repo, n, False) if c["name"] != "CodeRabbit"]
 
 
 def mergeable(repo: str, n: int) -> str:
@@ -84,10 +100,12 @@ def mergeable(repo: str, n: int) -> str:
 
 
 def no_conflicts(prs: list[tuple[str, int]]) -> None:
-    """Stop before any wait if a pull request still to merge conflicts with its base (often after an earlier merge)."""
-    bad = [f"{r}#{n}" for r, n in prs if mergeable(r, n) == "CONFLICTING"]
+    """Stop before any wait if a pull request still to merge conflicts with its base (often after an earlier merge),
+    or if GitHub cannot say yet: an unknown state is not taken as clean."""
+    states = {f"{r}#{n}": mergeable(r, n) for r, n in prs}
+    bad = [p for p, st in states.items() if st != "MERGEABLE"]
     if bad:
-        raise SystemExit(f"STOP: merge conflicts in {bad}; resolve them, push, and run again")
+        raise SystemExit(f"STOP: not mergeable {[(p, states[p]) for p in bad]}; resolve conflicts, push, run again")
 
 
 def wait_green(repo: str, n: int, may_rerun: bool) -> None:
@@ -113,18 +131,30 @@ def wait_green(repo: str, n: int, may_rerun: bool) -> None:
     raise SystemExit(f"STOP {repo}#{n}: checks still pending after {CHECK_TIMEOUT_S // 60} min")
 
 
+def wait_head(repo: str, n: int, sha: str) -> None:
+    """After a push: the pull request's head is the pushed commit and its checks have registered on it."""
+    deadline = time.time() + 5 * 60
+    while time.time() < deadline:
+        if pr_info(repo, n)["headRefOid"] == sha and read_checks(repo, n, False):
+            return
+        time.sleep(5)
+    raise SystemExit(f"STOP {repo}#{n}: head is not {sha[:7]} with checks after 5 min")
+
+
 def wait_tag(sha: str) -> tuple[str, str]:
     deadline = time.time() + TAG_TIMEOUT_S
     while time.time() < deadline:
-        tags = json.loads(gh("api", f"repos/{ORG}/.github/tags", "--jq", "[.[]|{name,sha:.commit.sha}]"))
-        for t in tags:
-            if t["sha"] == sha:
-                return t["name"], sha
+        query = '.[]|"\\(.name) \\(.commit.sha)"'
+        lines = gh("api", "--paginate", f"repos/{ORG}/.github/tags?per_page=100", "--jq", query)
+        for line in lines.splitlines():
+            name, _, tag_sha = line.partition(" ")
+            if tag_sha == sha:
+                return name, sha
         time.sleep(POLL_S)
     raise SystemExit(f"STOP: no tag on .github {sha[:7]} after {TAG_TIMEOUT_S // 60} min (tag-main workflow?)")
 
 
-def bump_pins(repo: str, branch: str, tag: str, sha: str) -> bool:
+def bump_pins(repo: str, branch: str, tag: str, sha: str) -> str | None:
     """Move every OnePeek/.github workflow pin on the branch to the tag, in one ordinary commit (hooks run)."""
     src = ROOT / repo
     git(src, "fetch", "-q", "origin", branch)
@@ -140,12 +170,12 @@ def bump_pins(repo: str, branch: str, tag: str, sha: str) -> bool:
                     f.write_text(new)
                     changed.append(str(f.relative_to(wt)))
             if not changed:
-                return False
+                return None
             git(wt, "add", "--", *changed)
             git(wt, "commit", "-q", "-m", f"chore: pin OnePeek/.github workflows to {tag} (ship_change_set)")
             git(wt, "push", "-q", "origin", f"HEAD:{branch}")
             say(f"{repo}: pins -> {tag} on {branch} ({len(changed)} file(s))")
-            return True
+            return git(wt, "rev-parse", "HEAD").strip()
         finally:
             git(src, "worktree", "remove", "--force", str(wt))
 
@@ -169,8 +199,9 @@ def main(argv: list[str]) -> int:
             problems.append(f"{repo}#{n} targets {i['baseRefName']}, not {want}")
         if i["isDraft"]:
             problems.append(f"{repo}#{n} is a draft")
-        if i["mergeable"] == "CONFLICTING":
-            problems.append(f"{repo}#{n} has merge conflicts: resolve them before any check is waited on")
+        state = mergeable(repo, n) if i["mergeable"] == "UNKNOWN" else i["mergeable"]
+        if state != "MERGEABLE":
+            problems.append(f"{repo}#{n} is {state}: resolve conflicts before any check is waited on")
     docs = [p for p in prs if p[0] == "onepeek-docs"]
     if len(docs) > 1:
         problems.append("a change set has one docs pull request")
@@ -179,9 +210,13 @@ def main(argv: list[str]) -> int:
         for repo, n in prs:
             if repo in ("onepeek-docs", ".github"):
                 continue
-            pin = gh("api", f"repos/{ORG}/{repo}/contents/docs-version.txt?ref={info[(repo, n)]['headRefName']}",
-                     "-H", "Accept: application/vnd.github.raw").strip()
-            if not pin.endswith(head):
+            r = subprocess.run(["gh", "api", f"repos/{ORG}/{repo}/contents/docs-version.txt"
+                                f"?ref={info[(repo, n)]['headRefName']}", "-H", "Accept: application/vnd.github.raw"],
+                               capture_output=True, text=True, check=False)
+            pin = r.stdout.strip()
+            if r.returncode != 0:
+                problems.append(f"{repo}#{n} has no readable docs-version.txt")
+            elif not pin.endswith(head):
                 problems.append(f"{repo}#{n} docs-version.txt is {pin.split('@')[-1][:7]}, not docs head {head[:7]}")
 
     say("plan: " + " -> ".join(f"{r}#{n} ({'merge' if r == 'onepeek-docs' else 'squash'} into {BASE.get(r, 'dev')})"
@@ -198,8 +233,10 @@ def main(argv: list[str]) -> int:
     for k, (repo, n) in enumerate(prs):
         no_conflicts(prs[k:])
         if tag and repo not in ("onepeek-docs", ".github"):
-            bump_pins(repo, info[(repo, n)]["headRefName"], *tag)
-            time.sleep(POLL_S)  # let the new push's checks register before reading them
+            pushed = bump_pins(repo, info[(repo, n)]["headRefName"], *tag)
+            if pushed:
+                wait_head(repo, n, pushed)
+                no_conflicts([(repo, n)])
         wait_green(repo, n, may_rerun=merged_any)
         method = "--merge" if repo == "onepeek-docs" else "--squash"
         gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, "--delete-branch")

@@ -17,7 +17,9 @@ A change set is merged in one sitting, in one order (`onepeek-docs/standards/dev
    2. `.github` into `main` (squash), then waits for its release tag and moves every later pull request's `OnePeek/.github` workflow pins to that tag in one commit;
    3. infra, then the design system, then backend, then web, then the other repos, each squashed into `dev`.
    
-   Before each merge it waits for that pull request's **required** checks. A check that failed before an earlier repo in the set merged is re-run once (it may have needed that repo, for example the contract check needs infra's `scripts/contract.py`). A second failure stops the run, and nothing after it is merged.
+   Conflicts come first: a pull request that conflicts with its base, or whose state GitHub cannot report yet, stops the run before any wait, and the ones still to merge are checked again after every merge and pin move.
+
+   Before each merge it waits for that pull request's **required** checks (on a branch with none required yet, every check except CodeRabbit, so nothing merges unchecked). A check that failed before an earlier repo in the set merged is re-run once (it may have needed that repo, for example the contract check needs infra's `scripts/contract.py`). A second failure stops the run, and nothing after it is merged.
 4. **On a stop:** read the failed check's log, fix it as a commit on that pull request, then run the same command again; merged pull requests are left out of the list.
 5. **After:** the docs merge's follow-ups (republish the architecture pages, `status.yaml`), and the deploy where the repo deploys (`done` means deployed, decision 143).
 
