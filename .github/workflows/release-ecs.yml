@@ -48,7 +48,7 @@ on:
         type: boolean
         default: false
       db-bootstrap-role:
-        description: The onepeek-<env>-db-bootstrap role that infra's reusable db-bootstrap workflow assumes (backend only, with migrate; decision 148).
+        description: The onepeek-<env>-deploy-db-bootstrap role that infra's reusable db-bootstrap workflow assumes (backend only, with migrate; decision 148).
         type: string
         default: ""
     secrets:
@@ -356,7 +356,7 @@ jobs:
 
   db-bootstrap:
     # Step 4b (decision 148). Infra's reviewed workflow on its release branch registers and runs db-bootstrap with this
-    # signed digest under the onepeek-<env>-db-bootstrap role, never this repo's deploy role: it creates only missing
+    # signed digest under the onepeek-<env>-deploy-db-bootstrap role, never this repo's deploy role: it creates only missing
     # logins and first values, and changes nothing once they exist. A failure stops the release before migrate.
     # Pinned to infra's release branch on purpose: the role trusts only job_workflow_ref
     # OnePeek/onepeek-infra/.github/workflows/db-bootstrap.yml@refs/heads/release (aws-stack §12).
