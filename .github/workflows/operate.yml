@@ -178,9 +178,16 @@ jobs:
               sys.exit("placeholders left in the template: " + ", ".join(left))
           doc = json.loads(text)
           containers = doc["containerDefinitions"]
-          if len(containers) != 1:
-              sys.exit("a task template holds exactly one container")
-          containers[0]["image"] = os.environ["IMAGE_REF"]
+          if not containers:
+              sys.exit("a task template holds no container")
+          # Every container without an image gets this release image: the only container of a service template, or the
+          # sidecar of a two-container template (PgBouncer, Valkey), whose main container keeps the image Terraform set.
+          for container in containers:
+              if not container.get("image"):
+                  container["image"] = os.environ["IMAGE_REF"]
+          empty = [str(c.get("name", "?")) for c in containers if not (isinstance(c["image"], str) and c["image"].strip())]
+          if empty:
+              sys.exit("containers with no image after rendering: " + ", ".join(empty))
           doc["tags"] = [{"key": "version", "value": os.environ["VERSION"]}, {"key": "release-run", "value": os.environ["RUN_ID"]}]
           print(json.dumps(doc))'
           }
