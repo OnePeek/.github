@@ -69,9 +69,9 @@ class Checks(unittest.TestCase):
             self.assertEqual(ship.read_checks("r", 1, True), [])
 
     def test_any_other_failure_stops(self) -> None:
-        with mock.patch.object(ship.subprocess, "run", return_value=done(1, "", "HTTP 502")):
-            with self.assertRaises(SystemExit):
-                ship.read_checks("r", 1, True)
+        with mock.patch.object(ship.subprocess, "run", return_value=done(1, "", "HTTP 502")), \
+                self.assertRaises(SystemExit):
+            ship.read_checks("r", 1, True)
 
     def test_without_required_checks_waits_on_all_but_the_ai_review(self) -> None:
         every = [{"name": "ci", "bucket": "pass"}, {"name": "CodeRabbit", "bucket": "pending"}]
@@ -91,9 +91,9 @@ class Conflicts(unittest.TestCase):
 
 class Errors(unittest.TestCase):
     def test_command_failure_stops_with_its_error_text(self) -> None:
-        with mock.patch.object(ship.subprocess, "run", return_value=done(1, "", "Pull request is not mergeable")):
-            with self.assertRaises(SystemExit) as stop:
-                ship.gh("pr", "merge", "1")
+        failed = done(1, "", "Pull request is not mergeable")
+        with mock.patch.object(ship.subprocess, "run", return_value=failed), self.assertRaises(SystemExit) as stop:
+            ship.gh("pr", "merge", "1")
         self.assertIn("not mergeable", str(stop.exception))
 
 

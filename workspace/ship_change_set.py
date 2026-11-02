@@ -210,8 +210,8 @@ def main(argv: list[str]) -> int:
         for repo, n in prs:
             if repo in ("onepeek-docs", ".github"):
                 continue
-            r = subprocess.run(["gh", "api", f"repos/{ORG}/{repo}/contents/docs-version.txt"
-                                f"?ref={info[(repo, n)]['headRefName']}", "-H", "Accept: application/vnd.github.raw"],
+            url = f"repos/{ORG}/{repo}/contents/docs-version.txt?ref={info[(repo, n)]['headRefName']}"
+            r = subprocess.run(["gh", "api", url, "-H", "Accept: application/vnd.github.raw"],
                                capture_output=True, text=True, check=False)
             pin = r.stdout.strip()
             if r.returncode != 0:
