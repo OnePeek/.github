@@ -23,4 +23,4 @@ These principles grow over time: when a review teaches us something, add it here
 Read `onepeek-docs/standards/engineering-standards.md` (https://github.com/OnePeek/onepeek-docs/blob/main/standards/engineering-standards.md) before changing anything. In short:
 - **Names and language.** Canonical names from founder decision 97; plain English in anything a person reads; never name the prior internal product.
 - **Pull requests.** Every change goes through a pull request; before launch, review is optional (decision 124). People and AI agents never commit, push, merge or deploy without an explicit instruction.
-- **Repos pin the shared workflows by commit SHA,** never by a moving tag. After a change merges here, update the SHA in each repo's `.github/workflows/` by pull request.
+- **Repos pin the shared workflows by full commit SHA** with the version tag as a trailing comment (`@<sha> # v1.4.0`), never by a moving tag. `tag-main.yml` cuts a version tag on every merge here. Pins move by Dependabot pull request (proven in phase 2 of workstream W7); until then by `python3 scripts/bump_pins.py <repo-dir> <tag> <sha>`. Nobody edits a pin by hand.

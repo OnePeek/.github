@@ -1,0 +1,36 @@
+# Copy to <repo>/.github/dependabot.yml (decision 146). Bots move the pins so nobody does by hand:
+#  - github-actions: third-party actions AND OnePeek/.github shared workflows. Keep every `uses:` pinned to a full
+#    commit SHA with the version tag as a trailing comment (`@<sha> # v1.4.0`).
+#  - npm: one entry per directory (Dependabot allows one entry per ecosystem + directory + target branch).
+#    @onepeek/* packages come daily as one group; every other package weekly would need a second entry, so they share
+#    this entry and are simply excluded from that group (they get their own grouped pull request).
+# Set target-branch to the repo's integration branch (dev). The npm registry needs the DEPENDABOT_PACKAGES_TOKEN
+# Dependabot secret (a token with read:packages). Delete the npm entry in a repo with no package.json.
+version: 2
+registries:
+  github-packages:
+    type: npm-registry
+    url: https://npm.pkg.github.com
+    token: ${{ secrets.DEPENDABOT_PACKAGES_TOKEN }}
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: dev
+    schedule: { interval: daily }
+    groups:
+      onepeek-shared-workflows:
+        patterns: ['OnePeek/.github*']
+      third-party-actions:
+        patterns: ['*']
+        exclude-patterns: ['OnePeek/.github*']
+  - package-ecosystem: npm
+    directory: /
+    target-branch: dev
+    registries: [github-packages]
+    schedule: { interval: daily }
+    groups:
+      onepeek-packages:
+        patterns: ['@onepeek/*']
+      npm-dependencies:
+        patterns: ['*']
+        exclude-patterns: ['@onepeek/*']
