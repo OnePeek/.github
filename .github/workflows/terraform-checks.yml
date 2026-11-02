@@ -38,6 +38,9 @@ jobs:
 
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
+      - name: Provider cache
+        run: mkdir -p "${TF_PLUGIN_CACHE_DIR}"
+
       - name: Format
         run: terraform fmt -check -recursive
 
@@ -46,9 +49,6 @@ jobs:
           path: .terraform-plugin-cache
           key: terraform-providers-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl', '**/versions.tf') }}
           restore-keys: terraform-providers-${{ runner.os }}-
-
-      - name: Provider cache
-        run: mkdir -p "${TF_PLUGIN_CACHE_DIR}"
 
       - name: Validate each root
         env:
