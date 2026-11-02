@@ -524,22 +524,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: The onepeek-infra commit pinned by this repo's infra-version.txt (the one source of the pin)
-        id: pin
-        run: |
-          ref=$(sed -n 's/^onepeek-infra@\([0-9a-f]\{40\}\)$/\1/p' infra-version.txt | head -n 1)
-          if [ -z "${ref}" ]; then
-            echo "::error::infra-version.txt must hold a line 'onepeek-infra@<40-hex commit>' (aws-stack §16 Infra pin)."
-            exit 1
-          fi
-          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ github.repository_owner }}/onepeek-infra
-          ref: ${{ steps.pin.outputs.ref }}
-          token: ${{ secrets.INFRA_READ_TOKEN }}
-          path: _infra
-          persist-credentials: false
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ inputs.role-to-assume }}
@@ -557,15 +541,17 @@ jobs:
         if: ${{ inputs.image == 'backend' }}
         with:
           platforms: arm64
-      - name: The services file's services for this image (at the pinned infra commit), for E7
+      - name: The services file's services for this image, for E7
         id: file
         env:
           IMAGE: ${{ inputs.image }}
         run: |
+          # The one services file a release uses: the copy infra's last apply published (delivery-pipelines §13, decision 153).
+          aws s3 cp "s3://${NAME}-deploy/services.${ENVIRONMENT}.yaml" services.yaml --only-show-errors
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os
           import yaml
-          doc = yaml.safe_load(open("_infra/config/services.%s.yaml" % os.environ["ENVIRONMENT"]))
+          doc = yaml.safe_load(open("services.yaml"))
           defaults = doc.get("defaults", {})
           rolled = {"request", "connection", "event", "job", "workflow", "schedule"}
           names = []
@@ -623,12 +609,10 @@ jobs:
       - name: The gateway routes (backend only, additive within a release; the gateway reloads within 30 s)
         if: ${{ inputs.image == 'backend' && !inputs.dry-run }}
         run: |
-          # `app api routes` reads the services file through the repo's own infra-version.txt and the sibling folder onepeek-infra.
-          mv _infra ../onepeek-infra
-          uv run --frozen --no-dev app api routes --env "${ENVIRONMENT}" --out gateway-routes.json
+          # `app api routes` reads the same services file the release read above (platform/api.md §16 `--services-file`).
+          uv run --frozen --no-dev app api routes --env "${ENVIRONMENT}" --services-file services.yaml --out gateway-routes.json
           # No encryption flags: the bucket default applies (aws-stack §16). `--sse aws:kms` alone would ask for the AWS-managed key.
           aws s3 cp gateway-routes.json "s3://${NAME}-deploy/gateway-routes.json" --only-show-errors
-          mv ../onepeek-infra _infra
       - name: Record every service's current task definition (for the rollback)
         id: previous
         env:
