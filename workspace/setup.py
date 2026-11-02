@@ -13,7 +13,7 @@ matter; `--check` also fails when a repo's copy differs from the shared one (edi
 It links (or, where symlinks are not allowed, copies) into <root>/.claude/:
   skills/<name>    from <repo>/.claude/skills/<name>
   agents/<name>.md from <repo>/.claude/agents/<name>.md
-and <root>/AGENTS.md and <root>/CLAUDE.md from .github/workspace/ (CLAUDE.md loads AGENTS.md, as in every repo). Your own files there (for example settings.local.json)
+and <root>/AGENTS.md and <root>/CLAUDE.md from .github/workspace/ (CLAUDE.md loads AGENTS.md, as in every repo). It then runs `lefthook install` in every sibling folder that is a git clone with a lefthook.yml (or says how to install lefthook). Your own files there (for example settings.local.json)
 are never touched; a name used by two repos is refused, not overwritten.
 """
 
@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import pathlib
 import shutil
+import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -154,6 +155,29 @@ def stale() -> list[pathlib.Path]:
     return found
 
 
+def hook_repos(root: pathlib.Path) -> list[pathlib.Path]:
+    """Every folder beside .github that is a git clone with a lefthook.yml (not only the repos that carry skills)."""
+    return sorted(p for p in root.iterdir() if p.is_dir() and (p / ".git").exists() and (p / "lefthook.yml").exists())
+
+
+def install_hooks() -> int:
+    """Install each linked repo's lefthook git hooks (the pre-commit gitleaks step lives there). Returns 1 on failure."""
+    repos = hook_repos(ROOT)
+    if not shutil.which("lefthook"):
+        print("lefthook is not installed, so no git hooks were set up. Install it once (macOS: brew install lefthook; "
+              "or: npm i -g lefthook), then run this script again. Also install gitleaks (brew install gitleaks): "
+              "the pre-commit hook fails without it.")
+        return 1
+    failed = 0
+    for r in repos:
+        res = subprocess.run(["lefthook", "install"], cwd=r, capture_output=True, text=True)
+        print(f"{'hooks ok ' if res.returncode == 0 else 'hooks FAIL'} {r.name}")
+        failed += res.returncode != 0
+    if not shutil.which("gitleaks"):
+        print("warning: gitleaks is not installed; commits will be refused until it is (brew install gitleaks).")
+    return 1 if failed else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--check", action="store_true", help="report only; exit 1 if anything is missing or stale")
@@ -188,7 +212,8 @@ def main() -> int:
         print(f"removed {p.relative_to(ROOT)}")
     for dst, src in sorted(want.items()):
         print(f"{place(dst, src):8} {dst.relative_to(ROOT)} -> {src.relative_to(ROOT)}")
-    return 1 if clashes else 0
+    hooks = install_hooks()
+    return 1 if clashes or hooks else 0
 
 
 if __name__ == "__main__":

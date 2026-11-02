@@ -22,34 +22,29 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Is there anything to check?
-        id: lock
+      - name: Lockfile present
         run: |
-          if [ -f pnpm-lock.yaml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; echo "No pnpm-lock.yaml yet: nothing to check."; fi
+          if [ ! -f pnpm-lock.yaml ]; then echo "::error::pnpm-lock.yaml is missing: commit the lockfile (nothing is checked without it)."; exit 1; fi
 
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        if: steps.lock.outputs.present == 'true'
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: steps.lock.outputs.present == 'true'
         with:
           node-version-file: .node-version
           cache: pnpm
 
       - name: Install
-        if: steps.lock.outputs.present == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # read by the committed .npmrc for npm.pkg.github.com
         run: pnpm install --frozen-lockfile
 
       - name: Lint, types, tests, format
-        if: steps.lock.outputs.present == 'true'
         run: |
-          pnpm run --if-present lint
-          pnpm run --if-present typecheck
-          pnpm run --if-present test
-          pnpm run --if-present format:check
+          pnpm run lint
+          pnpm run typecheck
+          pnpm run test
+          pnpm run format:check
 
       - name: Production build (release only)
-        if: steps.lock.outputs.present == 'true' && inputs.full
-        run: pnpm run --if-present build
+        if: inputs.full
+        run: pnpm run build
