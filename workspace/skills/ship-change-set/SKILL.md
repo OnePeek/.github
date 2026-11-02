@@ -23,4 +23,5 @@ A change set is merged in one sitting, in one order (`onepeek-docs/standards/dev
 
 ## Never
 - Merge past a red required check, or with `--admin`.
+- Wait on checks for a pull request with merge conflicts: resolve them first (the script stops on them).
 - Run it on a release pull request (`dev` into `release`); releases have their own flow.
