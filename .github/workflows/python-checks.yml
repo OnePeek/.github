@@ -5,7 +5,7 @@ on:
   workflow_call:
     inputs:
       full:
-        description: "true on pull requests into release: also run the slower suites."
+        description: "Accepted for callers; the release-only slower suites were removed, so it changes nothing."
         type: boolean
         default: false
 
@@ -36,14 +36,5 @@ jobs:
         run: uvx "ruff@${RUFF_VERSION}" format --check .
 
       - name: Unit tests
-        run: |
-          # Until a repo has tests, pytest reports "no tests collected" (exit 5): treat that as a pass.
-          set +e
-          uv run --with "pytest==${PYTEST_VERSION}" pytest -q
-          code=$?
-          if [ "$code" -eq 5 ]; then echo "No tests yet."; exit 0; fi
-          exit "$code"
-
-      - name: Slower suites (release only)
-        if: inputs.full
-        run: echo "Integration, contract and image smoke tests are added with the first service code (TRD §8.15)."
+        # No tests collected (pytest exit code 5) fails: a repo with no tests has no passing check.
+        run: uv run --with "pytest==${PYTEST_VERSION}" pytest -q

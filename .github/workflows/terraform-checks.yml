@@ -18,11 +18,12 @@ permissions:
 
 env:
   CHECKOV_VERSION: 3.3.29
+  TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
 
 jobs:
   checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -40,6 +41,15 @@ jobs:
       - name: Format
         run: terraform fmt -check -recursive
 
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .terraform-plugin-cache
+          key: terraform-providers-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl', '**/versions.tf') }}
+          restore-keys: terraform-providers-${{ runner.os }}-
+
+      - name: Provider cache
+        run: mkdir -p "${TF_PLUGIN_CACHE_DIR}"
+
       - name: Validate each root
         env:
           ROOTS: ${{ inputs.roots }}
@@ -49,6 +59,26 @@ jobs:
             terraform -chdir="${root}" init -backend=false -input=false
             terraform -chdir="${root}" validate
           done
+
+      - name: Terraform tests (every module or root with a *.tftest.hcl)
+        # Registry provider downloads only; no backend, no cloud credentials.
+        run: |
+          set -euo pipefail
+          # A suite's module is the folder above its tests/ folder (any depth under tests/), else its own folder.
+          dirs=$(find . -name '*.tftest.hcl' -not -path '*/.terraform/*' -print0 | while IFS= read -r -d '' f; do
+            d=$(dirname "$f")
+            case "$d" in
+              */tests/*) d=${d%%/tests/*} ;;
+              */tests) d=${d%/tests} ;;
+            esac
+            printf '%s\n' "$d"
+          done | sort -u)
+          if [ -z "${dirs}" ]; then echo "::error::no *.tftest.hcl found: this check would test nothing"; exit 1; fi
+          while IFS= read -r d; do
+            echo "== ${d}"
+            terraform -chdir="${d}" init -backend=false -input=false
+            terraform -chdir="${d}" test
+          done <<< "${dirs}"
 
       - name: tflint
         run: |
