@@ -3,6 +3,9 @@
     python3 .github/workspace/ship_change_set.py onepeek-docs#116 .github#22 onepeek-infra#76 backend-service#59
     python3 .github/workspace/ship_change_set.py ... --go     # merge; without --go it only prints the plan and checks
 
+Conflicts are checked first: a pull request that conflicts with its base stops the run before any wait, and
+every pull request still to merge is checked again after each merge.
+
 Order: docs (merge commit into main) -> .github (squash into main, then wait for its release tag) -> infra ->
 design system -> backend -> web -> the other repos (squash into dev). After .github merges, every later pull
 request's `OnePeek/.github` workflow pins move to the new tag in one commit, so callers never run on a stale
@@ -68,6 +71,23 @@ def checks(repo: str, n: int) -> list[dict]:
         return json.loads(r.stdout) if r.stdout.strip().startswith("[") else []
     got = read(True)
     return got or [c for c in read(False) if c["name"] != "CodeRabbit"]
+
+
+def mergeable(repo: str, n: int) -> str:
+    """GitHub computes this lazily: UNKNOWN right after a push or a merge into the base, so ask until it settles."""
+    for _ in range(15):
+        state = pr_info(repo, n)["mergeable"]
+        if state != "UNKNOWN":
+            return state
+        time.sleep(4)
+    return "UNKNOWN"
+
+
+def no_conflicts(prs: list[tuple[str, int]]) -> None:
+    """Stop before any wait if a pull request still to merge conflicts with its base (often after an earlier merge)."""
+    bad = [f"{r}#{n}" for r, n in prs if mergeable(r, n) == "CONFLICTING"]
+    if bad:
+        raise SystemExit(f"STOP: merge conflicts in {bad}; resolve them, push, and run again")
 
 
 def wait_green(repo: str, n: int, may_rerun: bool) -> None:
@@ -149,6 +169,8 @@ def main(argv: list[str]) -> int:
             problems.append(f"{repo}#{n} targets {i['baseRefName']}, not {want}")
         if i["isDraft"]:
             problems.append(f"{repo}#{n} is a draft")
+        if i["mergeable"] == "CONFLICTING":
+            problems.append(f"{repo}#{n} has merge conflicts: resolve them before any check is waited on")
     docs = [p for p in prs if p[0] == "onepeek-docs"]
     if len(docs) > 1:
         problems.append("a change set has one docs pull request")
@@ -173,7 +195,8 @@ def main(argv: list[str]) -> int:
         return 0
 
     merged_any, tag = False, None
-    for repo, n in prs:
+    for k, (repo, n) in enumerate(prs):
+        no_conflicts(prs[k:])
         if tag and repo not in ("onepeek-docs", ".github"):
             bump_pins(repo, info[(repo, n)]["headRefName"], *tag)
             time.sleep(POLL_S)  # let the new push's checks register before reading them
