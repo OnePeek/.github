@@ -1,11 +1,16 @@
 """workspace/local_ci.py: it finds the pull-request workflows, fills a reusable workflow's inputs, and skips remote steps."""
+import contextlib
 import importlib.util
+import io
 import os
 import pathlib
 import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
+
+import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("local_ci", ROOT / "workspace/local_ci.py")
@@ -167,6 +172,76 @@ class LocalCi(unittest.TestCase):
             self.assertEqual(lc.main([str(d), "--jobs", "c"]), 0)
         finally:
             lc.WORKSPACE = old
+
+
+class Versions(unittest.TestCase):
+    """Playbook §8a P3: uv and tflint at CI's versions; P6: one shared provider cache."""
+
+    def repo(self, workflow: str) -> pathlib.Path:
+        return LocalCi.repo(self, workflow)
+
+    def test_the_shared_workflows_pin_the_versions_local_ci_checks(self):
+        wf = ROOT / ".github/workflows"
+        uv_files = ["secret-scan.yml", "python-checks.yml", "terraform-checks.yml", "contract.yml"]
+        for name in uv_files:
+            text = (wf / name).read_text(encoding="utf-8")
+            self.assertIn(f'version: "{lc.UV_VERSION}"', text, name)
+        self.assertIn(f"tflint_version: v{lc.TFLINT_VERSION}", (wf / "terraform-checks.yml").read_text(encoding="utf-8"))
+        self.assertIn(f"uv=={lc.UV_VERSION}", (wf / "release-ecs.yml").read_text(encoding="utf-8"))
+        for f in wf.glob("*.yml"):  # no setup-uv or setup-tflint without its exact version
+            doc = yaml.safe_load(f.read_text(encoding="utf-8"))
+            for job in (doc.get("jobs") or {}).values():
+                for st in job.get("steps") or []:
+                    uses = str(st.get("uses") or "")
+                    if uses.startswith("astral-sh/setup-uv"):
+                        self.assertEqual((st.get("with") or {}).get("version"), lc.UV_VERSION, f.name)
+                    if uses.startswith("terraform-linters/setup-tflint"):
+                        self.assertEqual((st.get("with") or {}).get("tflint_version"), f"v{lc.TFLINT_VERSION}", f.name)
+
+    def test_a_different_uv_fails_the_run_with_the_fix(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+        with mock.patch.object(lc, "tool_version", side_effect=lambda t: "0.9.7" if t == "uv" else None):
+            self.assertIn(lc.UV_VERSION, lc.uv_problem())
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
+        with mock.patch.object(lc, "tool_version", side_effect=lambda t: lc.UV_VERSION if t == "uv" else None):
+            self.assertEqual(lc.uv_problem(), "")
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+
+    def test_a_different_tflint_skips_its_steps_with_the_reason(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: tflint --recursive\n")
+        fake = pathlib.Path(tempfile.mkdtemp())
+        (fake / "tflint").write_text("#!/bin/sh\necho 'TFLint version 0.50.0'\nexit 1\n")
+        (fake / "tflint").chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": f"{fake}:{os.environ['PATH']}"}), \
+                mock.patch.object(lc, "uv_problem", return_value=""):
+            self.assertIn("CI pins 0.65.0", lc.tflint_problem())
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)  # skipped, not run (the fake would fail)
+        self.assertIn("tflint 0.50.0 is installed; CI pins 0.65.0", buf.getvalue())
+
+    def test_steps_use_one_shared_provider_cache_unless_the_laptop_sets_one(self):
+        home = pathlib.Path(tempfile.mkdtemp())
+        d = self.repo("on: [pull_request]\nenv:\n  TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache\njobs:\n  a:\n"
+                      "    runs-on: ubuntu-latest\n    steps:\n      - run: test \"$TF_PLUGIN_CACHE_DIR\" = \"$WANT\" && test -d \"$WANT\"\n"
+                      "        env:\n          WANT: " + str(home / ".cache/onepeek/terraform-plugins") + "\n")
+        env = {k: v for k, v in os.environ.items() if k != "TF_PLUGIN_CACHE_DIR"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(lc, "SHARED_PLUGIN_CACHE", home / ".cache/onepeek/terraform-plugins"), \
+                mock.patch.object(lc, "uv_problem", return_value=""):
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+        own = home / "own"
+        with mock.patch.dict(os.environ, {"TF_PLUGIN_CACHE_DIR": str(own)}), mock.patch.object(lc, "uv_problem", return_value=""):
+            self.assertEqual(lc.plugin_cache(), own)
+            self.assertTrue(own.is_dir())
+
+
+class GithubRepoJobs(unittest.TestCase):
+    def test_the_service_list_job_runs_locally(self):  # §8a P5
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), mock.patch.object(lc, "uv_problem", return_value=""):
+            self.assertEqual(lc.main([str(ROOT), "--list", "--jobs", "service-list"]), 0)
+        self.assertIn("workflow-lint.yml:service-list: Tests, then the drift check\n", buf.getvalue())
 
 
 if __name__ == "__main__":

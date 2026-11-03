@@ -38,7 +38,47 @@ SIBLINGS = {"_backend": "backend-service", "_web": "onepeek-web", "_infra": "one
 USES_SIBLINGS = re.compile(r"(?<![A-Za-z0-9_])_(backend|web|infra)(?![A-Za-z0-9_])")
 # Linters CI installs with a setup action; when the laptop lacks one, its step is skipped with a reason, not failed.
 OPTIONAL_TOOLS = ("tflint", "trivy")
+# The versions CI pins (foundation-playbook §8a P3; scripts/test_local_ci.py keeps the shared workflows at these).
+# A different uv on the laptop fails the run with the fix; a different tflint skips its steps with the reason.
+UV_VERSION = "0.12.0"
+TFLINT_VERSION = "0.65.0"
+# One provider cache for every local run and worktree (§8a P6), unless the laptop sets TF_PLUGIN_CACHE_DIR itself.
+SHARED_PLUGIN_CACHE = pathlib.Path.home() / ".cache" / "onepeek" / "terraform-plugins"
 REMOTE = re.compile(r"\bgh api\b|\bgh pr\b|\baws \b|GH_TOKEN|GITHUB_TOKEN|configure-aws-credentials|terraform (plan|apply)|\bgit push\b|(?m:terraform\b[^\n]*\binit\b(?![^\n]*-backend=false))|\bgit clone\b[^\n]*github\.com")
+
+
+def tool_version(tool: str) -> str | None:
+    """The installed version of uv or tflint (`uv 0.12.0 (...)`, `TFLint version 0.65.0`), or None when missing."""
+    if not shutil.which(tool):
+        return None
+    r = subprocess.run([tool, "--version"], capture_output=True, text=True)
+    m = re.search(r"(\d+\.\d+\.\d+)", r.stdout + r.stderr)
+    return m.group(1) if m else "unknown"
+
+
+def uv_problem() -> str:
+    """Why the laptop's uv cannot stand in for CI's, or "" (a missing uv is handled where it is needed)."""
+    v = tool_version("uv")
+    if v is None or v == UV_VERSION:
+        return ""
+    return f"uv {v} is installed; CI pins uv {UV_VERSION}. Install it (`uv self update {UV_VERSION}`, or your package manager), then run again."
+
+
+def tflint_problem() -> str:
+    """Why tflint steps are skipped here (missing, or not CI's version), or ""."""
+    v = tool_version("tflint")
+    if v is None:
+        return "tflint is not installed on this laptop"
+    if v != TFLINT_VERSION:
+        return f"tflint {v} is installed; CI pins {TFLINT_VERSION}"
+    return ""
+
+
+def plugin_cache() -> pathlib.Path:
+    """The laptop's TF_PLUGIN_CACHE_DIR when set, else the one shared cache (§8a P6); it exists afterwards."""
+    d = pathlib.Path(os.environ.get("TF_PLUGIN_CACHE_DIR") or SHARED_PLUGIN_CACHE)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def pr_workflows(repo: pathlib.Path):
@@ -138,6 +178,8 @@ def run_step(cmd: str, cwd: pathlib.Path, env: dict[str, str], shell: str) -> tu
     # No cloud credentials or settings from the laptop reach a step (as the contract job does in CI).
     base = {k: v for k, v in base.items() if not k.startswith("AWS_")}
     base.update({"AWS_SHARED_CREDENTIALS_FILE": "/dev/null", "AWS_CONFIG_FILE": "/dev/null"})
+    # Terraform providers go to one shared cache, not a copy per repo or worktree (a workflow's own value is CI's).
+    env = {**env, "TF_PLUGIN_CACHE_DIR": str(plugin_cache())}
     r = subprocess.run(argv, cwd=cwd, env={**base, "CI": "true", **files, **env}, capture_output=True, text=True)
     return r.returncode, (r.stdout + r.stderr), time.time() - t
 
@@ -228,6 +270,9 @@ def main(argv: list[str] | None = None) -> int:
     started = time.time()
     ctx = contexts(repo, name)
     a.ctx, a.own = ctx, name
+    if not a.list and (problem := uv_problem()):
+        print(f"FAIL  {problem}")
+        return 1
 
     for check, cmd in shared_checks(repo, kind, name):
         if a.list:
@@ -342,6 +387,9 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                 missing = [t for t in OPTIONAL_TOOLS if re.search(rf"(?m)^\s*{t}\b", cmd) and not shutil.which(t)]
                 if missing:
                     skipped.append(f"{label} (SKIP: {missing[0]} is not installed on this laptop)")
+                    continue
+                if re.search(r"(?m)^\s*tflint\b", cmd) and (why := tflint_problem()):
+                    skipped.append(f"{label} (SKIP: {why})")
                     continue
                 if any(re.search(rf"\bmv\s+{re.escape(c)}\b", cmd) for c in checkout_paths if not c.startswith("${{")):
                     skipped.append(f"{label} (CI-only: places a checkout the laptop does not make)")

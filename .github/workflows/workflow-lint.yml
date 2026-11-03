@@ -4,6 +4,7 @@ name: workflow-lint
 on:
   pull_request:
     branches: [main]
+    types: [opened, edited, reopened, synchronize]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -13,7 +14,15 @@ permissions:
   contents: read
 
 jobs:
+  depends-on:
+    # Declared dependencies first (playbook §8a P1): while a `Depends on:` pull request is unmerged, nothing else runs.
+    uses: ./.github/workflows/depends-on.yml
+    secrets:
+      AGENTS_APP_CLIENT_ID: ${{ secrets.AGENTS_APP_CLIENT_ID }}
+      AGENTS_APP_PRIVATE_KEY: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
+
   actionlint:
+    needs: depends-on
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -40,9 +49,11 @@ jobs:
         run: ./actionlint -color
 
   secrets:
+    needs: depends-on
     uses: ./.github/workflows/secret-scan.yml
 
   zizmor:
+    needs: depends-on
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -53,6 +64,7 @@ jobs:
         run: pip install --quiet zizmor==1.31.1 && zizmor --no-progress --min-severity medium .github/workflows
 
   runner-labels:
+    needs: depends-on
     # ci-runners.md section 5.4: where jobs may run (the rules, with a fixture each, are in scripts/test_check_runner_labels.py).
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -66,32 +78,54 @@ jobs:
           python scripts/check_runner_labels.py --kind public --repo OnePeek/.github \
             --list .github/workflow-lint/github-only-jobs.yaml .github/workflows
 
+  pins:
+    needs: depends-on
+    # The shared pin check runs here too (this repo has no pins and no docs-version.txt, so it proves the workflow runs).
+    uses: ./.github/workflows/pins.yml
+
   service-list:
+    needs: depends-on
     # operate.yml's service choices must equal the services file; the render function must match release-ecs.yml.
+    # local_ci.py runs the last step too (playbook §8a P5), with onepeek-infra at origin/dev as _infra.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
-    env:
-      HAS_INFRA_TOKEN: ${{ secrets.ORG_READ_TOKEN != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: A token to read onepeek-infra is passed (the App, or the ORG_READ_TOKEN fallback)
+        id: tokens
+        env:
+          HAS_APP: ${{ secrets.AGENTS_APP_CLIENT_ID != '' && secrets.AGENTS_APP_PRIVATE_KEY != '' }}
+          HAS_ORG_READ_TOKEN: ${{ secrets.ORG_READ_TOKEN != '' }}
+        run: |
+          if [ "${HAS_APP}" != "true" ] && [ "${HAS_ORG_READ_TOKEN}" != "true" ]; then
+            echo "::error::Neither AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY nor ORG_READ_TOKEN is set in this repo: the drift check against the services file cannot run (playbook §8a S6). Add the App secrets."
+            exit 1
+          fi
+          echo "app=${HAS_APP}" >> "$GITHUB_OUTPUT"
+          [ "${HAS_APP}" = "true" ] || echo "::warning::ORG_READ_TOKEN is deprecated: set the agents' App secrets instead (playbook §8a S6)."
+      - name: The agents' GitHub App token (Contents read on onepeek-infra)
+        id: app
+        if: ${{ steps.tokens.outputs.app == 'true' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: onepeek-infra
+          permission-contents: read
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ env.HAS_INFRA_TOKEN == 'true' }}
         with:
           repository: ${{ github.repository_owner }}/onepeek-infra
           ref: dev
-          token: ${{ secrets.ORG_READ_TOKEN }}
+          token: ${{ steps.app.outputs.token || secrets.ORG_READ_TOKEN }}
           path: _infra
           persist-credentials: false
       - name: Tests, then the drift check
         run: |
           pip install --quiet pyyaml==6.0.3
           python -m unittest discover -s scripts -p 'test_*.py'
-          if [ "${HAS_INFRA_TOKEN}" != "true" ]; then
-            echo "::error::ORG_READ_TOKEN is not set in this repo: the drift check against the services file cannot run. Add the secret."
-            exit 1
-          fi
           python scripts/check_service_list.py --services-file _infra/config/services.preprod.yaml

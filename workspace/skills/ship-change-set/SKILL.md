@@ -16,6 +16,13 @@ A change set is merged in one sitting, in one order (`onepeek-docs/standards/dev
    1. docs into `main` with a merge commit;
    2. `.github` into `main` (squash), then waits for its release tag and moves every later pull request's `OnePeek/.github` workflow pins to that tag in one commit;
    3. infra, then the design system, then backend, then web, then the other repos, each squashed into `dev`.
+   4. after the whole set, when `.github` was tagged: a pin-move pull request in every other repo whose workflows pin `OnePeek/.github` (with a note when it was more than one minor version behind, as its inputs may need a hand fix); review and merge those like any pull request.
+
+   **Expand first** (`foundation-playbook.md` §8a P1, development-cycle §2a item 7): when the consumer of a strictly validated contract must merge before its producer, pass `--order repoA,repoB,...` naming every repo of the set once; it replaces the fixed order.
+
+   **Declared dependencies** (§8a P1): a pull request whose body says `Depends on: OnePeek/<repo>#<n>` merges after that one (the order is otherwise kept); after the dependency merges, the dependent's failed checks (its `depends-on` job) are re-run. A listed pull request outside the set must already be merged, or the dry run stops.
+
+   After each merge, the local worktrees of the merged branch (from `git worktree list`) are removed when they are clean; a worktree with uncommitted changes is kept and named.
    
    Conflicts come first: a pull request that conflicts with its base, or whose state GitHub cannot report yet, stops the run before any wait, and the ones still to merge are checked again after every merge and pin move.
 
