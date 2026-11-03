@@ -34,6 +34,12 @@ class LocalCi(unittest.TestCase):
         d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n      - run: gh api repos/x\n")
         self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
 
+    def test_the_workflow_working_directory_applies_to_its_jobs(self):
+        d = self.repo("on: [pull_request]\ndefaults:\n  run:\n    working-directory: sub\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: test -f marker\n")
+        (d / "sub").mkdir()
+        (d / "sub/marker").write_text("x", encoding="utf-8")
+        self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+
     def test_a_failing_step_fails(self):
         d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 3\n")
         self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
