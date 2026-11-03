@@ -59,11 +59,11 @@ on:
         type: string
         default: ""
       smoke-script:
-        description: The caller repo's smoke checks against https://<domain> (delivery-pipelines UC-DEL-001 row 7), run without AWS credentials with DOMAIN set. Absent = a visible warning.
+        description: The caller repo's smoke checks against https://<domain>, run in addition to the shared baseline readiness check (delivery-pipelines UC-DEL-001 row 7), without AWS credentials, with DOMAIN set. Absent = a visible warning.
         type: string
         default: smoke.sh
       allow-drop:
-        description: Reviewed setting and secret names allowed to disappear from a service in this release (the contract step of an expand/contract change; delivery-pipelines §5 step 4). Space or comma separated.
+        description: Reviewed setting and secret names allowed to disappear from a service in this release (the contract step of an expand/contract change; delivery-pipelines §5 step 4). Space or comma separated; a name applies to every container.
         type: string
         default: ""
     secrets:
@@ -421,12 +421,12 @@ jobs:
         run: |
           # --- render-taskdef begin (identical in release-ecs.yml and operate.yml; checked by scripts/check_service_list.py) ---
           # The service's currently registered task definition, for drop protection (delivery-pipelines §5 step 4):
-          # prints the file it wrote, or first-deploy when the service has none yet.
+          # prints the file it wrote, or first-deploy when the service has none yet. Any AWS error fails closed.
           current_td() {  # current_td <service> <file>
             local td
-            td=$(aws ecs describe-services --cluster "${NAME}" --services "$1" --query 'services[0].taskDefinition' --output text)
+            td=$(aws ecs describe-services --cluster "${NAME}" --services "$1" --query 'services[0].taskDefinition' --output text) || return 1
             if [ -z "${td}" ] || [ "${td}" = "None" ]; then echo first-deploy; return 0; fi
-            aws ecs describe-task-definition --task-definition "${td}" --query taskDefinition --output json > "$2"
+            aws ecs describe-task-definition --task-definition "${td}" --query taskDefinition --output json > "$2" || return 1
             echo "$2"
           }
           render() {  # render <service> <one-off | first-deploy | current task definition file> -> task definition JSON on stdout
@@ -696,12 +696,12 @@ jobs:
         run: |
           # --- render-taskdef begin (identical in release-ecs.yml and operate.yml; checked by scripts/check_service_list.py) ---
           # The service's currently registered task definition, for drop protection (delivery-pipelines §5 step 4):
-          # prints the file it wrote, or first-deploy when the service has none yet.
+          # prints the file it wrote, or first-deploy when the service has none yet. Any AWS error fails closed.
           current_td() {  # current_td <service> <file>
             local td
-            td=$(aws ecs describe-services --cluster "${NAME}" --services "$1" --query 'services[0].taskDefinition' --output text)
+            td=$(aws ecs describe-services --cluster "${NAME}" --services "$1" --query 'services[0].taskDefinition' --output text) || return 1
             if [ -z "${td}" ] || [ "${td}" = "None" ]; then echo first-deploy; return 0; fi
-            aws ecs describe-task-definition --task-definition "${td}" --query taskDefinition --output json > "$2"
+            aws ecs describe-task-definition --task-definition "${td}" --query taskDefinition --output json > "$2" || return 1
             echo "$2"
           }
           render() {  # render <service> <one-off | first-deploy | current task definition file> -> task definition JSON on stdout
@@ -822,12 +822,12 @@ jobs:
         run: |
           # --- render-taskdef begin (identical in release-ecs.yml and operate.yml; checked by scripts/check_service_list.py) ---
           # The service's currently registered task definition, for drop protection (delivery-pipelines §5 step 4):
-          # prints the file it wrote, or first-deploy when the service has none yet.
+          # prints the file it wrote, or first-deploy when the service has none yet. Any AWS error fails closed.
           current_td() {  # current_td <service> <file>
             local td
-            td=$(aws ecs describe-services --cluster "${NAME}" --services "$1" --query 'services[0].taskDefinition' --output text)
+            td=$(aws ecs describe-services --cluster "${NAME}" --services "$1" --query 'services[0].taskDefinition' --output text) || return 1
             if [ -z "${td}" ] || [ "${td}" = "None" ]; then echo first-deploy; return 0; fi
-            aws ecs describe-task-definition --task-definition "${td}" --query taskDefinition --output json > "$2"
+            aws ecs describe-task-definition --task-definition "${td}" --query taskDefinition --output json > "$2" || return 1
             echo "$2"
           }
           render() {  # render <service> <one-off | first-deploy | current task definition file> -> task definition JSON on stdout
@@ -911,6 +911,13 @@ jobs:
           role-to-assume: ${{ inputs.role-to-assume }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - name: Baseline readiness through the edge (backend /api/status, web /sign-in), always
+        env:
+          DOMAIN: ${{ inputs.domain }}
+          IMAGE: ${{ inputs.image }}
+        run: |
+          if [ "${IMAGE}" = "backend" ]; then path="/api/status"; else path="/sign-in"; fi
+          curl --fail --silent --show-error --max-time 10 --retry 6 --retry-delay 10 --retry-all-errors "https://${DOMAIN}${path}" >/dev/null
       - name: Every service's task definition carries this release's image digest (describe-services; no ecs:ListTasks)
         env:
           DIGEST: ${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
@@ -924,7 +931,7 @@ jobs:
               echo "::error::${svc} runs ${images}, not digest ${DIGEST}."; exit 1
             fi
           done
-      - name: The repo's own smoke checks against the domain (UC-DEL-001 row 7; /api/status, /sign-in, @smoke journeys)
+      - name: The repo's own smoke checks against the domain, in addition (UC-DEL-001 row 7; @smoke journeys)
         env:
           SCRIPT: ${{ inputs.smoke-script }}
           DOMAIN: ${{ inputs.domain }}
@@ -933,8 +940,8 @@ jobs:
             ""|/*|*..*) echo "::error::smoke-script must be a path inside the repository, got '${SCRIPT}'."; exit 1 ;;
           esac
           if [ ! -f "${SCRIPT}" ]; then
-            echo "::warning::${SCRIPT} is not in this repository: only the task definition digest check ran."
-            echo "Warning: no ${SCRIPT} in the repository; only the task definition digest check ran." >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::${SCRIPT} is not in this repository: only the baseline readiness and digest checks ran."
+            echo "Warning: no ${SCRIPT} in the repository; only the baseline readiness and digest checks ran." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           # Without the deploy role's credentials or the means to request them again: black-box probes only.

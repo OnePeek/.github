@@ -438,6 +438,23 @@ class DropProtection(unittest.TestCase):
             self.assertEqual(out.stdout.strip(), want)
             self.assertEqual("describe-task-definition --task-definition arn:td/api:7" in calls, want != "first-deploy")
 
+    def test_an_aws_error_fails_closed_in_every_copy(self):
+        for failing in ("describe-services", "describe-task-definition"):
+            aws = f"""case "$*" in *{failing}*) echo "AccessDeniedException" >&2; exit 254;; *describe-services*) echo arn:td/api:7;; *describe-task-definition*) echo '{{}}';; esac"""
+            out, _, _ = run_step(FUNCTION + "\ncurrent_td api current-api.json", aws)
+            self.assertNotEqual(out.returncode, 0, failing)
+            self.assertNotIn("first-deploy", out.stdout)
+        for text in (TEXT, OPERATE):
+            self.assertEqual(text.count("--output text) || return 1"), text.count("current_td() {"))
+            self.assertEqual(text.count('--output json > "$2" || return 1'), text.count("current_td() {"))
+
+    def test_an_aws_error_in_the_rollout_registers_nothing(self):
+        aws = """case "$*" in *describe-services*) echo "ThrottlingException" >&2; exit 254;; *"s3 cp"*) echo '{"family": "f", "containerDefinitions": [{"name": "api"}]}';; *register-task-definition*) echo arn:td/api:8;; esac"""
+        out, calls, _ = run_step(step("rollout", "Verify, render, register and update each order"), aws,
+                                 {"IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9", "ORDERS": '[["api"]]'})
+        self.assertNotEqual(out.returncode, 0)
+        self.assertNotIn("register-task-definition", calls)
+
     def test_a_drop_in_the_rollout_stops_before_anything_is_registered(self):
         aws = f"""case "$*" in
 *describe-services*) echo arn:td/api:7;;
@@ -552,6 +569,23 @@ esac"""
         self.assertNotIn("update-service", calls)
 
 
+class BaselineReadiness(unittest.TestCase):
+    """UC-DEL-001 row 7: the shared readiness check always runs, whatever the caller's smoke script does."""
+    script = step("smoke", "Baseline readiness")
+
+    def test_each_image_checks_its_path_and_a_failure_fails_the_job(self):
+        for image, path in (("backend", "/api/status"), ("web", "/sign-in")):
+            out, calls, _ = run_step(self.script, "", {"DOMAIN": "d", "IMAGE": image})
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("https://d" + path, calls)
+            out, _, _ = run_step(self.script, "", {"DOMAIN": "d", "IMAGE": image}, extra_stubs={"curl": "exit 22"})
+            self.assertEqual(out.returncode, 22)
+
+    def test_it_is_not_conditional(self):
+        st = next(s for s in RELEASE["jobs"]["smoke"]["steps"] if s.get("name", "").startswith("Baseline readiness"))
+        self.assertNotIn("if", st)
+
+
 class Smoke(unittest.TestCase):
     def smoke(self, services: str, images: list[str], svc_td: str = "arn:td/x:2"):
         aws = f"""case "$*" in
@@ -585,7 +619,7 @@ class SmokeScript(unittest.TestCase):
         names = [s.get("name", "") for s in RELEASE["jobs"]["smoke"]["steps"]]
         self.assertTrue(any(n.startswith("Every service's task definition") for n in names))
         self.assertTrue(any(n.startswith("The repo's own") for n in names))
-        self.assertNotIn("curl", json.dumps(RELEASE["jobs"]["smoke"]["steps"]))  # the edge checks are the caller's script
+        self.assertLess(names.index(next(n for n in names if n.startswith("Baseline readiness"))), names.index(next(n for n in names if n.startswith("The repo's own"))))
         self.assertEqual(RELEASE[True]["workflow_call"]["inputs"]["smoke-script"]["default"], "smoke.sh")
 
     def test_an_absent_script_is_skipped_with_a_visible_warning(self):
@@ -732,7 +766,7 @@ esac"""
         out, calls, _ = run_step(PREVIOUS + f'\nprevious_deployment backend {current}', "", {"GITHUB_REPOSITORY": "OnePeek/backend-service"}, extra_stubs={"gh": gh})
         return out, calls
 
-    def test_the_newest_successful_record_of_another_commit_wins(self):
+    def test_the_first_successful_record_older_than_the_running_one_wins(self):
         rows = [("3", COMMIT, DIGEST), ("2", "sha-" + "2" * 12, "sha256:" + "2" * 64), ("1", "sha-" + "1" * 12, "sha256:" + "1" * 64)]
         out, _ = self.previous(rows, {"2": "failure", "1": "success"})
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
@@ -742,6 +776,17 @@ esac"""
         rows = [("3", COMMIT, DIGEST), ("2", "sha-" + "2" * 12, "sha256:" + "2" * 64)]
         out, _ = self.previous(rows, {"3": "success", "2": "inactive"})
         self.assertEqual(out.stdout.strip(), "sha-" + "2" * 12 + " sha256:" + "2" * 64)
+
+    def test_a_newer_release_than_the_running_one_is_never_a_target(self):
+        # A newer release (4) failed and was rolled back, so the services run 3: the target is 2, never 4.
+        rows = [("4", "sha-" + "4" * 12, "sha256:" + "4" * 64), ("3", COMMIT, DIGEST), ("2", "sha-" + "2" * 12, "sha256:" + "2" * 64)]
+        out, _ = self.previous(rows, {"4": "success", "2": "success"})
+        self.assertEqual(out.stdout.strip(), "sha-" + "2" * 12 + " sha256:" + "2" * 64)
+
+    def test_no_record_of_the_running_commit_means_no_target(self):
+        rows = [("2", "sha-" + "2" * 12, "sha256:" + "2" * 64), ("1", "sha-" + "1" * 12, "sha256:" + "1" * 64)]
+        out, _ = self.previous(rows, {"2": "success", "1": "success"})
+        self.assertEqual(out.stdout.strip(), "")
 
     def test_nothing_is_printed_when_there_is_no_earlier_record(self):
         out, _ = self.previous([("3", COMMIT, DIGEST)], {"3": "success"})

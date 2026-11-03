@@ -156,17 +156,23 @@ jobs:
           else
             key="awskms:///alias/${NAME}-image-signing"
           fi
-          # The previous recorded deployment of this environment for an image (playbook §5.2 "Rollback target"): the newest
-          # successful release-ecs deployment record whose commit is not the one running now. Prints "<commit> <digest>".
+          # The previous recorded deployment of this environment for an image (playbook §5.2 "Rollback target"): walking the
+          # release-ecs records newest first, skip every record up to and including the running commit's, then take the
+          # next successful one (never a newer, rolled-back release). Prints "<commit> <digest>", or nothing.
           # GitHub marks an older successful deployment `inactive` when a newer one succeeds, so both states count.
           previous_deployment() {  # previous_deployment <image> <current commit>
             gh api --paginate "repos/${GITHUB_REPOSITORY}/deployments?environment=${ENVIRONMENT}&per_page=100" \
               --jq '.[] | select((.payload | type) == "object" and (.payload.digests | type) == "object") | [.id, .payload.commit, (.payload.digests["'"$1"'"] // "")] | @tsv' \
-              | while IFS=$'\t' read -r id commit digest; do
+              | { past=""
+                while IFS=$'\t' read -r id commit digest; do
+                  if [ -z "${past}" ]; then
+                    if [ "${commit}" = "$2" ]; then past=yes; fi
+                    continue
+                  fi
                   if [ -z "${digest}" ] || [ "${commit}" = "$2" ]; then continue; fi
                   state=$(gh api "repos/${GITHUB_REPOSITORY}/deployments/${id}/statuses?per_page=1" --jq '.[0].state // ""')
                   if [ "${state}" = "success" ] || [ "${state}" = "inactive" ]; then echo "${commit} ${digest}"; break; fi
-                done
+                done; }
           }
           VERSION_NOW=""
           while read -r svc; do
@@ -208,12 +214,12 @@ jobs:
             cosign verify --experimental-oci11 --insecure-ignore-tlog=true --key "${key}" "${IMAGE_REF}" >/dev/null
           # --- render-taskdef begin (identical in release-ecs.yml and operate.yml; checked by scripts/check_service_list.py) ---
           # The service's currently registered task definition, for drop protection (delivery-pipelines §5 step 4):
-          # prints the file it wrote, or first-deploy when the service has none yet.
+          # prints the file it wrote, or first-deploy when the service has none yet. Any AWS error fails closed.
           current_td() {  # current_td <service> <file>
             local td
-            td=$(aws ecs describe-services --cluster "${NAME}" --services "$1" --query 'services[0].taskDefinition' --output text)
+            td=$(aws ecs describe-services --cluster "${NAME}" --services "$1" --query 'services[0].taskDefinition' --output text) || return 1
             if [ -z "${td}" ] || [ "${td}" = "None" ]; then echo first-deploy; return 0; fi
-            aws ecs describe-task-definition --task-definition "${td}" --query taskDefinition --output json > "$2"
+            aws ecs describe-task-definition --task-definition "${td}" --query taskDefinition --output json > "$2" || return 1
             echo "$2"
           }
           render() {  # render <service> <one-off | first-deploy | current task definition file> -> task definition JSON on stdout
