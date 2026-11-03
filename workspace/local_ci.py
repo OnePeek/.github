@@ -67,7 +67,10 @@ def run_step(cmd: str, cwd: pathlib.Path, env: dict[str, str], shell: str) -> tu
     t = time.time()
     env = {**env, "PATH": f"{venv_bin()}:{os.environ['PATH']}", "VIRTUAL_ENV": str(venv_bin().parent)}
     argv = ["bash", "-eo", "pipefail", "-c", cmd] if shell in ("", "bash") or shell.startswith("bash") else ["sh", "-ec", cmd]
-    r = subprocess.run(argv, cwd=cwd, env={**os.environ, "CI": "true", **env}, capture_output=True, text=True)
+    # The steps see the laptop's environment minus local_ci's own settings (ONEPEEK_WORKSPACE leaked into a repo's tests),
+    # and an empty TF_PLUGIN_CACHE_DIR is dropped (a step's `mkdir -p "$TF_PLUGIN_CACHE_DIR"` fails on it).
+    base = {k: v for k, v in os.environ.items() if k != "ONEPEEK_WORKSPACE" and not (k == "TF_PLUGIN_CACHE_DIR" and not v)}
+    r = subprocess.run(argv, cwd=cwd, env={**base, "CI": "true", **env}, capture_output=True, text=True)
     return r.returncode, (r.stdout + r.stderr), time.time() - t
 
 
