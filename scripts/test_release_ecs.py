@@ -15,20 +15,23 @@ import yaml
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github/workflows"
 RELEASE = yaml.safe_load((WORKFLOWS / "release-ecs.yml").read_text(encoding="utf-8"))
 TEXT = (WORKFLOWS / "release-ecs.yml").read_text(encoding="utf-8")
+OPERATE = (WORKFLOWS / "operate.yml").read_text(encoding="utf-8")
 DIGEST = "sha256:" + "a" * 64
+COMMIT = "sha-" + "f" * 12
 ENV = {"NAME": "onepeek-preprod", "ENVIRONMENT": "preprod", "IMAGE": "backend", "MAIN": "backend", "VERSION": "1.2.3",
-       "NPM_TOKEN": "", "GITHUB_SHA": "f" * 40, "AWS_REGION": "ap-south-1"}  # fmt: skip
+       "COMMIT": COMMIT, "NPM_TOKEN": "", "GITHUB_SHA": "f" * 40, "AWS_REGION": "ap-south-1"}  # fmt: skip
 
 
 def step(job: str, name: str) -> str:
     return next(s["run"] for s in RELEASE["jobs"][job]["steps"] if s.get("name", "").startswith(name))
 
 
-def run_step(script: str, aws: str, extra_env: dict[str, str] | None = None, files: dict[str, str] | None = None):
-    """Returns the result, every stub call, and what the step wrote to GITHUB_OUTPUT."""
+def run_step(script: str, aws: str, extra_env: dict[str, str] | None = None, files: dict[str, str] | None = None,
+             extra_stubs: dict[str, str] | None = None, with_summary: bool = False):
+    """Returns the result, every stub call, and what the step wrote to GITHUB_OUTPUT (and GITHUB_STEP_SUMMARY)."""
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
-        stubs = {"aws": aws, "docker": "", "cosign": "", "curl": "", "sha256sum": "", "tar": ""}
+        stubs = {"aws": aws, "docker": "", "cosign": "", "curl": "", "sha256sum": "", "tar": "", **(extra_stubs or {})}
         for tool, body in stubs.items():
             f = root / tool
             f.write_text(f'#!/bin/bash\necho "{tool} $*" >> "{root}/calls"\n{body}\n')
@@ -39,16 +42,19 @@ def run_step(script: str, aws: str, extra_env: dict[str, str] | None = None, fil
             **os.environ, **ENV, **(extra_env or {}), "PATH": f"{root}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(root / "output"), "GITHUB_STEP_SUMMARY": str(root / "summary"),
         })  # fmt: skip
         read = lambda n: (root / n).read_text() if (root / n).exists() else ""
+        if with_summary:
+            return out, read("calls"), read("output"), read("summary"), {n: read(n) for n in ("deployment.json", "status.json")}
         return out, read("calls"), read("output")
 
 
-def aws_stub(ecr: str, digest: str = DIGEST, version: str = "1.2.3") -> str:
+def aws_stub(ecr: str, digest: str = DIGEST, commit: str = COMMIT) -> str:
     return f"""case "$*" in
 *sts*) echo 111111111111;;
 *"ecr get-login-password"*) echo pw;;
 *"ecr describe-images"*) {ecr};;
 *"release/backend/digest"*) echo {digest};;
-*"release/backend/version"*) echo {version};;
+*"release/backend/commit"*) echo {commit};;
+*"release/backend/version"*) echo "the version record must not be read" >&2; exit 9;;
 esac"""
 
 
@@ -58,32 +64,65 @@ BUILT = '{"containerimage.digest": "sha256:' + "b" * 64 + '"}'
 
 
 class BuildReuse(unittest.TestCase):
+    """Playbook §5.2: the preprod image is keyed on the commit; a re-run of the same commit reuses its image."""
     script = step("build", "Build for ARM64")
 
-    def test_the_recorded_image_is_reused_and_nothing_is_built(self):
+    def test_this_commits_image_is_looked_up_by_sha_12_and_reused_without_a_build(self):
         out, calls, output = run_step(self.script, aws_stub(IN_ECR))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(f"--image-ids imageTag={COMMIT}", calls)
+        self.assertNotIn("imageTag=v", calls)
+        self.assertNotIn("docker buildx", calls)
+        self.assertIn(f"digest={DIGEST}", output)
+
+    def test_a_second_merge_with_the_same_version_still_builds(self):
+        # Two merges in a row without a version bump (playbook §5.2): the version plays no part in the lookup.
+        out, calls, output = run_step(self.script, aws_stub(NOT_IN_ECR, digest="sha256:" + "c" * 64, commit="sha-" + "0" * 12), files={"meta.json": BUILT})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("docker buildx build", calls)
+        self.assertIn("sha256:" + "b" * 64, output)
+        self.assertNotIn("version bump", out.stdout + out.stderr)
+
+    def test_an_unrecorded_image_of_this_commit_is_reused_not_refused(self):
+        out, calls, output = run_step(self.script, aws_stub(IN_ECR, digest="sha256:" + "c" * 64, commit="none"))
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertNotIn("docker buildx", calls)
         self.assertIn(f"digest={DIGEST}", output)
 
-    def test_a_version_not_in_ecr_is_built(self):
-        out, calls, output = run_step(self.script, aws_stub(NOT_IN_ECR), files={"meta.json": BUILT})
+    def test_only_the_commit_tag_is_pushed_and_the_version_is_metadata(self):
+        out, calls, _ = run_step(self.script, aws_stub(NOT_IN_ECR), files={"meta.json": BUILT})
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn("docker buildx build", calls)
-        self.assertIn("sha256:" + "b" * 64, output)
+        build = next(line for line in calls.splitlines() if "docker buildx build" in line)
+        self.assertEqual(re.findall(r"--tag (\S+)", build), [f"111111111111.dkr.ecr.ap-south-1.amazonaws.com/onepeek-preprod/backend:{COMMIT}"])
+        self.assertIn(f"org.opencontainers.image.version=1.2.3+{COMMIT}", build)
+        self.assertIn(f"VERSION=1.2.3+{COMMIT}", build)
+        self.assertIn("ONEPEEK_COMMIT=" + "f" * 40, build)
 
-    def test_an_ecr_digest_that_is_not_the_recorded_one_refuses(self):
-        out, calls, _ = run_step(self.script, aws_stub(IN_ECR, digest="sha256:" + "c" * 64))
-        self.assertEqual(out.returncode, 1)
-        self.assertNotIn("docker buildx", calls)
-
-    def test_an_image_recorded_for_another_version_refuses(self):
-        self.assertEqual(run_step(self.script, aws_stub(IN_ECR, version="1.2.2"))[0].returncode, 1)
+    def test_the_web_image_is_built_with_release_sha_12(self):
+        out, calls, _ = run_step(self.script, aws_stub(NOT_IN_ECR), {"IMAGE": "web", "MAIN": "web"}, files={"meta.json": BUILT})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(f"--build-arg RELEASE={COMMIT}", calls)
 
     def test_any_other_ecr_answer_stops(self):
         out, calls, _ = run_step(self.script, aws_stub('echo "AccessDeniedException" >&2; exit 254'))
         self.assertEqual(out.returncode, 1)
         self.assertNotIn("docker buildx", calls)
+
+
+class Version(unittest.TestCase):
+    script = step("version", "Record the commit")
+
+    def test_the_commit_is_recorded_and_an_existing_version_tag_does_not_stop_preprod(self):
+        out, calls, output = run_step(self.script, "", {"VERSION_FILE": "m.json", "EXTRA": ""}, files={"m.json": '{".": "1.2.3"}'}, extra_stubs={"git": "exit 0"})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(f"commit={COMMIT}", output)
+        self.assertIn("version=1.2.3", output)
+        self.assertNotIn("git", calls)
+
+    def test_no_job_checks_or_creates_a_version_tag(self):
+        self.assertNotIn("refs/tags/v", TEXT)
+        self.assertNotIn("gh release", TEXT)
+        self.assertNotIn("tag-notify", RELEASE["jobs"])
 
 
 class SignOnce(unittest.TestCase):
@@ -103,6 +142,41 @@ class SignOnce(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("cosign sign", calls)
         self.assertIn("cosign attest", calls)
+
+    def test_an_image_recorded_for_another_commit_is_signed(self):
+        out, calls, _ = self.signing(aws_stub(IN_ECR, commit="sha-" + "0" * 12))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("cosign sign", calls)
+
+    def test_the_record_is_digest_and_commit_never_version(self):
+        out, calls, _ = self.signing(aws_stub(IN_ECR, digest="sha256:" + "c" * 64))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(f"put-parameter --name /onepeek/preprod/release/backend/digest --type String --overwrite --value {DIGEST}", calls)
+        self.assertIn(f"put-parameter --name /onepeek/preprod/release/backend/commit --type String --overwrite --value {COMMIT}", calls)
+        self.assertNotIn("release/backend/version", calls)
+
+
+class RecordDigest(unittest.TestCase):
+    script = step("record-digest", "Read the recorded digests")
+
+    def read(self, commit: str, dry: str = "false"):
+        return run_step(self.script, aws_stub(IN_ECR, commit=commit), {"IMAGES": '["backend"]', "MAIN_IMAGE": "backend", "SIGNING_KEY": "k", "RELEASE_COMMIT": COMMIT, "DRY_RUN": dry})
+
+    def test_this_commits_record_is_verified_and_passed_on(self):
+        out, calls, output = self.read(COMMIT)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("cosign verify", calls)
+        self.assertIn(f"commit={COMMIT}", output)
+
+    def test_a_record_of_another_commit_refuses(self):
+        out, _, _ = self.read("sha-" + "0" * 12)
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("SSM records commit", out.stdout)
+
+    def test_a_dry_run_uses_the_recorded_commit(self):
+        out, _, output = self.read("sha-" + "0" * 12, dry="true")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("commit=sha-" + "0" * 12, output)
 
 
 class ArchitectureAwareTools(unittest.TestCase):
@@ -220,14 +294,19 @@ FUNCTION = re.search(r"# --- render-taskdef begin[^\n]*\n(.*?)# --- render-taskd
 REF = "r@" + DIGEST
 
 
-def render(template: dict, image_ref: str = REF):
+def render(template: dict, image_ref: str = REF, commit: str = COMMIT, version: str = "", mode: str = "one-off",
+           current: dict | None = None, allow_drop: str = ""):
     with tempfile.TemporaryDirectory() as d:
         Path(d, "t.json").write_text(json.dumps(template))
+        if current is not None:
+            Path(d, "current.json").write_text(json.dumps(current))
+            mode = str(Path(d, "current.json"))
         stub = Path(d, "aws")
         stub.write_text(f"#!/bin/bash\ncat '{d}/t.json'\n")
         stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
-        return subprocess.run(["bash", "-c", FUNCTION + "\nrender api"], capture_output=True, text=True, env={
-            **os.environ, "PATH": f"{d}:{os.environ['PATH']}", "NAME": "n", "IMAGE_REF": image_ref, "VERSION": "1", "GITHUB_RUN_ID": "9",
+        return subprocess.run(["bash", "-c", FUNCTION + f"\nrender api '{mode}'"], capture_output=True, text=True, env={
+            **os.environ, "PATH": f"{d}:{os.environ['PATH']}", "NAME": "n", "IMAGE_REF": image_ref, "COMMIT": commit, "VERSION": version, "GITHUB_RUN_ID": "9",
+            "ALLOW_DROP": allow_drop,
         })  # fmt: skip
 
 
@@ -257,7 +336,23 @@ class RenderFunction(unittest.TestCase):
             self.assertEqual({k: v for k, v in after.items() if k != "image"}, {k: v for k, v in before.items() if k != "image"})
         self.assertNotIn("command", doc["containerDefinitions"][1])
         self.assertEqual(doc["taskRoleArn"], "arn:role/pgbouncer")
-        self.assertEqual(doc["tags"], [{"key": "version", "value": "1"}, {"key": "release-run", "value": "9"}])
+        self.assertEqual(doc["tags"], [{"key": "commit", "value": COMMIT}, {"key": "release-run", "value": "9"}])
+
+    def test_tags_are_the_commit_and_run_and_a_version_only_when_promoting(self):
+        tags = json.loads(render({"family": "f", "containerDefinitions": [{"name": "api"}]}, version="v1.2.3").stdout)["tags"]
+        self.assertEqual(tags, [{"key": "commit", "value": COMMIT}, {"key": "release-run", "value": "9"}, {"key": "version", "value": "v1.2.3"}])
+
+    def test_no_commit_refuses(self):
+        out = render({"family": "f", "containerDefinitions": [{"name": "api"}]}, commit="")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(out.stdout, "")
+
+    def test_release_steps_never_pass_a_version_tag_in_preprod(self):
+        for job in ("migrate", "rollout", "register-one-offs"):
+            for st in RELEASE["jobs"][job]["steps"]:
+                if "render-taskdef begin" in st.get("run", ""):
+                    self.assertEqual(st["env"]["VERSION"], "", job)
+                    self.assertEqual(st["env"]["COMMIT"], "${{ needs.record-digest.outputs.commit }}", job)
 
     def test_a_null_empty_or_missing_image_is_filled(self):
         for container in ({"name": "api", "image": None}, {"name": "api", "image": ""}, {"name": "api"}):
@@ -277,6 +372,112 @@ class RenderFunction(unittest.TestCase):
 
     def test_a_placeholder_left_refuses(self):
         self.assertNotEqual(render({"family": "f", "containerDefinitions": [{"name": "api", "x": "__IMAGE__"}]}).returncode, 0)
+
+
+def env(*names):
+    return [{"name": n, "value": "x"} for n in names]
+
+
+def secrets(*names):
+    return [{"name": n, "valueFrom": "arn:ssm:" + n} for n in names]
+
+
+RUNNING = {"family": "f", "containerDefinitions": [{"name": "api", "image": "old", "environment": env("A", "B"), "secrets": secrets("S")}]}
+
+
+class DropProtection(unittest.TestCase):
+    """delivery-pipelines §5 step 4: per service, against the service's currently registered task definition."""
+
+    def test_a_setting_or_secret_that_would_disappear_is_refused(self):
+        for c in ({"name": "api", "environment": env("A"), "secrets": secrets("S")}, {"name": "api", "environment": env("A", "B")}):
+            out = render({"family": "f", "containerDefinitions": [c]}, current=RUNNING)
+            self.assertNotEqual(out.returncode, 0, c)
+            self.assertIn("drop protection", out.stderr)
+            self.assertEqual(out.stdout, "")
+
+    def test_a_dropped_name_listed_in_allow_drop_passes(self):
+        out = render({"family": "f", "containerDefinitions": [{"name": "api", "environment": env("A")}]}, current=RUNNING, allow_drop="B, S")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn("B", out.stderr)
+
+    def test_allow_drop_allows_only_the_names_it_lists(self):
+        out = render({"family": "f", "containerDefinitions": [{"name": "api", "environment": env("A")}]}, current=RUNNING, allow_drop="B")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("api/S", out.stderr)
+
+    def test_a_name_moved_between_settings_and_secrets_is_not_a_drop(self):
+        out = render({"family": "f", "containerDefinitions": [{"name": "api", "environment": env("A", "S"), "secrets": secrets("B")}]}, current=RUNNING)
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_a_name_in_both_settings_and_secrets_is_refused_even_on_a_first_deploy(self):
+        both = {"family": "f", "containerDefinitions": [{"name": "api", "environment": env("A", "S"), "secrets": secrets("S")}]}
+        for kwargs in ({"current": RUNNING}, {"mode": "first-deploy"}):
+            out = render(both, **kwargs)
+            self.assertNotEqual(out.returncode, 0, kwargs)
+            self.assertIn("both a setting and a secret", out.stderr)
+        self.assertNotEqual(render(both, current=RUNNING, allow_drop="S").returncode, 0)
+
+    def test_a_first_deploy_with_no_registered_revision_passes(self):
+        out = render({"family": "f", "containerDefinitions": [{"name": "api", "environment": env("A")}]}, mode="first-deploy")
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_a_vanished_container_counts_as_dropping_its_names(self):
+        out = render({"family": "f", "containerDefinitions": [{"name": "other", "environment": env("A", "B"), "secrets": secrets("S")}]}, current=RUNNING)
+        self.assertNotEqual(out.returncode, 0)
+
+    def test_one_offs_are_not_checked_and_an_unknown_mode_refuses(self):
+        both = {"family": "f", "containerDefinitions": [{"name": "migrate", "environment": env("S"), "secrets": secrets("S")}]}
+        self.assertEqual(render(both, mode="one-off").returncode, 0)
+        self.assertNotEqual(render({"family": "f", "containerDefinitions": [{"name": "api"}]}, mode="/no/such/file").returncode, 0)
+
+    def test_current_td_reads_the_services_registered_revision_or_reports_a_first_deploy(self):
+        for described, want in (("arn:td/api:7", "current-api.json"), ("None", "first-deploy")):
+            aws = f"""case "$*" in *describe-services*) echo {described};; *describe-task-definition*) echo '{json.dumps(RUNNING)}';; esac"""
+            out, calls, _ = run_step(FUNCTION + "\ncurrent_td api current-api.json", aws)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(out.stdout.strip(), want)
+            self.assertEqual("describe-task-definition --task-definition arn:td/api:7" in calls, want != "first-deploy")
+
+    def test_an_aws_error_fails_closed_in_every_copy(self):
+        for failing in ("describe-services", "describe-task-definition"):
+            aws = f"""case "$*" in *{failing}*) echo "AccessDeniedException" >&2; exit 254;; *describe-services*) echo arn:td/api:7;; *describe-task-definition*) echo '{{}}';; esac"""
+            out, _, _ = run_step(FUNCTION + "\ncurrent_td api current-api.json", aws)
+            self.assertNotEqual(out.returncode, 0, failing)
+            self.assertNotIn("first-deploy", out.stdout)
+        for text in (TEXT, OPERATE):
+            self.assertEqual(text.count("--output text) || return 1"), text.count("current_td() {"))
+            self.assertEqual(text.count('--output json > "$2" || return 1'), text.count("current_td() {"))
+
+    def test_an_aws_error_in_the_rollout_registers_nothing(self):
+        aws = """case "$*" in *describe-services*) echo "ThrottlingException" >&2; exit 254;; *"s3 cp"*) echo '{"family": "f", "containerDefinitions": [{"name": "api"}]}';; *register-task-definition*) echo arn:td/api:8;; esac"""
+        out, calls, _ = run_step(step("rollout", "Verify, render, register and update each order"), aws,
+                                 {"IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9", "ORDERS": '[["api"]]'})
+        self.assertNotEqual(out.returncode, 0)
+        self.assertNotIn("register-task-definition", calls)
+
+    def test_a_drop_in_the_rollout_stops_before_anything_is_registered(self):
+        aws = f"""case "$*" in
+*describe-services*) echo arn:td/api:7;;
+*describe-task-definition*) echo '{json.dumps(RUNNING)}';;
+*"s3 cp"*) echo '{json.dumps({"family": "f", "containerDefinitions": [{"name": "api", "environment": env("A")}]})}';;
+*register-task-definition*) echo arn:td/api:8;;
+esac"""
+        base = {"IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9", "ORDERS": '[["api"]]'}
+        script = step("rollout", "Verify, render, register and update each order")
+        out, calls, _ = run_step(script, aws, base)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertNotIn("register-task-definition", calls)
+        out, calls, _ = run_step(script, aws, {**base, "ALLOW_DROP": "B S"})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("register-task-definition", calls)
+
+    def test_the_inputs_reach_the_render(self):
+        self.assertEqual(RELEASE[True]["workflow_call"]["inputs"]["allow-drop"]["default"], "")
+        roll = next(s for s in RELEASE["jobs"]["rollout"]["steps"] if s.get("id") == "roll")
+        self.assertEqual(roll["env"]["ALLOW_DROP"], "${{ inputs.allow-drop }}")
+        self.assertIn('render migrate one-off', TEXT)
+        self.assertIn('render ops one-off', TEXT)
+        self.assertIn('mode=$(current_td "${svc}" "current-${svc}.json")', OPERATE)
 
 
 INDEX = {
@@ -368,13 +569,30 @@ esac"""
         self.assertNotIn("update-service", calls)
 
 
+class BaselineReadiness(unittest.TestCase):
+    """UC-DEL-001 row 7: the shared readiness check always runs, whatever the caller's smoke script does."""
+    script = step("smoke", "Baseline readiness")
+
+    def test_each_image_checks_its_path_and_a_failure_fails_the_job(self):
+        for image, path in (("backend", "/api/status"), ("web", "/sign-in")):
+            out, calls, _ = run_step(self.script, "", {"DOMAIN": "d", "IMAGE": image})
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("https://d" + path, calls)
+            out, _, _ = run_step(self.script, "", {"DOMAIN": "d", "IMAGE": image}, extra_stubs={"curl": "exit 22"})
+            self.assertEqual(out.returncode, 22)
+
+    def test_it_is_not_conditional(self):
+        st = next(s for s in RELEASE["jobs"]["smoke"]["steps"] if s.get("name", "").startswith("Baseline readiness"))
+        self.assertNotIn("if", st)
+
+
 class Smoke(unittest.TestCase):
     def smoke(self, services: str, images: list[str], svc_td: str = "arn:td/x:2"):
         aws = f"""case "$*" in
 *describe-services*) echo {svc_td};;
 *describe-task-definition*) echo '{json.dumps(images)}';;
 esac"""
-        return run_step(step("smoke", "The edge answers"), aws, {"DOMAIN": "d", "IMAGE": "backend", "DIGEST": DIGEST, "SERVICES": services})[0]
+        return run_step(step("smoke", "Every service's task definition"), aws, {"DOMAIN": "d", "IMAGE": "backend", "DIGEST": DIGEST, "SERVICES": services})[0]
 
     def test_a_daemon_passes_when_its_sidecar_runs_the_digest_whatever_the_order(self):
         sidecar, main = f"x/backend@{DIGEST}", "x/pgbouncer@sha256:" + "e" * 64
@@ -387,6 +605,198 @@ esac"""
 
     def test_a_digest_only_in_the_middle_of_an_image_name_fails(self):
         self.assertEqual(self.smoke('["api"]', [f"x/backend@{DIGEST}-other"]).returncode, 1)
+
+
+class SmokeScript(unittest.TestCase):
+    """UC-DEL-001 row 7: the caller's smoke-script checks the domain without AWS credentials; absent = a warning."""
+    script = step("smoke", "The repo's own smoke checks")
+
+    def run_smoke(self, path: str, files: dict[str, str] | None = None):
+        out, _, _, summary, _ = run_step(self.script, "", {"SCRIPT": path, "DOMAIN": "preprod.example", "AWS_SESSION_TOKEN": "secret-token"}, files, with_summary=True)
+        return out, summary
+
+    def test_it_runs_after_the_shared_checks_in_the_same_job(self):
+        names = [s.get("name", "") for s in RELEASE["jobs"]["smoke"]["steps"]]
+        self.assertTrue(any(n.startswith("Every service's task definition") for n in names))
+        self.assertTrue(any(n.startswith("The repo's own") for n in names))
+        self.assertLess(names.index(next(n for n in names if n.startswith("Baseline readiness"))), names.index(next(n for n in names if n.startswith("The repo's own"))))
+        self.assertEqual(RELEASE[True]["workflow_call"]["inputs"]["smoke-script"]["default"], "smoke.sh")
+
+    def test_an_absent_script_is_skipped_with_a_visible_warning(self):
+        out, summary = self.run_smoke("smoke.sh")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("::warning::smoke.sh is not in this repository", out.stdout)
+        self.assertIn("no smoke.sh", summary)
+
+    def test_a_failing_script_fails_the_smoke_and_so_rolls_back(self):
+        self.assertEqual(self.run_smoke("smoke.sh", {"smoke.sh": "exit 3\n"})[0].returncode, 3)
+        self.assertIn("needs.smoke.result == 'failure'", RELEASE["jobs"]["rollback"]["if"])
+
+    def test_a_passing_script_gets_the_domain_and_no_aws_credentials(self):
+        out, _ = self.run_smoke("smoke.sh", {"smoke.sh": 'echo "domain=${DOMAIN} token=${AWS_SESSION_TOKEN:-none}"\n'})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("domain=preprod.example token=none", out.stdout)
+
+    def test_a_path_outside_the_repository_refuses(self):
+        for path in ("../x.sh", "/etc/x.sh", ""):
+            self.assertEqual(self.run_smoke(path)[0].returncode, 1, path)
+
+
+class Watch(unittest.TestCase):
+    def watch(self, known: str, firing: str, seconds: str):
+        script = step("watch", "10 minutes after stable").replace("SECONDS + 600", "SECONDS + " + seconds)
+        aws = f"""case "$*" in
+*"--state-value ALARM"*) echo "{firing}";;
+*describe-alarms*) echo "{known}";;
+esac"""
+        out, _, _, summary, _ = run_step(script, aws, extra_stubs={"sleep": "exit 0"}, with_summary=True)
+        return out, summary
+
+    def test_no_deploy_alarm_at_all_is_a_visible_warning_not_a_silent_pass(self):
+        out, summary = self.watch("", "", "0")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("::warning::No alarm named onepeek-preprod-deploy-* exists", out.stdout)
+        self.assertIn("could not detect a regression", summary)
+
+    def test_a_firing_alarm_fails_the_watch(self):
+        out, _ = self.watch("onepeek-preprod-deploy-api-5xx", "onepeek-preprod-deploy-api-5xx", "5")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("Deploy alarms firing: onepeek-preprod-deploy-api-5xx", out.stdout)
+
+    def test_existing_quiet_alarms_pass_without_a_warning(self):
+        out, summary = self.watch("onepeek-preprod-deploy-api-5xx", "", "0")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("warning", out.stdout)
+        self.assertEqual(summary, "")
+
+
+class Assets(unittest.TestCase):
+    def test_the_folder_is_sha_12(self):
+        aws = """case "$*" in *list-objects-v2*--prefix*) echo None;; esac"""
+        out, calls, _ = run_step(step("assets", "Copy /app/dist/assets"), aws, {"IMAGE_REF": REF, "REGISTRY": "r", "DRY_RUN": "false"})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(f"--prefix {COMMIT}/", calls)
+        self.assertIn(f"s3 sync ./assets-out s3://onepeek-preprod-web-assets/{COMMIT}/", calls)
+
+
+class RollbackIssue(unittest.TestCase):
+    def test_the_issue_title_names_the_commit(self):
+        self.assertIn('--title "Release ${COMMIT} to ${ENVIRONMENT} rolled back"', step("rollback", "Open an issue"))
+
+
+class Notify(unittest.TestCase):
+    script = step("notify", "Deployment record")
+
+    def notify(self, watch: str, rollback: str, stable_at: str = "1700000300"):
+        gh = 'case "$*" in *"/statuses"*) ;; *deployments*) echo 42;; esac'
+        env = {"COMMIT": COMMIT, "NEXT_VERSION": "1.2.3", "DIGESTS": json.dumps({"backend": DIGEST}), "SERVICES": '["api", "worker"]',
+               "WATCH": watch, "ROLLBACK": rollback, "STARTED": "1700000000", "STABLE_AT": stable_at, "MERGED_AT": "2023-11-14T22:13:20Z",
+               "GITHUB_SERVER_URL": "https://github.com", "GITHUB_REPOSITORY": "OnePeek/backend-service", "GITHUB_RUN_ID": "9", "GITHUB_SHA": "f" * 40}  # fmt: skip
+        out, calls, _, summary, files = run_step(self.script, "", env, extra_stubs={"gh": gh}, with_summary=True)
+        return out, calls, summary, {k: json.loads(v) for k, v in files.items() if v}
+
+    def test_a_watched_release_records_a_successful_deployment_and_no_release(self):
+        out, calls, summary, files = self.notify("success", "skipped")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("release create", calls)
+        self.assertIn("repos/OnePeek/backend-service/deployments --input deployment.json", calls)
+        self.assertEqual(files["status.json"]["state"], "success")
+        payload = files["deployment.json"]["payload"]
+        self.assertEqual((payload["commit"], payload["digests"], payload["services"]), (COMMIT, {"backend": DIGEST}, ["api", "worker"]))
+        self.assertEqual(files["deployment.json"]["environment"], "preprod")
+        self.assertIn(f"Release {COMMIT} to preprod: success.", summary)
+
+    def test_the_summary_has_the_run_duration_and_merge_to_running_time(self):
+        _, _, summary, files = self.notify("success", "skipped")
+        self.assertIn("- merge_to_running: 5m 00s", summary)  # merged at 1700000000 (22:13:20Z), stable at 1700000300
+        self.assertIn("- duration: ", summary)
+        self.assertEqual(files["deployment.json"]["payload"]["merge_to_running"], "5m 00s")
+        self.assertIn('- services: ["api", "worker"]', summary)
+
+    def test_a_failed_release_is_recorded_and_announced_as_a_failure(self):
+        out, _, summary, files = self.notify("failure", "success", stable_at="")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(files["status.json"]["state"], "failure")
+        self.assertIn("::error::Release " + COMMIT + " to preprod: failure, rolled back.", out.stdout)
+        self.assertIn("failure, rolled back", summary)
+        self.assertIn("not running", summary)
+
+    def test_it_runs_after_any_result_but_never_in_a_dry_run(self):
+        job = RELEASE["jobs"]["notify"]
+        self.assertIn("always()", job["if"])
+        self.assertIn("!inputs.dry-run", job["if"])
+        self.assertIn("rollback", job["needs"])
+        self.assertEqual(job["permissions"], {"contents": "read", "deployments": "write"})
+
+
+class ApiClient(unittest.TestCase):
+    def test_preprod_publishes_the_dev_prerelease_under_next(self):
+        script = step("api-client", "Publish the prerelease under next")
+        npm = 'case "$*" in *"pkg get name"*) echo \'"@onepeek/api-client"\';; *view*) exit 1;; esac'
+        out, calls, _ = run_step(script, "", {"VERSION": "1.2.3", "GITHUB_SHA": "abcdef1234567890"}, extra_stubs={"npm": npm, "pnpm": ""})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("npm pkg set version=1.2.3-dev.abcdef1", calls)
+        self.assertIn("pnpm publish --tag next", calls)
+        self.assertNotIn("latest", calls)
+
+    def test_a_rerun_of_a_published_commit_is_a_no_op(self):
+        script = step("api-client", "Publish the prerelease under next")
+        npm = 'case "$*" in *"pkg get name"*) echo \'"@onepeek/api-client"\';; *view*) echo 1.2.3-dev.abcdef1;; esac'
+        out, calls, _ = run_step(script, "", {"VERSION": "1.2.3", "GITHUB_SHA": "abcdef1234567890"}, extra_stubs={"npm": npm, "pnpm": ""})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("npm view @onepeek/api-client@1.2.3-dev.abcdef1 version", calls)
+        self.assertNotIn("pnpm publish", calls)
+
+    def test_it_waits_for_a_clean_watch(self):
+        self.assertIn("needs.watch.result == 'success'", RELEASE["jobs"]["api-client"]["if"])
+
+
+PREVIOUS = re.search(r"(previous_deployment\(\) \{.*?\n          \})", OPERATE, re.S).group(1)
+
+
+class OperateRollbackTarget(unittest.TestCase):
+    """Playbook §5.2: a preprod rollback goes to the previous recorded deployment's digest, keyed on the commit."""
+
+    def previous(self, rows: list[tuple[str, str, str]], states: dict[str, str], current: str = COMMIT):
+        listing = "\\n".join("\\t".join(r) for r in rows)
+        cases = "".join(f'*"deployments/{i}/statuses"*) echo {s};;\n' for i, s in states.items())
+        gh = f"""case "$*" in
+{cases}*"deployments?environment=preprod"*) printf '{listing}\\n';;
+esac"""
+        out, calls, _ = run_step(PREVIOUS + f'\nprevious_deployment backend {current}', "", {"GITHUB_REPOSITORY": "OnePeek/backend-service"}, extra_stubs={"gh": gh})
+        return out, calls
+
+    def test_the_first_successful_record_older_than_the_running_one_wins(self):
+        rows = [("3", COMMIT, DIGEST), ("2", "sha-" + "2" * 12, "sha256:" + "2" * 64), ("1", "sha-" + "1" * 12, "sha256:" + "1" * 64)]
+        out, _ = self.previous(rows, {"2": "failure", "1": "success"})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(out.stdout.strip(), "sha-" + "1" * 12 + " sha256:" + "1" * 64)
+
+    def test_an_older_record_marked_inactive_by_github_is_still_a_target(self):
+        rows = [("3", COMMIT, DIGEST), ("2", "sha-" + "2" * 12, "sha256:" + "2" * 64)]
+        out, _ = self.previous(rows, {"3": "success", "2": "inactive"})
+        self.assertEqual(out.stdout.strip(), "sha-" + "2" * 12 + " sha256:" + "2" * 64)
+
+    def test_a_newer_release_than_the_running_one_is_never_a_target(self):
+        # A newer release (4) failed and was rolled back, so the services run 3: the target is 2, never 4.
+        rows = [("4", "sha-" + "4" * 12, "sha256:" + "4" * 64), ("3", COMMIT, DIGEST), ("2", "sha-" + "2" * 12, "sha256:" + "2" * 64)]
+        out, _ = self.previous(rows, {"4": "success", "2": "success"})
+        self.assertEqual(out.stdout.strip(), "sha-" + "2" * 12 + " sha256:" + "2" * 64)
+
+    def test_no_record_of_the_running_commit_means_no_target(self):
+        rows = [("2", "sha-" + "2" * 12, "sha256:" + "2" * 64), ("1", "sha-" + "1" * 12, "sha256:" + "1" * 64)]
+        out, _ = self.previous(rows, {"2": "success", "1": "success"})
+        self.assertEqual(out.stdout.strip(), "")
+
+    def test_nothing_is_printed_when_there_is_no_earlier_record(self):
+        out, _ = self.previous([("3", COMMIT, DIGEST)], {"3": "success"})
+        self.assertEqual(out.stdout.strip(), "")
+
+    def test_preprod_current_is_the_running_commit_tag_and_prod_the_version(self):
+        self.assertIn("--include TAGS --query \"tags[?key=='commit'].value | [0]\"", OPERATE)
+        self.assertIn('/onepeek/${ENVIRONMENT}/release/${image}/version', OPERATE)
+        self.assertIn("'^sha-[0-9a-f]{12}$'", OPERATE)
+        self.assertIn('--image-ids "imageTag=${target}"', OPERATE)
 
 
 class DbBootstrapRoleGuard(unittest.TestCase):

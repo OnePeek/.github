@@ -25,7 +25,7 @@ on:
         options: [preprod, prod]
         default: preprod
       version:
-        description: Rollback target; empty = the previous release tag
+        description: "Rollback target: sha-<12> (preprod) or v<version> (prod); empty = the previous recorded deployment"
         type: string
         default: ""
       reason:
@@ -120,6 +120,7 @@ jobs:
           cosign-release: v2.6.5
       - name: Redeploy or roll back
         env:
+          GH_TOKEN: ${{ github.token }}
           ACTION: ${{ inputs.action }}
           SERVICE: ${{ inputs.service }}
           TARGET: ${{ inputs.version }}
@@ -155,28 +156,76 @@ jobs:
           else
             key="awskms:///alias/${NAME}-image-signing"
           fi
+          # The previous recorded deployment of this environment for an image (playbook §5.2 "Rollback target"): walking the
+          # release-ecs records newest first, skip every record up to and including the running commit's, then take the
+          # next successful one (never a newer, rolled-back release). Prints "<commit> <digest>", or nothing.
+          # GitHub marks an older successful deployment `inactive` when a newer one succeeds, so both states count.
+          previous_deployment() {  # previous_deployment <image> <current commit>
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/deployments?environment=${ENVIRONMENT}&per_page=100" \
+              --jq '.[] | select((.payload | type) == "object" and (.payload.digests | type) == "object") | [.id, .payload.commit, (.payload.digests["'"$1"'"] // "")] | @tsv' \
+              | { past=""
+                while IFS=$'\t' read -r id commit digest; do
+                  if [ -z "${past}" ]; then
+                    if [ "${commit}" = "$2" ]; then past=yes; fi
+                    continue
+                  fi
+                  if [ -z "${digest}" ] || [ "${commit}" = "$2" ]; then continue; fi
+                  state=$(gh api "repos/${GITHUB_REPOSITORY}/deployments/${id}/statuses?per_page=1" --jq '.[0].state // ""')
+                  if [ "${state}" = "success" ] || [ "${state}" = "inactive" ]; then echo "${commit} ${digest}"; break; fi
+                done; }
+          }
           VERSION_NOW=""
           while read -r svc; do
             image=$(awk -F'\t' -v s="${svc}" '$1==s{print $2}' targets.tsv)
-            current=$(aws ssm get-parameter --name "/onepeek/${ENVIRONMENT}/release/${image}/version" --query Parameter.Value --output text)
             if [ "${ACTION}" = "redeploy" ]; then
               aws ecs update-service --cluster "${NAME}" --service "${svc}" --force-new-deployment >/dev/null
               echo "Redeploying ${svc} (same revision)."
               continue
             fi
             target="${TARGET}"
-            if [ -z "${target}" ]; then
-              target=$(git tag --list 'v*' --sort=-v:refname | grep -x -A1 "v${current}" | tail -n1 | sed 's/^v//')
-              if [ -z "${target}" ] || [ "${target}" = "${current}" ]; then echo "::error::No release tag before v${current}."; exit 1; fi
+            VERSION=""
+            if [ "${ENVIRONMENT}" = "prod" ]; then
+              # Prod is keyed on the version added at promotion (playbook §5.2); its task definitions also carry the commit.
+              current=$(aws ssm get-parameter --name "/onepeek/${ENVIRONMENT}/release/${image}/version" --query Parameter.Value --output text)
+              if [ -z "${target}" ]; then
+                target=$(git tag --list 'v*' --sort=-v:refname | grep -x -A1 "v${current}" | tail -n1 | sed 's/^v//')
+                if [ -z "${target}" ] || [ "${target}" = "${current}" ]; then echo "::error::No release tag before v${current}."; exit 1; fi
+              fi
+              target="${target#v}"
+              digest=$(aws ecr describe-images --repository-name "${NAME}/${image}" --image-ids "imageTag=v${target}" --query 'imageDetails[0].imageDigest' --output text)
+              COMMIT="sha-$(git rev-list -n 1 "v${target}" | cut -c1-12)"
+              VERSION="${target}"   # the version tag is <semver> (delivery-pipelines §5 step 3)
+            else
+              # Preprod is keyed on the commit (playbook §5.2): a sha-<12> target, or the previous recorded deployment.
+              # "Current" is what the service runs (its task definition's commit tag), not the last record: a failed or
+              # rolled-back release has already moved /release/<image>/commit.
+              running=$(aws ecs describe-services --cluster "${NAME}" --services "${svc}" --query 'services[0].taskDefinition' --output text)
+              current=$(aws ecs describe-task-definition --task-definition "${running}" --include TAGS --query "tags[?key=='commit'].value | [0]" --output text)
+              if [ -z "${target}" ]; then
+                read -r target digest < <(previous_deployment "${image}" "${current}") || true
+                if [ -z "${target:-}" ]; then echo "::error::No recorded ${ENVIRONMENT} deployment of ${image} before ${current}."; exit 1; fi
+              else
+                if ! printf '%s' "${target}" | grep -Eq '^sha-[0-9a-f]{12}$'; then echo "::error::A preprod rollback target is sha-<12>."; exit 1; fi
+                digest=$(aws ecr describe-images --repository-name "${NAME}/${image}" --image-ids "imageTag=${target}" --query 'imageDetails[0].imageDigest' --output text)
+              fi
+              COMMIT="${target}"
             fi
-            digest=$(aws ecr describe-images --repository-name "${NAME}/${image}" --image-ids "imageTag=v${target}" --query 'imageDetails[0].imageDigest' --output text)
             IMAGE_REF="${registry}/${NAME}/${image}@${digest}"
             cosign verify --experimental-oci11 --insecure-ignore-tlog=true --key "${key}" "${IMAGE_REF}" >/dev/null
-            VERSION="${target}"
-            # --- render-taskdef begin (identical in release-ecs.yml and operate.yml; checked by scripts/check_service_list.py) ---
-          render() {  # render <service> -> task definition JSON on stdout
+          # --- render-taskdef begin (identical in release-ecs.yml and operate.yml; checked by scripts/check_service_list.py) ---
+          # The service's currently registered task definition, for drop protection (delivery-pipelines §5 step 4):
+          # prints the file it wrote, or first-deploy when the service has none yet. Any AWS error fails closed.
+          current_td() {  # current_td <service> <file>
+            local td
+            td=$(aws ecs describe-services --cluster "${NAME}" --services "$1" --query 'services[0].taskDefinition' --output text) || return 1
+            if [ -z "${td}" ] || [ "${td}" = "None" ]; then echo first-deploy; return 0; fi
+            aws ecs describe-task-definition --task-definition "${td}" --query taskDefinition --output json > "$2" || return 1
+            echo "$2"
+          }
+          render() {  # render <service> <one-off | first-deploy | current task definition file> -> task definition JSON on stdout
             aws s3 cp "s3://${NAME}-deploy/taskdef/$1.json" - \
-              | IMAGE_REF="${IMAGE_REF}" VERSION="${VERSION}" RUN_ID="${GITHUB_RUN_ID}" python3 -c '
+              | IMAGE_REF="${IMAGE_REF}" COMMIT="${COMMIT}" VERSION="${VERSION:-}" RUN_ID="${GITHUB_RUN_ID}" \
+                MODE="$2" ALLOW_DROP="${ALLOW_DROP:-}" python3 -c '
           import json, os, re, sys
           text = sys.stdin.read()
           left = sorted(set(re.findall(r"__[A-Z0-9_]+__", text)))
@@ -194,15 +243,41 @@ jobs:
           empty = [str(c.get("name", "?")) for c in containers if not (isinstance(c["image"], str) and c["image"].strip())]
           if empty:
               sys.exit("containers with no image after rendering: " + ", ".join(empty))
-          doc["tags"] = [{"key": "version", "value": os.environ["VERSION"]}, {"key": "release-run", "value": os.environ["RUN_ID"]}]
+          if not os.environ["COMMIT"]:
+              sys.exit("no commit to tag the task definition with")
+          # Tags (delivery-pipelines §5 step 3): commit=sha-<12> and release-run always; version=<semver> only on promotion.
+          doc["tags"] = [{"key": "commit", "value": os.environ["COMMIT"]}, {"key": "release-run", "value": os.environ["RUN_ID"]}]
+          if os.environ["VERSION"]:
+              doc["tags"].append({"key": "version", "value": os.environ["VERSION"]})
+          # Drop protection (§5 step 4), for services only: no name in both settings and secrets, and no setting or secret
+          # name of the registered revision disappears unless the caller reviewed it in allow-drop (the contract step).
+          mode = os.environ["MODE"]
+          if mode not in ("one-off", "first-deploy") and not os.path.isfile(mode):
+              sys.exit("render needs one-off, first-deploy or the current task definition file, got: " + mode)
+          def names(c, key):
+              return {e["name"] for e in (c.get(key) or [])}
+          if mode != "one-off":
+              both = sorted("%s/%s" % (c.get("name", "?"), n) for c in containers for n in names(c, "environment") & names(c, "secrets"))
+              if both:
+                  sys.exit("drop protection: names that are both a setting and a secret: " + ", ".join(both))
+          if mode not in ("one-off", "first-deploy"):
+              current = json.load(open(mode))
+              allowed = set(os.environ["ALLOW_DROP"].replace(",", " ").split())
+              new = {c.get("name"): names(c, "environment") | names(c, "secrets") for c in containers}
+              gone = sorted("%s/%s" % (c.get("name", "?"), n) for c in current.get("containerDefinitions", [])
+                            for n in (names(c, "environment") | names(c, "secrets")) - new.get(c.get("name"), set()) - allowed)
+              if gone:
+                  sys.exit("drop protection: names in the registered revision that this render would drop (list them in allow-drop "
+                           "only for the contract step of an expand/contract change): " + ", ".join(gone))
           print(json.dumps(doc))'
           }
           # --- render-taskdef end ---
-            render "${svc}" > "td-${svc}.json"
+            mode=$(current_td "${svc}" "current-${svc}.json")
+            render "${svc}" "${mode}" > "td-${svc}.json"
             arn=$(aws ecs register-task-definition --cli-input-json "file://td-${svc}.json" --query taskDefinition.taskDefinitionArn --output text)
             aws ecs update-service --cluster "${NAME}" --service "${svc}" --task-definition "${arn}" >/dev/null
-            echo "Rolling ${svc} back to v${target} (${arn##*/})."
-            VERSION_NOW="${target}"
+            echo "Rolling ${svc} back to ${VERSION:+v}${VERSION:-${COMMIT}} (${arn##*/})."
+            VERSION_NOW="${VERSION:-${COMMIT}}"
           done < selected.txt
           # shellcheck disable=SC2046
           aws ecs wait services-stable --cluster "${NAME}" --services $(cat selected.txt)
