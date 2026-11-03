@@ -1,7 +1,9 @@
 # Redeploy or roll back one named service (onepeek-docs architecture/lld/infra/delivery-pipelines.md UC-DEL-002, §5).
-# `workflow_dispatch` runs from the release branch only (the deploy roles trust no other branch). A repo's own button
-# can also call it as a shared workflow. The service choice list below is generated from the services file by
-# scripts/check_service_list.py, which fails CI if the list drifts (run it with --write to regenerate).
+# `workflow_dispatch` runs from dev for preprod and from release for prod (UC-DEL-002). A repo's own button can also
+# call it as a shared workflow. It holds the cross-repo release lock while it changes anything (playbook §5.4): the
+# lock job takes it, the unlock job releases it whatever happened, and no `concurrency` group queues runs. The service
+# choice list below is generated from the services file by scripts/check_service_list.py, which fails CI if the list
+# drifts (run it with --write to regenerate).
 name: operate
 
 on:
@@ -57,6 +59,13 @@ on:
         description: The repo's deploy role; empty = the repository variable AWS_ROLE_<ENV>.
         type: string
         default: ""
+    secrets:
+      AGENTS_APP_CLIENT_ID:
+        description: The agents' GitHub App (playbook §5.3). Its token, with Actions read, lets a waiting run see that another repo's lock holder has finished (§5.4); without it only this repo's holders can be checked.
+        required: false
+      AGENTS_APP_PRIVATE_KEY:
+        description: The agents' GitHub App private key (with AGENTS_APP_CLIENT_ID).
+        required: false
 
 permissions: {}
 
@@ -66,23 +75,213 @@ env:
   AWS_DEFAULT_REGION: ap-south-1
   ENVIRONMENT: ${{ inputs.environment }}
   NAME: onepeek-${{ inputs.environment }}
+  LOCK_WAIT_SECONDS: "1800" # waits up to 30 minutes for the release lock (playbook §5.4)
+  LOCK_POLL_SECONDS: "30" # polling every 30 s
 
 jobs:
+  lock:
+    # The cross-repo release lock (foundation-playbook §5.4), before anything changes. Preprod runs from dev, prod from
+    # release (UC-DEL-002).
+    if: ${{ (inputs.environment == 'preprod' && github.ref == 'refs/heads/dev') || (inputs.environment == 'prod' && github.ref == 'refs/heads/release') }}
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
+    timeout-minutes: 35
+    environment: ${{ inputs.environment == 'prod' && 'prod' || null }}
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    env:
+      HAS_APP: ${{ secrets.AGENTS_APP_CLIENT_ID != '' && secrets.AGENTS_APP_PRIVATE_KEY != '' }}
+    outputs:
+      attempt: ${{ steps.take.outputs.attempt }}
+    steps:
+      - name: The deploy role
+        id: role
+        env:
+          GIVEN: ${{ inputs.role-to-assume }}
+          PREPROD: ${{ vars.AWS_ROLE_PREPROD }}
+          PROD: ${{ vars.AWS_ROLE_PROD }}
+        run: |
+          role="${GIVEN}"
+          if [ -z "${role}" ]; then if [ "${ENVIRONMENT}" = "prod" ]; then role="${PROD}"; else role="${PREPROD}"; fi; fi
+          if [ -z "${role}" ]; then echo "::error::No deploy role: set the repository variable AWS_ROLE_<ENV>."; exit 1; fi
+          echo "role=${role}" >> "$GITHUB_OUTPUT"
+      - name: The agents' GitHub App token (Actions read), to see whether another repo's lock holder has finished
+        id: app
+        if: ${{ env.HAS_APP == 'true' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: backend-service,onepeek-web,onepeek-infra,mcp-athena # the repos that take the lock (playbook §5.4)
+          permission-actions: read
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.role.outputs.role }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - name: Take the release lock
+        id: take
+        env:
+          LOCK_GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+        run: |
+          # --- release-lock begin (identical in release-ecs.yml and operate.yml; checked by scripts/check_service_list.py) ---
+          # The cross-repo release lock (foundation-playbook §5.4): one per environment, s3://onepeek-<env>-deploy/locks/release.json,
+          # taken with a conditional write (If-None-Match: *) and removed with a conditional delete on its ETag (If-Match). The
+          # record names the repo, run ID, run attempt, commit and start time. Anything unreadable fails closed: no lock, no deploy.
+          # A lock is never removed while its run is still running: only its own run, or a waiter that GitHub shows the holder's
+          # run has finished, removes it.
+          LOCK_BUCKET="${NAME}-deploy"
+          LOCK_KEY="locks/release.json"
+          LOCK_ERR=$(mktemp)
+          lock_url() {  # lock_url <repo> <run id>
+            echo "${GITHUB_SERVER_URL}/$1/actions/runs/$2"
+          }
+          lock_read() {  # lock_read <file> -> the ETag (the record is written to <file>), or "absent"; 1 on any other answer
+            local etag msg
+            if etag=$(aws s3api get-object --bucket "${LOCK_BUCKET}" --key "${LOCK_KEY}" "$1" --query ETag --output text 2>"${LOCK_ERR}"); then
+              if [ -z "${etag}" ] || [ "${etag}" = "None" ]; then echo "The release lock has no ETag." >&2; return 1; fi
+              echo "${etag}"
+              return 0
+            fi
+            msg=$(cat "${LOCK_ERR}")
+            case "${msg}" in *NoSuchKey*) echo absent; return 0 ;; esac
+            echo "${msg}" >&2
+            return 1
+          }
+          lock_holder() {  # lock_holder <file> -> "<repo> <run id> <run attempt>"; 1 when the file is not a lock record
+            python3 -c '
+          import json, re, sys
+          try:
+              record = json.load(open(sys.argv[1]))
+              repo, run, attempt = record["repo"], str(record["run_id"]), str(record["run_attempt"])
+          except Exception as error:
+              sys.exit("not a release lock record: %r" % error)
+          if not (re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) and run.isdigit() and attempt.isdigit()):
+              sys.exit("not a release lock record: " + json.dumps(record))
+          print(repo, run, attempt)' "$1"
+          }
+          lock_delete() {  # lock_delete <etag> -> 0 removed, 2 changed or gone meanwhile (read it again), 1 any other answer
+            local msg
+            if aws s3api delete-object --bucket "${LOCK_BUCKET}" --key "${LOCK_KEY}" --if-match "$1" >/dev/null 2>"${LOCK_ERR}"; then
+              return 0
+            fi
+            msg=$(cat "${LOCK_ERR}")
+            case "${msg}" in *PreconditionFailed*|*ConditionalRequestConflict*|*NoSuchKey*) return 2 ;; esac
+            echo "::error::The release lock could not be removed: ${msg}"
+            return 1
+          }
+          lock_run_finished() {  # lock_run_finished <repo> <run id> -> 0 only when GitHub reports the run completed
+            local status
+            if ! status=$(GH_TOKEN="${LOCK_GH_TOKEN}" gh api "repos/$1/actions/runs/$2" --jq .status 2>"${LOCK_ERR}"); then
+              # Unreadable counts as running. Another repo's run needs the GitHub App token (GITHUB_TOKEN sees one repo only).
+              echo "::warning::Cannot read the state of $(lock_url "$1" "$2"), so it counts as running: $(cat "${LOCK_ERR}")"
+              return 1
+            fi
+            [ "${status}" = "completed" ]
+          }
+          lock_take() {  # waits up to LOCK_WAIT_SECONDS, polling every LOCK_POLL_SECONDS, then fails naming the holder's run
+            local msg etag holder repo run attempt rc deadline
+            python3 -c '
+          import datetime, json, os
+          e = os.environ
+          json.dump({"repo": e["GITHUB_REPOSITORY"], "run_id": e["GITHUB_RUN_ID"], "run_attempt": e["GITHUB_RUN_ATTEMPT"],
+                     "commit": "sha-" + e["GITHUB_SHA"][:12], "started": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                     "run": "%s/%s/actions/runs/%s" % (e["GITHUB_SERVER_URL"], e["GITHUB_REPOSITORY"], e["GITHUB_RUN_ID"])},
+                    open("lock-mine.json", "w"))'
+            deadline=$((SECONDS + LOCK_WAIT_SECONDS))
+            while :; do
+              # No encryption flags: the bucket default applies (aws-stack §16).
+              if aws s3api put-object --bucket "${LOCK_BUCKET}" --key "${LOCK_KEY}" --body lock-mine.json --if-none-match '*' \
+                --content-type application/json >/dev/null 2>"${LOCK_ERR}"; then
+                echo "Took the ${ENVIRONMENT} release lock (s3://${LOCK_BUCKET}/${LOCK_KEY})."
+                return 0
+              fi
+              msg=$(cat "${LOCK_ERR}")
+              case "${msg}" in
+                *PreconditionFailed*|*ConditionalRequestConflict*) ;;   # held, or another write at the same moment: see who holds it
+                *) echo "::error::The release lock could not be written, so nothing is deployed: ${msg}"; return 1 ;;
+              esac
+              if ! etag=$(lock_read lock-held.json); then
+                echo "::error::The release lock is unreadable, so nothing is deployed."
+                return 1
+              fi
+              if [ "${etag}" = "absent" ]; then   # released between the write and the read: write again
+                if [ "${SECONDS}" -ge "${deadline}" ]; then echo "::error::The release lock could not be taken in ${LOCK_WAIT_SECONDS} s."; return 1; fi
+                sleep 1
+                continue
+              fi
+              if ! holder=$(lock_holder lock-held.json); then
+                echo "::error::The release lock holds no readable record, so nothing is deployed (s3://${LOCK_BUCKET}/${LOCK_KEY})."
+                return 1
+              fi
+              read -r repo run attempt <<< "${holder}"
+              if { [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${run}" = "${GITHUB_RUN_ID}" ]; } || lock_run_finished "${repo}" "${run}"; then
+                # An earlier attempt of this run (one attempt runs at a time), or a finished run that never released it.
+                echo "The release lock is held by $(lock_url "${repo}" "${run}") (attempt ${attempt}), which is not running; taking it over."
+                rc=0
+                lock_delete "${etag}" || rc=$?
+                if [ "${rc}" -eq 1 ]; then return 1; fi
+                continue
+              fi
+              if [ "${SECONDS}" -ge "${deadline}" ]; then
+                echo "::error::The ${ENVIRONMENT} release lock is still held after ${LOCK_WAIT_SECONDS} s by $(lock_url "${repo}" "${run}")."
+                return 1
+              fi
+              echo "Waiting for the ${ENVIRONMENT} release lock, held by $(lock_url "${repo}" "${run}")."
+              sleep "${LOCK_POLL_SECONDS}"
+            done
+          }
+          lock_release() {  # removes the lock only when this run holds it
+            local etag holder repo run attempt rc
+            if ! etag=$(lock_read lock-held.json); then
+              echo "::error::The release lock is unreadable; it stays until a later release sees this run has finished."
+              return 1
+            fi
+            if [ "${etag}" = "absent" ]; then echo "No release lock is held."; return 0; fi
+            if ! holder=$(lock_holder lock-held.json); then
+              echo "::error::The release lock holds no readable record; it is left in place."
+              return 1
+            fi
+            read -r repo run attempt <<< "${holder}"
+            if [ "${repo}" != "${GITHUB_REPOSITORY}" ] || [ "${run}" != "${GITHUB_RUN_ID}" ]; then
+              echo "The release lock is held by $(lock_url "${repo}" "${run}"), not this run; it is left in place."
+              return 0
+            fi
+            rc=0
+            lock_delete "${etag}" || rc=$?
+            case "${rc}" in
+              0) echo "Released the ${ENVIRONMENT} release lock." ;;
+              2) echo "::warning::The release lock changed while it was being released; it is left in place." ;;
+              *) return 1 ;;
+            esac
+          }
+          # --- release-lock end ---
+          lock_take
+          echo "attempt=${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
   operate:
+    needs: lock
     # The real prod control is the prod role's trust (runner_environment: github-hosted, ci-runners.md section 11.3);
     # the prod prefix in runs-on is defence in depth.
-    if: ${{ github.ref == 'refs/heads/release' }}
+    if: ${{ (inputs.environment == 'preprod' && github.ref == 'refs/heads/dev') || (inputs.environment == 'prod' && github.ref == 'refs/heads/release') }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
     timeout-minutes: 30
     environment: ${{ inputs.environment == 'prod' && 'prod' || null }}
-    concurrency:
-      group: release-${{ inputs.environment }}
-      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write
       deployments: write
     steps:
+      - name: This run attempt holds the release lock (a re-run of only some jobs does not)
+        env:
+          LOCKED_ATTEMPT: ${{ needs.lock.outputs.attempt }}
+        run: |
+          if [ "${LOCKED_ATTEMPT}" != "${GITHUB_RUN_ATTEMPT}" ]; then
+            echo "::error::Attempt ${GITHUB_RUN_ATTEMPT} did not take the release lock (attempt '${LOCKED_ATTEMPT}' did). Re-run all jobs, not only the failed ones."
+            exit 1
+          fi
       - name: Check the inputs
         env:
           ACTION: ${{ inputs.action }}
@@ -302,3 +501,166 @@ jobs:
           id=$(gh api "repos/${GITHUB_REPOSITORY}/deployments" -f ref="${GITHUB_SHA}" -f environment="${ENVIRONMENT}" \
             -F auto_merge=false -F "required_contexts[]" -f description="${ACTION} ${SERVICE}" -f payload="{\"reason\":$(printf '%s' "${REASON}" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}" --jq .id)
           gh api "repos/${GITHUB_REPOSITORY}/deployments/${id}/statuses" -f state=success -f description="${ACTION} ${SERVICE}: ${REASON}" >/dev/null
+
+  unlock:
+    # Releases the release lock whatever happened, and only if this run holds it (playbook §5.4).
+    needs: [lock, operate]
+    if: ${{ always() && needs.lock.result != 'skipped' }}
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    environment: ${{ inputs.environment == 'prod' && 'prod' || null }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: The deploy role
+        id: role
+        env:
+          GIVEN: ${{ inputs.role-to-assume }}
+          PREPROD: ${{ vars.AWS_ROLE_PREPROD }}
+          PROD: ${{ vars.AWS_ROLE_PROD }}
+        run: |
+          role="${GIVEN}"
+          if [ -z "${role}" ]; then if [ "${ENVIRONMENT}" = "prod" ]; then role="${PROD}"; else role="${PREPROD}"; fi; fi
+          if [ -z "${role}" ]; then echo "::error::No deploy role: set the repository variable AWS_ROLE_<ENV>."; exit 1; fi
+          echo "role=${role}" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.role.outputs.role }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - name: Release the release lock
+        run: |
+          # --- release-lock begin (identical in release-ecs.yml and operate.yml; checked by scripts/check_service_list.py) ---
+          # The cross-repo release lock (foundation-playbook §5.4): one per environment, s3://onepeek-<env>-deploy/locks/release.json,
+          # taken with a conditional write (If-None-Match: *) and removed with a conditional delete on its ETag (If-Match). The
+          # record names the repo, run ID, run attempt, commit and start time. Anything unreadable fails closed: no lock, no deploy.
+          # A lock is never removed while its run is still running: only its own run, or a waiter that GitHub shows the holder's
+          # run has finished, removes it.
+          LOCK_BUCKET="${NAME}-deploy"
+          LOCK_KEY="locks/release.json"
+          LOCK_ERR=$(mktemp)
+          lock_url() {  # lock_url <repo> <run id>
+            echo "${GITHUB_SERVER_URL}/$1/actions/runs/$2"
+          }
+          lock_read() {  # lock_read <file> -> the ETag (the record is written to <file>), or "absent"; 1 on any other answer
+            local etag msg
+            if etag=$(aws s3api get-object --bucket "${LOCK_BUCKET}" --key "${LOCK_KEY}" "$1" --query ETag --output text 2>"${LOCK_ERR}"); then
+              if [ -z "${etag}" ] || [ "${etag}" = "None" ]; then echo "The release lock has no ETag." >&2; return 1; fi
+              echo "${etag}"
+              return 0
+            fi
+            msg=$(cat "${LOCK_ERR}")
+            case "${msg}" in *NoSuchKey*) echo absent; return 0 ;; esac
+            echo "${msg}" >&2
+            return 1
+          }
+          lock_holder() {  # lock_holder <file> -> "<repo> <run id> <run attempt>"; 1 when the file is not a lock record
+            python3 -c '
+          import json, re, sys
+          try:
+              record = json.load(open(sys.argv[1]))
+              repo, run, attempt = record["repo"], str(record["run_id"]), str(record["run_attempt"])
+          except Exception as error:
+              sys.exit("not a release lock record: %r" % error)
+          if not (re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) and run.isdigit() and attempt.isdigit()):
+              sys.exit("not a release lock record: " + json.dumps(record))
+          print(repo, run, attempt)' "$1"
+          }
+          lock_delete() {  # lock_delete <etag> -> 0 removed, 2 changed or gone meanwhile (read it again), 1 any other answer
+            local msg
+            if aws s3api delete-object --bucket "${LOCK_BUCKET}" --key "${LOCK_KEY}" --if-match "$1" >/dev/null 2>"${LOCK_ERR}"; then
+              return 0
+            fi
+            msg=$(cat "${LOCK_ERR}")
+            case "${msg}" in *PreconditionFailed*|*ConditionalRequestConflict*|*NoSuchKey*) return 2 ;; esac
+            echo "::error::The release lock could not be removed: ${msg}"
+            return 1
+          }
+          lock_run_finished() {  # lock_run_finished <repo> <run id> -> 0 only when GitHub reports the run completed
+            local status
+            if ! status=$(GH_TOKEN="${LOCK_GH_TOKEN}" gh api "repos/$1/actions/runs/$2" --jq .status 2>"${LOCK_ERR}"); then
+              # Unreadable counts as running. Another repo's run needs the GitHub App token (GITHUB_TOKEN sees one repo only).
+              echo "::warning::Cannot read the state of $(lock_url "$1" "$2"), so it counts as running: $(cat "${LOCK_ERR}")"
+              return 1
+            fi
+            [ "${status}" = "completed" ]
+          }
+          lock_take() {  # waits up to LOCK_WAIT_SECONDS, polling every LOCK_POLL_SECONDS, then fails naming the holder's run
+            local msg etag holder repo run attempt rc deadline
+            python3 -c '
+          import datetime, json, os
+          e = os.environ
+          json.dump({"repo": e["GITHUB_REPOSITORY"], "run_id": e["GITHUB_RUN_ID"], "run_attempt": e["GITHUB_RUN_ATTEMPT"],
+                     "commit": "sha-" + e["GITHUB_SHA"][:12], "started": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                     "run": "%s/%s/actions/runs/%s" % (e["GITHUB_SERVER_URL"], e["GITHUB_REPOSITORY"], e["GITHUB_RUN_ID"])},
+                    open("lock-mine.json", "w"))'
+            deadline=$((SECONDS + LOCK_WAIT_SECONDS))
+            while :; do
+              # No encryption flags: the bucket default applies (aws-stack §16).
+              if aws s3api put-object --bucket "${LOCK_BUCKET}" --key "${LOCK_KEY}" --body lock-mine.json --if-none-match '*' \
+                --content-type application/json >/dev/null 2>"${LOCK_ERR}"; then
+                echo "Took the ${ENVIRONMENT} release lock (s3://${LOCK_BUCKET}/${LOCK_KEY})."
+                return 0
+              fi
+              msg=$(cat "${LOCK_ERR}")
+              case "${msg}" in
+                *PreconditionFailed*|*ConditionalRequestConflict*) ;;   # held, or another write at the same moment: see who holds it
+                *) echo "::error::The release lock could not be written, so nothing is deployed: ${msg}"; return 1 ;;
+              esac
+              if ! etag=$(lock_read lock-held.json); then
+                echo "::error::The release lock is unreadable, so nothing is deployed."
+                return 1
+              fi
+              if [ "${etag}" = "absent" ]; then   # released between the write and the read: write again
+                if [ "${SECONDS}" -ge "${deadline}" ]; then echo "::error::The release lock could not be taken in ${LOCK_WAIT_SECONDS} s."; return 1; fi
+                sleep 1
+                continue
+              fi
+              if ! holder=$(lock_holder lock-held.json); then
+                echo "::error::The release lock holds no readable record, so nothing is deployed (s3://${LOCK_BUCKET}/${LOCK_KEY})."
+                return 1
+              fi
+              read -r repo run attempt <<< "${holder}"
+              if { [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${run}" = "${GITHUB_RUN_ID}" ]; } || lock_run_finished "${repo}" "${run}"; then
+                # An earlier attempt of this run (one attempt runs at a time), or a finished run that never released it.
+                echo "The release lock is held by $(lock_url "${repo}" "${run}") (attempt ${attempt}), which is not running; taking it over."
+                rc=0
+                lock_delete "${etag}" || rc=$?
+                if [ "${rc}" -eq 1 ]; then return 1; fi
+                continue
+              fi
+              if [ "${SECONDS}" -ge "${deadline}" ]; then
+                echo "::error::The ${ENVIRONMENT} release lock is still held after ${LOCK_WAIT_SECONDS} s by $(lock_url "${repo}" "${run}")."
+                return 1
+              fi
+              echo "Waiting for the ${ENVIRONMENT} release lock, held by $(lock_url "${repo}" "${run}")."
+              sleep "${LOCK_POLL_SECONDS}"
+            done
+          }
+          lock_release() {  # removes the lock only when this run holds it
+            local etag holder repo run attempt rc
+            if ! etag=$(lock_read lock-held.json); then
+              echo "::error::The release lock is unreadable; it stays until a later release sees this run has finished."
+              return 1
+            fi
+            if [ "${etag}" = "absent" ]; then echo "No release lock is held."; return 0; fi
+            if ! holder=$(lock_holder lock-held.json); then
+              echo "::error::The release lock holds no readable record; it is left in place."
+              return 1
+            fi
+            read -r repo run attempt <<< "${holder}"
+            if [ "${repo}" != "${GITHUB_REPOSITORY}" ] || [ "${run}" != "${GITHUB_RUN_ID}" ]; then
+              echo "The release lock is held by $(lock_url "${repo}" "${run}"), not this run; it is left in place."
+              return 0
+            fi
+            rc=0
+            lock_delete "${etag}" || rc=$?
+            case "${rc}" in
+              0) echo "Released the ${ENVIRONMENT} release lock." ;;
+              2) echo "::warning::The release lock changed while it was being released; it is left in place." ;;
+              *) return 1 ;;
+            esac
+          }
+          # --- release-lock end ---
+          lock_release
