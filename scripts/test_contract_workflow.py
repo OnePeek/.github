@@ -1,7 +1,6 @@
 """Tests of .github/workflows/contract.yml (decision 153; delivery-pipelines §6.1 row "contract between repos").
 Run: python -m unittest discover -s scripts -p 'test_*.py'"""
 
-import json
 import os
 import re
 import subprocess
@@ -48,55 +47,35 @@ def checkouts(role: str) -> dict[str, str]:
     return found
 
 
-FAKE_GH = """#!/bin/bash
-# Stands in for gh api: prints $FAKE_PULLS_<repo, - as _> (a JSON list of {number, head:{sha}}) through the --jq filter.
-repo=$(sed -E 's#repos/[^/]+/([^/]+)/pulls.*#\\1#' <<<"$2" | tr - _)
-var="FAKE_PULLS_${repo}"
-jq -c "$4" <<<"${!var:-[]}"
-"""
-
-
-def pulls(*numbers: int) -> str:
-    return json.dumps([{"number": n, "head": {"sha": f"sha{n}"}} for n in numbers])
-
-
-def resolve(role: str, base: str, **by_repo: str) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
-    with tempfile.TemporaryDirectory() as d:
-        gh = Path(d, "gh")
-        gh.write_text(FAKE_GH)
-        gh.chmod(0o755)
-        env = {"ROLE": role, "BASE_REF": base, "OWNER": "OnePeek", "GH_TOKEN": "t", "PATH": f"{d}:{os.environ['PATH']}"}
-        env.update({f"FAKE_PULLS_{k}": v for k, v in by_repo.items()})
-        out, output = run("The other repos' ref", env)
-        return out, dict(line.split("=", 1) for line in output.split())
+def resolve(role: str, base: str, head: str = "feature/x") -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+    out, output = run("The other repos' ref", {"ROLE": role, "BASE_REF": base, "HEAD_REF": head})
+    return out, dict(line.split("=", 1) for line in output.split())
 
 
 class OtherRef(unittest.TestCase):
-    def test_a_pull_request_into_dev_takes_the_other_repos_at_dev(self):
-        out, refs = resolve("infra", "dev", backend_service=pulls(7), onepeek_web=pulls(8))
+    def test_dev_for_a_pull_request_into_dev(self):
+        out, refs = resolve("infra", "dev")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(refs, {"backend": "dev", "web": "dev"})
 
-    def test_a_release_pull_request_takes_each_other_repo_at_its_release_candidate_else_dev_never_release(self):
-        out, refs = resolve("infra", "release", backend_service=pulls(7))
-        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertEqual(refs, {"backend": "sha7", "web": "dev"})
-        out, refs = resolve("web", "release")
-        self.assertEqual(refs, {"backend": "dev", "infra": "dev"})
+    def test_a_release_pull_request_checks_the_other_repos_at_dev_never_release(self):
+        for role, others in (("infra", {"backend", "web"}), ("backend", {"web", "infra"}), ("web", {"backend", "infra"})):
+            out, refs = resolve(role, "release", "dev")
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertEqual(refs, {o: "dev" for o in others})
 
-    def test_more_than_one_open_release_pull_request_fails_naming_them(self):
-        out, _ = resolve("infra", "release", backend_service=pulls(7, 9))
-        self.assertEqual(out.returncode, 1)
-        self.assertIn("backend-service has 2 open pull requests into release (#7, #9)", out.stdout)
+    def test_a_hotfix_pull_request_into_release_checks_the_other_repos_at_release(self):
+        self.assertEqual(resolve("infra", "release", "hotfix/fix-x")[1], {"backend": "release", "web": "release"})
+
+    def test_a_hotfix_branch_into_dev_is_still_dev(self):
+        self.assertEqual(resolve("infra", "dev", "hotfix/fix-x")[1], {"backend": "dev", "web": "dev"})
 
     def test_any_other_base_or_role_refuses(self):
         self.assertEqual(resolve("backend", "main")[0].returncode, 1)
         self.assertEqual(resolve("docs", "dev")[0].returncode, 1)
 
-    def test_the_lookup_uses_the_read_token_and_never_inlines_event_inputs(self):
-        s = step("The other repos' ref")
-        self.assertEqual(s["env"]["GH_TOKEN"], "${{ secrets.ORG_READ_TOKEN }}")
-        self.assertNotIn("${{", s["run"])
+    def test_event_inputs_never_inline_into_the_script(self):
+        self.assertNotIn("${{", step("The other repos' ref")["run"])
 
     def test_every_other_repo_is_checked_out_at_its_own_ref_with_the_read_token(self):
         refs = {"onepeek-infra": "infra", "backend-service": "backend", "onepeek-web": "web"}

@@ -3,9 +3,9 @@
 # Called by backend-service, onepeek-web and onepeek-infra on pull requests into dev and release. Real code against real
 # files: the backend's `app check services` and settings loader against infra's config/services.<env>.yaml and published
 # settings, and web's start-up loader against the same settings. The calling repo is taken at the pull request; the other
-# repos at dev for a pull request into dev and, for a release pull request, at their release candidate (the head of their
-# open pull request into release, else their dev; never the stale release branch), so what is checked is what ships
-# together. The token reads Contents and Pull requests on those repos. The checks themselves live in one place,
+# repos at dev for a pull request into dev and, for a release pull request too (it is dev to release, so their dev is the
+# release candidate; never the stale release branch), and at release for a hotfix/* pull request into release, so what
+# is checked is what ships together. The checks themselves live in one place,
 # onepeek-infra's scripts/contract.py.
 name: contract
 
@@ -22,7 +22,7 @@ on:
         required: true
     secrets:
       ORG_READ_TOKEN:
-        description: Fine-grained token with Contents and Pull requests read on backend-service, onepeek-web and onepeek-infra.
+        description: Fine-grained token with Contents read on backend-service, onepeek-web and onepeek-infra.
         required: true
 
 permissions:
@@ -33,32 +33,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: The other repos' ref (dev for a pull request into dev, the release candidate for a release pull request)
+      - name: The other repos' ref (dev, or release for a hotfix pull request into release)
         id: ref
         env:
           ROLE: ${{ inputs.role }}
           BASE_REF: ${{ inputs.base_ref }}
-          OWNER: ${{ github.repository_owner }}
-          GH_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           case "${ROLE}" in backend|web|infra) ;; *) echo "::error::role must be backend, web or infra, not '${ROLE}'."; exit 1 ;; esac
           case "${BASE_REF}" in dev|release) ;; *) echo "::error::base_ref must be dev or release, not '${BASE_REF}'."; exit 1 ;; esac
+          # Release pull requests are dev to release, so every other repo's release candidate is its dev (never the
+          # stale release branch). A hotfix pull request into release ships against what is live, so it is checked
+          # against the other repos' release.
+          ref=dev
+          if [ "${BASE_REF}" = release ] && [[ "${HEAD_REF}" == hotfix/* ]]; then ref=release; fi
           for side in backend web infra; do
             [ "${side}" = "${ROLE}" ] && continue
-            case "${side}" in backend) name=backend-service ;; web) name=onepeek-web ;; infra) name=onepeek-infra ;; esac
-            ref=dev
-            if [ "${BASE_REF}" = release ]; then
-              # The release candidate: the head of the other repo's open pull request into release, else its dev.
-              # Never its release branch, which is the last shipped state and goes stale (decision 153).
-              heads=$(gh api "repos/${OWNER}/${name}/pulls?state=open&base=release&per_page=100" --jq '[.[] | {n: .number, sha: .head.sha}] | sort_by(.n)')
-              count=$(jq 'length' <<<"${heads}")
-              if [ "${count}" -gt 1 ]; then
-                echo "::error::${name} has ${count} open pull requests into release ($(jq -r '[.[].n | "#\(.)"] | join(", ")' <<<"${heads}")); the release candidate must be exactly one. Close or merge the others."
-                exit 1
-              fi
-              [ "${count}" -eq 1 ] && ref=$(jq -r '.[0].sha' <<<"${heads}")
-            fi
-            echo "${name} is taken at ${ref}"
+            echo "${side} is taken at ${ref}"
             echo "${side}=${ref}" >> "$GITHUB_OUTPUT"
           done
 
