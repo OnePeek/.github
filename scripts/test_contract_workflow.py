@@ -1,6 +1,7 @@
 """Tests of .github/workflows/contract.yml (decision 153; delivery-pipelines §6.1 row "contract between repos").
 Run: python -m unittest discover -s scripts -p 'test_*.py'"""
 
+import json
 import os
 import re
 import subprocess
@@ -47,21 +48,62 @@ def checkouts(role: str) -> dict[str, str]:
     return found
 
 
-class OtherBranch(unittest.TestCase):
-    def test_dev_for_a_pull_request_into_dev_and_release_for_a_release_pull_request(self):
-        for base in ("dev", "release"):
-            out, output = run("The other repos' branch", {"ROLE": "backend", "BASE_REF": base})
-            self.assertEqual(out.returncode, 0, out.stdout)
-            self.assertEqual(output.strip(), f"other={base}")
+FAKE_GH = """#!/bin/bash
+# Stands in for gh api: prints $FAKE_PULLS_<repo, - as _> (a JSON list of {number, head:{sha}}) through the --jq filter.
+repo=$(sed -E 's#repos/[^/]+/([^/]+)/pulls.*#\\1#' <<<"$2" | tr - _)
+var="FAKE_PULLS_${repo}"
+jq -c "$4" <<<"${!var:-[]}"
+"""
+
+
+def pulls(*numbers: int) -> str:
+    return json.dumps([{"number": n, "head": {"sha": f"sha{n}"}} for n in numbers])
+
+
+def resolve(role: str, base: str, **by_repo: str) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+    with tempfile.TemporaryDirectory() as d:
+        gh = Path(d, "gh")
+        gh.write_text(FAKE_GH)
+        gh.chmod(0o755)
+        env = {"ROLE": role, "BASE_REF": base, "OWNER": "OnePeek", "GH_TOKEN": "t", "PATH": f"{d}:{os.environ['PATH']}"}
+        env.update({f"FAKE_PULLS_{k}": v for k, v in by_repo.items()})
+        out, output = run("The other repos' ref", env)
+        return out, dict(line.split("=", 1) for line in output.split())
+
+
+class OtherRef(unittest.TestCase):
+    def test_a_pull_request_into_dev_takes_the_other_repos_at_dev(self):
+        out, refs = resolve("infra", "dev", backend_service=pulls(7), onepeek_web=pulls(8))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(refs, {"backend": "dev", "web": "dev"})
+
+    def test_a_release_pull_request_takes_each_other_repo_at_its_release_candidate_else_dev_never_release(self):
+        out, refs = resolve("infra", "release", backend_service=pulls(7))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(refs, {"backend": "sha7", "web": "dev"})
+        out, refs = resolve("web", "release")
+        self.assertEqual(refs, {"backend": "dev", "infra": "dev"})
+
+    def test_more_than_one_open_release_pull_request_fails_naming_them(self):
+        out, _ = resolve("infra", "release", backend_service=pulls(7, 9))
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("backend-service has 2 open pull requests into release (#7, #9)", out.stdout)
 
     def test_any_other_base_or_role_refuses(self):
-        self.assertEqual(run("The other repos' branch", {"ROLE": "backend", "BASE_REF": "main"})[0].returncode, 1)
-        self.assertEqual(run("The other repos' branch", {"ROLE": "docs", "BASE_REF": "dev"})[0].returncode, 1)
+        self.assertEqual(resolve("backend", "main")[0].returncode, 1)
+        self.assertEqual(resolve("docs", "dev")[0].returncode, 1)
 
-    def test_every_other_repo_is_checked_out_at_that_branch_with_the_read_token(self):
+    def test_the_lookup_uses_the_read_token_and_never_inlines_event_inputs(self):
+        s = step("The other repos' ref")
+        self.assertEqual(s["env"]["GH_TOKEN"], "${{ secrets.ORG_READ_TOKEN }}")
+        self.assertNotIn("${{", s["run"])
+
+    def test_every_other_repo_is_checked_out_at_its_own_ref_with_the_read_token(self):
+        refs = {"onepeek-infra": "infra", "backend-service": "backend", "onepeek-web": "web"}
         for s in STEPS:
             if "repository" in s.get("with", {}):
-                self.assertEqual(s["with"]["ref"], "${{ steps.ref.outputs.other }}")
+                repo = s["with"]["repository"].split("/")[-1]
+                self.assertEqual(s["with"]["ref"], "${{ steps.ref.outputs." + refs[repo] + " }}")
                 self.assertEqual(s["with"]["token"], "${{ secrets.ORG_READ_TOKEN }}")
                 self.assertFalse(s["with"]["persist-credentials"])
 
