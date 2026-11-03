@@ -22,26 +22,29 @@ ENV = {"NAME": "onepeek-preprod", "ENVIRONMENT": "preprod", "GITHUB_REPOSITORY":
        "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SHA": "f" * 40, "GITHUB_SERVER_URL": "https://github.com",
        "LOCK_WAIT_SECONDS": "2", "LOCK_POLL_SECONDS": "1", "LOCK_GH_TOKEN": "t"}  # fmt: skip
 
-# A fake S3 holding one object, with the conditional-write semantics the lock relies on: If-None-Match: * refuses an
+# A fake S3 (one file per key) with the conditional-write semantics the lock relies on: If-None-Match: * refuses an
 # existing key, If-Match refuses another ETag, a missing key is NoSuchKey. FAIL_<OP> injects any other error, and
 # RACE_ON_DELETE has another run take the lock just before a delete.
-FAKE_AWS = r'''#!/usr/bin/env python3
+FAKE_AWS = r"""#!/usr/bin/env python3
 import hashlib, json, os, shutil, sys
 state = os.environ["FAKE_S3"]
 args = sys.argv[1:]
 with open(os.path.join(state, "calls"), "a") as f:
     f.write("aws " + " ".join(args) + "\n")
-obj, tag = os.path.join(state, "object"), os.path.join(state, "etag")
+def opt(name):
+    return args[args.index(name) + 1] if name in args else None
+def paths():
+    k = opt("--key").replace("/", "_")
+    return os.path.join(state, "s3_" + k), os.path.join(state, "etag_" + k)
 def fail(op, message):
     sys.stderr.write("An error occurred (%s) when calling the %s operation: x\n" % (message, op))
     sys.exit(254)
-def opt(name):
-    return args[args.index(name) + 1] if name in args else None
 op = args[1] if len(args) > 1 else ""
 injected = os.environ.get("FAIL_" + op.replace("-", "_").upper())
 if injected:
     fail(op, injected)
 if op == "put-object":
+    obj, tag = paths()
     if opt("--if-none-match") == "*" and os.path.exists(obj):
         fail("PutObject", "PreconditionFailed")
     shutil.copy(opt("--body"), obj)
@@ -49,13 +52,15 @@ if op == "put-object":
     open(tag, "w").write(etag)
     print(json.dumps({"ETag": etag}))
 elif op == "get-object":
+    obj, tag = paths()
     if not os.path.exists(obj):
         fail("GetObject", "NoSuchKey")
     shutil.copy(obj, args[args.index("--key") + 2])
     print(open(tag).read())
 elif op == "delete-object":
+    obj, tag = paths()
     race = os.environ.get("RACE_ON_DELETE")
-    if race:
+    if race and opt("--key") == "locks/release.json":
         open(obj, "w").write(race)
         open(tag, "w").write('"raced"')
     if not os.path.exists(obj):
@@ -65,12 +70,19 @@ elif op == "delete-object":
     os.remove(obj)
     os.remove(tag)
 else:
-    fail(op, "UnexpectedCall")
-'''
+    print(os.environ.get("AWS_" + op.replace("-", "_").upper(), ""))
+"""
+TOKEN = "c" * 32  # a fixed fake lock token (32 hex characters)
 
 
-def record(repo: str = "OnePeek/onepeek-infra", run: str = "77", attempt: str = "1") -> str:
-    return json.dumps({"repo": repo, "run_id": run, "run_attempt": attempt, "commit": "sha-" + "1" * 12, "started": "2026-11-03T10:00:00+00:00"})
+def record(repo: str = "OnePeek/onepeek-infra", run: str = "77", attempt: str = "1", token: str = "f" * 32) -> str:
+    return json.dumps({"repo": repo, "run_id": run, "run_attempt": attempt, "commit": "sha-" + "1" * 12,
+                       "started": "2026-11-03T10:00:00+00:00", "token": token})  # fmt: skip
+
+
+def frozen(repo: str = "OnePeek/backend-service", run: str = "90") -> str:
+    return json.dumps({"repo": repo, "run_id": run, "run_attempt": "1", "who": "founder", "why": "hotfix hotfix/x",
+                       "run": "https://github.com/%s/actions/runs/%s" % (repo, run)})  # fmt: skip
 
 
 def job_step(doc: dict, job: str, name: str) -> str:
@@ -79,26 +91,38 @@ def job_step(doc: dict, job: str, name: str) -> str:
 
 TAKE = job_step(RELEASE, "lock", "Take the release lock")
 RELEASE_STEP = job_step(RELEASE, "unlock", "Release the release lock")
+LOCKWF = yaml.safe_load((WORKFLOWS / "release-lock.yml").read_text(encoding="utf-8"))
+ACTION = job_step(LOCKWF, "lock", "Take, release, freeze or thaw")
 
 
-def run(script: str, held: str | None = None, gh: str = 'echo \'{"status":"in_progress"}\' >/dev/null; echo in_progress', **extra: str):
-    """Returns (result, calls, the object left in S3 or None, GITHUB_OUTPUT)."""
+def run(script: str, held: str | None = None, gh: str = "echo in_progress", frozen_by: str | None = None, files: dict | None = None,
+        git: str | None = None, **extra: str):
+    """Returns (result, calls, the lock left in S3 or None, GITHUB_OUTPUT); `.frozen` and `.summary` on the result."""
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
-        aws = root / "aws"
-        aws.write_text(FAKE_AWS)
-        ghs = root / "gh"
-        ghs.write_text(f'#!/bin/bash\necho "gh $*" >> "{root}/calls"\n{gh}\n')
-        for f in (aws, ghs):
+        stubs = {"aws": FAKE_AWS, "gh": f'#!/bin/bash\necho "gh $*" >> "{root}/calls"\n{gh}\n'}
+        if git is not None:
+            stubs["git"] = f'#!/bin/bash\necho "git $*" >> "{root}/calls"\n{git}\n'
+        for name, body in stubs.items():
+            f = root / name
+            f.write_text(body)
             f.chmod(f.stat().st_mode | stat.S_IEXEC)
         if held is not None:
-            (root / "object").write_text(held)
-            (root / "etag").write_text('"held-etag"')
+            (root / "s3_locks_release.json").write_text(held)
+            (root / "etag_locks_release.json").write_text('"held-etag"')
+        if frozen_by is not None:
+            (root / "s3_locks_frozen.json").write_text(frozen_by)
+            (root / "etag_locks_frozen.json").write_text('"frozen-etag"')
+        for name, content in (files or {}).items():
+            (root / name).write_text(content)
         out = subprocess.run(["bash", "-eo", "pipefail", "-c", script], cwd=root, capture_output=True, text=True, timeout=60, env={
             **os.environ, **ENV, **extra, "FAKE_S3": str(root), "PATH": f"{root}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(root / "output"),
+            "GITHUB_STEP_SUMMARY": str(root / "summary"),
         })  # fmt: skip
         read = lambda n: (root / n).read_text() if (root / n).exists() else None
-        return out, read("calls") or "", read("object"), read("output") or ""
+        out.frozen = read("s3_locks_frozen.json")  # type: ignore[attr-defined]
+        out.summary = read("summary") or ""  # type: ignore[attr-defined]
+        return out, read("calls") or "", read("s3_locks_release.json"), read("output") or ""
 
 
 class Take(unittest.TestCase):
@@ -110,7 +134,13 @@ class Take(unittest.TestCase):
         self.assertEqual({k: mine[k] for k in ("repo", "run_id", "run_attempt", "commit")},
                          {"repo": REPO, "run_id": RUN, "run_attempt": "1", "commit": "sha-" + "f" * 12})
         self.assertTrue(mine["started"].endswith("+00:00"))
+        self.assertRegex(mine["token"], r"^[0-9a-f]{32}$")
+        self.assertIn("token=" + mine["token"], output)
         self.assertIn("attempt=1", output)
+
+    def test_every_take_draws_a_new_random_token(self):
+        tokens = {json.loads(run(TAKE)[2])["token"] for _ in range(3)}
+        self.assertEqual(len(tokens), 3)
 
     def test_a_lock_held_by_a_running_release_waits_then_fails_naming_its_run_and_is_left_alone(self):
         out, calls, obj, output = run(TAKE, held=record(), LOCK_WAIT_SECONDS="4")
@@ -133,6 +163,12 @@ class Take(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertNotIn("gh api", calls)
         self.assertEqual(json.loads(obj)["run_attempt"], "2")
+
+    def test_the_same_attempt_of_this_run_is_not_taken_over(self):
+        # Two takes in one caller run (release-lock.yml called twice) must not take each other's lock.
+        out, calls, obj, _ = run(TAKE, held=record(REPO, RUN, "1"))
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(obj, record(REPO, RUN, "1"))
 
     def test_the_same_run_id_in_another_repo_is_not_ours(self):
         out, _, obj, _ = run(TAKE, held=record("OnePeek/onepeek-web", RUN))
@@ -189,41 +225,117 @@ class Take(unittest.TestCase):
 
 
 class Release(unittest.TestCase):
-    def test_this_runs_lock_is_removed_on_its_etag(self):
-        out, calls, obj, _ = run(RELEASE_STEP, held=record(REPO, RUN))
+    def test_the_lock_is_removed_on_its_etag_only_with_its_token(self):
+        out, calls, obj, _ = run(RELEASE_STEP, held=record(REPO, RUN, token=TOKEN), LOCK_TOKEN=TOKEN)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn('delete-object --bucket onepeek-preprod-deploy --key locks/release.json --if-match "held-etag"', calls)
         self.assertIsNone(obj)
 
-    def test_any_attempt_of_this_run_releases_it(self):
-        out, _, obj, _ = run(RELEASE_STEP, held=record(REPO, RUN, "1"), GITHUB_RUN_ATTEMPT="3")
-        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIsNone(obj)
-
-    def test_another_runs_lock_is_never_removed(self):
-        for held in (record(), record(REPO, "5001"), record("OnePeek/onepeek-web", RUN)):
-            out, calls, obj, _ = run(RELEASE_STEP, held=held)
+    def test_another_token_is_never_released_even_from_this_run(self):
+        for held, given in ((record(REPO, RUN), TOKEN), (record(token=TOKEN), "a" * 32), (record(REPO, RUN, token=TOKEN), "")):
+            out, calls, obj, _ = run(RELEASE_STEP, held=held, LOCK_TOKEN=given)
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-            self.assertIn("not this run; it is left in place", out.stdout)
+            self.assertIn("it is left in place", out.stdout)
             self.assertNotIn("delete-object", calls)
             self.assertEqual(obj, held)
 
     def test_no_lock_is_fine(self):
-        out, calls, _, _ = run(RELEASE_STEP)
+        out, calls, _, _ = run(RELEASE_STEP, LOCK_TOKEN=TOKEN)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertNotIn("delete-object", calls)
 
     def test_an_unreadable_lock_fails_visibly(self):
-        out, calls, obj, _ = run(RELEASE_STEP, held=record(REPO, RUN), FAIL_GET_OBJECT="AccessDenied")
-        self.assertEqual(out.returncode, 1)
-        self.assertNotIn("delete-object", calls)
-        self.assertEqual(obj, record(REPO, RUN))
+        for error in ("AccessDenied", "InternalError"):
+            out, calls, obj, _ = run(RELEASE_STEP, held=record(REPO, RUN, token=TOKEN), LOCK_TOKEN=TOKEN, FAIL_GET_OBJECT=error)
+            self.assertEqual(out.returncode, 1)
+            self.assertNotIn("delete-object", calls)
+            self.assertEqual(obj, record(REPO, RUN, token=TOKEN))
 
     def test_a_lock_taken_over_meanwhile_is_left_in_place(self):
         other = record("OnePeek/onepeek-web", "88")
-        out, _, obj, _ = run(RELEASE_STEP, held=record(REPO, RUN), RACE_ON_DELETE=other)
+        out, _, obj, _ = run(RELEASE_STEP, held=record(REPO, RUN, token=TOKEN), LOCK_TOKEN=TOKEN, RACE_ON_DELETE=other)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(obj, other)
+
+
+class Frozen(unittest.TestCase):
+    """preprod-frozen (playbook §5.4, §5.6): locks/frozen.json refuses every take except the hotfix run's own."""
+
+    def test_a_frozen_environment_refuses_other_runs_at_once_with_the_reason(self):
+        out, calls, obj, _ = run(TAKE, frozen_by=frozen())
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("preprod is frozen by founder (hotfix hotfix/x) for the hotfix run https://github.com/OnePeek/backend-service/actions/runs/90", out.stdout)
+        self.assertNotIn("put-object", calls)
+        self.assertIsNone(obj)
+
+    def test_the_hotfix_run_itself_takes_the_lock(self):
+        out, _, obj, _ = run(TAKE, frozen_by=frozen(REPO, RUN))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(obj)["run_id"], RUN)
+
+    def test_an_unreadable_freeze_means_no_deploy(self):
+        out, calls, _, _ = run(TAKE, FAIL_GET_OBJECT="AccessDenied")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("frozen.json is unreadable", out.stdout)
+        self.assertNotIn("put-object", calls)
+
+    def test_freeze_is_written_by_a_hotfix_run_naming_itself(self):
+        out, calls, _, _ = run(ACTION, ACTION="freeze", GITHUB_REF="refs/heads/hotfix/x", GITHUB_REF_NAME="hotfix/x", GITHUB_ACTOR="founder")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("put-object --bucket onepeek-preprod-deploy --key locks/frozen.json --body lock-frozen-mine.json --if-none-match *", calls)
+        written = json.loads(out.frozen)  # type: ignore[attr-defined]
+        self.assertEqual((written["repo"], written["run_id"], written["who"], written["why"]), (REPO, RUN, "founder", "hotfix hotfix/x"))
+
+    def test_freeze_from_any_other_branch_is_refused(self):
+        out, calls, _, _ = run(ACTION, ACTION="freeze", GITHUB_REF="refs/heads/dev")
+        self.assertEqual(out.returncode, 1)
+        self.assertNotIn("put-object", calls)
+
+    def test_a_second_freeze_by_another_run_is_refused_and_by_the_same_run_is_fine(self):
+        out, _, _, _ = run(ACTION, frozen_by=frozen(), ACTION="freeze", GITHUB_REF="refs/heads/hotfix/y")
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(out.frozen, frozen())  # type: ignore[attr-defined]
+        out, _, _, _ = run(ACTION, frozen_by=frozen(REPO, RUN), ACTION="freeze", GITHUB_REF="refs/heads/hotfix/x")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_thaw_removes_the_freeze_on_its_etag(self):
+        out, calls, _, _ = run(ACTION, frozen_by=frozen(), ACTION="thaw")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn('delete-object --bucket onepeek-preprod-deploy --key locks/frozen.json --if-match "frozen-etag"', calls)
+        self.assertIsNone(out.frozen)  # type: ignore[attr-defined]
+        out, _, _, _ = run(ACTION, ACTION="thaw")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_an_unreadable_freeze_is_not_thawed(self):
+        out, calls, _, _ = run(ACTION, frozen_by=frozen(), ACTION="thaw", FAIL_GET_OBJECT="AccessDenied")
+        self.assertEqual(out.returncode, 1)
+        self.assertNotIn("delete-object", calls)
+
+
+class SharedLockWorkflow(unittest.TestCase):
+    """release-lock.yml (playbook §5.4 "Shared lock workflow"): take, release, freeze, thaw from the same code."""
+
+    def test_take_outputs_the_token_and_release_needs_it(self):
+        out, _, obj, output = run(ACTION, ACTION="take")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        token = json.loads(obj)["token"]
+        self.assertIn("token=" + token, output)
+        out, _, obj, _ = run(ACTION, held=record(REPO, RUN, token=token), ACTION="release", GIVEN_TOKEN=token)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIsNone(obj)
+
+    def test_the_interface(self):
+        call = LOCKWF[True]["workflow_call"]
+        self.assertEqual(set(call["inputs"]), {"runner", "environment", "action", "role-to-assume", "token"})
+        self.assertEqual(call["outputs"]["token"]["value"], "${{ jobs.lock.outputs.token }}")
+        self.assertTrue(all(s["required"] for s in call["secrets"].values()))
+        check = job_step(LOCKWF, "lock", "Check the action")
+        for action, token, code in (("take", "", 0), ("thaw", "", 0), ("release", "", 1), ("release", TOKEN, 0), ("unlock", "", 1)):
+            r = subprocess.run(["bash", "-eo", "pipefail", "-c", check], capture_output=True, text=True,
+                               env={**os.environ, "ACTION": action, "GIVEN_TOKEN": token})  # fmt: skip
+            self.assertEqual(r.returncode, code, action)
+        self.assertNotIn("concurrency", LOCKWF)
+        self.assertEqual(LOCKWF["jobs"]["lock"]["permissions"]["actions"], "read")
 
 
 def needs(doc: dict, job: str) -> list[str]:
@@ -231,7 +343,7 @@ def needs(doc: dict, job: str) -> list[str]:
     return [n] if isinstance(n, str) else n
 
 
-GUARDED = ["sbom-sign", "migrate", "assets", "rollout", "register-one-offs"]
+GUARDED = ["sbom-sign", "migrate", "assets", "rollout", "register-one-offs", "rollback", "notify"]
 
 
 class Wiring(unittest.TestCase):
@@ -240,32 +352,38 @@ class Wiring(unittest.TestCase):
     def test_release_ecs_takes_the_lock_before_anything_else(self):
         self.assertEqual(needs(RELEASE, "lock"), [])
         self.assertEqual(needs(RELEASE, "version"), ["lock"])
+        self.assertEqual(RELEASE["jobs"]["version"]["if"], "${{ needs.lock.outputs.skip != 'true' }}")
         for job in RELEASE["jobs"]:
             if job not in ("lock", "version"):
                 self.assertTrue(needs(RELEASE, job), job)
 
     def test_unlock_always_runs_after_every_deploy_job(self):
         unlock = RELEASE["jobs"]["unlock"]
-        self.assertEqual(unlock["if"], "${{ always() }}")
+        # Only when the lock job ran, and never for prod (which the lock job refuses).
+        self.assertEqual(unlock["if"], "${{ always() && needs.lock.result != 'skipped' && inputs.environment != 'prod' }}")
         self.assertEqual(set(needs(RELEASE, "unlock")), set(RELEASE["jobs"]) - {"unlock", "api-client"})
         self.assertIn("lock_release", job_step(RELEASE, "unlock", "Release the release lock"))
+        for doc in (RELEASE, OPERATE):
+            rel = next(s for s in doc["jobs"]["unlock"]["steps"] if s.get("name") == "Release the release lock")
+            self.assertEqual(rel["env"]["LOCK_TOKEN"], "${{ needs.lock.outputs.token }}")
+            self.assertEqual(doc["jobs"]["lock"]["outputs"]["token"], "${{ steps.take.outputs.token }}")
 
     def test_operate_takes_and_releases_the_lock_around_its_one_job(self):
         self.assertEqual(needs(OPERATE, "operate"), ["lock"])
         self.assertEqual(set(needs(OPERATE, "unlock")), {"lock", "operate"})
-        self.assertTrue(OPERATE["jobs"]["unlock"]["if"].startswith("${{ always()"))
+        self.assertEqual(OPERATE["jobs"]["unlock"]["if"], "${{ always() && needs.lock.result != 'skipped' }}")
         self.assertIn("lock_take", job_step(OPERATE, "lock", "Take the release lock"))
         self.assertIn("lock_release", job_step(OPERATE, "unlock", "Release the release lock"))
 
     def test_no_concurrency_group_queues_a_release(self):
         # GitHub keeps one pending run per group and cancels the older one (playbook §5.1 step 7, checklist M).
-        for doc in (RELEASE, OPERATE):
+        for doc in (RELEASE, OPERATE, LOCKWF):
             self.assertNotIn("concurrency", doc)
             for name, job in doc["jobs"].items():
                 self.assertNotIn("concurrency", job, name)
 
     def test_a_release_waits_30_minutes_polling_every_30_seconds(self):
-        for doc in (RELEASE, OPERATE):
+        for doc in (RELEASE, OPERATE, LOCKWF):
             self.assertEqual((doc["env"]["LOCK_WAIT_SECONDS"], doc["env"]["LOCK_POLL_SECONDS"]), ("1800", "30"))
             self.assertGreater(doc["jobs"]["lock"]["timeout-minutes"] * 60, 1800)
 
@@ -273,15 +391,40 @@ class Wiring(unittest.TestCase):
         self.assertIn('LOCK_BUCKET="${NAME}-deploy"', TAKE)
         self.assertIn('LOCK_KEY="locks/release.json"', TAKE)
 
-    def test_the_holders_state_is_read_with_the_app_token_when_there_is_one(self):
-        for doc in (RELEASE, OPERATE):
+    def test_the_app_secrets_are_required_and_their_token_reads_the_holders_state(self):
+        # No quiet fallback to GITHUB_TOKEN: without the App a lock left by another repo could never be taken over.
+        for doc in (RELEASE, OPERATE, LOCKWF):
+            for name in ("AGENTS_APP_CLIENT_ID", "AGENTS_APP_PRIVATE_KEY"):
+                self.assertTrue(doc[True]["workflow_call"]["secrets"][name]["required"], name)
             lock = doc["jobs"]["lock"]
             app = next(s for s in lock["steps"] if s.get("id") == "app")
+            self.assertNotIn("if", app)
             self.assertTrue(app["uses"].startswith("actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510"))
             self.assertEqual(app["with"]["permission-actions"], "read")
-            take = next(s for s in lock["steps"] if s.get("id") == "take")
-            self.assertEqual(take["env"]["LOCK_GH_TOKEN"], "${{ steps.app.outputs.token || github.token }}")
+            take = next(s for s in lock["steps"] if s.get("id") in ("take", "lock"))
+            self.assertEqual(take["env"]["LOCK_GH_TOKEN"], "${{ steps.app.outputs.token }}")
             self.assertEqual(lock["permissions"]["actions"], "read")
+            self.assertNotIn("github.token", json.dumps(lock))
+        check = job_step(RELEASE, "lock", "The agents' GitHub App secrets are set")
+        for has, code in (("false", 1), ("", 1), ("true", 0)):
+            r = subprocess.run(["bash", "-eo", "pipefail", "-c", check], capture_output=True, text=True, env={**os.environ, "HAS_APP": has})
+            self.assertEqual(r.returncode, code, has)
+            if code:
+                self.assertIn("AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY must be passed", r.stdout)
+        names = [s.get("name", "") for s in RELEASE["jobs"]["lock"]["steps"]]
+        self.assertLess(names.index("The agents' GitHub App secrets are set (required, playbook §5.4)"), names.index("Take the release lock"))
+
+    def test_deploy_from_dev_is_off_unless_the_input_turns_it_on(self):
+        script = job_step(RELEASE, "lock", "Deploy from dev is off")
+        self.assertIs(RELEASE[True]["workflow_call"]["inputs"]["deploy-from-dev"]["default"], False)
+        for ref, flag, code in (("refs/heads/dev", "false", 1), ("refs/heads/dev", "true", 0), ("refs/heads/release", "false", 0)):
+            r = subprocess.run(["bash", "-eo", "pipefail", "-c", script], capture_output=True, text=True,
+                               env={**os.environ, "GITHUB_REF": ref, "DEPLOY_FROM_DEV": flag})  # fmt: skip
+            self.assertEqual(r.returncode, code, (ref, flag))
+            if code:
+                self.assertIn("deploy from dev is disabled until the launch switch-over (foundation-playbook §5.4)", r.stdout)
+        names = [s.get("name", "") for s in RELEASE["jobs"]["lock"]["steps"]]
+        self.assertLess(names.index(next(n for n in names if n.startswith("Deploy from dev"))), names.index("Take the release lock"))
 
     def test_prod_is_promote_only(self):
         script = job_step(RELEASE, "lock", "Prod is promote-only")
@@ -291,10 +434,12 @@ class Wiring(unittest.TestCase):
         allowed = subprocess.run(["bash", "-eo", "pipefail", "-c", script], capture_output=True, text=True, env={**os.environ, "ENVIRONMENT_NAME": "preprod"})
         self.assertEqual(allowed.returncode, 0)
 
-    def test_operate_runs_preprod_from_dev_and_prod_from_release(self):
-        want = "${{ (inputs.environment == 'preprod' && github.ref == 'refs/heads/dev') || (inputs.environment == 'prod' && github.ref == 'refs/heads/release') }}"
+    def test_operate_runs_from_release_only_until_launch(self):
+        # Founder 2026-11-03 (playbook §5.4): until launch `release` is preprod; no default depends on dev.
+        want = "${{ github.ref == 'refs/heads/release' }}"
         self.assertEqual(OPERATE["jobs"]["lock"]["if"], want)
         self.assertEqual(OPERATE["jobs"]["operate"]["if"], want)
+        self.assertNotIn("refs/heads/dev", OPERATE_TEXT)
 
 
 class PartialReRun(unittest.TestCase):
@@ -335,6 +480,56 @@ class SameLockEverywhere(unittest.TestCase):
         self.assertEqual(RELEASE_STEP, job_step(OPERATE, "unlock", "Release the release lock"))
         self.assertIn("# --- release-lock begin", RELEASE_TEXT)
         self.assertIn("# --- release-lock begin", OPERATE_TEXT)
+        self.assertIn("lock_take", ACTION)
+
+
+INDEX = json.dumps({"onepeek-preprod-api": {"kind": "service", "order": 1, "service": "api", "image": "backend"},
+                    "onepeek-preprod-migrate": {"kind": "one-off", "order": 0, "service": "migrate", "image": "backend"},
+                    "onepeek-preprod-web": {"kind": "service", "order": 1, "service": "web", "image": "web"}})  # fmt: skip
+ORDER = job_step(RELEASE, "lock", "Order.")
+
+
+def order(running: str, git: str, **extra: str):
+    aws = {"AWS_DESCRIBE_SERVICES": "arn:td/api:7", "AWS_DESCRIBE_TASK_DEFINITION": running, **extra}
+    return run(ORDER, files={"index.json": INDEX}, git=git, IMAGE="backend", **aws)
+
+
+class Order(unittest.TestCase):
+    """Playbook §5.4 "Order, not only one at a time": an older run never undoes a newer one."""
+
+    def test_a_newer_commit_running_makes_this_release_a_skip_with_a_notice(self):
+        out, calls, _, output = order("sha-" + "2" * 12, 'case "$1" in rev-parse) echo ' + "2" * 40 + ';; merge-base) exit 0;; esac')
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("skip=true", output)
+        self.assertIn("::notice::api already runs sha-222222222222", out.stdout)
+        self.assertIn("Skipped", out.summary)  # type: ignore[attr-defined]
+        self.assertIn("git merge-base --is-ancestor " + "f" * 40 + " " + "2" * 40, calls)
+        self.assertIn("ecs describe-services --cluster onepeek-preprod --services api", calls)
+        self.assertNotIn("--services migrate", calls)
+        self.assertNotIn("--services web", calls)
+
+    def test_an_older_commit_running_deploys(self):
+        out, _, _, output = order("sha-" + "2" * 12, 'case "$1" in rev-parse) echo ' + "2" * 40 + ';; merge-base) exit 1;; esac')
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("skip=false", output)
+
+    def test_the_same_commit_or_no_deployment_or_no_tag_deploys_without_asking_git(self):
+        for running, services in (("sha-" + "f" * 12, "arn:td/api:7"), ("None", "arn:td/api:7"), ("x", "None")):
+            out, calls, _, output = order(running, "exit 9", AWS_DESCRIBE_SERVICES=services)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertIn("skip=false", output)
+            self.assertNotIn("git ", calls)
+
+    def test_a_commit_that_cannot_be_compared_means_no_deploy(self):
+        for running, git in (("sha-" + "2" * 12, "exit 1"), ("latest", "exit 9"),
+                             ("sha-" + "2" * 12, 'case "$1" in rev-parse) echo ' + "2" * 40 + ';; merge-base) exit 128;; esac')):
+            out, _, _, output = order(running, git)
+            self.assertEqual(out.returncode, 1, running)
+            self.assertNotIn("skip=", output)
+
+    def test_the_checkout_has_the_history(self):
+        checkout = next(s for s in RELEASE["jobs"]["lock"]["steps"] if str(s.get("uses", "")).startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"]["fetch-depth"], 0)
 
 
 if __name__ == "__main__":

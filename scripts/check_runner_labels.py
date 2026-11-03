@@ -10,6 +10,8 @@
      `onepeek-arm64-canary` directly.
   3. Every job that can run on `onepeek-*` sets `timeout-minutes`: at most 60 (fast, arm-build), 150 (stateful).
   4. No `pull_request_target`; no `workflow_run` job on `onepeek-*`.
+  5. Private repos: a workflow triggered by `push` to `dev` that calls release-ecs.yml with `environment: preprod` sets
+     `deploy-from-dev: true`; deploying preprod from dev stays off until the launch switch-over (foundation-playbook §5.4).
 
 Usage: check_runner_labels.py --kind public|private --repo OnePeek/<name> [--list FILE] WORKFLOW_DIR
 Exit status 1 when any rule is broken.
@@ -88,6 +90,14 @@ def _triggers(doc: dict) -> dict:
     return on or {}
 
 
+def _pushes_dev(triggers: dict) -> bool:
+    if "push" not in triggers:
+        return False
+    push = triggers["push"] or {}
+    branches = push.get("branches") if isinstance(push, dict) else None
+    return branches is None or "dev" in branches or "*" in branches or "**" in branches
+
+
 def load_listed(path: Path | None) -> set[tuple[str, str, str]]:
     if path is None:
         return set()
@@ -105,6 +115,12 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
     if "pull_request_target" in triggers:
         errors.append(f"{where}: rule 4: pull_request_target is not allowed.")
     jobs = doc.get("jobs") or {}
+    if kind == "private" and _pushes_dev(triggers):
+        for job_id, job in jobs.items():
+            uses, given = str(job.get("uses", "")), job.get("with") or {}
+            if "/release-ecs.yml@" in uses and given.get("environment") == "preprod" and given.get("deploy-from-dev") is not True:
+                errors.append(f"{where}: job {job_id}: rule 5: a push to dev deploys preprod only with deploy-from-dev: true, "
+                              "which stays off until the launch switch-over (foundation-playbook §5.4).")
     if kind == "public":
         for job_id, job in jobs.items():
             given = (job.get("with") or {}).get("runner")

@@ -182,6 +182,43 @@ class Rule4Triggers(unittest.TestCase):
         self.assertEqual(run("private", "OnePeek/x", "c.yml", own("ubuntu-latest", trigger="workflow_run")), [])
 
 
+def caller(trigger, environment="preprod", flag=""):
+    return f"""\
+        on: {trigger}
+        permissions: {{contents: read}}
+        jobs:
+          release:
+            uses: OnePeek/.github/.github/workflows/release-ecs.yml@{"a" * 40}
+            with:
+              environment: {environment}
+              {flag}
+        """
+
+
+class Rule5DeployFromDev(unittest.TestCase):
+    """foundation-playbook §5.4: until launch `release` is preprod; deploying preprod from dev is off."""
+
+    def rule5(self, text, kind="private"):
+        return [e for e in run(kind, "OnePeek/backend-service", "release.yml", text) if "rule 5" in e]
+
+    def test_a_push_to_dev_deploying_preprod_without_the_flag_is_refused(self):
+        for trigger in ("{push: {branches: [dev]}}", "push", "{push: {branches: ['**']}}"):
+            self.assertEqual(len(self.rule5(caller(trigger))), 1, trigger)
+
+    def test_the_flag_false_is_still_refused(self):
+        self.assertEqual(len(self.rule5(caller("{push: {branches: [dev]}}", flag="deploy-from-dev: false"))), 1)
+
+    def test_the_flag_true_is_allowed(self):
+        self.assertEqual(self.rule5(caller("{push: {branches: [dev]}}", flag="deploy-from-dev: true")), [])
+
+    def test_a_push_to_release_is_allowed(self):
+        self.assertEqual(self.rule5(caller("{push: {branches: [release]}}")), [])
+
+    def test_another_environment_or_a_public_repo_is_not_this_rule(self):
+        self.assertEqual(self.rule5(caller("{push: {branches: [dev]}}", environment="sandbox")), [])
+        self.assertEqual(self.rule5(caller("{push: {branches: [dev]}}"), kind="public"), [])
+
+
 class SharedWorkflows(unittest.TestCase):
     def test_this_repos_workflows_pass_the_public_rules(self):
         root = Path(__file__).resolve().parents[1]

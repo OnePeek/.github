@@ -1,0 +1,304 @@
+# Shared: the cross-repo release lock as its own call (onepeek-docs architecture/lld/infra/foundation-playbook.md §5.4,
+# "Shared lock workflow"), for releases that do not run release-ecs.yml or operate.yml, such as onepeek-infra's
+# release.yml, which calls it first (take) and last (release, with if: always() and the take's token). The lock code is
+# the same block as in release-ecs.yml and operate.yml (scripts/check_service_list.py keeps every copy identical).
+# Actions:
+#   take    wait for and take s3://onepeek-<env>-deploy/locks/release.json; outputs the token that releases it.
+#   release remove the lock, only when it holds the given token.
+#   freeze  preprod-frozen (§5.4, §5.6): a hotfix/* run writes locks/frozen.json naming itself; every other take fails.
+#   thaw    remove locks/frozen.json (the push that merges release back into dev).
+# Callers grant actions: read, pass AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY, and use no concurrency group.
+name: release-lock
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
+        type: string
+        default: github
+      environment:
+        description: Environment; the lock is in the onepeek-<environment>-deploy bucket.
+        type: string
+        required: true
+      action:
+        description: take, release, freeze or thaw.
+        type: string
+        required: true
+      role-to-assume:
+        description: The role that may hold the lock (ci-apply or the repo's deploy role).
+        type: string
+        required: true
+      token:
+        description: For release, the token output of the take call.
+        type: string
+        default: ""
+    outputs:
+      token:
+        description: The token of a take; pass it to the release call.
+        value: ${{ jobs.lock.outputs.token }}
+    secrets:
+      AGENTS_APP_CLIENT_ID:
+        description: The agents' GitHub App (playbook §5.3, §5.4). Required. Its token, with Actions read, lets a waiting run see that another repo's lock holder has finished; without it such a lock could never be taken over.
+        required: true
+      AGENTS_APP_PRIVATE_KEY:
+        description: The agents' GitHub App private key (with AGENTS_APP_CLIENT_ID). Required.
+        required: true
+
+permissions: {}
+
+env:
+  AWS_REGION: ap-south-1
+  AWS_DEFAULT_REGION: ap-south-1
+  NAME: onepeek-${{ inputs.environment }}
+  ENVIRONMENT: ${{ inputs.environment }}
+  LOCK_WAIT_SECONDS: "1800" # waits up to 30 minutes for the release lock (playbook §5.4)
+  LOCK_POLL_SECONDS: "30" # polling every 30 s
+
+jobs:
+  lock:
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
+    timeout-minutes: 35
+    environment: ${{ inputs.environment == 'prod' && 'prod' || null }}
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    outputs:
+      token: ${{ steps.lock.outputs.token }}
+    steps:
+      - name: Check the action
+        env:
+          ACTION: ${{ inputs.action }}
+          GIVEN_TOKEN: ${{ inputs.token }}
+        run: |
+          case "${ACTION}" in take|release|freeze|thaw) ;; *) echo "::error::action must be take, release, freeze or thaw, not '${ACTION}'."; exit 1 ;; esac
+          if [ "${ACTION}" = "release" ] && [ -z "${GIVEN_TOKEN}" ]; then echo "::error::release needs the token output of the take call."; exit 1; fi
+      - name: The agents' GitHub App secrets are set (required, playbook §5.4)
+        env:
+          HAS_APP: ${{ secrets.AGENTS_APP_CLIENT_ID != '' && secrets.AGENTS_APP_PRIVATE_KEY != '' }}
+        run: |
+          if [ "${HAS_APP}" != "true" ]; then
+            echo "::error::AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY must be passed: without the App token a lock left by another repo's finished run could never be taken over (playbook §5.4)."
+            exit 1
+          fi
+      - name: The agents' GitHub App token (Actions read), to see whether another repo's lock holder has finished
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: backend-service,onepeek-web,onepeek-infra,mcp-athena # the repos that take the lock (playbook §5.4)
+          permission-actions: read
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - name: Take, release, freeze or thaw the release lock
+        id: lock
+        env:
+          ACTION: ${{ inputs.action }}
+          LOCK_GH_TOKEN: ${{ steps.app.outputs.token }}
+          GIVEN_TOKEN: ${{ inputs.token }}
+        run: |
+          # --- release-lock begin (identical in release-ecs.yml, operate.yml and release-lock.yml; checked by scripts/check_service_list.py) ---
+          # The cross-repo release lock (foundation-playbook §5.4): one per environment, s3://onepeek-<env>-deploy/locks/release.json,
+          # taken with a conditional write (If-None-Match: *) and removed with a conditional delete on its ETag (If-Match). The
+          # record names the repo, run ID, run attempt, commit, start time and a random token; only the holder of the token
+          # releases it. Anything unreadable fails closed: no lock, no deploy. A lock is never removed while its run is still
+          # running: only its token's holder, or a waiter that GitHub shows the holder's run has finished, removes it.
+          # preprod-frozen: while s3://onepeek-<env>-deploy/locks/frozen.json exists (written by a hotfix run, §5.6), every take
+          # except that hotfix run's own fails with the reason.
+          LOCK_BUCKET="${NAME}-deploy"
+          LOCK_KEY="locks/release.json"
+          FROZEN_KEY="locks/frozen.json"
+          LOCK_ERR=$(mktemp)
+          lock_url() {  # lock_url <repo> <run id>
+            echo "${GITHUB_SERVER_URL}/$1/actions/runs/$2"
+          }
+          lock_read() {  # lock_read <key> <file> -> the ETag (the object is written to <file>), or "absent"; 1 on any other answer
+            local etag msg
+            if etag=$(aws s3api get-object --bucket "${LOCK_BUCKET}" --key "$1" "$2" --query ETag --output text 2>"${LOCK_ERR}"); then
+              if [ -z "${etag}" ] || [ "${etag}" = "None" ]; then echo "s3://${LOCK_BUCKET}/$1 has no ETag." >&2; return 1; fi
+              echo "${etag}"
+              return 0
+            fi
+            msg=$(cat "${LOCK_ERR}")
+            # Only NoSuchKey means absent. AccessDenied (for example without s3:ListBucket on locks/*) and every other answer fail closed.
+            case "${msg}" in *"(NoSuchKey)"*) echo absent; return 0 ;; esac
+            echo "${msg}" >&2
+            return 1
+          }
+          lock_holder() {  # lock_holder <file> -> "<repo> <run id> <run attempt> <token>"; 1 when the file is not such a record
+            python3 -c '
+          import json, re, sys
+          try:
+              record = json.load(open(sys.argv[1]))
+              repo, run, attempt, token = record["repo"], str(record["run_id"]), str(record["run_attempt"]), str(record.get("token", "-"))
+          except Exception as error:
+              sys.exit("not a release lock record: %r" % error)
+          if not (re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) and run.isdigit() and attempt.isdigit() and re.fullmatch(r"[0-9a-f]{32}|-", token)):
+              sys.exit("not a release lock record: " + json.dumps(record))
+          print(repo, run, attempt, token)' "$1"
+          }
+          lock_delete() {  # lock_delete <key> <etag> -> 0 removed, 2 changed or gone meanwhile (read it again), 1 any other answer
+            local msg
+            if aws s3api delete-object --bucket "${LOCK_BUCKET}" --key "$1" --if-match "$2" >/dev/null 2>"${LOCK_ERR}"; then
+              return 0
+            fi
+            msg=$(cat "${LOCK_ERR}")
+            case "${msg}" in *"(PreconditionFailed)"*|*"(ConditionalRequestConflict)"*|*"(NoSuchKey)"*) return 2 ;; esac
+            echo "::error::s3://${LOCK_BUCKET}/$1 could not be removed: ${msg}"
+            return 1
+          }
+          lock_run_finished() {  # lock_run_finished <repo> <run id> -> 0 only when GitHub reports the run completed
+            local status
+            if ! status=$(GH_TOKEN="${LOCK_GH_TOKEN}" gh api "repos/$1/actions/runs/$2" --jq .status 2>"${LOCK_ERR}"); then
+              echo "::warning::Cannot read the state of $(lock_url "$1" "$2"), so it counts as running: $(cat "${LOCK_ERR}")"
+              return 1
+            fi
+            [ "${status}" = "completed" ]
+          }
+          lock_record() {  # lock_record <file> [token]: this run's record
+            python3 -c '
+          import datetime, json, os, sys
+          e = os.environ
+          record = {"repo": e["GITHUB_REPOSITORY"], "run_id": e["GITHUB_RUN_ID"], "run_attempt": e["GITHUB_RUN_ATTEMPT"],
+                    "commit": "sha-" + e["GITHUB_SHA"][:12], "started": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                    "run": "%s/%s/actions/runs/%s" % (e["GITHUB_SERVER_URL"], e["GITHUB_REPOSITORY"], e["GITHUB_RUN_ID"]),
+                    "who": e.get("GITHUB_ACTOR", ""), "why": "hotfix " + e.get("GITHUB_REF_NAME", "")}
+          if len(sys.argv) > 2:
+              record["token"] = sys.argv[2]
+              del record["who"], record["why"]
+          json.dump(record, open(sys.argv[1], "w"))' "$@"
+          }
+          lock_frozen_for_others() {  # 0 when preprod-frozen names another run (the reason is printed), 1 when not frozen for us, 2 unreadable
+            local etag holder repo run attempt token
+            if ! etag=$(lock_read "${FROZEN_KEY}" lock-frozen.json); then return 2; fi
+            if [ "${etag}" = "absent" ]; then return 1; fi
+            if ! holder=$(lock_holder lock-frozen.json); then return 2; fi
+            read -r repo run attempt token <<< "${holder}"
+            if [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${run}" = "${GITHUB_RUN_ID}" ]; then return 1; fi
+            python3 -c 'import json,sys;r=json.load(open(sys.argv[1]));print("preprod is frozen by %s (%s) for the hotfix run %s" % (r.get("who","?"), r.get("why","?"), r.get("run","?")))' lock-frozen.json
+            return 0
+          }
+          lock_take() {  # waits up to LOCK_WAIT_SECONDS, polling every LOCK_POLL_SECONDS, then fails naming the holder's run
+            local msg etag holder repo run attempt token rc deadline reason
+            if [ -z "${LOCK_TOKEN:-}" ]; then echo "::error::No lock token."; return 1; fi
+            lock_record lock-mine.json "${LOCK_TOKEN}"
+            deadline=$((SECONDS + LOCK_WAIT_SECONDS))
+            while :; do
+              rc=0
+              reason=$(lock_frozen_for_others) || rc=$?
+              if [ "${rc}" -eq 0 ]; then echo "::error::The ${ENVIRONMENT} release lock is refused: ${reason}."; return 1; fi
+              if [ "${rc}" -eq 2 ]; then echo "::error::s3://${LOCK_BUCKET}/${FROZEN_KEY} is unreadable, so nothing is deployed."; return 1; fi
+              # No encryption flags: the bucket default applies (aws-stack §16).
+              if aws s3api put-object --bucket "${LOCK_BUCKET}" --key "${LOCK_KEY}" --body lock-mine.json --if-none-match '*' \
+                --content-type application/json >/dev/null 2>"${LOCK_ERR}"; then
+                echo "Took the ${ENVIRONMENT} release lock (s3://${LOCK_BUCKET}/${LOCK_KEY})."
+                return 0
+              fi
+              msg=$(cat "${LOCK_ERR}")
+              case "${msg}" in
+                *"(PreconditionFailed)"*|*"(ConditionalRequestConflict)"*) ;;   # held, or another write at the same moment: see who holds it
+                *) echo "::error::The release lock could not be written, so nothing is deployed: ${msg}"; return 1 ;;
+              esac
+              if ! etag=$(lock_read "${LOCK_KEY}" lock-held.json); then
+                echo "::error::The release lock is unreadable, so nothing is deployed."
+                return 1
+              fi
+              if [ "${etag}" = "absent" ]; then   # released between the write and the read: write again
+                if [ "${SECONDS}" -ge "${deadline}" ]; then echo "::error::The release lock could not be taken in ${LOCK_WAIT_SECONDS} s."; return 1; fi
+                sleep 1
+                continue
+              fi
+              if ! holder=$(lock_holder lock-held.json); then
+                echo "::error::The release lock holds no readable record, so nothing is deployed (s3://${LOCK_BUCKET}/${LOCK_KEY})."
+                return 1
+              fi
+              read -r repo run attempt token <<< "${holder}"
+              if { [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${run}" = "${GITHUB_RUN_ID}" ] && [ "${attempt}" -lt "${GITHUB_RUN_ATTEMPT}" ]; } \
+                || lock_run_finished "${repo}" "${run}"; then
+                # An earlier attempt of this run (one attempt runs at a time), or a finished run that never released it.
+                echo "The release lock is held by $(lock_url "${repo}" "${run}") (attempt ${attempt}), which is not running; taking it over."
+                rc=0
+                lock_delete "${LOCK_KEY}" "${etag}" || rc=$?
+                if [ "${rc}" -eq 1 ]; then return 1; fi
+                continue
+              fi
+              if [ "${SECONDS}" -ge "${deadline}" ]; then
+                echo "::error::The ${ENVIRONMENT} release lock is still held after ${LOCK_WAIT_SECONDS} s by $(lock_url "${repo}" "${run}")."
+                return 1
+              fi
+              echo "Waiting for the ${ENVIRONMENT} release lock, held by $(lock_url "${repo}" "${run}")."
+              sleep "${LOCK_POLL_SECONDS}"
+            done
+          }
+          lock_release() {  # removes the lock only when its token is LOCK_TOKEN (handed over by the lock job's outputs)
+            local etag holder repo run attempt token rc
+            if ! etag=$(lock_read "${LOCK_KEY}" lock-held.json); then
+              echo "::error::The release lock is unreadable; it stays until a later release sees this run has finished."
+              return 1
+            fi
+            if [ "${etag}" = "absent" ]; then echo "No release lock is held."; return 0; fi
+            if ! holder=$(lock_holder lock-held.json); then
+              echo "::error::The release lock holds no readable record; it is left in place."
+              return 1
+            fi
+            read -r repo run attempt token <<< "${holder}"
+            if [ -z "${LOCK_TOKEN:-}" ] || [ "${token}" != "${LOCK_TOKEN}" ]; then
+              echo "The release lock is held by $(lock_url "${repo}" "${run}") under another token, not this call; it is left in place."
+              return 0
+            fi
+            rc=0
+            lock_delete "${LOCK_KEY}" "${etag}" || rc=$?
+            case "${rc}" in
+              0) echo "Released the ${ENVIRONMENT} release lock." ;;
+              2) echo "::warning::The release lock changed while it was being released; it is left in place." ;;
+              *) return 1 ;;
+            esac
+          }
+          lock_freeze() {  # preprod-frozen (§5.4, §5.6): only a hotfix/* run writes it, naming itself
+            local msg etag holder repo run attempt token
+            case "${GITHUB_REF:-}" in refs/heads/hotfix/*) ;; *) echo "::error::Only a hotfix/* run freezes ${ENVIRONMENT} (playbook §5.6), not ${GITHUB_REF:-?}."; return 1 ;; esac
+            lock_record lock-frozen-mine.json
+            if aws s3api put-object --bucket "${LOCK_BUCKET}" --key "${FROZEN_KEY}" --body lock-frozen-mine.json --if-none-match '*' \
+              --content-type application/json >/dev/null 2>"${LOCK_ERR}"; then
+              echo "Froze ${ENVIRONMENT} for this hotfix run (s3://${LOCK_BUCKET}/${FROZEN_KEY})."
+              return 0
+            fi
+            msg=$(cat "${LOCK_ERR}")
+            case "${msg}" in *"(PreconditionFailed)"*|*"(ConditionalRequestConflict)"*) ;; *) echo "::error::preprod-frozen could not be written: ${msg}"; return 1 ;; esac
+            if ! etag=$(lock_read "${FROZEN_KEY}" lock-frozen.json) || [ "${etag}" = "absent" ] || ! holder=$(lock_holder lock-frozen.json); then
+              echo "::error::preprod-frozen could not be read back."
+              return 1
+            fi
+            read -r repo run attempt token <<< "${holder}"
+            if [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${run}" = "${GITHUB_RUN_ID}" ]; then echo "${ENVIRONMENT} is already frozen for this run."; return 0; fi
+            echo "::error::${ENVIRONMENT} is already frozen for $(lock_url "${repo}" "${run}")."
+            return 1
+          }
+          lock_thaw() {  # removes preprod-frozen (the push that merges release back into dev, §5.6)
+            local etag rc
+            if ! etag=$(lock_read "${FROZEN_KEY}" lock-frozen.json); then echo "::error::preprod-frozen is unreadable; it is left in place."; return 1; fi
+            if [ "${etag}" = "absent" ]; then echo "${ENVIRONMENT} is not frozen."; return 0; fi
+            rc=0
+            lock_delete "${FROZEN_KEY}" "${etag}" || rc=$?
+            case "${rc}" in
+              0) echo "Thawed ${ENVIRONMENT}." ;;
+              2) echo "::error::preprod-frozen changed while it was being removed; it is left in place."; return 1 ;;
+              *) return 1 ;;
+            esac
+          }
+          # --- release-lock end ---
+          case "${ACTION}" in
+            take)
+              LOCK_TOKEN=$(python3 -c "import secrets;print(secrets.token_hex(16))")
+              echo "token=${LOCK_TOKEN}" >> "$GITHUB_OUTPUT"
+              lock_take ;;
+            release) LOCK_TOKEN="${GIVEN_TOKEN}" lock_release ;;
+            freeze) lock_freeze ;;
+            thaw) lock_thaw ;;
+          esac

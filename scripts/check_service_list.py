@@ -5,7 +5,8 @@
 Fails if the `service` choice list in .github/workflows/operate.yml is not `all` plus the services file's
 long-running services, in file order. `--write` regenerates the list. It also fails if the task-definition
 render function differs between release-ecs.yml and operate.yml (one function, delivery-pipelines §5), or if the
-release-lock functions differ between the lock and unlock jobs of either file (one lock, foundation-playbook §5.4).
+release-lock functions differ between release-ecs.yml (lock and unlock jobs), operate.yml (lock and unlock jobs) and
+release-lock.yml (one lock, foundation-playbook §5.4).
 """
 
 from __future__ import annotations
@@ -55,11 +56,14 @@ def main(argv: list[str] | None = None) -> int:
         problems.append("a render-taskdef block is missing")
     elif any(b != rel[0] for b in rel + ops):
         problems.append("the render-taskdef function differs between release-ecs.yml and operate.yml")
-    locks = {"release-ecs.yml": blocks(release_text, LOCK), "operate.yml": blocks(text, LOCK)}
-    if any(len(found) != 2 for found in locks.values()):
-        problems.append("release-ecs.yml and operate.yml each need two release-lock blocks (the lock and unlock jobs)")
+    lock_file = args.workflows / "release-lock.yml"
+    locks = {"release-ecs.yml": blocks(release_text, LOCK), "operate.yml": blocks(text, LOCK),
+             "release-lock.yml": blocks(lock_file.read_text(encoding="utf-8"), LOCK) if lock_file.exists() else []}
+    wanted_copies = {"release-ecs.yml": 2, "operate.yml": 2, "release-lock.yml": 1}
+    if any(len(locks[f]) != n for f, n in wanted_copies.items()):
+        problems.append("release-lock blocks: release-ecs.yml and operate.yml need two each (lock and unlock), release-lock.yml one")
     elif len({b for found in locks.values() for b in found}) != 1:
-        problems.append("the release-lock functions differ between the lock and unlock jobs of release-ecs.yml and operate.yml")
+        problems.append("the release-lock functions differ between release-ecs.yml, operate.yml and release-lock.yml")
     for p in problems:
         print("::error::" + p)
     return 1 if problems else 0
