@@ -77,7 +77,7 @@ def shared_checks(repo: pathlib.Path, kind: str, name: str) -> list[tuple[str, l
         checks.append(("actionlint (with shellcheck)", ["actionlint"]))
     lint = WORKSPACE / ".github/scripts/check_runner_labels.py"
     if lint.exists():
-        checks.append(("runner-label lint", ["uv", "run", "-q", "--with", "pyyaml", "python", str(lint), "--kind", kind,
+        checks.append(("runner-label lint", [sys.executable, str(lint), "--kind", kind,
                                              "--repo", f"OnePeek/{name}", str(repo / ".github/workflows")]))
     return checks
 
