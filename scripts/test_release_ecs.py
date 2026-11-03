@@ -643,31 +643,55 @@ class SmokeScript(unittest.TestCase):
 
 
 class Watch(unittest.TestCase):
-    def watch(self, known: str, firing: str, seconds: str):
+    def watch(self, known: str, firing: str, seconds: str, services: str = '["api", "worker"]'):
         script = step("watch", "10 minutes after stable").replace("SECONDS + 600", "SECONDS + " + seconds)
-        aws = f"""case "$*" in
-*"--state-value ALARM"*) echo "{firing}";;
-*describe-alarms*) echo "{known}";;
+        # The stub answers like AWS: only the alarms among the requested --alarm-names that exist (or are firing).
+        aws = f"""want=" $* "
+pick() {{ for a in $1; do case "$want" in *" $a "*) printf '%s\\t' "$a";; esac; done; echo; }}
+case "$*" in
+*"--state-value ALARM"*) pick "{firing}";;
+*describe-alarms*) pick "{known}";;
 esac"""
-        out, _, _, summary, _ = run_step(script, aws, extra_stubs={"sleep": "exit 0"}, with_summary=True)
-        return out, summary
+        out, calls, _, summary, _ = run_step(script, aws, extra_env={"SERVICES": services}, extra_stubs={"sleep": "exit 0"}, with_summary=True)
+        return out, calls, summary
 
     def test_no_deploy_alarm_at_all_is_a_visible_warning_not_a_silent_pass(self):
-        out, summary = self.watch("", "", "0")
+        out, _, summary = self.watch("", "", "0")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn("::warning::No alarm named onepeek-preprod-deploy-* exists", out.stdout)
+        self.assertIn("::warning::None of the deploy alarms", out.stdout)
         self.assertIn("could not detect a regression", summary)
 
+    def test_it_asks_for_exactly_the_rolled_services_two_alarms(self):
+        _, calls, _ = self.watch("", "", "0")
+        self.assertIn("--alarm-names onepeek-preprod-deploy-api-errors onepeek-preprod-deploy-api-latency "
+                      "onepeek-preprod-deploy-worker-errors onepeek-preprod-deploy-worker-latency", calls)
+        self.assertNotIn("--alarm-name-prefix", calls)
+
     def test_a_firing_alarm_fails_the_watch(self):
-        out, _ = self.watch("onepeek-preprod-deploy-api-5xx", "onepeek-preprod-deploy-api-5xx", "5")
+        out, _, _ = self.watch("onepeek-preprod-deploy-api-errors", "onepeek-preprod-deploy-api-errors", "5")
         self.assertEqual(out.returncode, 1)
-        self.assertIn("Deploy alarms firing: onepeek-preprod-deploy-api-5xx", out.stdout)
+        self.assertIn("Deploy alarms firing: onepeek-preprod-deploy-api-errors", out.stdout)
+
+    def test_another_services_alarm_does_not_fail_this_release(self):
+        # api-critical starts with api-: a prefix watch would have caught it; exact names do not.
+        other = "onepeek-preprod-deploy-api-critical-errors onepeek-preprod-deploy-web-latency"
+        out, _, _ = self.watch("onepeek-preprod-deploy-api-errors " + other, other, "5", services='["api"]')
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
     def test_existing_quiet_alarms_pass_without_a_warning(self):
-        out, summary = self.watch("onepeek-preprod-deploy-api-5xx", "", "0")
+        out, _, summary = self.watch("onepeek-preprod-deploy-api-errors", "", "0")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertNotIn("warning", out.stdout)
         self.assertEqual(summary, "")
+
+    def test_no_rolled_service_fails_instead_of_watching_nothing(self):
+        out, _, _ = self.watch("", "", "0", services="[]")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("nothing to watch", out.stdout)
+
+    def test_a_bad_service_name_is_refused(self):
+        out, _, _ = self.watch("", "", "0", services='["api; rm -rf /"]')
+        self.assertNotEqual(out.returncode, 0)
 
 
 class Assets(unittest.TestCase):
