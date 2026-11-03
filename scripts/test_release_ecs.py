@@ -642,6 +642,13 @@ class SmokeScript(unittest.TestCase):
             self.assertEqual(self.run_smoke(path)[0].returncode, 1, path)
 
 
+# The watch step uses bash 4+ (`mapfile`), as every CI runner has; macOS ships bash 3.2, so local_ci.py (§8a P5) skips
+# these on such a laptop. CI and a Linux container always run them.
+BASH4 = subprocess.run(["bash", "-c", "mapfile -t x < /dev/null"], capture_output=True).returncode == 0
+
+
+@unittest.skipUnless(BASH4 or os.environ.get("CI") == "true" and os.environ.get("GITHUB_ACTIONS") == "true",
+                     "needs bash 4+ (mapfile); this bash is older")
 class Watch(unittest.TestCase):
     def watch(self, known: str, firing: str, seconds: str, services: str = '["api", "worker"]'):
         script = step("watch", "10 minutes after stable").replace("SECONDS + 600", "SECONDS + " + seconds)

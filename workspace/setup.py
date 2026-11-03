@@ -6,7 +6,7 @@ Run once after cloning the repos side by side, and again after a repo adds a ski
     python3 .github/workspace/setup.py --check    # report what is missing or stale; exit 1 if anything is
     python3 .github/workspace/setup.py --sync-repos   # copy the shared skills and agents into every code repo
 
-Shared skills and agents (review-spec, fix-docs-gap, spec-reviewer) are written once, in .github/workspace/skills and
+Shared skills and agents (review-spec, fix-docs-gap, preflight, spec-reviewer) are written once, in .github/workspace/skills and
 .github/workspace/agents. `--sync-repos` copies them into each repo in SYNC_REPOS with a "synced" note after the front
 matter; `--check` also fails when a repo's copy differs from the shared one (edit the shared copy, then re-sync).
 
@@ -32,16 +32,17 @@ SHARED_SKILLS = HERE / "skills"
 SHARED_AGENTS = HERE / "agents"
 # Which shared skills and agents each repo carries. backend-service has its own builder (build-module,
 # module-builder); marketing-website has no LLD, so only the docs-first skill applies.
-_ALL = ("review-spec", "fix-docs-gap", "build-from-lld", "spec-reviewer", "builder")
+# Every repo carries preflight (run before every push and release, foundation-playbook §8a P4).
+_ALL = ("review-spec", "fix-docs-gap", "build-from-lld", "spec-reviewer", "builder", "preflight")
 SYNC_REPOS: dict[str, tuple[str, ...]] = {
-    "backend-service": ("review-spec", "fix-docs-gap", "spec-reviewer"),
+    "backend-service": ("review-spec", "fix-docs-gap", "spec-reviewer", "preflight"),
     "onepeek-infra": _ALL,
     "onepeek-web": _ALL,
     "onepeek-design-system": _ALL,
     "browser-extension": _ALL,
     "plugin-owl": _ALL,
     "mcp-athena": _ALL,
-    "marketing-website": ("fix-docs-gap",),
+    "marketing-website": ("fix-docs-gap", "preflight"),
 }
 NOTE = "<!-- Synced from OnePeek/.github workspace/{kind}/{name} by setup.py --sync-repos. Edit it there, not here. -->\n"
 

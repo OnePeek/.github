@@ -1,0 +1,88 @@
+# Shared: the pin check (onepeek-docs architecture/lld/infra/foundation-playbook.md §8a P2 and S4). Called by every
+# OnePeek repo on pull requests and on pushes to dev and release. Fails when the repo's OnePeek/.github pins are not
+# all the commit of one v* tag, and, on a push to dev or release or a pull request into release, when docs-version.txt
+# is not an ancestor of onepeek-docs main (pull requests into dev pin the open docs pull request's head during a
+# change set, development-cycle §2a item 2). The logic is scripts/check_pins.py at the commit the caller pins this
+# workflow to. The docs rule reads the private docs repo with the agents' App token (S6): callers pass
+# AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY; without them only that rule fails, and only when it runs.
+name: pins
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
+        type: string
+        default: github
+    secrets:
+      AGENTS_APP_CLIENT_ID:
+        description: The agents' GitHub App (playbook §8a S6), for Contents read on onepeek-docs. Needed where docs-version.txt exists.
+        required: false
+      AGENTS_APP_PRIVATE_KEY:
+        description: The agents' GitHub App private key (with AGENTS_APP_CLIENT_ID).
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  pins:
+    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: This workflow's version (the caller's pin of pins.yml)
+        id: version
+        run: |
+          sha=$(grep -rhoiE 'OnePeek/\.github/\.github/workflows/pins\.yml@[0-9a-f]{40}' .github/workflows | head -n 1 | cut -d@ -f2 || true)
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "pins.yml runs at ${sha:-this repo (a local call)}"
+
+      - name: OnePeek/.github at that version
+        if: ${{ steps.version.outputs.sha != '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OnePeek/.github
+          ref: ${{ steps.version.outputs.sha }}
+          path: _shared
+          persist-credentials: false
+
+      - name: Does this event run the docs rule
+        id: docs
+        env:
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          script=scripts/check_pins.py
+          [ -n "${SHA}" ] && script=_shared/scripts/check_pins.py
+          echo "script=${script}" >> "$GITHUB_OUTPUT"
+          echo "needed=$(python3 "${script}" --docs-needed)" >> "$GITHUB_OUTPUT"
+
+      - name: The agents' GitHub App secrets are set (the docs rule reads the private docs repo)
+        if: ${{ steps.docs.outputs.needed == 'true' && hashFiles('docs-version.txt') != '' }}
+        env:
+          HAS_APP: ${{ secrets.AGENTS_APP_CLIENT_ID != '' && secrets.AGENTS_APP_PRIVATE_KEY != '' }}
+        run: |
+          if [ "${HAS_APP}" != "true" ]; then
+            echo "::error::AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY must be passed: the docs-version.txt rule reads the private onepeek-docs repo (playbook §8a P2, S6)."
+            exit 1
+          fi
+
+      - name: The agents' GitHub App token (Contents read on onepeek-docs)
+        id: app
+        if: ${{ steps.docs.outputs.needed == 'true' && hashFiles('docs-version.txt') != '' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: onepeek-docs
+          permission-contents: read
+
+      - name: Pins are one tagged version; docs-version.txt is on docs main
+        env:
+          SCRIPT: ${{ steps.docs.outputs.script }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 "${SCRIPT}" . --docs auto

@@ -1,0 +1,93 @@
+# Shared: declared dependencies (onepeek-docs architecture/lld/infra/foundation-playbook.md §8a P1, lesson L26). Every
+# repo's pull-request workflow runs this first and every other job `needs:` it, so no runner time is spent on a run
+# whose result is already known. It fails with "waiting for <repo>#<n>" while a pull request named in the body by a
+# `Depends on: OnePeek/<repo>#<n>` line is unmerged. Callers trigger on pull_request types opened, edited, reopened
+# and synchronize, so editing the lines re-evaluates it; ship_change_set.py re-runs it after merging the dependency.
+# Cross-repo reads use the agents' App token (S6): callers pass AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY; they
+# are needed only when the body has such a line. The logic is scripts/check_depends_on.py at the caller's pin.
+name: depends-on
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
+        type: string
+        default: github
+    secrets:
+      AGENTS_APP_CLIENT_ID:
+        description: The agents' GitHub App (playbook §8a S6), for Pull requests read on the repos the body names.
+        required: false
+      AGENTS_APP_PRIVATE_KEY:
+        description: The agents' GitHub App private key (with AGENTS_APP_CLIENT_ID).
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  depends-on:
+    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows
+            scripts
+
+      - name: This workflow's version (the caller's pin of depends-on.yml)
+        id: version
+        run: |
+          sha=$(grep -rhoiE 'OnePeek/\.github/\.github/workflows/depends-on\.yml@[0-9a-f]{40}' .github/workflows | head -n 1 | cut -d@ -f2 || true)
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "depends-on.yml runs at ${sha:-this repo (a local call)}"
+
+      - name: OnePeek/.github at that version
+        if: ${{ steps.version.outputs.sha != '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OnePeek/.github
+          ref: ${{ steps.version.outputs.sha }}
+          path: _shared
+          persist-credentials: false
+
+      - name: The repos the body names
+        id: deps
+        env:
+          SHA: ${{ steps.version.outputs.sha }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          script=scripts/check_depends_on.py
+          [ -n "${SHA}" ] && script=_shared/scripts/check_depends_on.py
+          echo "script=${script}" >> "$GITHUB_OUTPUT"
+          echo "repos=$(python3 "${script}" --repos)" >> "$GITHUB_OUTPUT"
+
+      - name: The agents' GitHub App secrets are set (a dependency in another repo is read with them)
+        if: ${{ steps.deps.outputs.repos != '' }}
+        env:
+          HAS_APP: ${{ secrets.AGENTS_APP_CLIENT_ID != '' && secrets.AGENTS_APP_PRIVATE_KEY != '' }}
+        run: |
+          if [ "${HAS_APP}" != "true" ]; then
+            echo "::error::AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY must be passed: the Depends on lines name pull requests in other repos (playbook §8a P1, S6)."
+            exit 1
+          fi
+
+      - name: The agents' GitHub App token (Pull requests read on the named repos)
+        id: app
+        if: ${{ steps.deps.outputs.repos != '' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.deps.outputs.repos }}
+          permission-pull-requests: read
+
+      - name: Every declared dependency is merged
+        env:
+          SCRIPT: ${{ steps.deps.outputs.script }}
+          BODY: ${{ github.event.pull_request.body }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 "${SCRIPT}" --check

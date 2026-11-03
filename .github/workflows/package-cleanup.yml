@@ -1,0 +1,124 @@
+# Shared: delete old prerelease versions of this repo's @onepeek/* npm packages (onepeek-docs
+# architecture/lld/infra/foundation-playbook.md §8a C3). Run weekly, and as a dry run on pull requests, in each publishing
+# repo (backend-service for api-client, onepeek-design-system for tokens and ui), so the caller's own GITHUB_TOKEN owns
+# what it deletes. Deletes `<x.y.z>-next.*` snapshots (api-client.md, design-system.md) and `0.0.0-pr<N>.*` previews
+# older than 30 days, keeping the latest 10 of each kind per package; released versions are never touched. Any API error,
+# a 403 included, fails the run: a permission change is visible, never a silent skip. The one exception: a 404 when
+# listing a package's versions means it is not published yet, which is a notice, not a failure.
+# Callers grant `packages: write` (and `contents: read`) to the calling job.
+name: package-cleanup
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
+        type: string
+        default: github
+      packages:
+        description: "Space-separated npm package names in the organisation, without the scope (api-client; tokens ui)."
+        type: string
+        required: true
+      dry-run:
+        description: "true: list what would be deleted, delete nothing. Pull requests are always a dry run."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Delete old snapshots and previews (keep the latest 10 of each kind)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PACKAGES: ${{ inputs.packages }}
+          DRY_RUN: ${{ inputs.dry-run || github.event_name == 'pull_request' }}
+        run: |
+          python3 - <<'PY'
+          import datetime, json, os, re, sys, urllib.error, urllib.request
+
+          KINDS = {"snapshot": re.compile(r"^\d+\.\d+\.\d+-next\."), "preview": re.compile(r"^0\.0\.0-pr\d+\.")}
+          KEEP = 10
+          MAX_AGE = datetime.timedelta(days=30)
+          API = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+
+
+          def kind(version):
+              return next((k for k, rx in KINDS.items() if rx.match(version)), None)
+
+
+          def created(v):
+              return datetime.datetime.fromisoformat(v["created_at"].replace("Z", "+00:00"))
+
+
+          def plan(versions, now):
+              """The versions to delete: per kind, all but the latest KEEP, and only those older than MAX_AGE."""
+              by_kind = {}
+              for v in versions:
+                  k = kind(v["name"])
+                  if k:
+                      by_kind.setdefault(k, []).append(v)
+              out = []
+              for k in sorted(by_kind):
+                  newest_first = sorted(by_kind[k], key=created, reverse=True)
+                  out += [v for v in newest_first[KEEP:] if now - created(v) > MAX_AGE]
+              return out
+
+
+          class NotFound(Exception):
+              pass
+
+
+          def call(method, path, missing_ok=False):
+              req = urllib.request.Request(f"{API}{path}", method=method, headers={
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}", "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28"})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      body = r.read()
+                      return json.loads(body) if body else None
+              except urllib.error.HTTPError as e:
+                  if e.code == 404 and missing_ok:
+                      raise NotFound(path) from None
+                  hint = " (the token lacks access to this package: grant this repo admin on it, or packages: write)" if e.code == 403 else ""
+                  sys.exit(f"::error::{method} {path}: HTTP {e.code}{hint}")
+
+
+          def versions(owner, pkg):
+              out, page = [], 1
+              while True:
+                  batch = call("GET", f"/orgs/{owner}/packages/npm/{pkg}/versions?per_page=100&page={page}", missing_ok=page == 1)
+                  out += batch
+                  if len(batch) < 100:
+                      return out
+                  page += 1
+
+
+          def main():
+              owner, dry = os.environ["OWNER"], os.environ["DRY_RUN"] == "true"
+              now = datetime.datetime.now(datetime.timezone.utc)
+              for pkg in os.environ["PACKAGES"].split():
+                  try:
+                      found = versions(owner, pkg)
+                  except NotFound:
+                      print(f"::notice::@{owner.lower()}/{pkg} is not published yet (HTTP 404): nothing to clean up")
+                      continue
+                  doomed = plan(found, now)
+                  print(f"@{owner.lower()}/{pkg}: {len(doomed)} version(s) to delete{' (dry run)' if dry else ''}")
+                  for v in doomed:
+                      print(f"  {'would delete' if dry else 'delete'} {v['name']} ({v['created_at']})")
+                      if not dry:
+                          call("DELETE", f"/orgs/{owner}/packages/npm/{pkg}/versions/{v['id']}")
+
+
+          if __name__ == "__main__":
+              main()
+          PY

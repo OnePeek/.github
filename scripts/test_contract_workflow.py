@@ -122,14 +122,54 @@ class OtherRef(unittest.TestCase):
     def test_event_inputs_never_inline_into_the_script(self):
         self.assertNotIn("${{", step("The other repos' ref")["run"])
 
-    def test_every_other_repo_is_checked_out_at_its_own_ref_with_the_read_token(self):
+    def test_every_other_repo_is_checked_out_at_its_own_ref_with_the_app_token_or_the_fallback(self):
         refs = {"onepeek-infra": "infra", "backend-service": "backend", "onepeek-web": "web"}
         for s in STEPS:
             if "repository" in s.get("with", {}):
                 repo = s["with"]["repository"].split("/")[-1]
                 self.assertEqual(s["with"]["ref"], "${{ steps.ref.outputs." + refs[repo] + " }}")
-                self.assertEqual(s["with"]["token"], "${{ secrets.ORG_READ_TOKEN }}")
+                self.assertEqual(s["with"]["token"], "${{ steps.app.outputs.token || secrets.ORG_READ_TOKEN }}")
                 self.assertFalse(s["with"]["persist-credentials"])
+
+
+class AppToken(unittest.TestCase):
+    """Playbook §8a S6: the App token, scoped to the repos the job names; ORG_READ_TOKEN only as a fallback."""
+
+    def test_the_app_token_names_the_three_repos_with_contents_and_pull_requests_read(self):
+        app = next(s for s in STEPS if s.get("id") == "app")
+        self.assertEqual(app["with"]["repositories"], "backend-service,onepeek-web,onepeek-infra")
+        self.assertEqual((app["with"]["permission-contents"], app["with"]["permission-pull-requests"]), ("read", "read"))
+        self.assertEqual(app["if"], "${{ steps.tokens.outputs.app == 'true' }}")
+        self.assertEqual(step("The other repos' ref")["env"]["GH_TOKEN"], "${{ steps.app.outputs.token || secrets.ORG_READ_TOKEN }}")
+
+    def test_the_secrets_are_optional_so_callers_on_either_keep_working(self):
+        secrets = DOC["on"]["workflow_call"]["secrets"] if "on" in DOC else DOC[True]["workflow_call"]["secrets"]
+        self.assertEqual({k: v["required"] for k, v in secrets.items()},
+                         {"AGENTS_APP_CLIENT_ID": False, "AGENTS_APP_PRIVATE_KEY": False, "ORG_READ_TOKEN": False})
+
+    def test_no_token_fails_the_app_wins_and_the_fallback_warns(self):
+        out, _ = run("A token to read the other repos", {"HAS_APP": "false", "HAS_ORG_READ_TOKEN": "false"})
+        self.assertEqual(out.returncode, 1)
+        out, output = run("A token to read the other repos", {"HAS_APP": "true", "HAS_ORG_READ_TOKEN": "true"})
+        self.assertEqual((out.returncode, output.strip()), (0, "app=true"))
+        self.assertNotIn("deprecated", out.stdout)
+        out, output = run("A token to read the other repos", {"HAS_APP": "false", "HAS_ORG_READ_TOKEN": "true"})
+        self.assertEqual((out.returncode, output.strip()), (0, "app=false"))
+        self.assertIn("ORG_READ_TOKEN is deprecated", out.stdout)
+
+
+class ServiceListJob(unittest.TestCase):
+    """workflow-lint.yml service-list reads onepeek-infra with the App token (S6); its last step runs locally (P5)."""
+
+    def test_infra_is_read_with_the_app_token_or_the_fallback_and_the_drift_step_needs_no_secret(self):
+        steps = yaml.safe_load((WORKFLOW.parent / "workflow-lint.yml").read_text(encoding="utf-8"))["jobs"]["service-list"]["steps"]
+        app = next(s for s in steps if s.get("id") == "app")
+        self.assertEqual((app["with"]["repositories"], app["with"]["permission-contents"]), ("onepeek-infra", "read"))
+        infra = next(s for s in steps if (s.get("with") or {}).get("path") == "_infra")
+        self.assertEqual(infra["with"]["token"], "${{ steps.app.outputs.token || secrets.ORG_READ_TOKEN }}")
+        last = steps[-1]
+        self.assertNotIn("secrets.", str(last))
+        self.assertIn("_infra/config/services.preprod.yaml", last["run"])
 
 
 class Sides(unittest.TestCase):
