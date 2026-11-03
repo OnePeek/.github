@@ -91,7 +91,7 @@ class SignOnce(unittest.TestCase):
 
     def signing(self, aws):
         script = re.sub(r"^.*(curl|grep |tar -xzf|\./syft).*$", "", self.script, flags=re.M)
-        return run_step(script, aws, {"SIGNING_KEY": "k"}, {"digest-backend.txt": f"backend={DIGEST}\n", "sbom.spdx.json": "{}"})
+        return run_step(script, aws, {"SIGNING_KEY": "k", "RUNNER_ARCH": "X64"}, {"digest-backend.txt": f"backend={DIGEST}\n", "sbom.spdx.json": "{}"})
 
     def test_a_reused_image_is_not_signed_again(self):
         out, calls, _ = self.signing(aws_stub(IN_ECR))
@@ -103,6 +103,40 @@ class SignOnce(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("cosign sign", calls)
         self.assertIn("cosign attest", calls)
+
+
+class ArchitectureAwareTools(unittest.TestCase):
+    """ci-runners.md section 5.3: tool downloads follow runner.arch, both SHA-256 values pinned; QEMU only off ARM64."""
+    text = (WORKFLOWS / "release-ecs.yml").read_text(encoding="utf-8")
+
+    def test_syft_has_both_pinned_checksums_and_no_downloaded_checksum_file(self):
+        self.assertIn("syft_1.55.0_linux_${syft_arch}.tar.gz", self.text)
+        for sha in ("bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d",
+                    "929bd163db2d7cd2255d3bcb8967208079813d7b46b0c952f7b794d8e2c7d304"):
+            self.assertIn(sha, self.text)
+        self.assertNotIn("syft.checksums", self.text)
+
+    def test_syft_asset_follows_the_architecture_and_unknown_stops(self):
+        script = re.sub(r"^.*\./syft.*$", "", step("sbom-sign", "Syft SPDX SBOM"), flags=re.M)
+        files = {"digest-backend.txt": f"backend={DIGEST}\n", "sbom.spdx.json": "{}"}
+        for arch, asset, rc in (("X64", "linux_amd64", 0), ("ARM64", "linux_arm64", 0), ("RISCV", "", 1)):
+            out, calls, _ = run_step(script, aws_stub(IN_ECR), {"SIGNING_KEY": "k", "RUNNER_ARCH": arch}, files)
+            self.assertEqual(out.returncode, rc, (arch, out.stdout, out.stderr))
+            if asset:
+                self.assertIn(asset, calls)
+            else:
+                self.assertNotIn("curl", calls)
+
+    def test_qemu_runs_only_off_arm64(self):
+        for name in ("release-ecs.yml", "deploy-ecs.yml"):
+            doc = yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))
+            found = 0
+            for job in doc["jobs"].values():
+                for st in job.get("steps", []):
+                    if "setup-qemu-action" in st.get("uses", ""):
+                        found += 1
+                        self.assertIn("runner.arch != 'ARM64'", st["if"], name)
+            self.assertGreaterEqual(found, 1, name)
 
 
 class NoRecordOnly(unittest.TestCase):

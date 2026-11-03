@@ -1,0 +1,8 @@
+# Jobs that can obtain a prod credential. They always run on GitHub-hosted runners: `runs-on: ubuntu-latest`,
+# whatever the RUNNER variable says (onepeek-docs architecture/lld/infra/ci-runners.md sections 5.3, 5.4 rule 2, 11.3).
+# One list for every OnePeek repo; scripts/check_runner_labels.py reads it. Each entry names the repo, the workflow
+# file and the job id, for example:
+#   - {repo: OnePeek/onepeek-infra, workflow: promote.yml, job: promote}
+# Empty today: no prod role exists yet. Prod-capable jobs in the shared workflows choose GitHub-hosted themselves
+# when their `environment` input is `prod`. At the end of the interim (section 16) the preprod-privileged jobs join this list.
+jobs: []

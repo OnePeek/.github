@@ -24,10 +24,16 @@ jobs:
       - name: Install actionlint (pinned, checksum verified)
         env:
           VERSION: 1.7.12
-          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          SHA256_AMD64: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          SHA256_ARM64: 325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6
         run: |
-          curl -sSfL -o actionlint.tar.gz "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
-          echo "${SHA256}  actionlint.tar.gz" | sha256sum -c -
+          case "${RUNNER_ARCH}" in
+            X64) asset=linux_amd64; sha="${SHA256_AMD64}" ;;
+            ARM64) asset=linux_arm64; sha="${SHA256_ARM64}" ;;
+            *) echo "::error::Unsupported runner architecture ${RUNNER_ARCH}."; exit 1 ;;
+          esac
+          curl -sSfL -o actionlint.tar.gz "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_${asset}.tar.gz"
+          echo "${sha}  actionlint.tar.gz" | sha256sum -c -
           tar -xzf actionlint.tar.gz actionlint
 
       - name: Lint workflows
@@ -45,6 +51,20 @@ jobs:
           persist-credentials: false
       - name: Security lint of the workflows
         run: pip install --quiet zizmor==1.31.1 && zizmor --no-progress --min-severity medium .github/workflows
+
+  runner-labels:
+    # ci-runners.md section 5.4: where jobs may run (the rules, with a fixture each, are in scripts/test_check_runner_labels.py).
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Runner label rules (public repo)
+        run: |
+          pip install --quiet pyyaml==6.0.3
+          python scripts/check_runner_labels.py --kind public --repo OnePeek/.github \
+            --list .github/workflow-lint/github-only-jobs.yaml .github/workflows
 
   service-list:
     # operate.yml's service choices must equal the services file; the render function must match release-ecs.yml.
