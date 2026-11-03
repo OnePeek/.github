@@ -4,13 +4,17 @@
 # watch, rollback (only on failure), tag-notify, api-client. Nobody deploys from a laptop.
 #
 # Provisional (delivery-pipelines §16 "Decided before building"): ARM64 images are built with QEMU on GitHub's
-# standard runners (Q1); team notices go to the release page and its email notifications (Q2).
+# standard runners (Q1), natively on ARM64 runners when the runner input picks them (ci-runners.md section 5.3); team notices go to the release page and its email notifications (Q2).
 # `dry-run: true` (§15) renders every task definition and checks every signature, and changes nothing.
 name: release-ecs
 
 on:
   workflow_call:
     inputs:
+      runner:
+        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
+        type: string
+        default: github
       environment:
         description: Environment; resources are named onepeek-<environment>.
         type: string
@@ -71,7 +75,7 @@ env:
 
 jobs:
   version:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -113,9 +117,11 @@ jobs:
           { echo "version=${version}"; echo "images=${images}"; } >> "$GITHUB_OUTPUT"
 
   build:
+    # arm-build class: the hosted fallback stays ubuntu-latest with QEMU (today's behaviour) instead of ubuntu-24.04-arm
+    # until hosted ARM is proven on a private repo (ci-runners.md section 5.3 lists ubuntu-24.04-arm).
     needs: version
     if: ${{ !inputs.dry-run }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -136,6 +142,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        if: ${{ runner.arch != 'ARM64' }}
         with:
           platforms: arm64
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -202,7 +209,7 @@ jobs:
   scan:
     needs: [version, build]
     if: ${{ !inputs.dry-run }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -252,7 +259,7 @@ jobs:
   sbom-sign:
     needs: [version, build, scan]
     if: ${{ !inputs.dry-run }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -282,9 +289,14 @@ jobs:
           digest=$(cut -d= -f2 "digest-${IMAGE}.txt")
           ref="${registry}/${NAME}/${IMAGE}@${digest}"
           aws ecr get-login-password | docker login --username AWS --password-stdin "${registry}"
-          curl -sSfL -o syft.tgz "https://github.com/anchore/syft/releases/download/v1.55.0/syft_1.55.0_linux_amd64.tar.gz"
-          curl -sSfL -o syft.checksums "https://github.com/anchore/syft/releases/download/v1.55.0/syft_1.55.0_checksums.txt"
-          grep " syft_1.55.0_linux_amd64.tar.gz$" syft.checksums | sed 's/  / /' | awk '{print $1"  syft.tgz"}' | sha256sum -c -
+          # Pinned by architecture (both SHA-256 values; syft v1.55.0): the runner may be x64 or ARM64.
+          case "${RUNNER_ARCH}" in
+            X64) syft_arch=amd64; syft_sha=bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d ;;
+            ARM64) syft_arch=arm64; syft_sha=929bd163db2d7cd2255d3bcb8967208079813d7b46b0c952f7b794d8e2c7d304 ;;
+            *) echo "::error::Unsupported runner architecture ${RUNNER_ARCH}."; exit 1 ;;
+          esac
+          curl -sSfL -o syft.tgz "https://github.com/anchore/syft/releases/download/v1.55.0/syft_1.55.0_linux_${syft_arch}.tar.gz"
+          echo "${syft_sha}  syft.tgz" | sha256sum -c -
           tar -xzf syft.tgz syft
           ./syft "registry:${ref}" -o spdx-json=sbom.spdx.json
           # A reused image was signed and attested before its digest was recorded; record-digest verifies the signature again.
@@ -311,7 +323,7 @@ jobs:
     # digests; in a dry run they are simply the digests of the latest release. Nothing is registered here.
     needs: [version, build, scan, sbom-sign]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -378,7 +390,7 @@ jobs:
   migrate:
     needs: [version, record-digest, db-bootstrap]
     if: ${{ !cancelled() && needs.record-digest.result == 'success' && inputs.migrate && (needs.db-bootstrap.result == 'success' || inputs.dry-run) }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -458,7 +470,7 @@ jobs:
     # UC-DEL-005: between sbom-sign and rollout. The files are the exact bytes of the built image.
     needs: [version, record-digest]
     if: ${{ !cancelled() && needs.record-digest.result == 'success' && inputs.assets }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -512,7 +524,7 @@ jobs:
   rollout:
     needs: [version, record-digest, db-bootstrap, migrate, assets]
     if: ${{ !cancelled() && needs.record-digest.result == 'success' && !contains(needs.*.result, 'failure') }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -538,7 +550,7 @@ jobs:
           "${RUNNER_TEMP}/tools/bin/pip" install --quiet pyyaml==6.0.3 uv==0.9.7
           echo "${RUNNER_TEMP}/tools/bin" >> "$GITHUB_PATH"
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-        if: ${{ inputs.image == 'backend' }}
+        if: ${{ inputs.image == 'backend' && runner.arch != 'ARM64' }}
         with:
           platforms: arm64
       - name: The services file's services for this image, for E7
@@ -696,7 +708,7 @@ jobs:
     # 6b. The ops family only. Nothing is run. migrate is registered in its own job, db-bootstrap by infra's db-bootstrap workflow (4b), db-rotate only by ci-apply.
     needs: [version, record-digest, rollout]
     if: ${{ !cancelled() && needs.rollout.result == 'success' && inputs.image == 'backend' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -763,7 +775,7 @@ jobs:
   smoke:
     needs: [version, record-digest, rollout, register-one-offs]
     if: ${{ !cancelled() && !inputs.dry-run && needs.rollout.result == 'success' && !contains(needs.*.result, 'failure') }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -797,7 +809,7 @@ jobs:
   watch:
     needs: [version, rollout, smoke]
     if: ${{ !cancelled() && needs.smoke.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
     timeout-minutes: 12
     permissions:
       contents: read
@@ -821,7 +833,7 @@ jobs:
   rollback:
     needs: [version, record-digest, rollout, register-one-offs, smoke, watch]
     if: ${{ always() && !inputs.dry-run && (needs.rollout.result == 'failure' || needs.register-one-offs.result == 'failure' || needs.smoke.result == 'failure' || needs.watch.result == 'failure') }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -863,7 +875,7 @@ jobs:
   tag-notify:
     needs: [version, record-digest, rollout, smoke, watch]
     if: ${{ !cancelled() && !inputs.dry-run && needs.watch.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: write
@@ -895,7 +907,7 @@ jobs:
     # Backend only: publish @onepeek/api-client, generated from the committed OpenAPI file, to GitHub Packages.
     needs: [version, tag-notify]
     if: ${{ !cancelled() && !inputs.dry-run && inputs.image == 'backend' && needs.tag-notify.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 15
     permissions:
       contents: read

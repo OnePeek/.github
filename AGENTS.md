@@ -8,6 +8,7 @@ OnePeek's organisation-wide GitHub files: the shared CI workflows, the pull requ
 
 ## Layout
 - `.github/workflows/`: shared reusable workflows (`secret-scan`, `python-checks`, `node-checks`, `terraform-checks`, `release-tag`, and `contract`, the contract between repos of decision 153) that every repo calls as `OnePeek/.github/.github/workflows/<name>.yml@<commit SHA>`. Every action is pinned to a commit SHA; downloaded tools are pinned and checksum-verified. Rules: `onepeek-docs/standards/branching-and-delivery.md`.
+- **Runners.** Every reusable workflow takes `runner` (`onepeek`, `canary` or `github`, default `github`) and maps it, with the job's class, to `runs-on` itself; callers pass `runner: ${{ vars.RUNNER || 'github' }}` and never a label. Jobs that can hold a prod credential stay GitHub-hosted. `scripts/check_runner_labels.py` enforces the rules (`onepeek-docs` `architecture/lld/infra/ci-runners.md` §5.3-5.4); the prod-privileged job list is `.github/workflow-lint/github-only-jobs.yaml`.
 - `PULL_REQUEST_TEMPLATE.md`: what changed, why, the docs link and how it was tested.
 - `CONTRIBUTING.md` and `SECURITY.md`: how to contribute and how to report a vulnerability.
 - `profile/`: the organisation's public profile page.
