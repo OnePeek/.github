@@ -3,10 +3,10 @@
 # Called by backend-service, onepeek-web and onepeek-infra on pull requests into dev and release. Real code against real
 # files: the backend's `app check services` and settings loader against infra's config/services.<env>.yaml and published
 # settings, and web's start-up loader against the same settings. The calling repo is taken at the pull request; the other
-# repos at dev for a pull request into dev and, for a release pull request too (it is dev to release, so their dev is the
-# release candidate; never the stale release branch), and at release for a hotfix/* pull request into release, so what
-# is checked is what ships together. The checks themselves live in one place,
-# onepeek-infra's scripts/contract.py.
+# repos at dev for a pull request into dev; for a release pull request, at their release candidate: the head commit of
+# their open dev -> release pull request, else their release branch (delivery-pipelines §6.1), so what is checked is the
+# exact version that ships; and at release for a hotfix/* pull request into release. The checks themselves live in one
+# place, onepeek-infra's scripts/contract.py.
 name: contract
 
 on:
@@ -26,7 +26,7 @@ on:
         required: true
     secrets:
       ORG_READ_TOKEN:
-        description: Fine-grained token with Contents read on backend-service, onepeek-web and onepeek-infra.
+        description: Fine-grained token with Contents read and Pull requests read on backend-service, onepeek-web and onepeek-infra (a release pull request reads the other repos' open release pull requests).
         required: true
 
 permissions:
@@ -37,22 +37,40 @@ jobs:
     runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
-      - name: The other repos' ref (dev, or release for a hotfix pull request into release)
+      - name: The other repos' ref (dev; the release candidate for a release pull request; release for a hotfix)
         id: ref
         env:
           ROLE: ${{ inputs.role }}
           BASE_REF: ${{ inputs.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
+          OWNER: ${{ github.repository_owner }}
+          GH_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
         run: |
           case "${ROLE}" in backend|web|infra) ;; *) echo "::error::role must be backend, web or infra, not '${ROLE}'."; exit 1 ;; esac
           case "${BASE_REF}" in dev|release) ;; *) echo "::error::base_ref must be dev or release, not '${BASE_REF}'."; exit 1 ;; esac
-          # Release pull requests are dev to release, so every other repo's release candidate is its dev (never the
-          # stale release branch). A hotfix pull request into release ships against what is live, so it is checked
-          # against the other repos' release.
-          ref=dev
-          if [ "${BASE_REF}" = release ] && [[ "${HEAD_REF}" == hotfix/* ]]; then ref=release; fi
           for side in backend web infra; do
             [ "${side}" = "${ROLE}" ] && continue
+            case "${side}" in backend) repo=backend-service ;; web) repo=onepeek-web ;; infra) repo=onepeek-infra ;; esac
+            if [ "${BASE_REF}" = dev ]; then
+              ref=dev
+            elif [[ "${HEAD_REF}" == hotfix/* ]]; then
+              ref=release   # a hotfix ships against what is live
+            else
+              # The release candidate (delivery-pipelines §6.1): the head commit of the open dev -> release pull request,
+              # which is exactly what its promotion ships, else the release branch, which is what runs. Fails closed.
+              if ! heads=$(gh api "repos/${OWNER}/${repo}/pulls?state=open&base=release&head=${OWNER}:dev" --jq '.[].head.sha'); then
+                echo "::error::Cannot read ${repo}'s open pull requests into release, so its release candidate is unknown."
+                exit 1
+              fi
+              if [ -z "${heads}" ]; then
+                ref=release
+              elif [[ "${heads}" =~ ^[0-9a-f]{40}$ ]]; then   # one line only: =~ anchors to the whole value
+                ref="${heads}"
+              else
+                echo "::error::${repo}: expected at most one open dev -> release pull request with a commit SHA, got: ${heads}"
+                exit 1
+              fi
+            fi
             echo "${side} is taken at ${ref}"
             echo "${side}=${ref}" >> "$GITHUB_OUTPUT"
           done

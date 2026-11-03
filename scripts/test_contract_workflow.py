@@ -3,6 +3,7 @@ Run: python -m unittest discover -s scripts -p 'test_*.py'"""
 
 import os
 import re
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -29,11 +30,17 @@ def condition(s: dict, role: str) -> bool:
     return (role == match.group(2)) == (match.group(1) == "==")
 
 
-def run(name: str, env: dict[str, str]) -> tuple[subprocess.CompletedProcess[str], str]:
+def run(name: str, env: dict[str, str], gh: str = "echo gh must not be called >&2; exit 9") -> tuple[subprocess.CompletedProcess[str], str]:
+    """Runs a step with a stub `gh` (its calls are appended to <tmp>/calls; the body sees "$*")."""
     with tempfile.TemporaryDirectory() as d:
         output = Path(d, "output")
+        stub = Path(d, "gh")
+        stub.write_text(f'#!/bin/bash\necho "gh $*" >> "{d}/calls"\n{gh}\n')
+        stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
         out = subprocess.run(["bash", "-eo", "pipefail", "-c", step(name)["run"]], capture_output=True, text=True,
-                             env={**os.environ, **env, "GITHUB_OUTPUT": str(output)})  # fmt: skip
+                             env={**os.environ, **env, "OWNER": "OnePeek", "GITHUB_OUTPUT": str(output), "PATH": f"{d}:{os.environ['PATH']}"})  # fmt: skip
+        calls = Path(d, "calls")
+        out.calls = calls.read_text() if calls.exists() else ""  # type: ignore[attr-defined]
         return out, output.read_text() if output.exists() else ""
 
 
@@ -47,9 +54,19 @@ def checkouts(role: str) -> dict[str, str]:
     return found
 
 
-def resolve(role: str, base: str, head: str = "feature/x") -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
-    out, output = run("The other repos' ref", {"ROLE": role, "BASE_REF": base, "HEAD_REF": head})
+def resolve(role: str, base: str, head: str = "feature/x", gh: str | None = None) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+    out, output = run("The other repos' ref", {"ROLE": role, "BASE_REF": base, "HEAD_REF": head}, *([gh] if gh else []))
     return out, dict(line.split("=", 1) for line in output.split())
+
+
+SHA_BACKEND, SHA_WEB, SHA_INFRA = "b" * 40, "c" * 40, "d" * 40
+# Open dev -> release pull requests: backend and infra have one, web has none.
+OPEN_RELEASE_PRS = f"""case "$*" in
+*repos/OnePeek/backend-service/pulls?state=open\\&base=release\\&head=OnePeek:dev*) echo {SHA_BACKEND};;
+*repos/OnePeek/onepeek-infra/pulls?state=open\\&base=release\\&head=OnePeek:dev*) echo {SHA_INFRA};;
+*repos/OnePeek/onepeek-web/pulls?state=open\\&base=release\\&head=OnePeek:dev*) ;;
+*) echo "unexpected: $*" >&2; exit 9;;
+esac"""
 
 
 class OtherRef(unittest.TestCase):
@@ -58,11 +75,39 @@ class OtherRef(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(refs, {"backend": "dev", "web": "dev"})
 
-    def test_a_release_pull_request_checks_the_other_repos_at_dev_never_release(self):
-        for role, others in (("infra", {"backend", "web"}), ("backend", {"web", "infra"}), ("web", {"backend", "infra"})):
-            out, refs = resolve(role, "release", "dev")
-            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-            self.assertEqual(refs, {o: "dev" for o in others})
+    def test_a_release_pull_request_checks_each_other_repo_at_the_head_of_its_open_release_pull_request(self):
+        # delivery-pipelines §6.1: the release candidate is the exact commit that repo's promotion ships, never a moving dev.
+        out, refs = resolve("web", "release", "dev", OPEN_RELEASE_PRS)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(refs, {"backend": SHA_BACKEND, "infra": SHA_INFRA})
+        self.assertEqual(resolve("backend", "release", "dev", OPEN_RELEASE_PRS)[1], {"web": "release", "infra": SHA_INFRA})
+
+    def test_a_repo_with_no_open_release_pull_request_is_checked_at_release_what_runs(self):
+        out, refs = resolve("infra", "release", "dev", OPEN_RELEASE_PRS)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(refs, {"backend": SHA_BACKEND, "web": "release"})
+        self.assertNotIn("dev", refs.values())
+
+    def test_only_the_dev_head_counts_as_the_release_candidate(self):
+        out, _ = resolve("infra", "release", "dev", OPEN_RELEASE_PRS)
+        self.assertEqual(out.calls.count("base=release&head=OnePeek:dev"), 2, out.calls)  # type: ignore[attr-defined]
+
+    def test_an_unreadable_pull_request_list_fails_closed(self):
+        out, refs = resolve("infra", "release", "dev", 'echo "HTTP 403: Resource not accessible" >&2; exit 1')
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("release candidate is unknown", out.stdout)
+        self.assertEqual(refs, {})
+
+    def test_anything_but_one_commit_sha_fails_closed(self):
+        for answer in ("echo " + SHA_BACKEND + "; echo " + SHA_WEB, "echo main"):
+            out, _ = resolve("infra", "release", "dev", answer)
+            self.assertEqual(out.returncode, 1, answer)
+
+    def test_pull_requests_into_dev_never_ask_github(self):
+        out, refs = resolve("backend", "dev")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(refs, {"web": "dev", "infra": "dev"})
+        self.assertEqual(out.calls, "")  # type: ignore[attr-defined]
 
     def test_a_hotfix_pull_request_into_release_checks_the_other_repos_at_release(self):
         self.assertEqual(resolve("infra", "release", "hotfix/fix-x")[1], {"backend": "release", "web": "release"})

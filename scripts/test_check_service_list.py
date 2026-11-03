@@ -4,15 +4,18 @@ from pathlib import Path
 
 import check_service_list as c
 
-BLOCK = "          # --- render-taskdef begin (x) ---\n          render() { :; }\n          # --- render-taskdef end ---\n"
+LOCK = "          # --- release-lock begin (x) ---\n          lock_take() { :; }\n          # --- release-lock end ---\n"
+BLOCK = "          # --- render-taskdef begin (x) ---\n          render() { :; }\n          # --- render-taskdef end ---\n" + LOCK + LOCK
 OPERATE = "on:\n  options:\n    # service-list begin\n    options: [all, api]\n    # service-list end\n" + BLOCK
 SERVICES = "services:\n  api: {triggers: [request]}\n  migrate: {triggers: [migration]}\n"
 
 
 class T(unittest.TestCase):
-    def run_check(self, operate, release=BLOCK, services=SERVICES, *extra):
+    def run_check(self, operate, release=BLOCK, services=SERVICES, *extra, lock=LOCK):
         with tempfile.TemporaryDirectory() as d:
             w = Path(d)
+            if lock is not None:
+                (w / "release-lock.yml").write_text(lock)
             (w / "operate.yml").write_text(operate)
             (w / "release-ecs.yml").write_text(release)
             (w / "s.yaml").write_text(services)
@@ -25,7 +28,19 @@ class T(unittest.TestCase):
         self.assertEqual(self.run_check(OPERATE, services=SERVICES + "  web: {triggers: [request]}\n"), 1)
 
     def test_render_function_differs(self):
-        self.assertEqual(self.run_check(OPERATE, release=BLOCK.replace(":;", "echo;")), 1)
+        self.assertEqual(self.run_check(OPERATE, release=BLOCK.replace("render() { :; }", "render() { echo; }")), 1)
+
+    def test_lock_functions_differ(self):
+        # One lock (foundation-playbook §5.4): a lock or unlock job with its own copy of the functions is refused.
+        self.assertEqual(self.run_check(OPERATE, release=BLOCK.replace(LOCK, LOCK.replace(":;", "echo;"), 1)), 1)
+        self.assertEqual(self.run_check(OPERATE.replace(LOCK, LOCK.replace(":;", "echo;"), 1)), 1)
+
+    def test_a_missing_lock_block_is_refused(self):
+        self.assertEqual(self.run_check(OPERATE, release=BLOCK.replace(LOCK, "", 1)), 1)
+        self.assertEqual(self.run_check(OPERATE, lock=None), 1)
+
+    def test_the_shared_lock_workflow_must_match(self):
+        self.assertEqual(self.run_check(OPERATE, lock=LOCK.replace(":;", "echo;")), 1)
 
 
 if __name__ == "__main__":
