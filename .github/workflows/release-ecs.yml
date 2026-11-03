@@ -75,7 +75,7 @@ env:
 
 jobs:
   version:
-    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -117,9 +117,11 @@ jobs:
           { echo "version=${version}"; echo "images=${images}"; } >> "$GITHUB_OUTPUT"
 
   build:
+    # arm-build class: the hosted fallback stays ubuntu-latest with QEMU (today's behaviour) instead of ubuntu-24.04-arm
+    # until hosted ARM is proven on a private repo (ci-runners.md section 5.3 lists ubuntu-24.04-arm).
     needs: version
     if: ${{ !inputs.dry-run }}
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 20
     permissions:
       contents: read

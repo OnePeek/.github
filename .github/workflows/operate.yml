@@ -69,6 +69,8 @@ env:
 
 jobs:
   operate:
+    # The real prod control is the prod role's trust (runner_environment: github-hosted, ci-runners.md section 11.3);
+    # the prod prefix in runs-on is defence in depth.
     if: ${{ github.ref == 'refs/heads/release' }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
     timeout-minutes: 30

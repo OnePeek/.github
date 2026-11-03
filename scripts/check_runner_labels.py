@@ -26,17 +26,22 @@ import yaml
 
 EXEMPT = {("OnePeek/onepeek-infra", "ci-runner-canary.yml"), ("OnePeek/onepeek-infra", "ci-runner-image.yml")}
 EXEMPT_LABELS = {"onepeek-arm64", "onepeek-arm64-canary"}
+MAPPING_REPO = "OnePeek/.github"  # the only public repo whose workflow_call workflows may hold the mapping
 PROD_GUARD = "inputs.environment == 'prod' && 'ubuntu-latest' || "
 LIMITS = {"fast": 60, "arm-build": 60, "stateful": 150}
 
 
 def _forms(var: str) -> dict[str, str]:
-    """The exact runs-on expressions of section 5.3, by job class, for `var` (inputs.runner or vars.RUNNER)."""
+    """The exact runs-on expressions of section 5.3, by job class, for `var` (inputs.runner or vars.RUNNER).
+
+    In the shared workflows the arm-build class falls back to ubuntu-latest (with QEMU) until hosted ARM is proven
+    on a private repo, so there it equals the fast form."""
+    arm_hosted = "ubuntu-latest" if var == "inputs.runner" else "ubuntu-24.04-arm"
     def three(onepeek: str, canary: str, hosted: str) -> str:
         return f"{var} == 'onepeek' && '{onepeek}' || {var} == 'canary' && '{canary}' || '{hosted}'"
     return {
         "fast": three("onepeek-arm64", "onepeek-arm64-canary", "ubuntu-latest"),
-        "arm-build": three("onepeek-arm64", "onepeek-arm64-canary", "ubuntu-24.04-arm"),
+        "arm-build": three("onepeek-arm64", "onepeek-arm64-canary", arm_hosted),
         "stateful": three("onepeek-arm64-od", "onepeek-arm64-od", "ubuntu-latest"),
         "github-only": "ubuntu-latest",
     }
@@ -100,6 +105,10 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
         errors.append(f"{where}: rule 4: pull_request_target is not allowed.")
     jobs = doc.get("jobs") or {}
     if kind == "public":
+        for job_id, job in jobs.items():
+            given = (job.get("with") or {}).get("runner")
+            if given is not None and given != "github":
+                errors.append(f"{where}: job {job_id}: rule 1: a public repo passes no runner other than github, got {given!r}.")
         errors += _public(where, name, doc, jobs, callable_)
     for job_id, job in jobs.items():
         if "runs-on" not in job:
@@ -107,7 +116,11 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
         ro = job["runs-on"]
         label = f"{where}: job {job_id}"
         if kind == "public":
-            cls = classify(ro, "inputs.runner", True) if callable_ else None
+            cls = classify(ro, "inputs.runner", True) if callable_ and repo == MAPPING_REPO else None
+            if callable_ and cls is None and ro != "ubuntu-latest":
+                errors.append(f"{label}: rule 1: runs-on in a public workflow_call workflow must be ubuntu-latest"
+                              + (" or a mapping form of section 5.3." if repo == MAPPING_REPO else "."))
+                continue
         else:
             cls = classify(ro, "vars.RUNNER", False)
             if cls is None and (repo, name) in EXEMPT and ro in EXEMPT_LABELS:

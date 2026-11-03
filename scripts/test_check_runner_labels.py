@@ -7,7 +7,7 @@ from pathlib import Path
 import check_runner_labels as lint
 
 FAST_PUBLIC = "${{ inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}"
-ARM_PUBLIC = "${{ inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-24.04-arm' }}"
+ARM_PUBLIC = "${{ inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}"
 STATEFUL_PUBLIC = "${{ inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}"
 FAST_PRIVATE = FAST_PUBLIC.replace("inputs.runner", "vars.RUNNER")
 STATEFUL_PRIVATE = STATEFUL_PUBLIC.replace("inputs.runner", "vars.RUNNER")
@@ -81,6 +81,34 @@ class Rule1Public(unittest.TestCase):
         self.assertTrue(any("rule 1" in e for e in errs), errs)
         text = own("ubuntu-latest").replace("steps: [{run: echo}]", "steps: [{run: echo, if: vars.RUNNER == 'x'}]")
         self.assertTrue(any("vars.RUNNER" in e for e in run("public", "OnePeek/.github", "a.yml", text)))
+
+
+class Rule1PublicPassthrough(unittest.TestCase):
+    def test_free_passthrough_in_a_public_reusable_workflow_is_refused(self):
+        for ro in ("${{ inputs.label }}", "${{ inputs.runner }}", "ubuntu-24.04", "[ubuntu-latest]"):
+            errs = run("public", "OnePeek/.github", "a.yml", reusable(ro))
+            self.assertTrue(any("rule 1" in e for e in errs), (ro, errs))
+
+    def test_plain_hosted_label_is_allowed(self):
+        self.assertEqual(run("public", "OnePeek/.github", "a.yml", reusable("ubuntu-latest")), [])
+
+    def test_mapping_is_allowed_only_in_the_dot_github_repo(self):
+        errs = run("public", "OnePeek/plugin-owl", "a.yml", reusable(FAST_PUBLIC))
+        self.assertTrue(any("rule 1" in e for e in errs), errs)
+        self.assertEqual(run("public", "OnePeek/plugin-owl", "a.yml", reusable("ubuntu-latest")), [])
+
+    def test_a_public_repo_passes_no_runner_but_github(self):
+        call = """\
+            on: pull_request
+            jobs:
+              j:
+                uses: OnePeek/.github/.github/workflows/secret-scan.yml@abc
+                with:
+                  runner: %s
+            """
+        for given, ok in (("github", True), ("onepeek", False), ("canary", False), ("${{ vars.RUNNER }}", False)):
+            errs = run("public", "OnePeek/plugin-owl", "c.yml", call % given)
+            self.assertEqual(errs == [], ok, (given, errs))
 
 
 class Rule2Private(unittest.TestCase):
@@ -177,7 +205,7 @@ class SharedWorkflows(unittest.TestCase):
             doc = yaml.safe_load((Path(__file__).resolve().parents[1] / ".github" / "workflows" / name).read_text())
             for job_id, job in doc["jobs"].items():
                 ro = job.get("runs-on")
-                if ro and "onepeek-" in ro and "version" != job_id:
+                if ro and "onepeek-" in ro:
                     self.assertIn("inputs.environment == 'prod' && 'ubuntu-latest' ||", ro, (name, job_id))
 
 
