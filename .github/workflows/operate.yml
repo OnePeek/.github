@@ -561,10 +561,14 @@ jobs:
           if [ "${ENVIRONMENT}" = "preprod" ]; then
             curl --fail --silent --show-error --max-time 10 --retry 6 --retry-delay 10 --retry-all-errors "https://${DOMAIN_PREPROD}/api/status" >/dev/null
           fi
-          # Watch: 5 minutes of the deploy alarms (the full 10-minute watch belongs to the release).
+          # Watch: 5 minutes of the selected services' own deploy alarms, onepeek-<env>-deploy-<service>-{errors,latency} (aws-stack
+          # §10.4; the full 10-minute watch belongs to the release).
           end=$((SECONDS + 300))
           while [ "${SECONDS}" -lt "${end}" ]; do
-            alarms=$(aws cloudwatch describe-alarms --alarm-name-prefix "${NAME}-deploy-" --state-value ALARM --query 'MetricAlarms[].AlarmName' --output text)
+            alarms=$(while read -r s; do
+              aws cloudwatch describe-alarms --alarm-names "${NAME}-deploy-${s}-errors" "${NAME}-deploy-${s}-latency" \
+                --state-value ALARM --query 'MetricAlarms[].AlarmName' --output text
+            done < selected.txt | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')
             if [ -n "${alarms}" ]; then echo "::error::Deploy alarms firing: ${alarms}"; exit 1; fi
             sleep 30
           done
