@@ -204,9 +204,6 @@ def bump_pins(repo: str, branch: str, tag: str, sha: str) -> str | None:
             changed, _ = rewrite_pins(wt, tag, sha)
             if not changed:
                 return None
-            existing = json.loads(gh("pr", "list", "-R", f"{ORG}/{repo}", "--head", branch, "--state", "open",
-                                     "--json", "number,url") or "[]")
-            remote = git(src, "ls-remote", "origin", f"refs/heads/{branch}").split()
             git(wt, "add", "--", *changed)
             git(wt, "commit", "-q", "-m", f"chore: pin OnePeek/.github workflows to {tag} (ship_change_set)")
             git(wt, "push", "-q", "origin", f"HEAD:{branch}")
@@ -296,12 +293,16 @@ def callers() -> list[str]:
 
 def open_pin_move(repo: str, tag: str, sha: str) -> str | None:
     """A pin-move pull request in a caller whose pins were not moved inside the set: every pin to tag@sha, one commit
-    off its base, pushed from a detached worktree to `chore/pin-github-<tag>` (no local branch is created, none is
-    deleted). Safe to re-run: when that branch already exists it is replaced with --force-with-lease on that branch only,
-    and an open pull request for it is updated, never a second one opened."""
+    pushed from a detached worktree to `chore/pin-github-<tag>` (no local branch is created, none is deleted). Safe to
+    re-run: when that branch already exists the pins are rewritten on top of it (anyone else's commits stay) and pushed
+    as an ordinary fast-forward, never forced, or not pushed at all when it already has them; only a missing branch is
+    built from the base. An open pull request for it is updated, never a second one opened."""
     src, base = ROOT / repo, BASE.get(repo, "dev")
     branch = f"chore/pin-github-{tag}"
     git(src, "fetch", "-q", "origin", base)
+    on_remote = bool(git(src, "ls-remote", "origin", f"refs/heads/{branch}").split())
+    if on_remote:
+        git(src, "fetch", "-q", "origin", branch)
     with tempfile.TemporaryDirectory(prefix=f"pins-{repo}-") as tmp:
         wt = pathlib.Path(tmp) / "wt"
         git(src, "worktree", "add", "-q", "--detach", str(wt), f"origin/{base}")
@@ -312,11 +313,13 @@ def open_pin_move(repo: str, tag: str, sha: str) -> str | None:
                 return None
             existing = json.loads(gh("pr", "list", "-R", f"{ORG}/{repo}", "--head", branch, "--state", "open",
                                      "--json", "number,url") or "[]")
-            remote = git(src, "ls-remote", "origin", f"refs/heads/{branch}").split()
-            git(wt, "add", "--", *changed)
-            git(wt, "commit", "-q", "-m", f"chore: pin OnePeek/.github workflows to {tag} (ship_change_set)")
-            lease = [f"--force-with-lease=refs/heads/{branch}:{remote[0]}"] if remote else []
-            git(wt, "push", "-q", *lease, "origin", f"HEAD:refs/heads/{branch}")
+            if on_remote:
+                git(wt, "checkout", "-q", "-f", "--detach", f"origin/{branch}")
+                changed, _ = rewrite_pins(wt, tag, sha)
+            if changed:
+                git(wt, "add", "--", *changed)
+                git(wt, "commit", "-q", "-m", f"chore: pin OnePeek/.github workflows to {tag} (ship_change_set)")
+                git(wt, "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
         finally:
             git(src, "worktree", "remove", "--force", str(wt))
     if existing:

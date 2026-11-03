@@ -255,7 +255,19 @@ class PinMoves(unittest.TestCase):
         self.assertEqual([c[:2] for c in calls], [("pr", "list")])  # no pr create
         self.assertIn(f"@{NEW} # v1.8.2", self.origin_show("onepeek-web", "chore/pin-github-v1.8.2:.github/workflows/ci.yml"))
         files = sh("git", "--git-dir", str(self.root / "origins/onepeek-web.git"), "ls-tree", "-r", "--name-only", "chore/pin-github-v1.8.2")
-        self.assertNotIn("stale.txt", files)  # rebuilt off the base
+        self.assertIn("stale.txt", files)  # someone else's commit on the branch survives (no force)
+
+    def test_a_rerun_keeps_a_commit_by_someone_else_and_adds_nothing_when_pinned(self) -> None:
+        src = git_repo(self.root, "onepeek-web", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))
+        self.stale_branch(src)
+        bare = str(self.root / "origins/onepeek-web.git")
+        with mock.patch.object(ship, "gh", side_effect=self.fake_gh([])):
+            ship.open_pin_move("onepeek-web", "v1.8.2", NEW)
+            first = sh("git", "--git-dir", bare, "rev-parse", "chore/pin-github-v1.8.2").strip()
+            ship.open_pin_move("onepeek-web", "v1.8.2", NEW)
+        self.assertEqual(sh("git", "--git-dir", bare, "rev-parse", "chore/pin-github-v1.8.2").strip(), first)  # nothing to push
+        self.assertEqual(sh("git", "--git-dir", bare, "log", "--format=%s", "chore/pin-github-v1.8.2").splitlines()[1:3],
+                         ["earlier attempt", "init"])
 
     def test_an_existing_branch_without_a_pull_request_is_updated_and_gets_one(self) -> None:  # a re-run
         src = git_repo(self.root, "onepeek-web", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))

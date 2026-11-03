@@ -32,7 +32,7 @@ ORG = "OnePeek"
 # `OnePeek/.github/` (empty for the repo root), `ref` the text after `@` (empty when there is none), `comment` an
 # optional trailing `# ...`.
 USES = re.compile(r"""(?P<lead>\buses:[ \t]*["']?)(?P<name>OnePeek/\.github)(?=[/@\s"']|$)(?:/(?P<path>[^@\s"'#]*))?"""
-                  r"""(?:@(?P<ref>[^\s"'#]*))?(?P<quote>["']?)(?P<comment>[ \t]+#[^\n]*)?""", re.I | re.M)
+                  r"""(?:@(?P<ref>[^\s"'#},]*))?(?P<quote>["']?)(?P<comment>[ \t]+#[^\n]*)?""", re.I | re.M)
 SHA = re.compile(r"[0-9a-f]{40}")
 TAG = re.compile(r"v\d+\.\d+\.\d+")
 DOCS_PIN = re.compile(r"onepeek-docs@([0-9a-f]{40})")

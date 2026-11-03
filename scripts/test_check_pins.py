@@ -71,6 +71,11 @@ class Pins(Repo):
         out = self.problems(d)
         self.assertTrue(any("w0.yml:3" in p and "not the commit of a v* tag" in p for p in out), out)
 
+    def test_a_flow_style_pin_ends_the_ref_at_the_brace_or_comma(self) -> None:
+        d = self.repo(f"    - {{uses: OnePeek/.github/.github/workflows/pins.yml@{B}}}\n",
+                      f"    - {{uses: OnePeek/.github/.github/workflows/pins.yml@{B}, with: {{a: b}}}}\n")
+        self.assertEqual([ref for _, _, _, ref in cp.pins(d)], [B, B])
+
     def test_a_branch_or_a_tag_name_fails(self) -> None:  # P2: a ref that is not a 40-character SHA
         for ref in ("main", "v1.8.0", B[:39], ""):
             body = f"    uses: OnePeek/.github/.github/workflows/secret-scan.yml{'@' + ref if ref else ''}\n"
