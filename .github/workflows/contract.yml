@@ -34,7 +34,7 @@ permissions:
 
 jobs:
   contract:
-    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: The other repos' ref (dev, or release for a hotfix pull request into release)
