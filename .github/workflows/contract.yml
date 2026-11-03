@@ -3,8 +3,10 @@
 # Called by backend-service, onepeek-web and onepeek-infra on pull requests into dev and release. Real code against real
 # files: the backend's `app check services` and settings loader against infra's config/services.<env>.yaml and published
 # settings, and web's start-up loader against the same settings. The calling repo is taken at the pull request; the other
-# repos at dev for a pull request into dev and at release for a release pull request, so what is checked is what ships
-# together. The checks themselves live in one place, onepeek-infra's scripts/contract.py.
+# repos at dev for a pull request into dev and, for a release pull request too (it is dev to release, so their dev is the
+# release candidate; never the stale release branch), and at release for a hotfix/* pull request into release, so what
+# is checked is what ships together. The checks themselves live in one place,
+# onepeek-infra's scripts/contract.py.
 name: contract
 
 on:
@@ -31,15 +33,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: The other repos' branch (dev for a pull request into dev, release for a release pull request)
+      - name: The other repos' ref (dev, or release for a hotfix pull request into release)
         id: ref
         env:
           ROLE: ${{ inputs.role }}
           BASE_REF: ${{ inputs.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           case "${ROLE}" in backend|web|infra) ;; *) echo "::error::role must be backend, web or infra, not '${ROLE}'."; exit 1 ;; esac
           case "${BASE_REF}" in dev|release) ;; *) echo "::error::base_ref must be dev or release, not '${BASE_REF}'."; exit 1 ;; esac
-          echo "other=${BASE_REF}" >> "$GITHUB_OUTPUT"
+          # Release pull requests are dev to release, so every other repo's release candidate is its dev (never the
+          # stale release branch). A hotfix pull request into release ships against what is live, so it is checked
+          # against the other repos' release.
+          ref=dev
+          if [ "${BASE_REF}" = release ] && [[ "${HEAD_REF}" == hotfix/* ]]; then ref=release; fi
+          for side in backend web infra; do
+            [ "${side}" = "${ROLE}" ] && continue
+            echo "${side} is taken at ${ref}"
+            echo "${side}=${ref}" >> "$GITHUB_OUTPUT"
+          done
 
       - name: This pull request
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,32 +59,32 @@ jobs:
           path: _${{ inputs.role }}
           persist-credentials: false
 
-      - name: onepeek-infra at the other branch
+      - name: onepeek-infra at its ref
         if: ${{ inputs.role != 'infra' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.repository_owner }}/onepeek-infra
-          ref: ${{ steps.ref.outputs.other }}
+          ref: ${{ steps.ref.outputs.infra }}
           token: ${{ secrets.ORG_READ_TOKEN }}
           path: _infra
           persist-credentials: false
 
-      - name: backend-service at the other branch
+      - name: backend-service at its ref
         if: ${{ inputs.role == 'infra' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.repository_owner }}/backend-service
-          ref: ${{ steps.ref.outputs.other }}
+          ref: ${{ steps.ref.outputs.backend }}
           token: ${{ secrets.ORG_READ_TOKEN }}
           path: _backend
           persist-credentials: false
 
-      - name: onepeek-web at the other branch
+      - name: onepeek-web at its ref
         if: ${{ inputs.role == 'infra' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.repository_owner }}/onepeek-web
-          ref: ${{ steps.ref.outputs.other }}
+          ref: ${{ steps.ref.outputs.web }}
           token: ${{ secrets.ORG_READ_TOKEN }}
           path: _web
           persist-credentials: false

@@ -47,21 +47,42 @@ def checkouts(role: str) -> dict[str, str]:
     return found
 
 
-class OtherBranch(unittest.TestCase):
-    def test_dev_for_a_pull_request_into_dev_and_release_for_a_release_pull_request(self):
-        for base in ("dev", "release"):
-            out, output = run("The other repos' branch", {"ROLE": "backend", "BASE_REF": base})
-            self.assertEqual(out.returncode, 0, out.stdout)
-            self.assertEqual(output.strip(), f"other={base}")
+def resolve(role: str, base: str, head: str = "feature/x") -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+    out, output = run("The other repos' ref", {"ROLE": role, "BASE_REF": base, "HEAD_REF": head})
+    return out, dict(line.split("=", 1) for line in output.split())
+
+
+class OtherRef(unittest.TestCase):
+    def test_dev_for_a_pull_request_into_dev(self):
+        out, refs = resolve("infra", "dev")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(refs, {"backend": "dev", "web": "dev"})
+
+    def test_a_release_pull_request_checks_the_other_repos_at_dev_never_release(self):
+        for role, others in (("infra", {"backend", "web"}), ("backend", {"web", "infra"}), ("web", {"backend", "infra"})):
+            out, refs = resolve(role, "release", "dev")
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertEqual(refs, {o: "dev" for o in others})
+
+    def test_a_hotfix_pull_request_into_release_checks_the_other_repos_at_release(self):
+        self.assertEqual(resolve("infra", "release", "hotfix/fix-x")[1], {"backend": "release", "web": "release"})
+
+    def test_a_hotfix_branch_into_dev_is_still_dev(self):
+        self.assertEqual(resolve("infra", "dev", "hotfix/fix-x")[1], {"backend": "dev", "web": "dev"})
 
     def test_any_other_base_or_role_refuses(self):
-        self.assertEqual(run("The other repos' branch", {"ROLE": "backend", "BASE_REF": "main"})[0].returncode, 1)
-        self.assertEqual(run("The other repos' branch", {"ROLE": "docs", "BASE_REF": "dev"})[0].returncode, 1)
+        self.assertEqual(resolve("backend", "main")[0].returncode, 1)
+        self.assertEqual(resolve("docs", "dev")[0].returncode, 1)
 
-    def test_every_other_repo_is_checked_out_at_that_branch_with_the_read_token(self):
+    def test_event_inputs_never_inline_into_the_script(self):
+        self.assertNotIn("${{", step("The other repos' ref")["run"])
+
+    def test_every_other_repo_is_checked_out_at_its_own_ref_with_the_read_token(self):
+        refs = {"onepeek-infra": "infra", "backend-service": "backend", "onepeek-web": "web"}
         for s in STEPS:
             if "repository" in s.get("with", {}):
-                self.assertEqual(s["with"]["ref"], "${{ steps.ref.outputs.other }}")
+                repo = s["with"]["repository"].split("/")[-1]
+                self.assertEqual(s["with"]["ref"], "${{ steps.ref.outputs." + refs[repo] + " }}")
                 self.assertEqual(s["with"]["token"], "${{ secrets.ORG_READ_TOKEN }}")
                 self.assertFalse(s["with"]["persist-credentials"])
 
