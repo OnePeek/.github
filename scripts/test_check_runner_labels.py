@@ -8,6 +8,7 @@ import check_runner_labels as lint
 
 FAST_PUBLIC = "${{ inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}"
 ARM_PUBLIC = "${{ inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}"
+LIGHT_PUBLIC = "${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}"
 STATEFUL_PUBLIC = "${{ inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}"
 FAST_PRIVATE = FAST_PUBLIC.replace("inputs.runner", "vars.RUNNER")
 STATEFUL_PRIVATE = STATEFUL_PUBLIC.replace("inputs.runner", "vars.RUNNER")
@@ -49,7 +50,7 @@ def own(runs_on, timeout="5", trigger="pull_request"):
 
 class Rule1Public(unittest.TestCase):
     def test_reusable_mapping_is_allowed(self):
-        for m in (FAST_PUBLIC, ARM_PUBLIC, STATEFUL_PUBLIC, PROD_GUARD):
+        for m in (LIGHT_PUBLIC, FAST_PUBLIC, ARM_PUBLIC, STATEFUL_PUBLIC, PROD_GUARD):
             self.assertEqual(run("public", "OnePeek/.github", "a.yml", reusable(m)), [], m)
 
     def test_non_reusable_workflow_naming_onepeek_label_is_refused(self):
