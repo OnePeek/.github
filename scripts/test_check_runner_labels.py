@@ -48,6 +48,16 @@ def own(runs_on, timeout="5", trigger="pull_request"):
         """
 
 
+class ExemptMatrix(unittest.TestCase):
+    def test_an_exempt_workflow_may_name_its_labels_through_a_matrix(self):
+        text = ("on: [workflow_dispatch]\njobs:\n  smoke:\n    strategy:\n      matrix:\n        runner: [onepeek-arm64-canary, onepeek-arm64]\n"
+                "    runs-on: ${{ matrix.runner }}\n    timeout-minutes: 20\n    steps: [{run: echo}]\n")
+        self.assertEqual(run("private", "OnePeek/onepeek-infra", "ci-runner-canary.yml", text), [])
+        self.assertNotEqual(run("private", "OnePeek/onepeek-web", "ci-runner-canary.yml", text), [])
+        bad = text.replace("onepeek-arm64]", "onepeek-arm64-od]")
+        self.assertNotEqual(run("private", "OnePeek/onepeek-infra", "ci-runner-canary.yml", bad), [])
+
+
 class Rule1Public(unittest.TestCase):
     def test_reusable_mapping_is_allowed(self):
         for m in (LIGHT_PUBLIC, FAST_PUBLIC, ARM_PUBLIC, STATEFUL_PUBLIC, PROD_GUARD):

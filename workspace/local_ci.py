@@ -136,6 +136,9 @@ def main(argv: list[str] | None = None) -> int:
                     if rc:
                         return rc
                 continue
+            wf_dir = ((doc.get("defaults") or {}).get("run") or {}).get("working-directory")
+            if wf_dir and not ((job.get("defaults") or {}).get("run") or {}).get("working-directory"):
+                job = {**job, "defaults": {"run": {"working-directory": wf_dir}}}
             rc = run_job(f"{path.name}:{job_id}", job, wf_env, inputs, repo, a, skipped)
             if rc:
                 return rc
@@ -170,6 +173,9 @@ def run_job(label0: str, job: dict, wf_env: dict, inputs: dict, repo: pathlib.Pa
                     continue
                 if any("secrets." in str(v) for v in {**(job.get("env") or {}), **(step.get("env") or {})}.values()):
                     skipped.append(f"{label} (needs a repository secret)")
+                    continue
+                if re.search(r"\bgitleaks (git|detect)\b", cmd):
+                    skipped.append(f"{label} (history scan: CI scans the pull request's commits; the pre-commit hook scans each commit)")
                     continue
                 if re.match(r"(Install|Set up|Download) ", str(step.get("name") or "")):
                     skipped.append(f"{label} (tool install; the laptop has its own)")

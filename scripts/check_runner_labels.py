@@ -124,8 +124,12 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
                 continue
         else:
             cls = classify(ro, "vars.RUNNER", False)
-            if cls is None and (repo, name) in EXEMPT and ro in EXEMPT_LABELS:
-                cls = "fast"
+            if cls is None and (repo, name) in EXEMPT:
+                # An exempt workflow names the labels directly, or through a matrix of only those labels.
+                matrix = ((job.get("strategy") or {}).get("matrix") or {}).get("runner")
+                if ro in EXEMPT_LABELS or (ro == "${{ matrix.runner }}" and isinstance(matrix, list) and matrix
+                                           and set(matrix) <= EXEMPT_LABELS):
+                    cls = "fast"
             if cls is None:
                 errors.append(f"{label}: rule 2: runs-on {ro!r} is not one of the forms of ci-runners.md section 5.3.")
                 continue
