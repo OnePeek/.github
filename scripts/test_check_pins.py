@@ -60,8 +60,27 @@ class Pins(Repo):
         self.assertIn("v1.7.0", out[0])
 
     def test_other_actions_are_not_pins(self) -> None:
-        d = self.repo(f"    uses: actions/checkout@{A} # v7\n")
+        d = self.repo(f"    uses: actions/checkout@{A} # v7\n", f"    uses: OnePeek/.github-other/x.yml@{A}\n")
         self.assertEqual(cp.pins(d), [])
+
+    def test_a_pin_in_any_letter_case_counts(self) -> None:  # P2: every uses naming OnePeek/.github
+        d = self.repo(f"    uses: onepeek/.GitHub/.github/workflows/secret-scan.yml@{'e' * 40}\n",
+                      f"    - uses: 'ONEPEEK/.github/.github/workflows/pins.yml@{B}' # v1.8.0\n")
+        self.assertEqual([(f, wf, ref) for f, _, wf, ref in cp.pins(d)],
+                         [("w0.yml", "secret-scan.yml", "e" * 40), ("w1.yml", "pins.yml", B)])
+        out = self.problems(d)
+        self.assertTrue(any("w0.yml:3" in p and "not the commit of a v* tag" in p for p in out), out)
+
+    def test_a_branch_or_a_tag_name_fails(self) -> None:  # P2: a ref that is not a 40-character SHA
+        for ref in ("main", "v1.8.0", B[:39], ""):
+            body = f"    uses: OnePeek/.github/.github/workflows/secret-scan.yml{'@' + ref if ref else ''}\n"
+            out = self.problems(self.repo(body))
+            self.assertTrue(any("w0.yml:3" in p and "not a 40-character commit SHA" in p for p in out), (ref, out))
+
+    def test_a_sha_that_is_not_a_tag_commit_fails_even_when_alone(self) -> None:  # S4
+        out = self.problems(self.repo(uses("f" * 40) + uses("f" * 40, "pins")))
+        self.assertEqual(len(out), 2)
+        self.assertTrue(all("not the commit of a v* tag" in p for p in out), out)
 
 
 class DocsRule(Repo):

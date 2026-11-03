@@ -21,7 +21,8 @@ import urllib.error
 import urllib.request
 
 ORG = "OnePeek"
-LINE = re.compile(r"^\s*Depends on:\s*OnePeek/([\w.-]+)#(\d+)\s*$", re.M | re.I)
+# A repo name is ASCII letters, digits, `.`, `_` and `-`, never only dots (`.` and `..` are not repos).
+LINE = re.compile(r"^[ \t]*Depends on:[ \t]*OnePeek/(?!\.+#)([A-Za-z0-9._-]+)#(\d+)[ \t]*$", re.M | re.I | re.ASCII)
 
 
 def parse(body: str | None) -> list[tuple[str, int]]:

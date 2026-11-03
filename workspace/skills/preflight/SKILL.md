@@ -14,7 +14,7 @@ A check that runs only in CI, or only on a release pull request, costs a CI roun
 2. **It runs, in order:**
    1. Declared dependencies (§8a P1): the `Depends on: OnePeek/<repo>#<n>` lines of the branch's open pull request, or, before it has one, each `--depends-on OnePeek/<repo>#<n>` you pass. While one is unmerged, preflight refuses: keep the branch local, or open its pull request as a draft (a draft's push is only a warning; its CI waits in the `depends-on` job). When your change needs another repo's unmerged pull request, write that line in your pull request body.
    2. local CI (`local_ci.py`). If local CI does not end `LOCAL CI OK`, preflight refuses: it stops there and runs nothing else.
-   3. The pin checks: every `OnePeek/.github` pin is the commit of **one** `v*` tag.
+   3. The pin checks: every `uses:` naming `OnePeek/.github` (any letter case) is a 40-character commit SHA, and all are the commit of **one** `v*` tag; a branch or tag name fails.
    4. The tool versions:
       - Terraform, Python and Node must match every tracked `.terraform-version`, `.python-version` and `.node-version`;
       - uv must be CI's pinned version;
@@ -22,7 +22,7 @@ A check that runs only in CI, or only on a release pull request, costs a CI roun
    5. With `--release`:
       - `docs-version.txt` is on onepeek-docs `main`;
       - the agents' App grants every permission the workflows ask it for and is installed on the repos they name;
-      - the other repos the contract and the release lock read are in a clean release state: at most one open `dev` -> `release` pull request, and with none, `release` is an ancestor of `dev`.
+      - the other repos the contract and the release lock read are in a clean release state: at most one open `dev` -> `release` pull request, and with none, `release` is not stale. Not stale means the last `dev` commit merged into `release` (the second parent of the newest merge commit on `release`; a hotfix squashed on top does not count), or `release` itself when it was fast-forwarded onto `dev`, is an ancestor of `dev`. No merge commit and `release` not on `dev` fails with "no release merge found".
 3. **Read the result.** Each line starts with a status:
    - `PASS`: fine.
    - `FAIL`: fix it before you push. The line names the fix (install a version, move pins with one pin-move, merge the docs pull request first, rebuild `release` from `dev`, ask the founder to grant an App permission).

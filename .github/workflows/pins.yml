@@ -37,7 +37,7 @@ jobs:
       - name: This workflow's version (the caller's pin of pins.yml)
         id: version
         run: |
-          sha=$(grep -rhoE 'OnePeek/\.github/\.github/workflows/pins\.yml@[0-9a-f]{40}' .github/workflows | head -n 1 | cut -d@ -f2 || true)
+          sha=$(grep -rhoiE 'OnePeek/\.github/\.github/workflows/pins\.yml@[0-9a-f]{40}' .github/workflows | head -n 1 | cut -d@ -f2 || true)
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "pins.yml runs at ${sha:-this repo (a local call)}"
 

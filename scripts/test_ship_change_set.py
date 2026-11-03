@@ -50,9 +50,24 @@ class Pin(unittest.TestCase):
             f"    uses: OnePeek/.github/.github/workflows/contract.yml@{old_sha} # v1.1.2\n"
             f"    uses: actions/checkout@{old_sha} # v7\n"
         )
-        out = ship.PIN.sub(lambda m: f"{m.group(1)}@{new_sha} # v1.1.3", text)
+        out = ship.PIN.sub(lambda m: ship.moved_pin(m, "v1.1.3", new_sha), text)
         self.assertIn(f"contract.yml@{new_sha} # v1.1.3", out)
         self.assertIn(f"actions/checkout@{old_sha} # v7", out)
+
+    def test_only_the_sha_and_the_tag_change_and_trailing_comment_text_is_kept(self) -> None:
+        new = "b" * 40
+        cases = {
+            f"    uses: OnePeek/.github/.github/workflows/a.yml@{'a' * 40} # v1.1.2 (shared CI, see #12)\n":
+                f"    uses: OnePeek/.github/.github/workflows/a.yml@{new} # v1.1.3 (shared CI, see #12)\n",
+            f"    uses: onepeek/.GITHUB/.github/workflows/a.yml@main\n":  # any letter case and any ref (P2)
+                f"    uses: onepeek/.GITHUB/.github/workflows/a.yml@{new} # v1.1.3\n",
+            f"    - uses: 'OnePeek/.github/.github/workflows/a.yml@v1.0.0' # v1.0.0\n":
+                f"    - uses: 'OnePeek/.github/.github/workflows/a.yml@{new}' # v1.1.3\n",
+            f"    uses: OnePeek/.github/.github/workflows/a.yml@{'c' * 40} # pre-tag (OnePeek/.github#34)\n":
+                f"    uses: OnePeek/.github/.github/workflows/a.yml@{new} # v1.1.3\n",
+        }
+        for before, after in cases.items():
+            self.assertEqual(ship.PIN.sub(lambda m: ship.moved_pin(m, "v1.1.3", new), before), after, before)
 
 
 
@@ -134,6 +149,14 @@ class OrderOverride(unittest.TestCase):
         got = ship.ordered(self.PRS, "onepeek-docs,backend-service,onepeek-infra")
         self.assertEqual(got, [("onepeek-docs", 3), ("backend-service", 2), ("onepeek-infra", 1)])
 
+    def test_order_never_moves_onepeek_docs_off_first_place(self) -> None:  # §8a P2
+        for bad in ("backend-service,onepeek-docs,onepeek-infra", "backend-service,onepeek-infra,onepeek-docs"):
+            with self.assertRaises(SystemExit) as stop:
+                ship.ordered(self.PRS, bad)
+            self.assertIn("onepeek-docs first", str(stop.exception))
+        self.assertEqual(ship.ordered([("backend-service", 2), ("onepeek-infra", 1)], "backend-service,onepeek-infra"),
+                         [("backend-service", 2), ("onepeek-infra", 1)])  # no docs pull request in the set
+
     def test_order_must_name_every_repo_of_the_set_once(self) -> None:
         for bad in ("backend-service,onepeek-infra", "onepeek-docs,backend-service,onepeek-infra,onepeek-web",
                     "onepeek-docs,backend-service,backend-service"):
@@ -171,27 +194,124 @@ class PinMoves(unittest.TestCase):
     def test_callers_are_the_repos_whose_base_branch_pins_github(self) -> None:
         git_repo(self.root, "backend-service", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))
         git_repo(self.root, "onepeek-docs", "jobs:\n  s:\n" + USES.format(OLD, "v1.4.0"), base="main")
-        git_repo(self.root, "marketing-website", "jobs: {}\n")
-        self.assertEqual(ship.callers(), ["backend-service", "onepeek-docs"])
+        git_repo(self.root, "mcp-athena", "jobs:\n  s:\n    uses: onepeek/.github/.github/workflows/x.yml@main\n")
+        git_repo(self.root, "marketing-website", "jobs:\n  s:\n    uses: OnePeek/.github-other/x.yml@main\n")
+        self.assertEqual(ship.callers(), ["backend-service", "mcp-athena", "onepeek-docs"])
+
+    def fake_gh(self, prs: list | None = None, calls: list | None = None):
+        """`gh pr list` answers the open pull requests for the branch; `gh pr create` answers a new URL."""
+        def gh(*args):
+            if calls is not None:
+                calls.append(args)
+            if args[:2] == ("pr", "list"):
+                return __import__("json").dumps(prs or [])
+            if args[:2] == ("pr", "create"):
+                return "https://github.com/OnePeek/x/pull/9\n"
+            raise AssertionError(args)
+        return gh
+
+    def origin_show(self, repo: str, what: str) -> str:
+        return sh("git", "--git-dir", str(self.root / f"origins/{repo}.git"), "show", what)
 
     def test_a_pin_move_pull_request_moves_every_pin_on_a_new_branch(self) -> None:
         src = git_repo(self.root, "onepeek-web", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0") + USES.format(OLD, "v1.7.0"))
-        with mock.patch.object(ship, "gh", return_value="https://github.com/OnePeek/onepeek-web/pull/9\n") as gh:
-            self.assertEqual(ship.open_pin_move("onepeek-web", "v1.8.2", NEW), "https://github.com/OnePeek/onepeek-web/pull/9")
-        text = sh("git", "--git-dir", str(self.root / "origins/onepeek-web.git"), "show", "chore/pin-github-v1.8.2:.github/workflows/ci.yml")
+        calls: list = []
+        with mock.patch.object(ship, "gh", side_effect=self.fake_gh(calls=calls)):
+            self.assertEqual(ship.open_pin_move("onepeek-web", "v1.8.2", NEW), "https://github.com/OnePeek/x/pull/9")
+        text = self.origin_show("onepeek-web", "chore/pin-github-v1.8.2:.github/workflows/ci.yml")
         self.assertEqual(text.count(f"@{NEW} # v1.8.2"), 2)
         self.assertNotIn(OLD, text)
-        args = gh.call_args.args
+        args = calls[-1]
         self.assertEqual(args[args.index("--base") + 1], "dev")
         self.assertNotIn("More than one minor version behind", args[args.index("--body") + 1])
         self.assertEqual(sh("git", "-C", str(src), "worktree", "list").count("\n"), 1)  # nothing left behind
+        self.assertEqual(sh("git", "-C", str(src), "branch", "--list", "chore/*"), "")  # no local branch created
 
     def test_a_caller_far_behind_gets_the_hand_fix_note(self) -> None:
         git_repo(self.root, "mcp-athena", "jobs:\n  s:\n" + USES.format(OLD, "v1.1.1"))
-        with mock.patch.object(ship, "gh", return_value="url") as gh:
+        calls: list = []
+        with mock.patch.object(ship, "gh", side_effect=self.fake_gh(calls=calls)):
             ship.open_pin_move("mcp-athena", "v1.8.2", NEW)
-        body = gh.call_args.args[gh.call_args.args.index("--body") + 1]
+        body = calls[-1][calls[-1].index("--body") + 1]
         self.assertIn("More than one minor version behind", body)
+
+    def stale_branch(self, src: pathlib.Path) -> str:
+        """An earlier run's chore/pin-github-v1.8.2 on the origin (pushed from a detached HEAD), not on the base."""
+        sh("git", "-C", str(src), "switch", "-q", "--detach")
+        (src / "stale.txt").write_text("an earlier attempt")
+        sh("git", "-C", str(src), "add", "stale.txt")
+        sh("git", "-C", str(src), "commit", "-q", "-m", "earlier attempt")
+        sh("git", "-C", str(src), "push", "-q", "origin", "HEAD:refs/heads/chore/pin-github-v1.8.2")
+        sh("git", "-C", str(src), "switch", "-q", "dev")
+        return sh("git", "-C", str(src), "rev-parse", "HEAD@{1}").strip()
+
+    def test_an_existing_pull_request_for_the_tag_is_updated_never_a_second_one(self) -> None:
+        src = git_repo(self.root, "onepeek-web", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))
+        self.stale_branch(src)
+        calls: list = []
+        pr = [{"number": 9, "url": "https://github.com/OnePeek/onepeek-web/pull/9"}]
+        with mock.patch.object(ship, "gh", side_effect=self.fake_gh(pr, calls)):
+            self.assertEqual(ship.open_pin_move("onepeek-web", "v1.8.2", NEW), pr[0]["url"])
+        self.assertEqual([c[:2] for c in calls], [("pr", "list")])  # no pr create
+        self.assertIn(f"@{NEW} # v1.8.2", self.origin_show("onepeek-web", "chore/pin-github-v1.8.2:.github/workflows/ci.yml"))
+        files = sh("git", "--git-dir", str(self.root / "origins/onepeek-web.git"), "ls-tree", "-r", "--name-only", "chore/pin-github-v1.8.2")
+        self.assertNotIn("stale.txt", files)  # rebuilt off the base
+
+    def test_an_existing_branch_without_a_pull_request_is_updated_and_gets_one(self) -> None:  # a re-run
+        src = git_repo(self.root, "onepeek-web", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))
+        self.stale_branch(src)
+        calls: list = []
+        with mock.patch.object(ship, "gh", side_effect=self.fake_gh([], calls)):
+            ship.open_pin_move("onepeek-web", "v1.8.2", NEW)
+        self.assertEqual([c[:2] for c in calls], [("pr", "list"), ("pr", "create")])
+        self.assertIn(f"@{NEW} # v1.8.2", self.origin_show("onepeek-web", "chore/pin-github-v1.8.2:.github/workflows/ci.yml"))
+
+    def test_a_branch_that_moved_since_it_was_read_is_not_overwritten(self) -> None:  # the lease
+        src = git_repo(self.root, "onepeek-web", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))
+        self.stale_branch(src)
+        real_git, moved = ship.git, []
+
+        def git(cwd, *args):
+            if args[:1] == ("push",) and not moved:  # someone pushes to the branch between the read and our push
+                other = self.root / "other"
+                sh("git", "clone", "-q", "-b", "chore/pin-github-v1.8.2", str(self.root / "origins/onepeek-web.git"), str(other))
+                sh("git", "-C", str(other), "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q",
+                   "--allow-empty", "-m", "someone else")
+                sh("git", "-C", str(other), "push", "-q", "origin", "HEAD")
+                moved.append(sh("git", "-C", str(other), "rev-parse", "HEAD").strip())
+            return real_git(cwd, *args)
+        with mock.patch.object(ship, "gh", side_effect=self.fake_gh([])), mock.patch.object(ship, "git", side_effect=git), \
+                self.assertRaises(SystemExit):
+            ship.open_pin_move("onepeek-web", "v1.8.2", NEW)
+        self.assertEqual(self.origin_show("onepeek-web", "chore/pin-github-v1.8.2").split()[1], moved[0])
+
+    def test_a_local_branch_with_an_unpushed_commit_is_untouched(self) -> None:
+        src = git_repo(self.root, "onepeek-web", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))
+        sh("git", "-C", str(src), "switch", "-q", "-c", "chore/pin-github-v1.8.2")
+        (src / "mine.txt").write_text("local work")
+        sh("git", "-C", str(src), "add", "mine.txt")
+        sh("git", "-C", str(src), "commit", "-q", "-m", "local only")
+        mine = sh("git", "-C", str(src), "rev-parse", "HEAD").strip()
+        sh("git", "-C", str(src), "switch", "-q", "dev")
+        with mock.patch.object(ship, "gh", side_effect=self.fake_gh([])):
+            ship.open_pin_move("onepeek-web", "v1.8.2", NEW)
+        self.assertEqual(sh("git", "-C", str(src), "rev-parse", "refs/heads/chore/pin-github-v1.8.2").strip(), mine)
+        self.assertNotIn("mine.txt", sh("git", "--git-dir", str(self.root / "origins/onepeek-web.git"), "ls-tree", "-r",
+                                        "--name-only", "chore/pin-github-v1.8.2"))
+
+    def test_a_failure_in_one_caller_does_not_stop_the_others(self) -> None:
+        done_for = []
+
+        def open_pin_move(repo, tag, sha):
+            if repo == "mcp-athena":
+                raise SystemExit("STOP: `git -C x push ...` failed: denied")
+            done_for.append(repo)
+        with mock.patch.object(ship, "callers", return_value=["mcp-athena", "onepeek-web", "plugin-owl"]), \
+                mock.patch.object(ship, "open_pin_move", side_effect=open_pin_move):
+            failures = ship.pin_moves(set(), "v1.8.2", NEW)
+        self.assertEqual(done_for, ["onepeek-web", "plugin-owl"])
+        self.assertEqual(len(failures), 1)
+        self.assertIn("mcp-athena", failures[0])
 
     def test_a_caller_already_at_the_tag_gets_no_pull_request(self) -> None:
         git_repo(self.root, "onepeek-infra", "jobs:\n  s:\n" + USES.format(NEW, "v1.8.2"))
@@ -246,6 +366,14 @@ class DeclaredDependencies(unittest.TestCase):
                          [("onepeek-docs", 1), ("backend-service", 2), ("onepeek-infra", 3), ("onepeek-web", 4)])
         self.assertEqual(ship.with_dependencies(prs, {}), prs)
 
+    def test_onepeek_docs_stays_first_and_may_not_depend_on_the_set(self) -> None:  # §8a P2
+        prs = [("onepeek-docs", 1), (".github", 2), ("backend-service", 3)]
+        deps = {(".github", 2): [("backend-service", 3)]}
+        self.assertEqual(ship.with_dependencies(prs, deps), [("onepeek-docs", 1), ("backend-service", 3), (".github", 2)])
+        with self.assertRaises(SystemExit):
+            ship.with_dependencies(prs, {("onepeek-docs", 1): [("backend-service", 3)]})
+        self.assertEqual(ship.with_dependencies(prs, {("onepeek-docs", 1): [("onepeek-web", 9)]})[0], ("onepeek-docs", 1))
+
     def test_a_cycle_stops(self) -> None:
         prs = [("a", 1), ("b", 2)]
         with self.assertRaises(SystemExit):
@@ -288,6 +416,35 @@ class DeclaredDependencies(unittest.TestCase):
                 mock.patch.object(ship, "rerun_failed", side_effect=lambda r, n: events.append(("rerun", r))):
             self.assertEqual(ship.main(["onepeek-infra#3", "backend-service#2", "--go"]), 0)
         self.assertEqual(events, [("merge", "backend-service"), ("rerun", "onepeek-infra"), ("merge", "onepeek-infra")])
+
+    def test_pin_moves_go_to_every_caller_whose_pins_were_not_moved_inside_the_set(self) -> None:  # §8a P2
+        root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        for r in ("onepeek-docs", ".github", "backend-service"):
+            (root / r / ".git").mkdir(parents=True)
+        bodies = {("onepeek-docs", 1): "", (".github", 2): "", ("backend-service", 3): ""}
+        merged, base = set(), self.info(bodies)
+
+        def pr_info(r, n):
+            i = dict(base(r, n))
+            if (r, n) in merged:
+                i.update(state="MERGED", mergeCommit={"oid": "d" * 40})
+            return i
+
+        def gh(*args):
+            if args[:2] == ("pr", "merge"):
+                merged.add((args[4].split("/")[1], int(args[2])))
+            return ""
+        moved_to = []
+        with mock.patch.object(ship, "ROOT", root), mock.patch.object(ship, "pr_info", side_effect=pr_info), \
+                mock.patch.object(ship, "gh", side_effect=gh), mock.patch.object(ship, "wait_green"), \
+                mock.patch.object(ship, "remove_worktrees"), mock.patch.object(ship, "wait_tag", return_value=("v1.8.2", NEW)), \
+                mock.patch.object(ship, "bump_pins", return_value=None), \
+                mock.patch.object(ship.subprocess, "run", return_value=done(0, "onepeek-docs@" + "c" * 40)), \
+                mock.patch.object(ship, "callers", return_value=["backend-service", "onepeek-docs", "onepeek-web"]), \
+                mock.patch.object(ship, "open_pin_move", side_effect=lambda r, t, s: moved_to.append(r)):
+            self.assertEqual(ship.main(["onepeek-docs#1", ".github#2", "backend-service#3", "--go"]), 0)
+        self.assertEqual(moved_to, ["onepeek-docs", "onepeek-web"])  # docs merged before .github; web is outside the set
 
     def test_rerun_failed_re_runs_only_failed_runs(self) -> None:
         cs = [{"name": "depends-on", "bucket": "fail", "link": "https://github.com/OnePeek/x/actions/runs/11/job/1"},

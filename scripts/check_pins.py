@@ -4,8 +4,9 @@
     python3 check_pins.py <repo-dir> [--docs auto|always|never]
     python3 check_pins.py --docs-needed     # prints true or false for this CI event (auto)
 
-1. Every `OnePeek/.github/.github/workflows/<name>.yml@<sha>` pin in the repo's workflows is the commit of a `v*` tag of
-   OnePeek/.github (S4), and all of them are the commit of **one** tag (P2).
+1. Every `uses:` in the repo's workflows that names `OnePeek/.github` (in any letter case) is a pin: its ref is a
+   40-character commit SHA (a branch or a tag name fails), the commit of a `v*` tag of OnePeek/.github (S4), and all of
+   them are the commit of **one** tag (P2).
 2. `docs-version.txt` (`onepeek-docs@<sha>`) is an ancestor of onepeek-docs `main`. With `--docs auto` (CI) this runs
    only on a push to `dev` or `release` and on a pull request into `release`; a pull request into `dev` pins the open
    docs pull request's head during a change set (development-cycle §2a item 2). It reads the private docs repo through
@@ -27,18 +28,23 @@ import urllib.error
 import urllib.request
 
 ORG = "OnePeek"
-PIN = re.compile(r"OnePeek/\.github/\.github/workflows/([\w.-]+\.yml)@([0-9a-f]{40})")
+# Every `uses:` naming OnePeek/.github, in any letter case, with whatever ref it has (P2): `path` is the part after
+# `OnePeek/.github/` (empty for the repo root), `ref` the text after `@` (empty when there is none), `comment` an
+# optional trailing `# ...`.
+USES = re.compile(r"""(?P<lead>\buses:[ \t]*["']?)(?P<name>OnePeek/\.github)(?=[/@\s"']|$)(?:/(?P<path>[^@\s"'#]*))?"""
+                  r"""(?:@(?P<ref>[^\s"'#]*))?(?P<quote>["']?)(?P<comment>[ \t]+#[^\n]*)?""", re.I | re.M)
+SHA = re.compile(r"[0-9a-f]{40}")
 TAG = re.compile(r"v\d+\.\d+\.\d+")
 DOCS_PIN = re.compile(r"onepeek-docs@([0-9a-f]{40})")
 
 
 def pins(repo: pathlib.Path) -> list[tuple[str, int, str, str]]:
-    """(file, line, workflow, sha) for every shared-workflow pin in the repo's workflows."""
+    """(file, line, what it calls, ref) for every `uses:` naming OnePeek/.github in the repo's workflows."""
     out = []
     for f in sorted((repo / ".github" / "workflows").glob("*.y*ml")):
         for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
-            for m in PIN.finditer(line):
-                out.append((f.name, n, m.group(1), m.group(2)))
+            for m in USES.finditer(line):
+                out.append((f.name, n, pathlib.PurePosixPath(m.group("path") or m.group("name")).name, m.group("ref") or ""))
     return out
 
 
@@ -70,11 +76,16 @@ def remote_tags() -> dict[str, list[str]]:
 
 
 def pin_problems(found: list[tuple[str, int, str, str]], tags: dict[str, list[str]]) -> list[str]:
-    problems = [f"{f}:{n} pins {wf} at {sha[:7]}, which is not the commit of a v* tag of {ORG}/.github"
-                for f, n, wf, sha in found if sha not in tags]
-    shas = sorted({sha for *_, sha in found})
+    problems = []
+    for f, n, wf, ref in found:
+        if not SHA.fullmatch(ref):
+            problems.append(f"{f}:{n} pins {wf} at {ref!r}, which is not a 40-character commit SHA; pin the commit of a v* tag")
+        elif ref not in tags:
+            problems.append(f"{f}:{n} pins {wf} at {ref[:7]}, which is not the commit of a v* tag of {ORG}/.github")
+    shas = sorted({ref for *_, ref in found})
     if len(shas) > 1:
-        named = ", ".join(f"{sha[:7]} ({'/'.join(sorted(tags.get(sha, ['untagged'])))})" for sha in shas)
+        named = ", ".join(f"{sha[:7] if SHA.fullmatch(sha) else repr(sha)} ({'/'.join(sorted(tags.get(sha, ['untagged'])))})"
+                          for sha in shas)
         problems.append(f"the {ORG}/.github pins are not one version: {named}; move them all with one pin-move")
     return problems
 

@@ -26,6 +26,12 @@ class Parse(unittest.TestCase):
         self.assertEqual(cd.parse(None), [])
         self.assertEqual(cd.parse("Depends on: backend-service#73\nDepends on: OnePeek/x"), [])
 
+    def test_repo_names_are_ascii_and_never_only_dots(self) -> None:
+        self.assertEqual(cd.parse("Depends on: OnePeek/.github#34\nDepends on: OnePeek/a_b.c-9#1"), [(".github", 34), ("a_b.c-9", 1)])
+        for bad in ("OnePeek/.#1", "OnePeek/..#2", "OnePeek/...#3", "OnePeek/bäckend#4", "OnePeek/web١#5",
+                    "OnePeek/x/y#6", "OnePeek/x#١"):
+            self.assertEqual(cd.parse(f"Depends on: {bad}"), [], bad)
+
 
 class Waiting(unittest.TestCase):
     def test_open_waits_closed_unmerged_fails_and_merged_passes(self) -> None:

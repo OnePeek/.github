@@ -16,9 +16,9 @@ A change set is merged in one sitting, in one order (`onepeek-docs/standards/dev
    1. docs into `main` with a merge commit;
    2. `.github` into `main` (squash), then waits for its release tag and moves every later pull request's `OnePeek/.github` workflow pins to that tag in one commit;
    3. infra, then the design system, then backend, then web, then the other repos, each squashed into `dev`.
-   4. after the whole set, when `.github` was tagged: a pin-move pull request in every other repo whose workflows pin `OnePeek/.github` (with a note when it was more than one minor version behind, as its inputs may need a hand fix); review and merge those like any pull request.
+   4. after the whole set, when `.github` was tagged: a pin-move pull request in every repo whose workflows pin `OnePeek/.github` and whose pins were not moved inside the set (a repo outside the set, or one merged before `.github`, such as `onepeek-docs`), with a note when it was more than one minor version behind, as its inputs may need a hand fix; review and merge those like any pull request. Pin moves are safe to re-run: an existing branch or pull request for the tag is updated, never a second one, and no local branch is created or deleted. A failure in one repo does not stop the others; the run lists the failures at the end and exits 1.
 
-   **Expand first** (`foundation-playbook.md` §8a P1, development-cycle §2a item 7): when the consumer of a strictly validated contract must merge before its producer, pass `--order repoA,repoB,...` naming every repo of the set once; it replaces the fixed order.
+   **Expand first** (`foundation-playbook.md` §8a P1, development-cycle §2a item 7): when the consumer of a strictly validated contract must merge before its producer, pass `--order repoA,repoB,...` naming every repo of the set once; it replaces the fixed order. `onepeek-docs` always stays first: an `--order` that puts it later is refused, and a docs pull request may not depend on another pull request in the set.
 
    **Declared dependencies** (§8a P1): a pull request whose body says `Depends on: OnePeek/<repo>#<n>` merges after that one (the order is otherwise kept); after the dependency merges, the dependent's failed checks (its `depends-on` job) are re-run. A listed pull request outside the set must already be merged, or the dry run stops.
 

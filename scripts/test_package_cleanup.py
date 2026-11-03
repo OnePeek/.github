@@ -1,6 +1,7 @@
 """Tests for package-cleanup.yml (foundation-playbook §8a C3): which versions go, the dry run, and a 403 failing."""
 from __future__ import annotations
 
+import contextlib
 import datetime
 import io
 import json
@@ -59,20 +60,20 @@ class Plan(unittest.TestCase):
 
 
 class Run(unittest.TestCase):
-    def fake(self, calls: list, versions: list, fail: int | None = None):
+    def fake(self, calls: list, versions: list, fail: int | None = None, fail_on=lambda method, url: True):
         def urlopen(req, timeout=0):
             calls.append((req.get_method(), req.full_url))
-            if fail:
+            if fail and fail_on(req.get_method(), req.full_url):
                 raise urllib.error.HTTPError(req.full_url, fail, "no", {}, io.BytesIO(b""))
             body = json.dumps(versions).encode() if req.get_method() == "GET" else b""
             return mock.MagicMock(__enter__=lambda s: mock.MagicMock(read=lambda: body), __exit__=lambda *a: False)
         return urlopen
 
-    def run_main(self, dry: str, versions: list, fail: int | None = None) -> list:
+    def run_main(self, dry: str, versions: list, fail: int | None = None, packages: str = "api-client", **kw) -> list:
         ns, calls = load(), []
-        env = {"OWNER": "OnePeek", "PACKAGES": "api-client", "DRY_RUN": dry, "GH_TOKEN": "t"}
+        env = {"OWNER": "OnePeek", "PACKAGES": packages, "DRY_RUN": dry, "GH_TOKEN": "t"}
         old = [v(i, f"0.3.0-next.{i}", 40 + i) for i in range(12)] if versions is None else versions
-        with mock.patch.dict(os.environ, env), mock.patch("urllib.request.urlopen", self.fake(calls, old, fail)), \
+        with mock.patch.dict(os.environ, env), mock.patch("urllib.request.urlopen", self.fake(calls, old, fail, **kw)), \
                 mock.patch("datetime.datetime", wraps=datetime.datetime) as dt:
             dt.now.return_value = NOW
             ns["main"]()
@@ -91,6 +92,19 @@ class Run(unittest.TestCase):
         with self.assertRaises(SystemExit) as stop:
             self.run_main("false", [], fail=403)
         self.assertIn("HTTP 403", str(stop.exception))
+
+    def test_a_404_for_a_package_not_yet_published_is_a_notice_and_the_others_still_run(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            calls = self.run_main("false", None, fail=404, packages="tokens ui",
+                                  fail_on=lambda method, url: "/npm/tokens/" in url)
+        self.assertIn("::notice::@onepeek/tokens is not published yet (HTTP 404)", out.getvalue())
+        self.assertEqual([u.split("/npm/")[1] for m, u in calls if m == "DELETE"], ["ui/versions/10", "ui/versions/11"])
+
+    def test_a_404_on_a_delete_still_fails(self) -> None:
+        with self.assertRaises(SystemExit) as stop:
+            self.run_main("false", None, fail=404, fail_on=lambda method, url: method == "DELETE")
+        self.assertIn("HTTP 404", str(stop.exception))
 
     def test_pull_requests_are_always_a_dry_run(self) -> None:
         self.assertEqual(STEP["env"]["DRY_RUN"], "${{ inputs.dry-run || github.event_name == 'pull_request' }}")

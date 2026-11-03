@@ -156,26 +156,78 @@ class Tokens(unittest.TestCase):
 
 
 class ReleaseState(unittest.TestCase):
-    def state(self, prs, compare=(True, {"status": "ahead"})) -> list[str]:
+    """§8a P4: stale = the second parent of the newest merge commit reachable from release is not on dev."""
+    R = "repos/OnePeek/onepeek-web/"
+    MERGE, MERGED, HOTFIX = "m" * 40, "2" * 40, "h" * 40
+
+    def state(self, prs, release_on_dev=False, commits=(), on_dev=()) -> list[tuple[str, str]]:
+        """`commits`: release's history newest first, as parent counts; `on_dev`: the commits that are on dev."""
+        answers = {self.R + "pulls": (True, prs),
+                   self.R + "compare/release...dev": (True, {"status": "ahead" if release_on_dev else "diverged"})}
+        answers.update({self.R + f"compare/{c}...dev": (True, {"status": "behind"}) for c in (self.MERGED,)})
+        answers.update({self.R + f"compare/{c}...dev": (True, {"status": "ahead"}) for c in on_dev})
+        history = [{"sha": sha, "parents": [{"sha": "1" * 40}] + ([{"sha": self.MERGED}] if n > 1 else [])}
+                   for sha, n in commits]
+        answers[self.R + "commits?sha=release"] = (True, history)
         rep = pf.Report()
-        pf.release_state("onepeek-web", rep, api=api({"repos/OnePeek/onepeek-web/pulls": (True, prs),
-                                                      "repos/OnePeek/onepeek-web/compare": compare}))
-        return statuses(rep)
+        seen = []
+        call = api(answers)
+        pf.release_state("onepeek-web", rep, api=lambda path: seen.append(path) or call(path))
+        self.seen = seen
+        return rep.lines
+
+    def only(self, lines) -> str:
+        self.assertEqual(len(lines), 1, lines)
+        return lines[0][0]
 
     def test_more_than_one_open_release_pull_request_fails(self) -> None:
         pr = {"number": 1, "head": {"sha": "a" * 40}}
-        self.assertEqual(self.state([pr, pr]), ["FAIL"])
+        self.assertEqual(self.only(self.state([pr, pr])), "FAIL")
 
     def test_one_open_release_pull_request_passes(self) -> None:
-        self.assertEqual(self.state([{"number": 1, "head": {"sha": "a" * 40}}]), ["PASS"])
+        self.assertEqual(self.only(self.state([{"number": 1, "head": {"sha": "a" * 40}}])), "PASS")
 
-    def test_none_while_release_is_not_an_ancestor_of_dev_fails(self) -> None:
-        self.assertEqual(self.state([], (True, {"status": "diverged"})), ["FAIL"])
-        self.assertEqual(self.state([], (False, "HTTP 404")), ["FAIL"])
+    def test_a_merge_whose_second_parent_is_on_dev_passes(self) -> None:
+        self.assertEqual(self.only(self.state([], commits=[(self.MERGE, 2)], on_dev=[self.MERGED])), "PASS")
+        self.assertIn(self.R + f"compare/{self.MERGED}...dev", self.seen)
 
-    def test_none_while_release_is_an_ancestor_of_dev_passes(self) -> None:
-        for st in ("ahead", "identical"):
-            self.assertEqual(self.state([], (True, {"status": st})), ["PASS"])
+    def test_a_merge_whose_second_parent_is_off_dev_fails(self) -> None:
+        lines = self.state([], commits=[(self.MERGE, 2)])
+        self.assertEqual(self.only(lines), "FAIL")
+        self.assertIn("stale", lines[0][1])
+
+    def test_release_fast_forwarded_onto_dev_passes(self) -> None:
+        for status in ("ahead", "identical"):
+            rep = pf.Report()
+            pf.release_state("onepeek-web", rep, api=api({self.R + "pulls": (True, []),
+                                                          self.R + "compare/release...dev": (True, {"status": status})}))
+            self.assertEqual(statuses(rep), ["PASS"], status)
+
+    def test_a_hotfix_squashed_after_the_merge_passes(self) -> None:
+        lines = self.state([], commits=[(self.HOTFIX, 1), (self.MERGE, 2), ("o" * 40, 2)], on_dev=[self.MERGED])
+        self.assertEqual(self.only(lines), "PASS")
+        self.assertIn(self.MERGE[:7], lines[0][1])  # the newest merge, not the hotfix
+
+    def test_no_merge_and_not_on_dev_fails_with_no_release_merge_found(self) -> None:
+        lines = self.state([], commits=[(self.HOTFIX, 1), ("o" * 40, 1)])
+        self.assertEqual(self.only(lines), "FAIL")
+        self.assertIn("no release merge found", lines[0][1])
+
+    def test_the_history_is_walked_past_the_first_page(self) -> None:
+        page1 = [{"sha": f"{i:040x}", "parents": [{"sha": "1" * 40}]} for i in range(100)]
+        page2 = [{"sha": self.MERGE, "parents": [{"sha": "1" * 40}, {"sha": self.MERGED}]}]
+        rep = pf.Report()
+        pf.release_state("onepeek-web", rep, api=api({
+            self.R + "pulls": (True, []), self.R + "compare/release...dev": (True, {"status": "diverged"}),
+            self.R + "commits?sha=release&per_page=100&page=1": (True, page1),
+            self.R + "commits?sha=release&per_page=100&page=2": (True, page2),
+            self.R + f"compare/{self.MERGED}...dev": (True, {"status": "ahead"})}))
+        self.assertEqual(statuses(rep), ["PASS"])
+
+    def test_an_unreadable_release_fails(self) -> None:
+        rep = pf.Report()
+        pf.release_state("onepeek-web", rep, api=api({self.R + "pulls": (True, []), self.R + "compare": (False, "HTTP 404")}))
+        self.assertEqual(statuses(rep), ["FAIL"])
 
     def test_the_repos_read_are_the_contract_and_lock_sides_but_not_itself(self) -> None:
         contract = [("c.yml", "uses: OnePeek/.github/.github/workflows/contract.yml@" + "a" * 40)]
@@ -183,6 +235,8 @@ class ReleaseState(unittest.TestCase):
         lock = [("r.yml", "uses: OnePeek/.github/.github/workflows/release-ecs.yml@" + "a" * 40)]
         self.assertEqual(pf.release_repos("backend-service", lock), ["mcp-athena", "onepeek-infra", "onepeek-web"])
         self.assertEqual(pf.release_repos("onepeek-docs", [("s.yml", "secret-scan")]), [])
+        lower = [("c.yml", "uses: onepeek/.github/.github/workflows/contract.yml@" + "a" * 40)]
+        self.assertEqual(pf.release_repos("onepeek-web", lower), ["backend-service", "onepeek-infra"])
 
 
 class DependsOn(Repo):

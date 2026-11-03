@@ -16,7 +16,10 @@
      workflows and the shared ones they call request, and its installed repositories against the repositories those
      steps name ("unverified" without org-admin read); repository secrets cannot be read from a laptop ("unverified");
    - the other repos' release state, for each repo the contract or the release lock reads: more than one open
-     dev -> release pull request fails, and so does none while `release` is not an ancestor of `dev`.
+     dev -> release pull request fails, and so does none while `release` is stale: the second parent of the newest
+     merge commit reachable from `release` (the last dev commit merged into it; a hotfix squashed on top does not
+     count), or `release` itself when it is on `dev` (a fast-forward), is not an ancestor of `dev`; no merge commit
+     and `release` not on `dev` also fails ("no release merge found").
 
 Each line is PASS, FAIL, WARN or UNVERIFIED; the last line is `PREFLIGHT OK` or `PREFLIGHT FAILED`. Exit 1 on any FAIL.
 Needs `gh` signed in for the pin tags and `--release`.
@@ -42,7 +45,6 @@ CONTRACT_REPOS = ("backend-service", "onepeek-web", "onepeek-infra")  # contract
 LOCK_REPOS = ("backend-service", "onepeek-web", "onepeek-infra", "mcp-athena")  # the repos that take the lock (§5.4)
 LOCK_WORKFLOWS = ("release-lock.yml", "release-ecs.yml", "operate.yml")
 LEVEL = {"read": 1, "write": 2, "admin": 3}
-SHARED_USES = re.compile(r"OnePeek/\.github/(\.github/workflows/[\w.-]+\.yml)@([0-9a-f]{40})")
 
 
 def _load(name: str, path: pathlib.Path):
@@ -198,8 +200,8 @@ def uses_tflint(repo: pathlib.Path) -> bool:
 
 # 4. Release prerequisites -----------------------------------------------------------------------------------------
 def shared_text(path: str, sha: str) -> str:
-    """A shared workflow at the commit the caller pins (fetched when this checkout lacks it), else the local copy."""
-    for attempt in range(2):
+    """A shared workflow at the ref the caller pins (fetched when this checkout lacks it), else the local copy."""
+    for attempt in range(2 if sha else 0):
         rc, out = sh(["git", "-C", str(SHARED), "show", f"{sha}:{path}"])
         if rc == 0:
             return out
@@ -215,10 +217,12 @@ def workflows(repo: pathlib.Path) -> list[tuple[str, str]]:
     for f in sorted((repo / ".github/workflows").glob("*.y*ml")):
         text = f.read_text(encoding="utf-8")
         out.append((f.name, text))
-        for path, sha in SHARED_USES.findall(text):
-            if (path, sha) not in seen:
+        for m in check_pins.USES.finditer(text):  # every OnePeek/.github call, any letter case and any ref (P2)
+            path, sha = m.group("path") or "", m.group("ref") or ""
+            if path.startswith(".github/workflows/") and (path, sha) not in seen:
                 seen.add((path, sha))
-                out.append((f"{pathlib.Path(path).name}@{sha[:7]}", shared_text(path, sha)))
+                out.append((f"{pathlib.Path(path).name}@{sha[:7] if check_pins.SHA.fullmatch(sha) else sha}",
+                            shared_text(path, sha)))
     return out
 
 
@@ -294,7 +298,7 @@ def token_checks(texts: list[tuple[str, str]], own: str, rep: Report, api=gh_jso
 def release_repos(repo_name: str, texts: list[tuple[str, str]]) -> list[str]:
     """The repos whose release state this repo's release reads: the contract's other sides, the lock's other repos."""
     out: set[str] = set()
-    joined = "\n".join(t for _, t in texts)
+    joined = "\n".join(t for _, t in texts).lower()  # a pin in any letter case counts (P2)
     if "workflows/contract.yml@" in joined:
         out |= set(CONTRACT_REPOS)
     if any(f"workflows/{w}@" in joined for w in LOCK_WORKFLOWS):
@@ -303,7 +307,34 @@ def release_repos(repo_name: str, texts: list[tuple[str, str]]) -> list[str]:
     return sorted(out)
 
 
+def ancestor_of_dev(repo: str, commit: str, api) -> tuple[bool | None, str]:
+    """(True when `commit` is an ancestor of dev or dev itself, None when the compare fails, its status or error)."""
+    ok, cmp = api(f"repos/{ORG}/{repo}/compare/{commit}...dev")
+    if not ok:
+        return None, str(cmp)
+    return cmp.get("status") in ("ahead", "identical"), str(cmp.get("status"))
+
+
+def newest_release_merge(repo: str, api) -> tuple[bool, dict | None | str]:
+    """The newest merge commit reachable from `release` (walking its history newest first): (True, commit or None when
+    there is none) or (False, the error)."""
+    page = 1
+    while True:
+        ok, commits = api(f"repos/{ORG}/{repo}/commits?sha=release&per_page=100&page={page}")
+        if not ok:
+            return False, str(commits)
+        for c in commits or []:
+            if len(c.get("parents") or []) > 1:
+                return True, c
+        if len(commits or []) < 100:
+            return True, None
+        page += 1
+
+
 def release_state(repo: str, rep: Report, api=gh_json) -> None:
+    """At most one open dev -> release pull request; with none, `release` must not be stale (§8a P4): the last dev
+    commit merged into it (the second parent of the newest merge commit reachable from `release`, so a hotfix squashed
+    on top does not count; or `release` itself when it is on dev, a fast-forward) is an ancestor of dev."""
     ok, prs = api(f"repos/{ORG}/{repo}/pulls?state=open&base=release&head={ORG}:dev")
     if not ok:
         rep.add("FAIL", f"release state: cannot read {repo}'s open pull requests into release: {prs}")
@@ -314,14 +345,32 @@ def release_state(repo: str, rep: Report, api=gh_json) -> None:
     if len(prs) == 1:
         rep.add("PASS", f"release state: {repo} release candidate is #{prs[0]['number']} ({prs[0]['head']['sha'][:7]})")
         return
-    ok, cmp = api(f"repos/{ORG}/{repo}/compare/release...dev")
+    on_dev, why = ancestor_of_dev(repo, "release", api)
+    if on_dev is None:
+        rep.add("FAIL", f"release state: cannot compare {repo} release with dev (no release branch?): {why}")
+        return
+    if on_dev:
+        rep.add("PASS", f"release state: {repo} has no open release pull request; release is on dev (fast-forward)")
+        return
+    ok, merge = newest_release_merge(repo, api)
     if not ok:
-        rep.add("FAIL", f"release state: cannot compare {repo} release with dev (no release branch?): {cmp}")
-    elif cmp.get("status") in ("ahead", "identical"):
-        rep.add("PASS", f"release state: {repo} has no open release pull request; release is an ancestor of dev")
+        rep.add("FAIL", f"release state: cannot read {repo}'s release history: {merge}")
+        return
+    if merge is None:
+        rep.add("FAIL", f"release state: {repo} has no open release pull request, release is not on dev and no release "
+                        "merge found: the check would compare against code dev no longer builds on; rebuild release from dev")
+        return
+    merged = merge["parents"][1]["sha"]
+    on_dev, why = ancestor_of_dev(repo, merged, api)
+    if on_dev is None:
+        rep.add("FAIL", f"release state: cannot compare {repo}'s last release merge ({merged[:7]}) with dev: {why}")
+    elif on_dev:
+        rep.add("PASS", f"release state: {repo} has no open release pull request; its last release merge "
+                        f"({merge['sha'][:7]}) brought in {merged[:7]}, which is on dev")
     else:
-        rep.add("FAIL", f"release state: {repo} has no open release pull request and release is not an ancestor of dev "
-                        f"({cmp.get('status')}): the check would compare against a stale release; rebuild release from dev")
+        rep.add("FAIL", f"release state: {repo} has no open release pull request and release is stale: its last release "
+                        f"merge ({merge['sha'][:7]}) brought in {merged[:7]}, which is not an ancestor of dev ({why}); "
+                        "the check would compare against code dev no longer builds on; rebuild release from dev")
 
 
 def docs_check(repo: pathlib.Path, rep: Report) -> None:
