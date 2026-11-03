@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   no-prerelease-deps:
-    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

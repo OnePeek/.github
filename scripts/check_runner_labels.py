@@ -28,7 +28,7 @@ EXEMPT = {("OnePeek/onepeek-infra", "ci-runner-canary.yml"), ("OnePeek/onepeek-i
 EXEMPT_LABELS = {"onepeek-arm64", "onepeek-arm64-canary"}
 MAPPING_REPO = "OnePeek/.github"  # the only public repo whose workflow_call workflows may hold the mapping
 PROD_GUARD = "inputs.environment == 'prod' && 'ubuntu-latest' || "
-LIMITS = {"fast": 60, "arm-build": 60, "stateful": 150}
+LIMITS = {"light": 30, "fast": 60, "arm-build": 60, "stateful": 150}
 
 
 def _forms(var: str) -> dict[str, str]:
@@ -40,6 +40,7 @@ def _forms(var: str) -> dict[str, str]:
     def three(onepeek: str, canary: str, hosted: str) -> str:
         return f"{var} == 'onepeek' && '{onepeek}' || {var} == 'canary' && '{canary}' || '{hosted}'"
     return {
+        "light": three("onepeek-arm64-small", "onepeek-arm64-canary", "ubuntu-latest"),
         "fast": three("onepeek-arm64", "onepeek-arm64-canary", "ubuntu-latest"),
         "arm-build": three("onepeek-arm64", "onepeek-arm64-canary", arm_hosted),
         "stateful": three("onepeek-arm64-od", "onepeek-arm64-od", "ubuntu-latest"),
