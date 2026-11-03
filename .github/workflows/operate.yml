@@ -188,7 +188,7 @@ jobs:
               target="${target#v}"
               digest=$(aws ecr describe-images --repository-name "${NAME}/${image}" --image-ids "imageTag=v${target}" --query 'imageDetails[0].imageDigest' --output text)
               COMMIT="sha-$(git rev-list -n 1 "v${target}" | cut -c1-12)"
-              VERSION="v${target}"
+              VERSION="${target}"   # the version tag is <semver> (delivery-pipelines §5 step 3)
             else
               # Preprod is keyed on the commit (playbook §5.2): a sha-<12> target, or the previous recorded deployment.
               # "Current" is what the service runs (its task definition's commit tag), not the last record: a failed or
@@ -206,10 +206,20 @@ jobs:
             fi
             IMAGE_REF="${registry}/${NAME}/${image}@${digest}"
             cosign verify --experimental-oci11 --insecure-ignore-tlog=true --key "${key}" "${IMAGE_REF}" >/dev/null
-            # --- render-taskdef begin (identical in release-ecs.yml and operate.yml; checked by scripts/check_service_list.py) ---
-          render() {  # render <service> -> task definition JSON on stdout
+          # --- render-taskdef begin (identical in release-ecs.yml and operate.yml; checked by scripts/check_service_list.py) ---
+          # The service's currently registered task definition, for drop protection (delivery-pipelines §5 step 4):
+          # prints the file it wrote, or first-deploy when the service has none yet.
+          current_td() {  # current_td <service> <file>
+            local td
+            td=$(aws ecs describe-services --cluster "${NAME}" --services "$1" --query 'services[0].taskDefinition' --output text)
+            if [ -z "${td}" ] || [ "${td}" = "None" ]; then echo first-deploy; return 0; fi
+            aws ecs describe-task-definition --task-definition "${td}" --query taskDefinition --output json > "$2"
+            echo "$2"
+          }
+          render() {  # render <service> <one-off | first-deploy | current task definition file> -> task definition JSON on stdout
             aws s3 cp "s3://${NAME}-deploy/taskdef/$1.json" - \
-              | IMAGE_REF="${IMAGE_REF}" COMMIT="${COMMIT}" VERSION="${VERSION:-}" RUN_ID="${GITHUB_RUN_ID}" python3 -c '
+              | IMAGE_REF="${IMAGE_REF}" COMMIT="${COMMIT}" VERSION="${VERSION:-}" RUN_ID="${GITHUB_RUN_ID}" \
+                MODE="$2" ALLOW_DROP="${ALLOW_DROP:-}" python3 -c '
           import json, os, re, sys
           text = sys.stdin.read()
           left = sorted(set(re.findall(r"__[A-Z0-9_]+__", text)))
@@ -229,17 +239,38 @@ jobs:
               sys.exit("containers with no image after rendering: " + ", ".join(empty))
           if not os.environ["COMMIT"]:
               sys.exit("no commit to tag the task definition with")
-          # Tags (playbook §5.2): commit=sha-<12> and release-run always; version=v<version> only on promotion to prod.
+          # Tags (delivery-pipelines §5 step 3): commit=sha-<12> and release-run always; version=<semver> only on promotion.
           doc["tags"] = [{"key": "commit", "value": os.environ["COMMIT"]}, {"key": "release-run", "value": os.environ["RUN_ID"]}]
           if os.environ["VERSION"]:
               doc["tags"].append({"key": "version", "value": os.environ["VERSION"]})
+          # Drop protection (§5 step 4), for services only: no name in both settings and secrets, and no setting or secret
+          # name of the registered revision disappears unless the caller reviewed it in allow-drop (the contract step).
+          mode = os.environ["MODE"]
+          if mode not in ("one-off", "first-deploy") and not os.path.isfile(mode):
+              sys.exit("render needs one-off, first-deploy or the current task definition file, got: " + mode)
+          def names(c, key):
+              return {e["name"] for e in (c.get(key) or [])}
+          if mode != "one-off":
+              both = sorted("%s/%s" % (c.get("name", "?"), n) for c in containers for n in names(c, "environment") & names(c, "secrets"))
+              if both:
+                  sys.exit("drop protection: names that are both a setting and a secret: " + ", ".join(both))
+          if mode not in ("one-off", "first-deploy"):
+              current = json.load(open(mode))
+              allowed = set(os.environ["ALLOW_DROP"].replace(",", " ").split())
+              new = {c.get("name"): names(c, "environment") | names(c, "secrets") for c in containers}
+              gone = sorted("%s/%s" % (c.get("name", "?"), n) for c in current.get("containerDefinitions", [])
+                            for n in (names(c, "environment") | names(c, "secrets")) - new.get(c.get("name"), set()) - allowed)
+              if gone:
+                  sys.exit("drop protection: names in the registered revision that this render would drop (list them in allow-drop "
+                           "only for the contract step of an expand/contract change): " + ", ".join(gone))
           print(json.dumps(doc))'
           }
           # --- render-taskdef end ---
-            render "${svc}" > "td-${svc}.json"
+            mode=$(current_td "${svc}" "current-${svc}.json")
+            render "${svc}" "${mode}" > "td-${svc}.json"
             arn=$(aws ecs register-task-definition --cli-input-json "file://td-${svc}.json" --query taskDefinition.taskDefinitionArn --output text)
             aws ecs update-service --cluster "${NAME}" --service "${svc}" --task-definition "${arn}" >/dev/null
-            echo "Rolling ${svc} back to ${VERSION:-${COMMIT}} (${arn##*/})."
+            echo "Rolling ${svc} back to ${VERSION:+v}${VERSION:-${COMMIT}} (${arn##*/})."
             VERSION_NOW="${VERSION:-${COMMIT}}"
           done < selected.txt
           # shellcheck disable=SC2046

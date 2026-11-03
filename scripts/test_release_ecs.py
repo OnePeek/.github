@@ -15,6 +15,7 @@ import yaml
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github/workflows"
 RELEASE = yaml.safe_load((WORKFLOWS / "release-ecs.yml").read_text(encoding="utf-8"))
 TEXT = (WORKFLOWS / "release-ecs.yml").read_text(encoding="utf-8")
+OPERATE = (WORKFLOWS / "operate.yml").read_text(encoding="utf-8")
 DIGEST = "sha256:" + "a" * 64
 COMMIT = "sha-" + "f" * 12
 ENV = {"NAME": "onepeek-preprod", "ENVIRONMENT": "preprod", "IMAGE": "backend", "MAIN": "backend", "VERSION": "1.2.3",
@@ -293,14 +294,19 @@ FUNCTION = re.search(r"# --- render-taskdef begin[^\n]*\n(.*?)# --- render-taskd
 REF = "r@" + DIGEST
 
 
-def render(template: dict, image_ref: str = REF, commit: str = COMMIT, version: str = ""):
+def render(template: dict, image_ref: str = REF, commit: str = COMMIT, version: str = "", mode: str = "one-off",
+           current: dict | None = None, allow_drop: str = ""):
     with tempfile.TemporaryDirectory() as d:
         Path(d, "t.json").write_text(json.dumps(template))
+        if current is not None:
+            Path(d, "current.json").write_text(json.dumps(current))
+            mode = str(Path(d, "current.json"))
         stub = Path(d, "aws")
         stub.write_text(f"#!/bin/bash\ncat '{d}/t.json'\n")
         stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
-        return subprocess.run(["bash", "-c", FUNCTION + "\nrender api"], capture_output=True, text=True, env={
+        return subprocess.run(["bash", "-c", FUNCTION + f"\nrender api '{mode}'"], capture_output=True, text=True, env={
             **os.environ, "PATH": f"{d}:{os.environ['PATH']}", "NAME": "n", "IMAGE_REF": image_ref, "COMMIT": commit, "VERSION": version, "GITHUB_RUN_ID": "9",
+            "ALLOW_DROP": allow_drop,
         })  # fmt: skip
 
 
@@ -366,6 +372,95 @@ class RenderFunction(unittest.TestCase):
 
     def test_a_placeholder_left_refuses(self):
         self.assertNotEqual(render({"family": "f", "containerDefinitions": [{"name": "api", "x": "__IMAGE__"}]}).returncode, 0)
+
+
+def env(*names):
+    return [{"name": n, "value": "x"} for n in names]
+
+
+def secrets(*names):
+    return [{"name": n, "valueFrom": "arn:ssm:" + n} for n in names]
+
+
+RUNNING = {"family": "f", "containerDefinitions": [{"name": "api", "image": "old", "environment": env("A", "B"), "secrets": secrets("S")}]}
+
+
+class DropProtection(unittest.TestCase):
+    """delivery-pipelines §5 step 4: per service, against the service's currently registered task definition."""
+
+    def test_a_setting_or_secret_that_would_disappear_is_refused(self):
+        for c in ({"name": "api", "environment": env("A"), "secrets": secrets("S")}, {"name": "api", "environment": env("A", "B")}):
+            out = render({"family": "f", "containerDefinitions": [c]}, current=RUNNING)
+            self.assertNotEqual(out.returncode, 0, c)
+            self.assertIn("drop protection", out.stderr)
+            self.assertEqual(out.stdout, "")
+
+    def test_a_dropped_name_listed_in_allow_drop_passes(self):
+        out = render({"family": "f", "containerDefinitions": [{"name": "api", "environment": env("A")}]}, current=RUNNING, allow_drop="B, S")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn("B", out.stderr)
+
+    def test_allow_drop_allows_only_the_names_it_lists(self):
+        out = render({"family": "f", "containerDefinitions": [{"name": "api", "environment": env("A")}]}, current=RUNNING, allow_drop="B")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("api/S", out.stderr)
+
+    def test_a_name_moved_between_settings_and_secrets_is_not_a_drop(self):
+        out = render({"family": "f", "containerDefinitions": [{"name": "api", "environment": env("A", "S"), "secrets": secrets("B")}]}, current=RUNNING)
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_a_name_in_both_settings_and_secrets_is_refused_even_on_a_first_deploy(self):
+        both = {"family": "f", "containerDefinitions": [{"name": "api", "environment": env("A", "S"), "secrets": secrets("S")}]}
+        for kwargs in ({"current": RUNNING}, {"mode": "first-deploy"}):
+            out = render(both, **kwargs)
+            self.assertNotEqual(out.returncode, 0, kwargs)
+            self.assertIn("both a setting and a secret", out.stderr)
+        self.assertNotEqual(render(both, current=RUNNING, allow_drop="S").returncode, 0)
+
+    def test_a_first_deploy_with_no_registered_revision_passes(self):
+        out = render({"family": "f", "containerDefinitions": [{"name": "api", "environment": env("A")}]}, mode="first-deploy")
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_a_vanished_container_counts_as_dropping_its_names(self):
+        out = render({"family": "f", "containerDefinitions": [{"name": "other", "environment": env("A", "B"), "secrets": secrets("S")}]}, current=RUNNING)
+        self.assertNotEqual(out.returncode, 0)
+
+    def test_one_offs_are_not_checked_and_an_unknown_mode_refuses(self):
+        both = {"family": "f", "containerDefinitions": [{"name": "migrate", "environment": env("S"), "secrets": secrets("S")}]}
+        self.assertEqual(render(both, mode="one-off").returncode, 0)
+        self.assertNotEqual(render({"family": "f", "containerDefinitions": [{"name": "api"}]}, mode="/no/such/file").returncode, 0)
+
+    def test_current_td_reads_the_services_registered_revision_or_reports_a_first_deploy(self):
+        for described, want in (("arn:td/api:7", "current-api.json"), ("None", "first-deploy")):
+            aws = f"""case "$*" in *describe-services*) echo {described};; *describe-task-definition*) echo '{json.dumps(RUNNING)}';; esac"""
+            out, calls, _ = run_step(FUNCTION + "\ncurrent_td api current-api.json", aws)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(out.stdout.strip(), want)
+            self.assertEqual("describe-task-definition --task-definition arn:td/api:7" in calls, want != "first-deploy")
+
+    def test_a_drop_in_the_rollout_stops_before_anything_is_registered(self):
+        aws = f"""case "$*" in
+*describe-services*) echo arn:td/api:7;;
+*describe-task-definition*) echo '{json.dumps(RUNNING)}';;
+*"s3 cp"*) echo '{json.dumps({"family": "f", "containerDefinitions": [{"name": "api", "environment": env("A")}]})}';;
+*register-task-definition*) echo arn:td/api:8;;
+esac"""
+        base = {"IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9", "ORDERS": '[["api"]]'}
+        script = step("rollout", "Verify, render, register and update each order")
+        out, calls, _ = run_step(script, aws, base)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertNotIn("register-task-definition", calls)
+        out, calls, _ = run_step(script, aws, {**base, "ALLOW_DROP": "B S"})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("register-task-definition", calls)
+
+    def test_the_inputs_reach_the_render(self):
+        self.assertEqual(RELEASE[True]["workflow_call"]["inputs"]["allow-drop"]["default"], "")
+        roll = next(s for s in RELEASE["jobs"]["rollout"]["steps"] if s.get("id") == "roll")
+        self.assertEqual(roll["env"]["ALLOW_DROP"], "${{ inputs.allow-drop }}")
+        self.assertIn('render migrate one-off', TEXT)
+        self.assertIn('render ops one-off', TEXT)
+        self.assertIn('mode=$(current_td "${svc}" "current-${svc}.json")', OPERATE)
 
 
 INDEX = {
@@ -463,7 +558,7 @@ class Smoke(unittest.TestCase):
 *describe-services*) echo {svc_td};;
 *describe-task-definition*) echo '{json.dumps(images)}';;
 esac"""
-        return run_step(step("smoke", "The edge answers"), aws, {"DOMAIN": "d", "IMAGE": "backend", "DIGEST": DIGEST, "SERVICES": services})[0]
+        return run_step(step("smoke", "Every service's task definition"), aws, {"DOMAIN": "d", "IMAGE": "backend", "DIGEST": DIGEST, "SERVICES": services})[0]
 
     def test_a_daemon_passes_when_its_sidecar_runs_the_digest_whatever_the_order(self):
         sidecar, main = f"x/backend@{DIGEST}", "x/pgbouncer@sha256:" + "e" * 64
@@ -479,7 +574,7 @@ esac"""
 
 
 class SmokeScript(unittest.TestCase):
-    """Foundation-playbook P17: the caller repo's own smoke.sh runs after the shared checks."""
+    """UC-DEL-001 row 7: the caller's smoke-script checks the domain without AWS credentials; absent = a warning."""
     script = step("smoke", "The repo's own smoke checks")
 
     def run_smoke(self, path: str, files: dict[str, str] | None = None):
@@ -488,7 +583,9 @@ class SmokeScript(unittest.TestCase):
 
     def test_it_runs_after_the_shared_checks_in_the_same_job(self):
         names = [s.get("name", "") for s in RELEASE["jobs"]["smoke"]["steps"]]
-        self.assertLess(names.index(next(n for n in names if n.startswith("The edge answers"))), names.index(next(n for n in names if n.startswith("The repo's own"))))
+        self.assertTrue(any(n.startswith("Every service's task definition") for n in names))
+        self.assertTrue(any(n.startswith("The repo's own") for n in names))
+        self.assertNotIn("curl", json.dumps(RELEASE["jobs"]["smoke"]["steps"]))  # the edge checks are the caller's script
         self.assertEqual(RELEASE[True]["workflow_call"]["inputs"]["smoke-script"]["default"], "smoke.sh")
 
     def test_an_absent_script_is_skipped_with_a_visible_warning(self):
@@ -620,7 +717,6 @@ class ApiClient(unittest.TestCase):
         self.assertIn("needs.watch.result == 'success'", RELEASE["jobs"]["api-client"]["if"])
 
 
-OPERATE = (WORKFLOWS / "operate.yml").read_text(encoding="utf-8")
 PREVIOUS = re.search(r"(previous_deployment\(\) \{.*?\n          \})", OPERATE, re.S).group(1)
 
 
