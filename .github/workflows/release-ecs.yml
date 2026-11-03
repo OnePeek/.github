@@ -1328,18 +1328,40 @@ jobs:
           role-to-assume: ${{ inputs.role-to-assume }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
-      - name: 10 minutes after stable, poll the deploy alarms every 30 s
+      - name: 10 minutes after stable, poll the rolled services' deploy alarms every 30 s
+        env:
+          SERVICES: ${{ needs.rollout.outputs.services }}
         run: |
-          # aws-stack §16: deploy alarms may still be switched off (deploy_alarms_enabled). Then this watch cannot catch
-          # anything, which the run says out loud instead of reporting a clean watch.
-          known=$(aws cloudwatch describe-alarms --alarm-name-prefix "${NAME}-deploy-" --query 'MetricAlarms[].AlarmName' --output text)
+          # aws-stack §10.4: each service has exactly two deploy alarms, onepeek-<env>-deploy-<service>-errors and
+          # -latency; this release watches only those of the services it rolled (by exact name: a prefix for `api` would
+          # also match `api-critical`), so a web release never fails on an api alarm. They may be switched off
+          # (deploy_alarms_enabled, off until launch); then the watch cannot catch anything, which the run says out loud.
+          mapfile -t names < <(printf '%s' "${SERVICES:-[]}" | NAME="${NAME}" python3 -c '
+          import json, os, re, sys
+          for s in json.load(sys.stdin):
+              if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", s):
+                  sys.exit(f"bad service name {s!r}")
+              for kind in ("errors", "latency"):
+                  print(os.environ["NAME"] + "-deploy-" + s + "-" + kind)
+          ')
+          if [ "${#names[@]}" -eq 0 ]; then
+            echo "::error::The rollout reported no services, so there is nothing to watch."
+            exit 1
+          fi
+          poll() {  # $@: extra describe-alarms options; prints the matching alarm names on one line
+            aws cloudwatch describe-alarms --alarm-names "${names[@]}" "$@" --query 'MetricAlarms[].AlarmName' --output text \
+              | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'
+          }
+          known=$(poll)
           if [ -z "${known}" ]; then
-            echo "::warning::No alarm named ${NAME}-deploy-* exists: the 10-minute watch cannot detect a regression."
-            echo "Warning: no deploy alarm (${NAME}-deploy-*) exists, so the watch could not detect a regression." >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::None of the deploy alarms ${names[*]} exists: the 10-minute watch cannot detect a regression."
+            echo "Warning: none of the deploy alarms (${names[*]}) exists, so the watch could not detect a regression." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Watching: ${known}"
           fi
           end=$((SECONDS + 600))
           while [ "${SECONDS}" -lt "${end}" ]; do
-            alarms=$(aws cloudwatch describe-alarms --alarm-name-prefix "${NAME}-deploy-" --state-value ALARM --query 'MetricAlarms[].AlarmName' --output text)
+            alarms=$(poll --state-value ALARM)
             if [ -n "${alarms}" ]; then echo "::error::Deploy alarms firing: ${alarms}"; exit 1; fi
             sleep 30
           done
