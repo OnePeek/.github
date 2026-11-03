@@ -137,8 +137,8 @@ jobs:
           # record names the repo, run ID, run attempt, commit, start time and a random token; only the holder of the token
           # releases it. Anything unreadable fails closed: no lock, no deploy. A lock is never removed while its run is still
           # running: only its token's holder, or a waiter that GitHub shows the holder's run has finished, removes it.
-          # preprod-frozen: while s3://onepeek-<env>-deploy/locks/frozen.json exists (written by a hotfix run, §5.6), every take
-          # except that hotfix run's own fails with the reason.
+          # preprod-frozen: while s3://onepeek-<env>-deploy/locks/frozen.json exists (written from a hotfix/* branch, §5.6), it
+          # names that branch (repo and ref): any run from it may take the lock, every other take fails with the reason.
           LOCK_BUCKET="${NAME}-deploy"
           LOCK_KEY="locks/release.json"
           FROZEN_KEY="locks/frozen.json"
@@ -196,20 +196,32 @@ jobs:
           record = {"repo": e["GITHUB_REPOSITORY"], "run_id": e["GITHUB_RUN_ID"], "run_attempt": e["GITHUB_RUN_ATTEMPT"],
                     "commit": "sha-" + e["GITHUB_SHA"][:12], "started": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
                     "run": "%s/%s/actions/runs/%s" % (e["GITHUB_SERVER_URL"], e["GITHUB_REPOSITORY"], e["GITHUB_RUN_ID"]),
-                    "who": e.get("GITHUB_ACTOR", ""), "why": "hotfix " + e.get("GITHUB_REF_NAME", "")}
+                    "who": e.get("GITHUB_ACTOR", ""), "why": "hotfix " + e.get("GITHUB_REF_NAME", ""), "ref": e.get("GITHUB_REF", "")}
           if len(sys.argv) > 2:
               record["token"] = sys.argv[2]
-              del record["who"], record["why"]
+              del record["who"], record["why"], record["ref"]
           json.dump(record, open(sys.argv[1], "w"))' "$@"
           }
-          lock_frozen_for_others() {  # 0 when preprod-frozen names another run (the reason is printed), 1 when not frozen for us, 2 unreadable
-            local etag holder repo run attempt token
+          lock_frozen_branch() {  # lock_frozen_branch <file> -> "<repo> <ref>" of a preprod-frozen record; 1 when it is not one
+            python3 -c '
+          import json, re, sys
+          try:
+              record = json.load(open(sys.argv[1]))
+              repo, ref = record["repo"], record["ref"]
+          except Exception as error:
+              sys.exit("not a preprod-frozen record: %r" % error)
+          if not (re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) and re.fullmatch(r"refs/heads/hotfix/[A-Za-z0-9_./-]+", ref)):
+              sys.exit("not a preprod-frozen record: " + json.dumps(record))
+          print(repo, ref)' "$1"
+          }
+          lock_frozen_for_others() {  # 0 when preprod-frozen names another branch (the reason is printed), 1 when not frozen for us, 2 unreadable
+            local etag branch repo ref
             if ! etag=$(lock_read "${FROZEN_KEY}" lock-frozen.json); then return 2; fi
             if [ "${etag}" = "absent" ]; then return 1; fi
-            if ! holder=$(lock_holder lock-frozen.json); then return 2; fi
-            read -r repo run attempt token <<< "${holder}"
-            if [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${run}" = "${GITHUB_RUN_ID}" ]; then return 1; fi
-            python3 -c 'import json,sys;r=json.load(open(sys.argv[1]));print("preprod is frozen by %s (%s) for the hotfix run %s" % (r.get("who","?"), r.get("why","?"), r.get("run","?")))' lock-frozen.json
+            if ! branch=$(lock_frozen_branch lock-frozen.json); then return 2; fi
+            read -r repo ref <<< "${branch}"
+            if [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${ref}" = "${GITHUB_REF:-}" ]; then return 1; fi
+            python3 -c 'import json,sys;r=json.load(open(sys.argv[1]));print("preprod is frozen by %s (%s) for the hotfix branch %s %s, first frozen by %s" % (r.get("who","?"), r.get("why","?"), r["repo"], r["ref"], r.get("run","?")))' lock-frozen.json
             return 0
           }
           lock_take() {  # waits up to LOCK_WAIT_SECONDS, polling every LOCK_POLL_SECONDS, then fails naming the holder's run
@@ -288,24 +300,24 @@ jobs:
               *) return 1 ;;
             esac
           }
-          lock_freeze() {  # preprod-frozen (§5.4, §5.6): only a hotfix/* run writes it, naming itself
-            local msg etag holder repo run attempt token
+          lock_freeze() {  # preprod-frozen (§5.4, §5.6): only a hotfix/* run writes it, naming its branch (repo and ref)
+            local msg etag branch repo ref
             case "${GITHUB_REF:-}" in refs/heads/hotfix/*) ;; *) echo "::error::Only a hotfix/* run freezes ${ENVIRONMENT} (playbook §5.6), not ${GITHUB_REF:-?}."; return 1 ;; esac
             lock_record lock-frozen-mine.json
             if aws s3api put-object --bucket "${LOCK_BUCKET}" --key "${FROZEN_KEY}" --body lock-frozen-mine.json --if-none-match '*' \
               --content-type application/json >/dev/null 2>"${LOCK_ERR}"; then
-              echo "Froze ${ENVIRONMENT} for this hotfix run (s3://${LOCK_BUCKET}/${FROZEN_KEY})."
+              echo "Froze ${ENVIRONMENT} for ${GITHUB_REPOSITORY} ${GITHUB_REF} (s3://${LOCK_BUCKET}/${FROZEN_KEY})."
               return 0
             fi
             msg=$(cat "${LOCK_ERR}")
             case "${msg}" in *"(PreconditionFailed)"*|*"(ConditionalRequestConflict)"*) ;; *) echo "::error::preprod-frozen could not be written: ${msg}"; return 1 ;; esac
-            if ! etag=$(lock_read "${FROZEN_KEY}" lock-frozen.json) || [ "${etag}" = "absent" ] || ! holder=$(lock_holder lock-frozen.json); then
+            if ! etag=$(lock_read "${FROZEN_KEY}" lock-frozen.json) || [ "${etag}" = "absent" ] || ! branch=$(lock_frozen_branch lock-frozen.json); then
               echo "::error::preprod-frozen could not be read back."
               return 1
             fi
-            read -r repo run attempt token <<< "${holder}"
-            if [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${run}" = "${GITHUB_RUN_ID}" ]; then echo "${ENVIRONMENT} is already frozen for this run."; return 0; fi
-            echo "::error::${ENVIRONMENT} is already frozen for $(lock_url "${repo}" "${run}")."
+            read -r repo ref <<< "${branch}"
+            if [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${ref}" = "${GITHUB_REF}" ]; then echo "${ENVIRONMENT} is already frozen for this branch."; return 0; fi
+            echo "::error::${ENVIRONMENT} is already frozen for ${repo} ${ref}."
             return 1
           }
           lock_thaw() {  # removes preprod-frozen (the push that merges release back into dev, §5.6)
@@ -605,8 +617,8 @@ jobs:
           # record names the repo, run ID, run attempt, commit, start time and a random token; only the holder of the token
           # releases it. Anything unreadable fails closed: no lock, no deploy. A lock is never removed while its run is still
           # running: only its token's holder, or a waiter that GitHub shows the holder's run has finished, removes it.
-          # preprod-frozen: while s3://onepeek-<env>-deploy/locks/frozen.json exists (written by a hotfix run, §5.6), every take
-          # except that hotfix run's own fails with the reason.
+          # preprod-frozen: while s3://onepeek-<env>-deploy/locks/frozen.json exists (written from a hotfix/* branch, §5.6), it
+          # names that branch (repo and ref): any run from it may take the lock, every other take fails with the reason.
           LOCK_BUCKET="${NAME}-deploy"
           LOCK_KEY="locks/release.json"
           FROZEN_KEY="locks/frozen.json"
@@ -664,20 +676,32 @@ jobs:
           record = {"repo": e["GITHUB_REPOSITORY"], "run_id": e["GITHUB_RUN_ID"], "run_attempt": e["GITHUB_RUN_ATTEMPT"],
                     "commit": "sha-" + e["GITHUB_SHA"][:12], "started": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
                     "run": "%s/%s/actions/runs/%s" % (e["GITHUB_SERVER_URL"], e["GITHUB_REPOSITORY"], e["GITHUB_RUN_ID"]),
-                    "who": e.get("GITHUB_ACTOR", ""), "why": "hotfix " + e.get("GITHUB_REF_NAME", "")}
+                    "who": e.get("GITHUB_ACTOR", ""), "why": "hotfix " + e.get("GITHUB_REF_NAME", ""), "ref": e.get("GITHUB_REF", "")}
           if len(sys.argv) > 2:
               record["token"] = sys.argv[2]
-              del record["who"], record["why"]
+              del record["who"], record["why"], record["ref"]
           json.dump(record, open(sys.argv[1], "w"))' "$@"
           }
-          lock_frozen_for_others() {  # 0 when preprod-frozen names another run (the reason is printed), 1 when not frozen for us, 2 unreadable
-            local etag holder repo run attempt token
+          lock_frozen_branch() {  # lock_frozen_branch <file> -> "<repo> <ref>" of a preprod-frozen record; 1 when it is not one
+            python3 -c '
+          import json, re, sys
+          try:
+              record = json.load(open(sys.argv[1]))
+              repo, ref = record["repo"], record["ref"]
+          except Exception as error:
+              sys.exit("not a preprod-frozen record: %r" % error)
+          if not (re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) and re.fullmatch(r"refs/heads/hotfix/[A-Za-z0-9_./-]+", ref)):
+              sys.exit("not a preprod-frozen record: " + json.dumps(record))
+          print(repo, ref)' "$1"
+          }
+          lock_frozen_for_others() {  # 0 when preprod-frozen names another branch (the reason is printed), 1 when not frozen for us, 2 unreadable
+            local etag branch repo ref
             if ! etag=$(lock_read "${FROZEN_KEY}" lock-frozen.json); then return 2; fi
             if [ "${etag}" = "absent" ]; then return 1; fi
-            if ! holder=$(lock_holder lock-frozen.json); then return 2; fi
-            read -r repo run attempt token <<< "${holder}"
-            if [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${run}" = "${GITHUB_RUN_ID}" ]; then return 1; fi
-            python3 -c 'import json,sys;r=json.load(open(sys.argv[1]));print("preprod is frozen by %s (%s) for the hotfix run %s" % (r.get("who","?"), r.get("why","?"), r.get("run","?")))' lock-frozen.json
+            if ! branch=$(lock_frozen_branch lock-frozen.json); then return 2; fi
+            read -r repo ref <<< "${branch}"
+            if [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${ref}" = "${GITHUB_REF:-}" ]; then return 1; fi
+            python3 -c 'import json,sys;r=json.load(open(sys.argv[1]));print("preprod is frozen by %s (%s) for the hotfix branch %s %s, first frozen by %s" % (r.get("who","?"), r.get("why","?"), r["repo"], r["ref"], r.get("run","?")))' lock-frozen.json
             return 0
           }
           lock_take() {  # waits up to LOCK_WAIT_SECONDS, polling every LOCK_POLL_SECONDS, then fails naming the holder's run
@@ -756,24 +780,24 @@ jobs:
               *) return 1 ;;
             esac
           }
-          lock_freeze() {  # preprod-frozen (§5.4, §5.6): only a hotfix/* run writes it, naming itself
-            local msg etag holder repo run attempt token
+          lock_freeze() {  # preprod-frozen (§5.4, §5.6): only a hotfix/* run writes it, naming its branch (repo and ref)
+            local msg etag branch repo ref
             case "${GITHUB_REF:-}" in refs/heads/hotfix/*) ;; *) echo "::error::Only a hotfix/* run freezes ${ENVIRONMENT} (playbook §5.6), not ${GITHUB_REF:-?}."; return 1 ;; esac
             lock_record lock-frozen-mine.json
             if aws s3api put-object --bucket "${LOCK_BUCKET}" --key "${FROZEN_KEY}" --body lock-frozen-mine.json --if-none-match '*' \
               --content-type application/json >/dev/null 2>"${LOCK_ERR}"; then
-              echo "Froze ${ENVIRONMENT} for this hotfix run (s3://${LOCK_BUCKET}/${FROZEN_KEY})."
+              echo "Froze ${ENVIRONMENT} for ${GITHUB_REPOSITORY} ${GITHUB_REF} (s3://${LOCK_BUCKET}/${FROZEN_KEY})."
               return 0
             fi
             msg=$(cat "${LOCK_ERR}")
             case "${msg}" in *"(PreconditionFailed)"*|*"(ConditionalRequestConflict)"*) ;; *) echo "::error::preprod-frozen could not be written: ${msg}"; return 1 ;; esac
-            if ! etag=$(lock_read "${FROZEN_KEY}" lock-frozen.json) || [ "${etag}" = "absent" ] || ! holder=$(lock_holder lock-frozen.json); then
+            if ! etag=$(lock_read "${FROZEN_KEY}" lock-frozen.json) || [ "${etag}" = "absent" ] || ! branch=$(lock_frozen_branch lock-frozen.json); then
               echo "::error::preprod-frozen could not be read back."
               return 1
             fi
-            read -r repo run attempt token <<< "${holder}"
-            if [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${run}" = "${GITHUB_RUN_ID}" ]; then echo "${ENVIRONMENT} is already frozen for this run."; return 0; fi
-            echo "::error::${ENVIRONMENT} is already frozen for $(lock_url "${repo}" "${run}")."
+            read -r repo ref <<< "${branch}"
+            if [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${ref}" = "${GITHUB_REF}" ]; then echo "${ENVIRONMENT} is already frozen for this branch."; return 0; fi
+            echo "::error::${ENVIRONMENT} is already frozen for ${repo} ${ref}."
             return 1
           }
           lock_thaw() {  # removes preprod-frozen (the push that merges release back into dev, §5.6)

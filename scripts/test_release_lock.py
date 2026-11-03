@@ -80,8 +80,8 @@ def record(repo: str = "OnePeek/onepeek-infra", run: str = "77", attempt: str = 
                        "started": "2026-11-03T10:00:00+00:00", "token": token})  # fmt: skip
 
 
-def frozen(repo: str = "OnePeek/backend-service", run: str = "90") -> str:
-    return json.dumps({"repo": repo, "run_id": run, "run_attempt": "1", "who": "founder", "why": "hotfix hotfix/x",
+def frozen(repo: str = "OnePeek/backend-service", ref: str = "refs/heads/hotfix/x", run: str = "90") -> str:
+    return json.dumps({"repo": repo, "ref": ref, "run_id": run, "run_attempt": "1", "who": "founder", "why": "hotfix " + ref[11:],
                        "run": "https://github.com/%s/actions/runs/%s" % (repo, run)})  # fmt: skip
 
 
@@ -259,43 +259,52 @@ class Release(unittest.TestCase):
 
 
 class Frozen(unittest.TestCase):
-    """preprod-frozen (playbook §5.4, §5.6): locks/frozen.json refuses every take except the hotfix run's own."""
+    """preprod-frozen (playbook §5.4, §5.6): locks/frozen.json names a hotfix branch (repo and ref); any run from that
+    branch takes the lock, every other take is refused."""
 
-    def test_a_frozen_environment_refuses_other_runs_at_once_with_the_reason(self):
-        out, calls, obj, _ = run(TAKE, frozen_by=frozen())
-        self.assertEqual(out.returncode, 1)
-        self.assertIn("preprod is frozen by founder (hotfix hotfix/x) for the hotfix run https://github.com/OnePeek/backend-service/actions/runs/90", out.stdout)
-        self.assertNotIn("put-object", calls)
-        self.assertIsNone(obj)
+    def test_a_frozen_environment_refuses_runs_from_other_branches_at_once_with_the_reason(self):
+        for repo, ref in ((REPO, "refs/heads/release"), (REPO, "refs/heads/hotfix/y"), ("OnePeek/onepeek-web", "refs/heads/hotfix/x")):
+            out, calls, obj, _ = run(TAKE, frozen_by=frozen(), GITHUB_REPOSITORY=repo, GITHUB_REF=ref)
+            self.assertEqual(out.returncode, 1, (repo, ref))
+            self.assertIn("preprod is frozen by founder (hotfix hotfix/x) for the hotfix branch OnePeek/backend-service refs/heads/hotfix/x", out.stdout)
+            self.assertNotIn("put-object", calls)
+            self.assertIsNone(obj)
 
-    def test_the_hotfix_run_itself_takes_the_lock(self):
-        out, _, obj, _ = run(TAKE, frozen_by=frozen(REPO, RUN))
-        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertEqual(json.loads(obj)["run_id"], RUN)
+    def test_any_run_from_the_frozen_hotfix_branch_takes_the_lock(self):
+        # Each merge into the hotfix branch is a new run (another run ID than the one that froze it).
+        for run_id in ("90", RUN):
+            out, _, obj, _ = run(TAKE, frozen_by=frozen(), GITHUB_RUN_ID=run_id, GITHUB_REF="refs/heads/hotfix/x")
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertEqual(json.loads(obj)["run_id"], run_id)
 
     def test_an_unreadable_freeze_means_no_deploy(self):
         out, calls, _, _ = run(TAKE, FAIL_GET_OBJECT="AccessDenied")
         self.assertEqual(out.returncode, 1)
         self.assertIn("frozen.json is unreadable", out.stdout)
         self.assertNotIn("put-object", calls)
+        for junk in ("not json", json.dumps({"repo": REPO}), frozen(ref="refs/heads/release")):
+            out, calls, _, _ = run(TAKE, frozen_by=junk, GITHUB_REF="refs/heads/release")
+            self.assertEqual(out.returncode, 1, junk)
+            self.assertNotIn("put-object", calls)
 
-    def test_freeze_is_written_by_a_hotfix_run_naming_itself(self):
+    def test_freeze_is_written_from_a_hotfix_branch_naming_it(self):
         out, calls, _, _ = run(ACTION, ACTION="freeze", GITHUB_REF="refs/heads/hotfix/x", GITHUB_REF_NAME="hotfix/x", GITHUB_ACTOR="founder")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("put-object --bucket onepeek-preprod-deploy --key locks/frozen.json --body lock-frozen-mine.json --if-none-match *", calls)
         written = json.loads(out.frozen)  # type: ignore[attr-defined]
-        self.assertEqual((written["repo"], written["run_id"], written["who"], written["why"]), (REPO, RUN, "founder", "hotfix hotfix/x"))
+        self.assertEqual((written["repo"], written["ref"], written["who"], written["why"]), (REPO, "refs/heads/hotfix/x", "founder", "hotfix hotfix/x"))
+        self.assertNotIn("token", written)
 
     def test_freeze_from_any_other_branch_is_refused(self):
         out, calls, _, _ = run(ACTION, ACTION="freeze", GITHUB_REF="refs/heads/dev")
         self.assertEqual(out.returncode, 1)
         self.assertNotIn("put-object", calls)
 
-    def test_a_second_freeze_by_another_run_is_refused_and_by_the_same_run_is_fine(self):
-        out, _, _, _ = run(ACTION, frozen_by=frozen(), ACTION="freeze", GITHUB_REF="refs/heads/hotfix/y")
+    def test_a_second_freeze_from_another_branch_is_refused_and_from_the_same_branch_is_fine(self):
+        out, _, _, _ = run(ACTION, frozen_by=frozen(REPO), ACTION="freeze", GITHUB_REF="refs/heads/hotfix/y")
         self.assertEqual(out.returncode, 1)
-        self.assertEqual(out.frozen, frozen())  # type: ignore[attr-defined]
-        out, _, _, _ = run(ACTION, frozen_by=frozen(REPO, RUN), ACTION="freeze", GITHUB_REF="refs/heads/hotfix/x")
+        self.assertEqual(out.frozen, frozen(REPO))  # type: ignore[attr-defined]
+        out, _, _, _ = run(ACTION, frozen_by=frozen(REPO), ACTION="freeze", GITHUB_REF="refs/heads/hotfix/x")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
     def test_thaw_removes_the_freeze_on_its_etag(self):
