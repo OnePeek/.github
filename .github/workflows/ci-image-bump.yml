@@ -1,0 +1,203 @@
+# Shared, weekly: move the digest-pinned CI container images (`image: <name>@sha256:<digest> # <tag>` in the caller's
+# workflows) to the tag's current digest and open one pull request (foundation-playbook §12a slice 4 item 4). A caller
+# runs it on a weekly `schedule` and passes the agents' App secrets. Registry access is read-only and anonymous: the
+# script holds no registry credential, and the step that runs it gets no token. The App token (contents and pull
+# requests write, this repository only) is used only to push the branch and open the pull request, so CI runs on it.
+# The script is a verbatim copy of scripts/bump_ci_images.py (a test keeps them identical).
+name: ci-image-bump
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
+        type: string
+        default: github
+      base:
+        description: "The branch the pull request targets (the repo's integration branch)."
+        type: string
+        default: dev
+    secrets:
+      AGENTS_APP_CLIENT_ID:
+        required: true
+      AGENTS_APP_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - name: The agents' GitHub App token (this repository only)
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.base }}
+          persist-credentials: false
+
+      - name: Resolve each tag's current digest (anonymous, read-only) and rewrite the workflows
+        run: |
+          cat > "$RUNNER_TEMP/bump.py" <<'PY'
+          """Move digest-pinned CI container images to their tag's current digest (foundation-playbook §12a slice 4 item 4).
+
+          A CI image is written `image: <name>@sha256:<64 hex> # <tag>` (or `container: ...` as a string), in a workflow under
+          .github/workflows; the comment's first word is the tag (`17`, or `postgres:17`: the part after the last colon). For each
+          one this asks the registry for the tag's current digest and rewrites the line when it moved. Registry access is read-only
+          and anonymous (a pull token, a manifest GET); no credentials are used or needed for the public registries CI containers
+          come from (public.ecr.aws). A tag the registry cannot resolve is an error, never a skip.
+
+          Usage: bump_ci_images.py [--check] [ROOT]   (--check lists what would move and exits 1 if anything would; default rewrites)
+          Prints one `file:line: <name> <tag> <old> -> <new>` line per move.
+          """
+          from __future__ import annotations
+
+          import argparse
+          import json
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+          from typing import Callable
+
+          LINE = re.compile(
+              r"^(?P<head>\s*(?:-\s*)?(?:image|container):\s*)(?P<q>['\"]?)(?P<name>[^\s'\"@#]+)@(?P<digest>sha256:[0-9a-f]{64})(?P=q)"
+              r"(?P<gap>\s+)#\s*(?P<comment>.*?)\s*$")
+          ACCEPT = ", ".join([
+              "application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json",
+              "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"])
+          Resolver = Callable[[str, str], str]  # (name, tag) -> "sha256:<64 hex>"
+
+
+          def tag_of(comment: str) -> str | None:
+              word = comment.split()[0] if comment.split() else ""
+              tag = word.rsplit(":", 1)[-1]
+              return tag or None
+
+
+          def split_name(name: str) -> tuple[str, str]:
+              """(registry host, repository path); a name with no host is Docker Hub."""
+              first, _, rest = name.partition("/")
+              if rest and ("." in first or ":" in first or first == "localhost"):
+                  return first, rest
+              return "registry-1.docker.io", (name if "/" in name else f"library/{name}")
+
+
+          def _bearer(header: str) -> dict[str, str]:
+              return dict(re.findall(r'(\w+)="([^"]*)"', header))
+
+
+          def registry_digest(name: str, tag: str) -> str:
+              """The digest a tag points at, from the Docker-Content-Digest header of an anonymous manifest request."""
+              host, repo = split_name(name)
+              url = f"https://{host}/v2/{repo}/manifests/{tag}"
+              token = None
+              for _ in range(2):
+                  req = urllib.request.Request(url, method="HEAD", headers={"Accept": ACCEPT})
+                  if token:
+                      req.add_header("Authorization", f"Bearer {token}")
+                  try:
+                      with urllib.request.urlopen(req, timeout=30) as resp:
+                          digest = resp.headers.get("Docker-Content-Digest", "")
+                          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                              raise RuntimeError(f"{name}:{tag}: the registry sent no digest")
+                          return digest
+                  except urllib.error.HTTPError as e:
+                      challenge = e.headers.get("WWW-Authenticate", "")
+                      if e.code != 401 or token or not challenge.lower().startswith("bearer"):
+                          raise RuntimeError(f"{name}:{tag}: registry answered {e.code}") from e
+                      c = _bearer(challenge)
+                      query = "&".join(f"{k}={v}" for k, v in (("service", c.get("service")), ("scope", c.get("scope"))) if v)
+                      with urllib.request.urlopen(f"{c['realm']}?{query}", timeout=30) as tr:  # anonymous: no credentials sent
+                          body = json.load(tr)
+                      token = body.get("token") or body.get("access_token")
+              raise RuntimeError(f"{name}:{tag}: no digest")
+
+
+          def bump_file(path: Path, resolve: Resolver, write: bool) -> list[str]:
+              moved: list[str] = []
+              lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+              for n, raw in enumerate(lines, 1):
+                  m = LINE.match(raw.rstrip("\r\n"))
+                  if not m:
+                      continue
+                  tag = tag_of(m["comment"])
+                  if tag is None:
+                      raise RuntimeError(f"{path}:{n}: the comment after the digest must start with the tag")
+                  new = resolve(m["name"], tag)
+                  if new != m["digest"]:
+                      moved.append(f"{path}:{n}: {m['name']} {tag} {m['digest']} -> {new}")
+                      lines[n - 1] = raw.replace(m["digest"], new, 1)
+              if moved and write:
+                  path.write_text("".join(lines), encoding="utf-8")
+              return moved
+
+
+          def bump(root: Path, resolve: Resolver, write: bool = True) -> list[str]:
+              moved: list[str] = []
+              workflows = root / ".github/workflows"
+              for p in sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")]):
+                  moved += bump_file(p, resolve, write)
+              return moved
+
+
+          def main(argv: list[str] | None = None) -> int:
+              ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+              ap.add_argument("--check", action="store_true")
+              ap.add_argument("root", nargs="?", type=Path, default=Path("."))
+              a = ap.parse_args(argv)
+              try:
+                  moved = bump(a.root, registry_digest, write=not a.check)
+              except (RuntimeError, urllib.error.URLError, OSError) as e:
+                  print(f"::error::{e}")
+                  return 1
+              for line in moved:
+                  print(line)
+              if not moved:
+                  print("ci images: all digests are current")
+              return 1 if (moved and a.check) else 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+          python3 "$RUNNER_TEMP/bump.py" . | tee "$RUNNER_TEMP/moves.txt"
+
+      - name: Open the pull request
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BASE: ${{ inputs.base }}
+          REPO: ${{ github.repository }}
+        run: |
+          if git diff --quiet; then
+            echo "Every CI image digest is current."
+            exit 0
+          fi
+          branch="ci-image-bump"
+          git config user.name "onepeek-agents[bot]"
+          git config user.email "onepeek-agents[bot]@users.noreply.github.com"
+          git switch -c "${branch}"
+          git add .github/workflows
+          git commit -q -m "ci: move the CI container image digests to their tags' current digests"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "${branch}"
+          if [ -z "$(gh pr list --repo "${REPO}" --head "${branch}" --base "${BASE}" --state open --json number --jq '.[].number')" ]; then
+            {
+              echo "The weekly CI image bump (foundation-playbook §12a slice 4 item 4). Each digest-pinned \`image:\` moved to the current digest of the tag in its comment:"
+              echo
+              sed 's/^/- /' "$RUNNER_TEMP/moves.txt"
+            } > "$RUNNER_TEMP/body.md"
+            gh pr create --repo "${REPO}" --base "${BASE}" --head "${branch}" \
+              --title "ci: weekly CI image digest bump" --body-file "$RUNNER_TEMP/body.md"
+          fi
