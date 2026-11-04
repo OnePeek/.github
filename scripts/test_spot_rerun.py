@@ -43,6 +43,8 @@ class FakeGh:
             if job not in self.notes:
                 raise sr.GhError("403")
             return "".join(m + "\n" for m in self.notes[job])
+        if path.endswith("/logs") and getattr(self, "old_gh", False) and "--allow-escape-sequences" in args:
+            raise sr.GhError("gh api failed: unknown flag: --allow-escape-sequences")
         if path.endswith("/logs"):
             job = int(path.split("/")[-2])
             if job not in self.logs:
@@ -160,6 +162,19 @@ class Decision(unittest.TestCase):
             go(fake)
         self.assertIn("no reclaim seen after", err.getvalue())
         self.assertIn("404", err.getvalue())
+
+    def test_the_log_is_read_with_escape_sequences_allowed(self) -> None:
+        fake = FakeGh(logs={1: SHUTDOWN})
+        go(fake)
+        log_calls = [c for c in fake.calls if c[0] == "api" and str(c[-1]).endswith("/logs")]
+        self.assertTrue(log_calls and all("--allow-escape-sequences" in c for c in log_calls), log_calls)
+        self.assertEqual(len(fake.reruns()), 1)
+
+    def test_an_older_gh_without_the_flag_still_reads_the_log(self) -> None:
+        fake = FakeGh(logs={1: SHUTDOWN})
+        fake.old_gh = True
+        go(fake)
+        self.assertEqual(len(fake.reruns()), 1)
 
     def test_unreadable_log_is_no_reclaim(self) -> None:
         fake = FakeGh(logs={})
