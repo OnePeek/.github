@@ -119,6 +119,11 @@ class LocalCi(unittest.TestCase):
         with mock.patch.object(lc, "packages_token", return_value=""), mock.patch.dict(os.environ, {"PATH": path}):
             self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
 
+    def test_a_step_reading_the_needs_context_through_a_script_is_skipped(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+                      "      - env:\n          NEEDS: ${{ toJSON(needs) }}\n        run: python3 -c 'import os; os.environ[\"NEEDS\"]'\n")
+        self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+
     def test_a_failing_step_fails(self):
         d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 3\n")
         self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)

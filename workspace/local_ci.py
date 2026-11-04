@@ -419,8 +419,12 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                 if any(re.search(rf"\bmv\s+{re.escape(c)}\b", cmd) for c in checkout_paths if not c.startswith("${{")):
                     skipped.append(f"{label} (CI-only: places a checkout the laptop does not make)")
                     continue
+                # A value from the other jobs' results (`needs`) only a CI run has; a script may read it without the step's
+                # text naming it, so such a step is always skipped.
+                from_needs = {str(k) for k, v in {**(job.get("env") or {}), **(step.get("env") or {})}.items()
+                              if re.search(r"\$\{\{[^}]*\bneeds\b", str(v))}
                 unknown = [k for k in sorted(unresolved_env(job.get("env"), step.get("env"), ctx=a.ctx))
-                           if re.search(r"\$\{?" + re.escape(k) + r"\b", cmd)]
+                           if k in from_needs or re.search(r"\$\{?" + re.escape(k) + r"\b", cmd)]
                 if EXPR.search(str(step.get("working-directory", workdir))):
                     unknown.append("its working directory")
                 if unknown:
