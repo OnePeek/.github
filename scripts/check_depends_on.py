@@ -9,11 +9,14 @@ A repo's `docs-version.txt` is an implicit dependency (lesson L27, item a): when
 not on docs `main`, the open onepeek-docs pull request whose commits include it is waited for like a declared one, with
 no line needed; when no open docs pull request contains it, the check fails.
 
-    python3 check_depends_on.py --repos        # reads BODY; prints the named repos, comma-separated (for the App token)
+    python3 check_depends_on.py --repos        # reads the body (BODY_FILE, else BODY); prints the named repos, comma-separated (for the App token)
     python3 check_depends_on.py --docs-pin     # prints the docs commit docs-version.txt names, or nothing
-    python3 check_depends_on.py --check        # reads BODY, GH_TOKEN and DOCS_TOKEN; exit 1 "waiting for <repo>#<n>"
+    python3 check_depends_on.py --check        # reads the body, GH_TOKEN and DOCS_TOKEN; exit 1 "waiting for <repo>#<n>"
                                                # while one is unmerged (DOCS_TOKEN: Contents and Pull requests read
                                                # on onepeek-docs, used only when docs-version.txt names a commit)
+
+The body is the pull request's live body, fetched by depends-on.yml through the API into BODY_FILE (the event payload
+holds the body as of the trigger, so a body edited after it would be ignored); BODY is the fallback for other callers.
 
 Used by depends-on.yml (every pull-request workflow's first job), preflight.py and ship_change_set.py. Standard library only.
 """
@@ -45,6 +48,12 @@ def _load_check_pins():
 
 
 check_pins = _load_check_pins()
+
+
+def read_body() -> str:
+    """The pull request body: the file BODY_FILE names (the live body from the API), else the BODY variable."""
+    path = os.environ.get("BODY_FILE", "")
+    return pathlib.Path(path).read_text(encoding="utf-8") if path else os.environ.get("BODY", "")
 
 
 def parse(body: str | None) -> list[tuple[str, int]]:
@@ -115,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--check", action="store_true")
     ap.add_argument("--repo-dir", default=".", help="the caller repo's checkout (its docs-version.txt)")
     a = ap.parse_args(argv)
-    deps = parse(os.environ.get("BODY", ""))
+    deps = parse(read_body())
     if a.repos:
         print(",".join(dict.fromkeys(r for r, _ in deps)))
         return 0

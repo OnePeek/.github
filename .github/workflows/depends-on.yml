@@ -8,7 +8,9 @@
 # never edited (it re-ran every check on a body edit): when a dependency merges, ship_change_set.py re-runs the
 # dependent pull request's checks. Reads use the agents' App token (S6): callers pass AGENTS_APP_CLIENT_ID and
 # AGENTS_APP_PRIVATE_KEY; they are needed when the body has such a line or the repo has docs-version.txt. The logic is
-# scripts/check_depends_on.py at the caller's pin.
+# scripts/check_depends_on.py at the caller's pin. The body is read live from the API with the job's GITHUB_TOKEN
+# (pull-requests: read, which the caller's job must grant), never from the event payload, which is the body at trigger
+# time and would miss a line added or removed after it.
 name: depends-on
 
 on:
@@ -28,6 +30,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read  # the pull request's own live body (callers grant it to this job)
 
 jobs:
   depends-on:
@@ -57,11 +60,21 @@ jobs:
           path: _shared
           persist-credentials: false
 
+      - name: The pull request's live body (from the API, not the event payload)
+        id: body
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api "repos/${REPO}/pulls/${NUMBER}" --jq '.body // ""' > "${RUNNER_TEMP}/pr-body.txt"
+          echo "file=${RUNNER_TEMP}/pr-body.txt" >> "$GITHUB_OUTPUT"
+
       - name: The repos the body names, and the docs commit docs-version.txt pins
         id: deps
         env:
           SHA: ${{ steps.version.outputs.sha }}
-          BODY: ${{ github.event.pull_request.body }}
+          BODY_FILE: ${{ steps.body.outputs.file }}
         run: |
           script=scripts/check_depends_on.py
           [ -n "${SHA}" ] && script=_shared/scripts/check_depends_on.py
@@ -107,7 +120,7 @@ jobs:
       - name: Every dependency is merged (declared, and the docs pin's pull request)
         env:
           SCRIPT: ${{ steps.deps.outputs.script }}
-          BODY: ${{ github.event.pull_request.body }}
+          BODY_FILE: ${{ steps.body.outputs.file }}
           GH_TOKEN: ${{ steps.app.outputs.token }}
           DOCS_TOKEN: ${{ steps.docs-app.outputs.token }}
         run: python3 "${SCRIPT}" --check

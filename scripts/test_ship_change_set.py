@@ -454,7 +454,7 @@ class DeclaredDependencies(unittest.TestCase):
                 mock.patch.object(ship, "gh", side_effect=gh), mock.patch.object(ship, "wait_green"), \
                 mock.patch.object(ship, "remove_worktrees"), mock.patch.object(ship, "wait_tag", return_value=("v1.8.2", NEW)), \
                 mock.patch.object(ship, "bump_pins", return_value=None), mock.patch.object(ship, "rerun_failed"), \
-                mock.patch.object(ship, "move_docs_pin", return_value=(None, True)), \
+                mock.patch.object(ship, "move_docs_pin", return_value=(None, True)), mock.patch.object(ship, "tested_bases", return_value=set()), \
                 mock.patch.object(ship.subprocess, "run", return_value=done(0, "onepeek-docs@" + "c" * 40)), \
                 mock.patch.object(ship, "callers", return_value=["backend-service", "onepeek-docs", "onepeek-web"]), \
                 mock.patch.object(ship, "open_pin_move", side_effect=lambda r, t, s: moved_to.append(r)):
@@ -515,7 +515,8 @@ class DocsPin(unittest.TestCase):
             return done(0, f"# pin\nonepeek-docs@{pins[next(p for p in pins if p[0] == repo)]}\n")
         return prs, pr_info, gh, run
 
-    def go(self, pins: dict, only_pin: bool = True, bodies: dict | None = None, go: bool = True) -> int:
+    def go(self, pins: dict, only_pin: bool = True, bodies: dict | None = None, go: bool = True,
+           base_moved: bool = False) -> int:
         prs, pr_info, gh, run = self.harness(pins, bodies)
 
         def move(repo, branch, green, merge_sha):
@@ -525,6 +526,8 @@ class DocsPin(unittest.TestCase):
         with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "gh", side_effect=gh), \
                 mock.patch.object(ship.subprocess, "run", side_effect=run), mock.patch.object(ship, "remove_worktrees"), \
                 mock.patch.object(ship, "wait_green", side_effect=lambda r, n, m: self.events.append(("green", r))), \
+                mock.patch.object(ship, "tested_bases", return_value={"b" * 40}), \
+                mock.patch.object(ship, "base_head", return_value="c" * 40 if base_moved else "b" * 40), \
                 mock.patch.object(ship, "wait_head"), mock.patch.object(ship, "move_docs_pin", side_effect=move), \
                 mock.patch.object(ship, "rerun_failed", side_effect=lambda r, n: self.events.append(("rerun", r))):
             return ship.main([f"{r}#{n}" for r, n in prs] + (["--go"] if go else []))
@@ -547,6 +550,11 @@ class DocsPin(unittest.TestCase):
 
     def test_more_than_the_pin_changed_waits_for_ci(self) -> None:
         self.assertEqual(self.go({("backend-service", 2): DOCS_OLDER}, only_pin=False), 0)
+        self.assertEqual(self.events[-3:], [("pin", "backend-service", "2" * 40, DOCS_MERGE),
+                                            ("green", "backend-service"), ("merge", "backend-service", "f" * 40)])
+
+    def test_a_base_that_moved_since_the_green_run_waits_for_the_new_run(self) -> None:
+        self.assertEqual(self.go({("backend-service", 2): DOCS_OLDER}, base_moved=True), 0)
         self.assertEqual(self.events[-3:], [("pin", "backend-service", "2" * 40, DOCS_MERGE),
                                             ("green", "backend-service"), ("merge", "backend-service", "f" * 40)])
 
@@ -600,6 +608,29 @@ class MoveDocsPin(unittest.TestCase):
         with self.assertRaises(SystemExit):
             ship.move_docs_pin("backend-service", "feat/x", self.green, DOCS_MERGE)
         self.assertEqual(self.origin("rev-parse", "feat/x").strip(), later)
+
+    def test_a_comment_line_holding_the_old_pin_is_left_alone(self) -> None:
+        (self.src / "docs-version.txt").write_text(f"# was onepeek-docs@{DOCS_OLDER} before\nonepeek-docs@{DOCS_OLDER}\n")
+        sh("git", "-C", str(self.src), "commit", "-q", "-am", "comment")
+        sh("git", "-C", str(self.src), "push", "-q", "origin", "feat/x")
+        green = sh("git", "-C", str(self.src), "rev-parse", "HEAD").strip()
+        ship.move_docs_pin("backend-service", "feat/x", green, DOCS_MERGE)
+        self.assertEqual(self.origin("show", "feat/x:docs-version.txt"),
+                         f"# was onepeek-docs@{DOCS_OLDER} before\nonepeek-docs@{DOCS_MERGE}\n")
+
+    def test_base_unchanged_compares_the_tested_base_with_the_base_head_now(self) -> None:
+        with mock.patch.object(ship, "base_head", return_value="b" * 40):
+            self.assertTrue(ship.base_unchanged("backend-service", 2, {"b" * 40}, "dev"))
+            self.assertFalse(ship.base_unchanged("backend-service", 2, {"a" * 40}, "dev"))
+            self.assertFalse(ship.base_unchanged("backend-service", 2, set(), "dev"))  # unknown: wait
+
+    def test_tested_bases_reads_each_runs_base_and_is_empty_when_unknown(self) -> None:
+        chk = [{"name": "x", "bucket": "pass", "link": "https://github.com/OnePeek/r/actions/runs/9/job/1"}]
+        with mock.patch.object(ship, "read_checks", return_value=chk), \
+                mock.patch.object(ship, "gh", return_value='[{"number": 2, "base": {"sha": "%s"}}]' % ("b" * 40)):
+            self.assertEqual(ship.tested_bases("backend-service", 2), {"b" * 40})
+        with mock.patch.object(ship, "read_checks", return_value=chk), mock.patch.object(ship, "gh", return_value="[]"):
+            self.assertEqual(ship.tested_bases("backend-service", 2), set())
 
     def test_only_pin_changed_is_false_for_any_other_change(self) -> None:
         wt = self.src

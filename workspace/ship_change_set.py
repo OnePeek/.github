@@ -223,18 +223,26 @@ def pr_commits(repo: str, n: int) -> set[str]:
     return set(gh("api", "--paginate", f"repos/{ORG}/{repo}/pulls/{n}/commits?per_page=100", "--jq", ".[].sha").split())
 
 
-def pin_line(text: str) -> str | None:
-    """The docs commit a docs-version.txt names (its first `onepeek-docs@<sha>` line outside comments)."""
-    for line in text.splitlines():
+def pin_at(text: str) -> tuple[int, str] | None:
+    """(line index, docs commit) of the first `onepeek-docs@<sha>` line of a docs-version.txt outside comments."""
+    for i, line in enumerate(text.splitlines()):
         m = check_pins.DOCS_PIN.search(line)
         if m and not line.strip().startswith("#"):
-            return m.group(1)
+            return i, m.group(1)
     return None
 
 
+def pin_line(text: str) -> str | None:
+    """The docs commit a docs-version.txt names (its first `onepeek-docs@<sha>` line outside comments)."""
+    at = pin_at(text)
+    return at[1] if at else None
+
+
 def only_pin_changed(wt: pathlib.Path, green: str, new: str) -> bool:
-    """True when the only change from the green commit to the new one is the docs-version.txt pin line (one line out,
-    one line in, both `onepeek-docs@<sha>`)."""
+    """True when the diff from the green commit to the new one is exactly one line of docs-version.txt replaced by
+    another `onepeek-docs@<sha>` line and nothing else. It does not say the line is the pin line (a comment holding
+    such text would pass) and says nothing about the base branch; move_docs_pin edits only the pin line, and main
+    checks the base separately (base_unchanged)."""
     if git(wt, "diff", "--numstat", green, new).strip() != "1\t1\tdocs-version.txt":
         return False
     lines = [ln for ln in git(wt, "diff", "-U0", green, new, "--", "docs-version.txt").splitlines()
@@ -254,12 +262,15 @@ def move_docs_pin(repo: str, branch: str, green: str, merge_sha: str) -> tuple[s
         try:
             f = wt / "docs-version.txt"
             text = f.read_text(encoding="utf-8")
-            old = pin_line(text)
+            at = pin_at(text)
+            old = at[1] if at else None
             if old is None:
                 raise SystemExit(f"STOP {repo}: docs-version.txt at {green[:7]} holds no onepeek-docs@<sha> line")
             if old == merge_sha:
                 return None, True
-            f.write_text(text.replace(f"onepeek-docs@{old}", f"onepeek-docs@{merge_sha}", 1), encoding="utf-8")
+            lines = text.splitlines(keepends=True)
+            lines[at[0]] = lines[at[0]].replace(f"onepeek-docs@{old}", f"onepeek-docs@{merge_sha}", 1)  # that line only
+            f.write_text("".join(lines), encoding="utf-8")
             git(wt, "add", "--", "docs-version.txt")
             git(wt, "commit", "-q", "-m", f"chore: pin docs to the merge commit {merge_sha[:7]} (ship_change_set)")
             new = git(wt, "rev-parse", "HEAD").strip()
@@ -269,6 +280,32 @@ def move_docs_pin(repo: str, branch: str, green: str, merge_sha: str) -> tuple[s
             return new, only
         finally:
             git(src, "worktree", "remove", "--force", str(wt))
+
+
+def tested_bases(repo: str, n: int) -> set[str]:
+    """The base-branch commits the pull request's current check runs tested (each run's pull_requests[].base.sha for
+    this pull request); empty when a run does not say, which callers treat as unknown."""
+    out: set[str] = set()
+    for c in read_checks(repo, n, False):
+        m = re.search(r"/runs/(\d+)", c.get("link") or "")
+        if not m:
+            return set()
+        prs = json.loads(gh("api", f"repos/{ORG}/{repo}/actions/runs/{m.group(1)}", "--jq", ".pull_requests") or "[]")
+        shas = {p["base"]["sha"] for p in prs if p.get("number") == n}
+        if not shas:
+            return set()
+        out |= shas
+    return out
+
+
+def base_head(repo: str, branch: str) -> str:
+    """The base branch's head commit now."""
+    return gh("api", f"repos/{ORG}/{repo}/commits/{branch}", "--jq", ".sha").strip()
+
+
+def base_unchanged(repo: str, n: int, tested: set[str], branch: str) -> bool:
+    """True when the green run tested the base branch's current head (lesson L27 b), so a pin-only push needs no new run."""
+    return tested == {base_head(repo, branch)}
 
 
 def green_head(repo: str, n: int, may_rerun: bool) -> str:
@@ -522,16 +559,18 @@ def main(argv: list[str]) -> int:
                 wait_head(repo, n, pushed)
                 no_conflicts([(repo, n)])
         head = green_head(repo, n, may_rerun=merged_any)
+        tested = tested_bases(repo, n) if docs_merge and (repo, n) in pinned else set()
         if docs_merge and (repo, n) in pinned:
             pushed, only_pin = move_docs_pin(repo, info[(repo, n)]["headRefName"], head, docs_merge)
             if pushed:
                 wait_head(repo, n, pushed)
                 head = pushed
-                if not only_pin:
-                    say(f"{repo}#{n}: more than the docs pin changed since the green run; waiting for CI")
+                if not only_pin or not base_unchanged(repo, n, tested, info[(repo, n)]["baseRefName"]):
+                    say(f"{repo}#{n}: more than the docs pin changed since the green run, or its base moved; "
+                        "waiting for the new CI run")
                     head = green_head(repo, n, may_rerun=False)
                 else:
-                    say(f"{repo}#{n}: only the docs pin changed since the green run; merging without a new CI run")
+                    say(f"{repo}#{n}: only the docs pin changed and the green run tested the current base; merging without a new CI run")
         method = "--merge" if repo == "onepeek-docs" else "--squash"
         gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, "--delete-branch", "--match-head-commit", head)
         merged = pr_info(repo, n)

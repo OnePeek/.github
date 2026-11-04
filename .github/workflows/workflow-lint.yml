@@ -17,6 +17,9 @@ jobs:
   depends-on:
     # Dependencies first (playbook §8a P1, L26/L27): while a `Depends on:` pull request is unmerged, nothing else runs.
     uses: ./.github/workflows/depends-on.yml
+    permissions:
+      contents: read
+      pull-requests: read
     secrets:
       AGENTS_APP_CLIENT_ID: ${{ secrets.AGENTS_APP_CLIENT_ID }}
       AGENTS_APP_PRIVATE_KEY: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}

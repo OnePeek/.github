@@ -144,6 +144,18 @@ class Main(unittest.TestCase):
         self.assertEqual(self.run_main(["--check"], "")[0], 0)
 
 
+class LiveBody(unittest.TestCase):
+    def test_body_file_wins_over_the_event_body_and_parsing_stays_strict(self) -> None:
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        f = d / "body.txt"
+        f.write_text("Depends on: OnePeek/onepeek-web#5\nDepends on: OnePeek/../x#1\nxDepends on: OnePeek/a#2\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"BODY_FILE": str(f), "BODY": "Depends on: OnePeek/stale#1"}):
+            self.assertEqual(cd.parse(cd.read_body()), [("onepeek-web", 5)])
+        with mock.patch.dict(os.environ, {"BODY": "Depends on: OnePeek/a#1"}, clear=True):
+            self.assertEqual(cd.parse(cd.read_body()), [("a", 1)])
+
+
 class Workflow(unittest.TestCase):
     def test_the_app_token_is_only_minted_for_named_repos_with_pull_requests_read(self) -> None:
         app = next(s for s in STEPS if s.get("id") == "app")
@@ -152,11 +164,19 @@ class Workflow(unittest.TestCase):
         self.assertEqual(app["with"]["permission-pull-requests"], "read")
         self.assertEqual(set(k for k in app["with"] if k.startswith("permission-")), {"permission-pull-requests"})
 
-    def test_the_body_reaches_the_script_through_env_never_inline(self) -> None:
-        for s in STEPS:
-            self.assertNotIn("github.event.pull_request.body", str(s.get("run", "")))
-        self.assertEqual(STEPS[-1]["env"]["BODY"], "${{ github.event.pull_request.body }}")
+    def test_the_body_is_read_live_from_the_api_never_from_the_event_payload(self) -> None:
+        self.assertNotIn("github.event.pull_request.body", WORKFLOW.read_text(encoding="utf-8").replace("# ", ""),)
+        body = next(s for s in STEPS if s.get("id") == "body")
+        self.assertIn("gh api", body["run"])
+        self.assertIn("pulls/${NUMBER}", body["run"])
+        self.assertEqual(body["env"]["GH_TOKEN"], "${{ github.token }}")
+        self.assertEqual(STEPS[-1]["env"]["BODY_FILE"], "${{ steps.body.outputs.file }}")
+        self.assertNotIn("BODY", [k for k in STEPS[-1]["env"]])
         self.assertIn("--check", STEPS[-1]["run"])
+        wf = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        self.assertEqual(wf["permissions"], {"contents": "read", "pull-requests": "read"})
+        lint = yaml.safe_load((WORKFLOW.parent / "workflow-lint.yml").read_text(encoding="utf-8"))
+        self.assertEqual(lint["jobs"]["depends-on"]["permissions"], {"contents": "read", "pull-requests": "read"})
 
     def test_the_docs_pin_gets_its_own_token_read_only_on_onepeek_docs(self) -> None:  # L27 (a)
         deps = next(s for s in STEPS if s.get("id") == "deps")
