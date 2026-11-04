@@ -644,8 +644,9 @@ jobs:
           if [ "${recorded_digest}" = "${digest}" ] && [ "${recorded_commit}" = "${COMMIT}" ]; then
             echo "${IMAGE} ${COMMIT} is already signed and recorded."
           else
+            # cosign v2.6.5 has --registry-referrers-mode on sign only; attest stores its OCI 1.1 referrer with --new-bundle-format (delivery-pipelines §4 row 4).
             cosign sign --yes --tlog-upload=false --registry-referrers-mode=oci-1-1 --key "${SIGNING_KEY}" "${ref}"
-            cosign attest --yes --tlog-upload=false --registry-referrers-mode=oci-1-1 --type spdxjson \
+            cosign attest --yes --tlog-upload=false --new-bundle-format --type spdxjson \
               --predicate sbom.spdx.json --key "${SIGNING_KEY}" "${ref}"
           fi
           aws ssm put-parameter --name "/onepeek/${ENVIRONMENT}/release/${IMAGE}/digest" --type String --overwrite --value "${digest}" >/dev/null
