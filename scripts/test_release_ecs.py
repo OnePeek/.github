@@ -234,7 +234,15 @@ class DbBootstrap(unittest.TestCase):
 
     def test_secrets_and_permissions_are_explicit(self):
         self.assertEqual(self.job["permissions"], {"contents": "read", "id-token": "write"})
-        self.assertEqual(self.job["secrets"], {"INFRA_READ_TOKEN": "${{ secrets.INFRA_READ_TOKEN }}"})
+        self.assertEqual(self.job["secrets"], {
+            "AGENTS_APP_CLIENT_ID": "${{ secrets.AGENTS_APP_CLIENT_ID }}",
+            "AGENTS_APP_PRIVATE_KEY": "${{ secrets.AGENTS_APP_PRIVATE_KEY }}",
+            "INFRA_READ_TOKEN": "${{ secrets.INFRA_READ_TOKEN }}"})  # the token only as the fallback (playbook §8a S6)
+
+    def test_infra_read_token_is_optional_and_used_nowhere_else(self):
+        self.assertFalse(RELEASE[True]["workflow_call"]["secrets"]["INFRA_READ_TOKEN"]["required"])
+        others = {n for n, j in RELEASE["jobs"].items() if n != "db-bootstrap" and "INFRA_READ_TOKEN" in str(j)}
+        self.assertEqual(others, set())
 
     def test_it_runs_before_migrate_and_a_failure_stops_the_release(self):
         migrate, rollout = RELEASE["jobs"]["migrate"], RELEASE["jobs"]["rollout"]
