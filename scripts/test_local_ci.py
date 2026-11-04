@@ -94,6 +94,36 @@ class LocalCi(unittest.TestCase):
                       "      - run: docker run -d -p 127.0.0.1:1:1 x\n      - run: curl http://127.0.0.1:1 && exit 4\n")
         self.assertEqual(lc.main([str(d), "--jobs", "a", "--skip-docker"]), 0)
 
+    def test_every_step_after_a_role_is_assumed_is_skipped(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n"
+                      "      - uses: aws-actions/configure-aws-credentials@x\n        with: {role-to-assume: r}\n"
+                      "      - run: python3 scripts/calls_aws_inside.py && exit 5\n")
+        self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+
+    def test_an_install_needing_only_the_package_token_runs_with_the_gh_login(self):
+        wf = ("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+              "      - env:\n          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n        run: npm ci; test \"$NODE_AUTH_TOKEN\" = tok\n"
+              "      - run: npx eslint . || exit 6\n")
+        d = self.repo(wf)
+        stub = d / "bin"
+        stub.mkdir()
+        for tool in ("npm", "npx"):
+            (stub / tool).write_text("#!/bin/sh\nexit 0\n")
+            (stub / tool).chmod(0o755)
+        path = f"{stub}:{os.environ['PATH']}"
+        with mock.patch.object(lc, "packages_token", return_value="tok"), mock.patch.dict(os.environ, {"PATH": path}):
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+        # Without a token that can read packages, the install and the Node steps after it are skipped as before.
+        (d / ".github/workflows/checks.yml").write_text(wf, encoding="utf-8")
+        (stub / "npx").write_text("#!/bin/sh\nexit 9\n")
+        with mock.patch.object(lc, "packages_token", return_value=""), mock.patch.dict(os.environ, {"PATH": path}):
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+
+    def test_a_step_reading_the_needs_context_through_a_script_is_skipped(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+                      "      - env:\n          NEEDS: ${{ toJSON(needs) }}\n        run: python3 -c 'import os; os.environ[\"NEEDS\"]'\n")
+        self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+
     def test_a_failing_step_fails(self):
         d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 3\n")
         self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)

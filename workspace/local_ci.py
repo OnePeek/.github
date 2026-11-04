@@ -64,6 +64,17 @@ def uv_problem() -> str:
     return f"uv {v} is installed; CI pins uv {UV_VERSION}. Install it (`uv self update {UV_VERSION}`, or your package manager), then run again."
 
 
+def packages_token() -> str:
+    """The laptop's gh login token when it can read packages (the CI install's NODE_AUTH_TOKEN), else ""."""
+    if not shutil.which("gh"):
+        return ""
+    status = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    if "read:packages" not in status.stdout + status.stderr:
+        return ""
+    tok = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True)
+    return tok.stdout.strip() if tok.returncode == 0 else ""
+
+
 def tflint_problem() -> str:
     """Why tflint steps are skipped here (missing, or not CI's version), or ""."""
     v = tool_version("tflint")
@@ -160,7 +171,9 @@ def venv_bin() -> pathlib.Path:
     global _VENV
     if _VENV is None:
         _VENV = run_root() / "venv"
-        subprocess.run([sys.executable, "-m", "venv", str(_VENV)], check=True, capture_output=True)
+        # --system-site-packages: a step sees the packages local_ci itself runs with (PyYAML), as CI's runner Python has them;
+        # a step's own `pip install` still lands in the venv.
+        subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", str(_VENV)], check=True, capture_output=True)
     return _VENV / "bin"
 
 
@@ -358,7 +371,10 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
             workdir = ((job.get("defaults") or {}).get("run") or {}).get("working-directory", ".")
             deps_missing = False
             docker_skipped = False
+            aws_role = False
             for i, step in enumerate(job.get("steps") or []):
+                if "configure-aws-credentials" in str(step.get("uses") or ""):
+                    aws_role = True  # every later step of the job may call AWS through a script, not only by its own text
                 cmd = step.get("run")
                 if not cmd:
                     continue
@@ -366,10 +382,19 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                 label = f"{label0}: {step.get('name') or cmd.strip().splitlines()[0][:70]}"
                 env = {**job_env, **{k: expand(substitute(str(v), inputs), a.ctx) for k, v in (step.get("env") or {}).items()
                                      if not EXPR.search(expand(substitute(str(v), inputs), a.ctx))}}
+                if aws_role:
+                    skipped.append(f"{label} (needs AWS: runs after the job assumes a role)")
+                    continue
                 if REMOTE.search(cmd) or any(k in (step.get("env") or {}) for k in ("GH_TOKEN", "GITHUB_TOKEN")):
                     skipped.append(f"{label} (needs GitHub or AWS)")
                     continue
-                if any("secrets." in str(v) for v in {**(job.get("env") or {}), **(step.get("env") or {})}.values()):
+                secret_keys = {k for k, v in {**(job.get("env") or {}), **(step.get("env") or {})}.items() if "secrets." in str(v)}
+                if secret_keys == {"NODE_AUTH_TOKEN"} and re.search(r"\b(pnpm|npm|yarn) (install|ci)\b", cmd) \
+                        and (pkg_token := packages_token()):
+                    # The only secret is the package-registry read token: the laptop's gh login (read:packages) stands in,
+                    # so the Node checks after it run instead of being skipped. The value is passed to the step, never printed.
+                    env["NODE_AUTH_TOKEN"] = pkg_token
+                elif secret_keys:
                     skipped.append(f"{label} (needs a repository secret)")
                     if re.search(r"\b(pnpm|npm|yarn) (install|ci)\b", cmd):
                         deps_missing = True
@@ -394,8 +419,12 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                 if any(re.search(rf"\bmv\s+{re.escape(c)}\b", cmd) for c in checkout_paths if not c.startswith("${{")):
                     skipped.append(f"{label} (CI-only: places a checkout the laptop does not make)")
                     continue
+                # A value from the other jobs' results (`needs`) only a CI run has; a script may read it without the step's
+                # text naming it, so such a step is always skipped.
+                from_needs = {str(k) for k, v in {**(job.get("env") or {}), **(step.get("env") or {})}.items()
+                              if re.search(r"\$\{\{[^}]*\bneeds\b", str(v))}
                 unknown = [k for k in sorted(unresolved_env(job.get("env"), step.get("env"), ctx=a.ctx))
-                           if re.search(r"\$\{?" + re.escape(k) + r"\b", cmd)]
+                           if k in from_needs or re.search(r"\$\{?" + re.escape(k) + r"\b", cmd)]
                 if EXPR.search(str(step.get("working-directory", workdir))):
                     unknown.append("its working directory")
                 if unknown:

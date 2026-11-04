@@ -20,7 +20,11 @@ import os
 import re
 import subprocess
 import sys
+import time
 
+# A reclaimed runner's log can reach the API minutes after the job ends: the log is read up to LOG_TRIES times.
+LOG_TRIES = 4
+LOG_WAIT_SECONDS = 30  # 3 waits: 90 seconds at most
 MARKERS = ("The runner has received a shutdown signal", "lost communication with the server")
 RUN_ID = re.compile(r"[1-9][0-9]{0,19}", re.ASCII)
 REPO = re.compile(r"(?!\.+/)[A-Za-z0-9._-]+/(?!\.+$)[A-Za-z0-9._-]+", re.ASCII)
@@ -64,22 +68,35 @@ def annotations_text(repo: str, job_id: str) -> str:
 
 def reclaimed_jobs(repo: str, jobs: list[dict]) -> list[str]:
     """Names of the failed jobs whose log or annotations show a reclaim. A source that cannot be read counts as no
-    match for that source only. A job that prints a marker itself can force at most one extra re-run (attempt 1 only)."""
-    names: list[str] = []
-    for job in jobs:
-        job_id = str(job.get("id", ""))
-        if not RUN_ID.fullmatch(job_id):
-            continue
-        found = False
-        for read in (lambda: gh("api", f"repos/{repo}/actions/jobs/{job_id}/logs"),
-                     lambda: annotations_text(repo, job_id)):
+    match for that source only, and the reason goes to stderr. Logs are read in up to LOG_TRIES rounds, LOG_WAIT_SECONDS
+    apart (a reclaimed runner's log can reach the API late); the total wait stays inside the job's 5-minute limit.
+    A job that prints a marker itself can force at most one extra re-run (attempt 1 only)."""
+    ids = {str(j.get("id", "")): str(j.get("name", j.get("id", ""))) for j in jobs if RUN_ID.fullmatch(str(j.get("id", "")))}
+    found: set[str] = set()
+    for job_id in ids:
+        try:
+            if reclaimed(annotations_text(repo, job_id)):
+                found.add(job_id)
+        except GhError as e:
+            print(f"::warning::annotations of job {job_id} could not be read: {e}", file=sys.stderr)
+    why: dict[str, str] = {}
+    for attempt in range(LOG_TRIES):
+        for job_id in [j for j in ids if j not in found]:
             try:
-                found = found or reclaimed(read())
-            except GhError:
-                pass
-        if found:
-            names.append(str(job.get("name", job_id)))
-    return names
+                if reclaimed(gh("api", f"repos/{repo}/actions/jobs/{job_id}/logs")):
+                    found.add(job_id)
+                else:
+                    why[job_id] = "no marker in the log"
+            except GhError as e:
+                why[job_id] = str(e)
+        if len(found) == len(ids) or attempt + 1 == LOG_TRIES:
+            break
+        time.sleep(LOG_WAIT_SECONDS)
+    for job_id in ids:
+        if job_id not in found:
+            print(f"::warning::job {job_id}: no reclaim seen after {LOG_TRIES} log reads ({why.get(job_id, '')})",
+                  file=sys.stderr)
+    return [ids[j] for j in ids if j in found]
 
 
 def summary(text: str) -> None:

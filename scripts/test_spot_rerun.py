@@ -58,7 +58,7 @@ class FakeGh:
 
 def go(fake: FakeGh, run_id="42", repo="OnePeek/x") -> tuple[int, str]:
     out = io.StringIO()
-    with mock.patch.object(sr, "gh", fake), contextlib.redirect_stdout(out):
+    with mock.patch.object(sr, "gh", fake), mock.patch.object(sr, "LOG_WAIT_SECONDS", 0), contextlib.redirect_stdout(out):
         return sr.run(run_id, repo), out.getvalue()
 
 
@@ -122,6 +122,29 @@ class Decision(unittest.TestCase):
         fake = FakeGh(logs={1: "boring failure", 2: SHUTDOWN})
         go(fake)
         self.assertEqual(fake.reruns(), [])
+
+    def test_a_log_that_arrives_late_still_counts(self) -> None:
+        fake = FakeGh(logs={})
+        reads = {"n": 0}
+        real = fake.__call__
+
+        def late(*args: str) -> str:
+            if args[0] == "api" and any(str(a).endswith("/logs") for a in args):
+                reads["n"] += 1
+                if reads["n"] >= 3:
+                    fake.logs[1] = SHUTDOWN
+            return real(*args)
+        _, out = go(late)
+        self.assertEqual(len(fake.reruns()), 1)
+        self.assertEqual(reads["n"], 3)
+
+    def test_an_unreadable_log_is_reported_with_the_reason(self) -> None:
+        fake = FakeGh(logs={})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            go(fake)
+        self.assertIn("no reclaim seen after", err.getvalue())
+        self.assertIn("404", err.getvalue())
 
     def test_unreadable_log_is_no_reclaim(self) -> None:
         fake = FakeGh(logs={})

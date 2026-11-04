@@ -166,6 +166,21 @@ class Rule3Timeouts(unittest.TestCase):
         errs = run("private", "OnePeek/x", "c.yml", own(FAST_PRIVATE).replace("            timeout-minutes: 5\n", ""))
         self.assertTrue(any("rule 3" in e for e in errs), errs)
 
+    def test_light_limit_is_30(self):
+        light = LIGHT_PUBLIC.replace("inputs.runner", "vars.RUNNER")
+        self.assertEqual(run("private", "OnePeek/x", "c.yml", own(light, "30")), [])
+        self.assertTrue(any("rule 3" in e for e in run("private", "OnePeek/x", "c.yml", own(light, "31"))))
+
+    def test_sandbox_lock_is_the_named_exception(self):
+        light = LIGHT_PUBLIC.replace("inputs.runner", "vars.RUNNER")
+        lock = own(light, "85").replace("  j:", "  lock:")
+        self.assertEqual(run("private", "OnePeek/onepeek-infra", "sandbox.yml", lock), [])
+        self.assertTrue(run("private", "OnePeek/onepeek-infra", "sandbox.yml", own(light, "86").replace("  j:", "  lock:")))
+        # Only that job of that workflow in that repo.
+        self.assertTrue(run("private", "OnePeek/onepeek-infra", "sandbox.yml", own(light, "85")))
+        self.assertTrue(run("private", "OnePeek/onepeek-infra", "other.yml", lock))
+        self.assertTrue(run("private", "OnePeek/backend-service", "sandbox.yml", lock))
+
     def test_stateful_allows_more_than_fast(self):
         self.assertEqual(run("private", "OnePeek/x", "c.yml", own(STATEFUL_PRIVATE, "120")), [])
         self.assertTrue(run("private", "OnePeek/x", "c.yml", own(FAST_PRIVATE, "120")))
