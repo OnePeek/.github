@@ -1,0 +1,82 @@
+# Shared: automatic re-run after a spot reclaim (onepeek-docs architecture/lld/infra/ci-runners.md section 4, row R1,
+# decided 2026-11-04). A spot runner that is reclaimed mid-job fails the job ("The runner has received a shutdown
+# signal" or "lost communication with the server"). This workflow reads the failed jobs of the finished run and their
+# logs and, when one shows a reclaim and the run is on attempt 1, re-runs the failed jobs once (`gh run rerun --failed`)
+# and writes the job names to the run summary. A second failure, or any other failure, stays failed and visible.
+# The run id comes only from github.event.workflow_run.id and the repository from github.repository (strictly checked
+# in scripts/spot_rerun.py). Runs on the small runner class, like depends-on.yml. Logic: scripts/spot_rerun.py at the
+# caller's pin.
+#
+# Caller (a repo's .github/workflows/spot-rerun-caller.yml; list its CI workflow names under `workflows`, never this
+# workflow's own caller). The pin is the commit of the `v*` tag, like every other shared workflow:
+#
+#   name: spot-rerun-caller
+#   on:
+#     workflow_run:
+#       workflows: [checks, release]   # the repo's workflow names (`name:`)
+#       types: [completed]
+#   permissions:
+#     contents: read
+#   jobs:
+#     spot-rerun:
+#       if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+#       uses: OnePeek/.github/.github/workflows/spot-rerun.yml@<commit SHA> # v<tag>
+#       permissions:
+#         actions: write   # read the run's jobs and logs, and re-run the failed jobs
+#         contents: read
+#       with:
+#         runner: ${{ vars.RUNNER || 'github' }}
+name: spot-rerun
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
+        type: string
+        default: github
+
+permissions:
+  contents: read
+
+jobs:
+  spot-rerun:
+    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions:
+      actions: write  # read the run's jobs and logs; re-run the failed jobs
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows
+            scripts
+
+      - name: This workflow's version (the caller's pin of spot-rerun.yml)
+        id: version
+        run: |
+          sha=$(grep -rhoiE 'OnePeek/\.github/\.github/workflows/spot-rerun\.yml@[0-9a-f]{40}' .github/workflows | head -n 1 | cut -d@ -f2 || true)
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "spot-rerun.yml runs at ${sha:-this repo (a local call)}"
+
+      - name: OnePeek/.github at that version
+        if: ${{ steps.version.outputs.sha != '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OnePeek/.github
+          ref: ${{ steps.version.outputs.sha }}
+          path: _shared
+          persist-credentials: false
+
+      - name: Re-run the failed jobs once when a spot reclaim caused the failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          script=scripts/spot_rerun.py
+          [ -n "${SHA}" ] && script=_shared/scripts/spot_rerun.py
+          python3 "${script}"
