@@ -2,7 +2,8 @@
 # Called by backend-service and onepeek-web on a push to the branch their preprod deploy runs from (release until launch,
 # dev after the switch-over; playbook §5.4); prod is promote-only (promote.yml, UC-DEL-003), so this workflow refuses
 # environment prod. The caller only passes inputs. Jobs, in order:
-# lock (the cross-repo release lock and the order check, playbook §5.4), version, build, scan, sbom-sign, record-digest, db-bootstrap, migrate, assets, rollout, register-one-offs, smoke,
+# lock (the cross-repo release lock and the order check, playbook §5.4), version, build (build-image, or build-web for web,
+# joined by build), scan, sbom-sign, record-digest, db-bootstrap, migrate, assets, rollout, register-one-offs, smoke,
 # watch, rollback (only on failure), notify, unlock (always), api-client. Nobody deploys from a laptop.
 # Every preprod artefact is keyed on the commit, sha-<12> (foundation-playbook §5.2, decision 159): the image tag, the
 # web-assets folder, the SSM release record and the task-definition tags. The release-please version is image metadata
@@ -447,24 +448,22 @@ jobs:
           { echo "version=${version}"; echo "commit=${commit}"; echo "images=${images}"; echo "started=$(date +%s)"; } >> "$GITHUB_OUTPUT"
           echo "Release of ${commit} (next version ${version}) to ${ENVIRONMENT} started." >> "$GITHUB_STEP_SUMMARY"
 
-  build:
-    # arm-build class: the hosted fallback stays ubuntu-latest with QEMU (today's behaviour) instead of ubuntu-24.04-arm
-    # until hosted ARM is proven on a private repo (ci-runners.md section 5.3 lists ubuntu-24.04-arm).
+  build-image:
+    # Every image but web. arm-build class: the hosted fallback stays ubuntu-latest with QEMU (today's behaviour) instead
+    # of ubuntu-24.04-arm until hosted ARM is proven on a private repo (ci-runners.md section 5.3 lists ubuntu-24.04-arm).
+    # Its token has no packages scope: only the web build reads @onepeek packages (least privilege).
     needs: version
-    if: ${{ !inputs.dry-run }}
+    if: ${{ !inputs.dry-run && inputs.image != 'web' }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
-      packages: read # @onepeek/* from GitHub Packages for the web build
     strategy:
       fail-fast: true
       matrix:
         image: ${{ fromJSON(needs.version.outputs.images) }}
-    outputs:
-      built: ${{ steps.push.outputs.digest }}
-    steps:
+    steps: &build-steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -485,7 +484,7 @@ jobs:
           MAIN: ${{ inputs.image }}
           VERSION: ${{ needs.version.outputs.version }}
           COMMIT: ${{ needs.version.outputs.commit }}
-          NPM_TOKEN: ${{ github.token }} # packages: read on this job; each package grants this repo Actions read access
+          NPM_TOKEN: ${{ matrix.image == 'web' && github.token || '' }} # web only; packages: read on build-web, each package grants this repo Actions read access
         run: |
           if [ "${IMAGE}" != "${MAIN}" ]; then
             echo "::error::No Dockerfile location is defined for the extra image '${IMAGE}' (delivery-pipelines §16: the sandbox image waits for document parsing)."
@@ -534,6 +533,42 @@ jobs:
           name: digest-${{ matrix.image }}
           path: digest-${{ matrix.image }}.txt
           retention-days: 1
+
+  build-web:
+    # The web image: the same steps as build-image, and the only job whose token reads packages (@onepeek/* from
+    # GitHub Packages, a BuildKit secret in the build). Same runner class as build-image.
+    needs: version
+    if: ${{ !inputs.dry-run && inputs.image == 'web' }}
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      packages: read # @onepeek/* from GitHub Packages for the web build
+    strategy:
+      fail-fast: true
+      matrix:
+        image: ${{ fromJSON(needs.version.outputs.images) }}
+    steps: *build-steps
+
+  build:
+    # Joins build-image and build-web so the later jobs need one name: it passes only when exactly one of them ran and
+    # succeeded, and fails otherwise (a failed or cancelled build stops the release here).
+    needs: [build-image, build-web]
+    if: ${{ !inputs.dry-run && !cancelled() }}
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Exactly one build job succeeded
+        env:
+          IMAGE_RESULT: ${{ needs.build-image.result }}
+          WEB_RESULT: ${{ needs.build-web.result }}
+        run: |
+          case "${IMAGE_RESULT}/${WEB_RESULT}" in
+            success/skipped|skipped/success) echo "Build done (build-image ${IMAGE_RESULT}, build-web ${WEB_RESULT})." ;;
+            *) echo "::error::The build did not succeed (build-image ${IMAGE_RESULT}, build-web ${WEB_RESULT})."; exit 1 ;;
+          esac
 
   scan:
     needs: [version, build]
@@ -1487,7 +1522,7 @@ jobs:
     # Releases the release lock whatever happened, only with the token the lock job took it with (playbook §5.4); never
     # for prod, which the lock job refuses. If this job itself is lost, the next release that waits sees this run has
     # finished and takes the lock over.
-    needs: [lock, version, build, scan, sbom-sign, record-digest, db-bootstrap, migrate, assets, rollout, register-one-offs, smoke, watch, rollback, notify]
+    needs: [lock, version, build-image, build-web, build, scan, sbom-sign, record-digest, db-bootstrap, migrate, assets, rollout, register-one-offs, smoke, watch, rollback, notify]
     if: ${{ always() && needs.lock.result != 'skipped' && inputs.environment != 'prod' }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
     timeout-minutes: 5
