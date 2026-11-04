@@ -5,7 +5,7 @@
 name: spot-rerun-caller
 
 on:
-  workflow_run:
+  workflow_run:  # zizmor: ignore[dangerous-triggers] reads the run through the API only; nothing of it is checked out
     workflows: [workflow-lint]
     types: [completed]
 
