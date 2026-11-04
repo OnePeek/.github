@@ -535,6 +535,12 @@ class DocsPin(unittest.TestCase):
     def test_any_commit_of_the_docs_pull_request_is_accepted(self) -> None:
         self.assertEqual(self.go({("backend-service", 2): DOCS_OLDER, ("onepeek-web", 4): DOCS_HEAD}, go=False), 0)
 
+    def test_a_pin_round_docs_pull_request_does_not_check_code_pins(self) -> None:
+        with mock.patch.object(ship, "pr_files", return_value=[".github/workflows/checks.yml"]):
+            self.assertEqual(self.go({("backend-service", 2): "9" * 40}, go=False), 0)
+        with mock.patch.object(ship, "pr_files", return_value=[".github/workflows/checks.yml", "standards/x.md"]):
+            self.assertEqual(self.go({("backend-service", 2): "9" * 40}, go=False), 1)
+
     def test_a_pin_outside_the_docs_pull_request_is_a_problem(self) -> None:
         self.assertEqual(self.go({("backend-service", 2): "9" * 40}, go=False), 1)
 

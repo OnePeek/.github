@@ -111,7 +111,10 @@ def clean(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9 ._/()-]", "?", name)[:100]
 
 
-def run(run_id: str, repo: str) -> int:
+WORKFLOW_NAME = re.compile(r"[A-Za-z0-9 ._-]{1,100}", re.ASCII)
+
+
+def run(run_id: str, repo: str, workflow: str = "", rerun_all: str = "") -> int:
     """0 when nothing was needed or the re-run was requested; 1 only for an input or API error."""
     validate(run_id, repo)
     info = json.loads(gh("api", f"repos/{repo}/actions/runs/{run_id}", "--jq", "{run_attempt, conclusion}"))
@@ -125,6 +128,12 @@ def run(run_id: str, repo: str) -> int:
     if not names:
         summary(f"No re-run: no failed job in run {run_id} shows a spot reclaim.")
         return 0
+    whole = bool(workflow) and WORKFLOW_NAME.fullmatch(workflow) is not None and workflow in rerun_all.split()
+    if whole:  # its jobs share a lock or state per attempt: re-run every job (sandbox.md section 7c item 10)
+        gh("run", "rerun", run_id, "--repo", repo)
+        summary(f"Re-ran the whole of run {run_id} once ({clean(workflow)} is re-run whole): spot reclaim in "
+                + ", ".join(clean(n) for n in names) + ".")
+        return 0
     gh("run", "rerun", run_id, "--failed", "--repo", repo)
     summary(f"Re-ran the failed jobs of run {run_id} once: spot reclaim in " + ", ".join(clean(n) for n in names) + ".")
     return 0
@@ -132,7 +141,8 @@ def run(run_id: str, repo: str) -> int:
 
 def main() -> int:
     try:
-        return run(os.environ.get("RUN_ID", ""), os.environ.get("REPO", ""))
+        return run(os.environ.get("RUN_ID", ""), os.environ.get("REPO", ""), os.environ.get("WORKFLOW", ""),
+                   os.environ.get("RERUN_ALL", ""))
     except (ValueError, GhError, json.JSONDecodeError) as err:
         print(f"::error::{err}")
         return 1

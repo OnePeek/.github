@@ -223,6 +223,11 @@ def pr_commits(repo: str, n: int) -> set[str]:
     return set(gh("api", "--paginate", f"repos/{ORG}/{repo}/pulls/{n}/commits?per_page=100", "--jq", ".[].sha").split())
 
 
+def pr_files(repo: str, n: int) -> list[str]:
+    """The paths a pull request changes (GitHub lists at most 3,000)."""
+    return gh("api", "--paginate", f"repos/{ORG}/{repo}/pulls/{n}/files?per_page=100", "--jq", ".[].filename").split()
+
+
 def pin_at(text: str) -> tuple[int, str] | None:
     """(line index, docs commit) of the first `onepeek-docs@<sha>` line of a docs-version.txt outside comments."""
     for i, line in enumerate(text.splitlines()):
@@ -525,7 +530,11 @@ def main(argv: list[str]) -> int:
     if len(docs) > 1:
         problems.append("a change set has one docs pull request")
     pinned = set()  # code pull requests whose docs pin is a commit of the set's docs pull request (lesson L27 b)
-    if docs:  # every code pin must be a commit of the set's docs pull request (§2a step 2, lesson L27 b)
+    files = pr_files(*docs[0]) if docs else []
+    workflow_only = bool(files) and all(f.startswith(".github/") for f in files)
+    if workflow_only:  # a pin round's docs pull request changes no docs content: no code pin needs to be its commit (L31)
+        say(f"{docs[0][0]}#{docs[0][1]} changes only .github/ (a pin round): code pins are not checked against it")
+    if docs and not workflow_only:  # every code pin must be a commit of the set's docs pull request (§2a step 2, L27 b)
         commits = pr_commits(*docs[0])
         for repo, n in prs:
             if repo in ("onepeek-docs", ".github"):
