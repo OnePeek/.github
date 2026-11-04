@@ -51,21 +51,32 @@ PIN = "a" * 40
 class DocsWaiting(unittest.TestCase):  # lesson L27 (a): the implicit docs dependency
     def test_no_pin_or_a_pin_on_main_waits_for_nothing(self) -> None:
         never = mock.Mock(side_effect=AssertionError("not asked"))
-        self.assertEqual(cd.docs_waiting(None, never, never), [])
+        self.assertEqual(cd.docs_waiting(None, never, never), ([], []))
         for st in ("ahead", "identical"):
-            self.assertEqual(cd.docs_waiting(PIN, lambda s, st=st: st, never), [])
+            for strict in (False, True):
+                self.assertEqual(cd.docs_waiting(PIN, lambda s, st=st: st, never, strict), ([], []))
 
-    def test_a_pin_off_main_waits_for_the_open_docs_pull_request_containing_it(self) -> None:
+    def test_a_pin_in_an_open_docs_pull_request_passes_with_a_note(self) -> None:
         for st in ("diverged", "behind"):
-            out = cd.docs_waiting(PIN, lambda s, st=st: st, lambda s: [145, 150])
-            self.assertEqual(len(out), 1)
-            self.assertTrue(out[0].startswith("waiting for onepeek-docs#145"), out[0])
+            problems, notes = cd.docs_waiting(PIN, lambda s, st=st: st, lambda s: [145, 150])
+            self.assertEqual(problems, [])
+            self.assertEqual(len(notes), 1)
+            self.assertTrue(notes[0].startswith("waiting for onepeek-docs#145 (docs-version.txt pins aaaaaaa)"), notes[0])
+            self.assertIn("ship_change_set.py merges it first", notes[0])
 
-    def test_a_pin_in_no_open_docs_pull_request_fails(self) -> None:
+    def test_strict_fails_that_wait(self) -> None:
+        problems, notes = cd.docs_waiting(PIN, lambda s: "diverged", lambda s: [145, 150], strict=True)
+        self.assertEqual(notes, [])
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("waiting for onepeek-docs#145"), problems[0])
+
+    def test_a_pin_in_no_open_docs_pull_request_fails_even_when_not_strict(self) -> None:
         for st in ("diverged", "missing"):
-            out = cd.docs_waiting(PIN, lambda s, st=st: st, lambda s: [])
-            self.assertEqual(len(out), 1)
-            self.assertIn("docs pin aaaaaaa not on main and in no open docs PR", out[0])
+            for strict in (False, True):
+                problems, notes = cd.docs_waiting(PIN, lambda s, st=st: st, lambda s: [], strict)
+                self.assertEqual(notes, [])
+                self.assertEqual(len(problems), 1)
+                self.assertIn("docs pin aaaaaaa not on main and in no open docs PR", problems[0])
 
     def test_only_open_pull_requests_count_lowest_first(self) -> None:
         prs = [{"number": 9, "state": "open"}, {"number": 3, "state": "closed"}, {"number": 4, "state": "open"}]
@@ -103,8 +114,15 @@ class Main(unittest.TestCase):
         self.assertEqual(self.run_main(["--docs-pin"], ""), (0, "\n"))
         self.assertEqual(self.run_main(["--docs-pin"], "", pin=PIN), (0, PIN + "\n"))
 
-    def test_check_waits_for_the_docs_pull_request_with_no_line(self) -> None:
+    def test_check_passes_with_a_notice_while_the_docs_pull_request_is_open(self) -> None:
         rc, out = self.run_main(["--check"], "", pin=PIN, prs=[145])
+        self.assertEqual(rc, 0)
+        self.assertIn("::notice title=depends-on::waiting for onepeek-docs#145 (docs-version.txt pins aaaaaaa); "
+                      "ship_change_set.py merges it first", out)
+        self.assertNotIn("::error", out)
+
+    def test_check_strict_fails_on_that_wait(self) -> None:
+        rc, out = self.run_main(["--check", "--strict"], "", pin=PIN, prs=[145])
         self.assertEqual(rc, 1)
         self.assertIn("::error::waiting for onepeek-docs#145", out)
 
@@ -120,10 +138,21 @@ class Main(unittest.TestCase):
         self.assertIn("::error::waiting for backend-service#73", out)
 
     def test_check_reports_both_kinds_together(self) -> None:
+        rc, out = self.run_main(["--check", "--strict"], BODY, pin=PIN, prs=[7])
+        self.assertEqual(rc, 1)
+        self.assertIn("::error::waiting for onepeek-docs#7", out)
+        self.assertIn("::error::waiting for backend-service#73", out)
+
+    def test_a_declared_dependency_still_fails_when_the_docs_wait_is_only_a_notice(self) -> None:
         rc, out = self.run_main(["--check"], BODY, pin=PIN, prs=[7])
         self.assertEqual(rc, 1)
-        self.assertIn("waiting for onepeek-docs#7", out)
-        self.assertIn("waiting for backend-service#73", out)
+        self.assertIn("::notice title=depends-on::waiting for onepeek-docs#7", out)
+        self.assertIn("::error::waiting for backend-service#73", out)
+
+    def test_a_declared_dependency_closed_unmerged_fails(self) -> None:
+        rc, out = self.run_main(["--check"], "Depends on: OnePeek/backend-service#73", state=lambda r, n, t: ("closed", False))
+        self.assertEqual(rc, 1)
+        self.assertIn("closed without merging", out)
 
     def test_check_with_a_pin_needs_the_docs_token(self) -> None:
         rc, out = self.run_main(["--check"], "", pin=PIN, status="ahead", docs_token="")
