@@ -171,7 +171,9 @@ def venv_bin() -> pathlib.Path:
     global _VENV
     if _VENV is None:
         _VENV = run_root() / "venv"
-        subprocess.run([sys.executable, "-m", "venv", str(_VENV)], check=True, capture_output=True)
+        # --system-site-packages: a step sees the packages local_ci itself runs with (PyYAML), as CI's runner Python has them;
+        # a step's own `pip install` still lands in the venv.
+        subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", str(_VENV)], check=True, capture_output=True)
     return _VENV / "bin"
 
 
