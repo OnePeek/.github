@@ -18,7 +18,12 @@ is reported at the end without stopping the others. `--order repoA,repoB,...` re
 order (§8a P1, development-cycle §2a item 7: the consumer that validates a contract strictly merges before the
 producer); it names every repo in the set once. A pull request whose body says `Depends on: OnePeek/<repo>#<n>` (§8a P1,
 lesson L26) merges after that one (the order is otherwise kept), a listed pull request outside the set must already be
-merged, and after the dependency merges the dependent's failed checks (its `depends-on` job) are re-run. Neither
+merged, and after the dependency merges the dependent's failed checks (its `depends-on` job) are re-run. The docs pin
+is an implicit dependency (lesson L27): a code pull request's `docs-version.txt` may be any commit of the set's docs
+pull request, not only its head; after the docs pull request merges, its checks are re-run like a declared dependent's,
+and once they are green its pin moves to the docs merge commit in one commit pushed to its branch, and it is merged
+without waiting for a new CI run, because only that one line changed since the green run (checked; any other change
+waits for CI as before). Neither
 `--order` nor `Depends on:` ever moves onepeek-docs off first place. After each merge, the local worktrees of that branch are removed
 when clean (§8a P6). A required check that failed before an earlier repo in the set merged is re-run once
 (it may have needed that repo); a second failure stops the run. Nothing is merged past a red required check.
@@ -213,6 +218,110 @@ def bump_pins(repo: str, branch: str, tag: str, sha: str) -> str | None:
             git(src, "worktree", "remove", "--force", str(wt))
 
 
+def pr_commits(repo: str, n: int) -> set[str]:
+    """Every commit of a pull request (GitHub lists at most 250)."""
+    return set(gh("api", "--paginate", f"repos/{ORG}/{repo}/pulls/{n}/commits?per_page=100", "--jq", ".[].sha").split())
+
+
+def pin_at(text: str) -> tuple[int, str] | None:
+    """(line index, docs commit) of the first `onepeek-docs@<sha>` line of a docs-version.txt outside comments."""
+    for i, line in enumerate(text.splitlines()):
+        m = check_pins.DOCS_PIN.search(line)
+        if m and not line.strip().startswith("#"):
+            return i, m.group(1)
+    return None
+
+
+def pin_line(text: str) -> str | None:
+    """The docs commit a docs-version.txt names (its first `onepeek-docs@<sha>` line outside comments)."""
+    at = pin_at(text)
+    return at[1] if at else None
+
+
+def only_pin_changed(wt: pathlib.Path, green: str, new: str) -> bool:
+    """True when the diff from the green commit to the new one is exactly one line of docs-version.txt replaced by
+    another `onepeek-docs@<sha>` line and nothing else. It does not say the line is the pin line (a comment holding
+    such text would pass) and says nothing about the base branch; move_docs_pin edits only the pin line, and main
+    checks the base separately (base_unchanged)."""
+    if git(wt, "diff", "--numstat", green, new).strip() != "1\t1\tdocs-version.txt":
+        return False
+    lines = [ln for ln in git(wt, "diff", "-U0", green, new, "--", "docs-version.txt").splitlines()
+             if ln[:1] in "+-" and not ln.startswith(("+++", "---"))]
+    return len(lines) == 2 and all(check_pins.DOCS_PIN.fullmatch(ln[1:].strip()) for ln in lines)
+
+
+def move_docs_pin(repo: str, branch: str, green: str, merge_sha: str) -> tuple[str | None, bool]:
+    """Move the branch's docs-version.txt pin to the docs merge commit, in one commit on top of the green head
+    `green`, pushed as an ordinary fast-forward (it fails if the branch moved). Returns (the pushed commit or None when
+    the pin is already there, whether only the pin line changed since `green`)."""
+    src = ROOT / repo
+    git(src, "fetch", "-q", "origin", branch)
+    with tempfile.TemporaryDirectory(prefix=f"docs-pin-{repo}-") as tmp:
+        wt = pathlib.Path(tmp) / "wt"
+        git(src, "worktree", "add", "-q", "--detach", str(wt), green)
+        try:
+            f = wt / "docs-version.txt"
+            text = f.read_text(encoding="utf-8")
+            at = pin_at(text)
+            old = at[1] if at else None
+            if old is None:
+                raise SystemExit(f"STOP {repo}: docs-version.txt at {green[:7]} holds no onepeek-docs@<sha> line")
+            if old == merge_sha:
+                return None, True
+            lines = text.splitlines(keepends=True)
+            lines[at[0]] = lines[at[0]].replace(f"onepeek-docs@{old}", f"onepeek-docs@{merge_sha}", 1)  # that line only
+            f.write_text("".join(lines), encoding="utf-8")
+            git(wt, "add", "--", "docs-version.txt")
+            git(wt, "commit", "-q", "-m", f"chore: pin docs to the merge commit {merge_sha[:7]} (ship_change_set)")
+            new = git(wt, "rev-parse", "HEAD").strip()
+            only = only_pin_changed(wt, green, new)
+            git(wt, "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+            say(f"{repo}: docs pin -> {merge_sha[:7]} on {branch}")
+            return new, only
+        finally:
+            git(src, "worktree", "remove", "--force", str(wt))
+
+
+def tested_bases(repo: str, n: int) -> set[str]:
+    """The base-branch commits the pull request's current GitHub Actions runs tested (each run's
+    pull_requests[].base.sha for this pull request; equivalent to the merge commit's first parent, since the base only
+    moves forward and the merge commit is built at trigger time). Checks without an Actions run link (CodeRabbit and
+    other apps) are ignored, as checks() ignores them; empty when no run says, which callers treat as unknown."""
+    out: set[str] = set()
+    runs = 0
+    for c in read_checks(repo, n, False):
+        m = re.search(r"/runs/(\d+)", c.get("link") or "")
+        if not m:
+            continue
+        runs += 1
+        prs = json.loads(gh("api", f"repos/{ORG}/{repo}/actions/runs/{m.group(1)}", "--jq", ".pull_requests") or "[]")
+        shas = {p["base"]["sha"] for p in prs if p.get("number") == n}
+        if not shas:
+            return set()
+        out |= shas
+    return out if runs else set()
+
+
+def base_head(repo: str, branch: str) -> str:
+    """The base branch's head commit now."""
+    return gh("api", f"repos/{ORG}/{repo}/commits/{branch}", "--jq", ".sha").strip()
+
+
+def base_unchanged(repo: str, n: int, tested: set[str], branch: str) -> bool:
+    """True when the green run tested the base branch's current head (lesson L27 b), so a pin-only push needs no new run."""
+    return tested == {base_head(repo, branch)}
+
+
+def green_head(repo: str, n: int, may_rerun: bool) -> str:
+    """Wait for the required checks to be green and return the head they were green on (asked again if it moved)."""
+    while True:
+        head = pr_info(repo, n)["headRefOid"]
+        wait_green(repo, n, may_rerun)
+        if pr_info(repo, n)["headRefOid"] == head:
+            return head
+        say(f"{repo}#{n}: head moved while its checks ran; waiting again")
+
+
 def with_dependencies(prs: list[tuple[str, int]], deps: dict) -> list[tuple[str, int]]:
     """Each pull request after the ones in the set it declares (`Depends on:`); otherwise the given order is kept.
     onepeek-docs stays first, so a docs pull request may not depend on another pull request in the set."""
@@ -233,13 +342,15 @@ def with_dependencies(prs: list[tuple[str, int]], deps: dict) -> list[tuple[str,
 
 
 def rerun_failed(repo: str, n: int) -> None:
-    """Re-run the failed runs of a pull request (its depends-on job failed while the dependency was unmerged)."""
+    """Re-run the failed runs of a pull request (its depends-on job failed while the dependency, declared or its docs
+    pin's pull request, was unmerged)."""
     failed = [c for c in read_checks(repo, n, False) if c["bucket"] in ("fail", "cancel")]
     runs = {m.group(1) for c in failed if (m := re.search(r"/runs/(\d+)", c.get("link") or ""))}
     for run_id in runs:
         gh("run", "rerun", run_id, "-R", f"{ORG}/{repo}", "--failed")
     if runs:
         say(f"{repo}#{n}: re-ran {len(runs)} failed run(s) now that its dependency merged")
+        time.sleep(POLL_S)  # let the re-runs register before the checks are read again
 
 
 def minor_behind(old_tags: set[str], new: str) -> bool:
@@ -388,7 +499,8 @@ def main(argv: list[str]) -> int:
     a = ap.parse_args(argv)
 
     prs = ordered([parse(p) for p in a.prs], a.order)
-    if any(r == ".github" for r, _ in prs) and not all((ROOT / r / ".git").exists() for r, _ in prs):
+    local = any(r == ".github" for r, _ in prs) or (any(r == DOCS for r, _ in prs) and len(prs) > 1)
+    if local and not all((ROOT / r / ".git").exists() for r, _ in prs):
         raise SystemExit(f"run from the workspace root (the folder holding the repos); {ROOT} is not it")
     info = {p: pr_info(*p) for p in prs}
     deps = {p: depends_on.parse(i.get("body")) for p, i in info.items()}
@@ -412,19 +524,24 @@ def main(argv: list[str]) -> int:
     docs = [p for p in prs if p[0] == "onepeek-docs"]
     if len(docs) > 1:
         problems.append("a change set has one docs pull request")
-    if docs:  # every code pin must point at the docs pull request's last commit (§2a step 2)
-        head = info[docs[0]]["headRefOid"]
+    pinned = set()  # code pull requests whose docs pin is a commit of the set's docs pull request (lesson L27 b)
+    if docs:  # every code pin must be a commit of the set's docs pull request (§2a step 2, lesson L27 b)
+        commits = pr_commits(*docs[0])
         for repo, n in prs:
             if repo in ("onepeek-docs", ".github"):
                 continue
             url = f"repos/{ORG}/{repo}/contents/docs-version.txt?ref={info[(repo, n)]['headRefName']}"
             r = subprocess.run(["gh", "api", url, "-H", "Accept: application/vnd.github.raw"],
                                capture_output=True, text=True, check=False)
-            pin = r.stdout.strip()
+            pin = pin_line(r.stdout) if r.returncode == 0 else None
             if r.returncode != 0:
                 problems.append(f"{repo}#{n} has no readable docs-version.txt")
-            elif not pin.endswith(head):
-                problems.append(f"{repo}#{n} docs-version.txt is {pin.split('@')[-1][:7]}, not docs head {head[:7]}")
+            elif pin not in commits:
+                problems.append(f"{repo}#{n} docs-version.txt is {(pin or 'no pin')[:7]}, not a commit of "
+                                f"{docs[0][0]}#{docs[0][1]}")
+            else:
+                pinned.add((repo, n))
+                deps.setdefault((repo, n), []).append(docs[0])  # implicit: re-run its checks after the docs merge
 
     say("plan: " + " -> ".join(f"{r}#{n} ({'merge' if r == 'onepeek-docs' else 'squash'} into {BASE.get(r, 'dev')})"
                                for r, n in prs))
@@ -436,7 +553,7 @@ def main(argv: list[str]) -> int:
         say("dry run: add --go to merge")
         return 0
 
-    merged_any, tag, moved = False, None, set()
+    merged_any, tag, moved, docs_merge = False, None, set(), None
     for k, (repo, n) in enumerate(prs):
         no_conflicts(prs[k:])
         if tag and repo not in (DOCS, ".github"):
@@ -445,13 +562,27 @@ def main(argv: list[str]) -> int:
             if pushed:
                 wait_head(repo, n, pushed)
                 no_conflicts([(repo, n)])
-        wait_green(repo, n, may_rerun=merged_any)
+        head = green_head(repo, n, may_rerun=merged_any)
+        tested = tested_bases(repo, n) if docs_merge and (repo, n) in pinned else set()
+        if docs_merge and (repo, n) in pinned:
+            pushed, only_pin = move_docs_pin(repo, info[(repo, n)]["headRefName"], head, docs_merge)
+            if pushed:
+                wait_head(repo, n, pushed)
+                head = pushed
+                if not only_pin or not base_unchanged(repo, n, tested, info[(repo, n)]["baseRefName"]):
+                    say(f"{repo}#{n}: more than the docs pin changed since the green run, or its base moved; "
+                        "waiting for the new CI run")
+                    head = green_head(repo, n, may_rerun=False)
+                else:
+                    say(f"{repo}#{n}: only the docs pin changed and the green run tested the current base; merging without a new CI run")
         method = "--merge" if repo == "onepeek-docs" else "--squash"
-        gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, "--delete-branch")
+        gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, "--delete-branch", "--match-head-commit", head)
         merged = pr_info(repo, n)
         if merged["state"] != "MERGED":
             raise SystemExit(f"STOP {repo}#{n}: merge did not complete ({merged['state']})")
         say(f"{repo}#{n}: merged {merged['mergeCommit']['oid'][:7]}")
+        if repo == DOCS:
+            docs_merge = merged["mergeCommit"]["oid"]
         remove_worktrees(repo, info[(repo, n)]["headRefName"])
         for later in prs[k + 1:]:
             if (repo, n) in deps.get(later, []):
