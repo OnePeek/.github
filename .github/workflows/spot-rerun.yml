@@ -20,7 +20,7 @@
 #   jobs:
 #     spot-rerun:
 #       if: ${{ github.event.workflow_run.conclusion == 'failure' }}
-#       uses: OnePeek/.github/.github/workflows/spot-rerun.yml@<commit SHA> # v<tag>
+#       uses: <this workflow, pinned to the commit of a v* tag, like every other shared workflow>
 #       permissions:
 #         actions: write   # read the run's jobs and logs, and re-run the failed jobs
 #         checks: read     # the job's annotations (where a lost runner is reported)
