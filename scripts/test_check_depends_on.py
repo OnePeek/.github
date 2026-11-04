@@ -1,10 +1,13 @@
-"""Tests for scripts/check_depends_on.py and depends-on.yml (foundation-playbook §8a P1, lesson L26)."""
+"""Tests for scripts/check_depends_on.py and depends-on.yml (foundation-playbook §8a P1, lessons L26 and L27)."""
 from __future__ import annotations
 
 import io
+import json
 import os
 import pathlib
 import contextlib
+import shutil
+import tempfile
 import unittest
 from unittest import mock
 
@@ -42,13 +45,90 @@ class Waiting(unittest.TestCase):
         self.assertEqual(len(out), 2)
 
 
+PIN = "a" * 40
+
+
+class DocsWaiting(unittest.TestCase):  # lesson L27 (a): the implicit docs dependency
+    def test_no_pin_or_a_pin_on_main_waits_for_nothing(self) -> None:
+        never = mock.Mock(side_effect=AssertionError("not asked"))
+        self.assertEqual(cd.docs_waiting(None, never, never), [])
+        for st in ("ahead", "identical"):
+            self.assertEqual(cd.docs_waiting(PIN, lambda s, st=st: st, never), [])
+
+    def test_a_pin_off_main_waits_for_the_open_docs_pull_request_containing_it(self) -> None:
+        for st in ("diverged", "behind"):
+            out = cd.docs_waiting(PIN, lambda s, st=st: st, lambda s: [145, 150])
+            self.assertEqual(len(out), 1)
+            self.assertTrue(out[0].startswith("waiting for onepeek-docs#145"), out[0])
+
+    def test_a_pin_in_no_open_docs_pull_request_fails(self) -> None:
+        for st in ("diverged", "missing"):
+            out = cd.docs_waiting(PIN, lambda s, st=st: st, lambda s: [])
+            self.assertEqual(len(out), 1)
+            self.assertIn("docs pin aaaaaaa not on main and in no open docs PR", out[0])
+
+    def test_only_open_pull_requests_count_lowest_first(self) -> None:
+        prs = [{"number": 9, "state": "open"}, {"number": 3, "state": "closed"}, {"number": 4, "state": "open"}]
+        resp = mock.MagicMock()
+        resp.__enter__.return_value = io.StringIO(json.dumps(prs))
+        with mock.patch.object(cd.urllib.request, "urlopen", return_value=resp) as u:
+            self.assertEqual(cd.open_docs_prs(PIN, "t"), [4, 9])
+        self.assertTrue(u.call_args[0][0].full_url.endswith(f"/repos/OnePeek/onepeek-docs/commits/{PIN}/pulls"))
+
+    def test_a_commit_docs_does_not_have_is_in_no_pull_request(self) -> None:
+        err = cd.urllib.error.HTTPError("u", 422, "x", {}, None)
+        with mock.patch.object(cd.urllib.request, "urlopen", side_effect=err):
+            self.assertEqual(cd.open_docs_prs(PIN, "t"), [])
+
+
 class Main(unittest.TestCase):
-    def run_main(self, argv: list[str], body: str, state=None) -> tuple[int, str]:
+    def setUp(self) -> None:
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def run_main(self, argv: list[str], body: str, state=None, pin: str | None = None, status: str = "diverged",
+                 prs: list[int] | None = None, docs_token: str = "d") -> tuple[int, str]:
+        if pin:
+            (self.dir / "docs-version.txt").write_text(f"# the docs commit\nonepeek-docs@{pin}\n", encoding="utf-8")
         buf = io.StringIO()
-        with mock.patch.dict(os.environ, {"BODY": body, "GH_TOKEN": "t"}), contextlib.redirect_stdout(buf), \
-                mock.patch.object(cd, "api_state", side_effect=state or (lambda r, n, t: ("open", False))):
-            rc = cd.main(argv)
+        with mock.patch.dict(os.environ, {"BODY": body, "GH_TOKEN": "t", "DOCS_TOKEN": docs_token}), \
+                contextlib.redirect_stdout(buf), \
+                mock.patch.object(cd, "api_state", side_effect=state or (lambda r, n, t: ("open", False))), \
+                mock.patch.object(cd.check_pins, "compare_status", return_value=status), \
+                mock.patch.object(cd, "open_docs_prs", return_value=prs or []):
+            rc = cd.main([*argv, "--repo-dir", str(self.dir)])
         return rc, buf.getvalue()
+
+    def test_docs_pin_prints_the_pinned_commit_or_nothing(self) -> None:
+        self.assertEqual(self.run_main(["--docs-pin"], ""), (0, "\n"))
+        self.assertEqual(self.run_main(["--docs-pin"], "", pin=PIN), (0, PIN + "\n"))
+
+    def test_check_waits_for_the_docs_pull_request_with_no_line(self) -> None:
+        rc, out = self.run_main(["--check"], "", pin=PIN, prs=[145])
+        self.assertEqual(rc, 1)
+        self.assertIn("::error::waiting for onepeek-docs#145", out)
+
+    def test_check_fails_on_a_pin_in_no_open_docs_pull_request(self) -> None:
+        rc, out = self.run_main(["--check"], "", pin=PIN)
+        self.assertEqual(rc, 1)
+        self.assertIn("not on main and in no open docs PR", out)
+
+    def test_check_passes_on_a_pin_on_main_and_still_checks_declared_lines(self) -> None:
+        self.assertEqual(self.run_main(["--check"], "", pin=PIN, status="ahead")[0], 0)
+        rc, out = self.run_main(["--check"], BODY, pin=PIN, status="identical")
+        self.assertEqual(rc, 1)
+        self.assertIn("::error::waiting for backend-service#73", out)
+
+    def test_check_reports_both_kinds_together(self) -> None:
+        rc, out = self.run_main(["--check"], BODY, pin=PIN, prs=[7])
+        self.assertEqual(rc, 1)
+        self.assertIn("waiting for onepeek-docs#7", out)
+        self.assertIn("waiting for backend-service#73", out)
+
+    def test_check_with_a_pin_needs_the_docs_token(self) -> None:
+        rc, out = self.run_main(["--check"], "", pin=PIN, status="ahead", docs_token="")
+        self.assertEqual(rc, 1)
+        self.assertIn("no token to read onepeek-docs", out)
 
     def test_repos_lists_the_named_repos_for_the_token(self) -> None:
         self.assertEqual(self.run_main(["--repos"], BODY), (0, "backend-service,onepeek-web\n"))
@@ -78,6 +158,22 @@ class Workflow(unittest.TestCase):
         self.assertEqual(STEPS[-1]["env"]["BODY"], "${{ github.event.pull_request.body }}")
         self.assertIn("--check", STEPS[-1]["run"])
 
+    def test_the_docs_pin_gets_its_own_token_read_only_on_onepeek_docs(self) -> None:  # L27 (a)
+        deps = next(s for s in STEPS if s.get("id") == "deps")
+        self.assertIn('--docs-pin', deps["run"])
+        docs = next(s for s in STEPS if s.get("id") == "docs-app")
+        self.assertEqual(docs["if"], "${{ steps.deps.outputs.docs != '' }}")
+        self.assertEqual(docs["with"]["repositories"], "onepeek-docs")
+        self.assertEqual({k: v for k, v in docs["with"].items() if k.startswith("permission-")},
+                         {"permission-contents": "read", "permission-pull-requests": "read"})
+        self.assertEqual(STEPS[-1]["env"]["DOCS_TOKEN"], "${{ steps.docs-app.outputs.token }}")
+        guard = next(s for s in STEPS if "HAS_APP" in s.get("env", {}))
+        self.assertIn("steps.deps.outputs.docs != ''", guard["if"])
+
+    def test_the_callers_docs_version_file_is_checked_out(self) -> None:
+        # Cone-mode sparse checkout always keeps the root's files, so docs-version.txt is there; never turn cone off.
+        self.assertNotIn("sparse-checkout-cone-mode", STEPS[0]["with"])
+
     def test_the_callers_in_this_repo_run_it_first_and_every_other_job_needs_it(self) -> None:
         jobs = yaml.safe_load((WORKFLOW.parent / "workflow-lint.yml").read_text(encoding="utf-8"))["jobs"]
         self.assertEqual(jobs["depends-on"]["uses"], "./.github/workflows/depends-on.yml")
@@ -85,7 +181,8 @@ class Workflow(unittest.TestCase):
             if name != "depends-on":
                 self.assertEqual(job.get("needs"), "depends-on", name)
         on = yaml.safe_load((WORKFLOW.parent / "workflow-lint.yml").read_text(encoding="utf-8"))[True]
-        self.assertIn("edited", on["pull_request"]["types"])
+        self.assertNotIn("edited", on["pull_request"]["types"])  # L27 (d): the ship tool re-runs instead
+        self.assertEqual(on["pull_request"]["types"], ["opened", "reopened", "synchronize"])
 
 
 if __name__ == "__main__":

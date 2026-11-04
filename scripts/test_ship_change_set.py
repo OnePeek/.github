@@ -446,12 +446,15 @@ class DeclaredDependencies(unittest.TestCase):
         def gh(*args):
             if args[:2] == ("pr", "merge"):
                 merged.add((args[4].split("/")[1], int(args[2])))
+            if args[0] == "api" and "/commits" in args[2]:
+                return "c" * 40 + "\n"
             return ""
         moved_to = []
         with mock.patch.object(ship, "ROOT", root), mock.patch.object(ship, "pr_info", side_effect=pr_info), \
                 mock.patch.object(ship, "gh", side_effect=gh), mock.patch.object(ship, "wait_green"), \
                 mock.patch.object(ship, "remove_worktrees"), mock.patch.object(ship, "wait_tag", return_value=("v1.8.2", NEW)), \
-                mock.patch.object(ship, "bump_pins", return_value=None), \
+                mock.patch.object(ship, "bump_pins", return_value=None), mock.patch.object(ship, "rerun_failed"), \
+                mock.patch.object(ship, "move_docs_pin", return_value=(None, True)), \
                 mock.patch.object(ship.subprocess, "run", return_value=done(0, "onepeek-docs@" + "c" * 40)), \
                 mock.patch.object(ship, "callers", return_value=["backend-service", "onepeek-docs", "onepeek-web"]), \
                 mock.patch.object(ship, "open_pin_move", side_effect=lambda r, t, s: moved_to.append(r)):
@@ -461,9 +464,156 @@ class DeclaredDependencies(unittest.TestCase):
     def test_rerun_failed_re_runs_only_failed_runs(self) -> None:
         cs = [{"name": "depends-on", "bucket": "fail", "link": "https://github.com/OnePeek/x/actions/runs/11/job/1"},
               {"name": "ok", "bucket": "pass", "link": "https://github.com/OnePeek/x/actions/runs/12/job/2"}]
-        with mock.patch.object(ship, "read_checks", return_value=cs), mock.patch.object(ship, "gh") as gh:
+        with mock.patch.object(ship, "read_checks", return_value=cs), mock.patch.object(ship, "gh") as gh, \
+                mock.patch.object(ship.time, "sleep"):
             ship.rerun_failed("x", 1)
         gh.assert_called_once_with("run", "rerun", "11", "-R", "OnePeek/x", "--failed")
+
+
+DOCS_HEAD, DOCS_OLDER, DOCS_MERGE = "1" * 40, "2" * 40, "3" * 40
+
+
+class DocsPin(unittest.TestCase):
+    """Lesson L27 (b, d): a code pin may be any commit of the set's docs pull request; after the docs merge the code
+    pull request's checks are re-run, then its pin moves to the docs merge commit and it merges without a new CI run."""
+
+    def setUp(self) -> None:
+        self.root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        for r in ("onepeek-docs", "backend-service", "onepeek-web"):
+            (self.root / r / ".git").mkdir(parents=True)
+        patcher = mock.patch.object(ship, "ROOT", self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def harness(self, pins: dict, bodies: dict | None = None):
+        """Fake gh/pr_info for a set of onepeek-docs#1 and code pull requests whose docs-version.txt is `pins`."""
+        self.merged, self.events, self.heads = set(), [], {}
+        prs = [("onepeek-docs", 1), *pins]
+        bodies = bodies or {}
+
+        def pr_info(r, n):
+            i = {"state": "OPEN", "baseRefName": ship.BASE.get(r, "dev"), "isDraft": False, "mergeable": "MERGEABLE",
+                 "headRefName": f"b{n}",
+                 "headRefOid": self.heads.get(r) or (DOCS_HEAD if r == "onepeek-docs" else f"{n}" * 40),
+                 "body": bodies.get((r, n), ""), "mergeCommit": None}
+            if (r, n) in self.merged:
+                i.update(state="MERGED", mergeCommit={"oid": DOCS_MERGE if r == "onepeek-docs" else "e" * 40})
+            return i
+
+        def gh(*args):
+            if args[:2] == ("pr", "merge"):
+                repo = args[4].split("/")[1]
+                self.merged.add((repo, int(args[2])))
+                self.events.append(("merge", repo, args[args.index("--match-head-commit") + 1]))
+            if args[0] == "api" and args[2].startswith("repos/OnePeek/onepeek-docs/pulls/1/commits"):
+                return f"{DOCS_OLDER}\n{DOCS_HEAD}\n"
+            return ""
+
+        def run(cmd, **kw):
+            repo = cmd[2].split("/")[2]
+            return done(0, f"# pin\nonepeek-docs@{pins[next(p for p in pins if p[0] == repo)]}\n")
+        return prs, pr_info, gh, run
+
+    def go(self, pins: dict, only_pin: bool = True, bodies: dict | None = None, go: bool = True) -> int:
+        prs, pr_info, gh, run = self.harness(pins, bodies)
+
+        def move(repo, branch, green, merge_sha):
+            self.events.append(("pin", repo, green, merge_sha))
+            self.heads[repo] = "f" * 40  # the pushed pin commit is the new head
+            return "f" * 40, only_pin
+        with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "gh", side_effect=gh), \
+                mock.patch.object(ship.subprocess, "run", side_effect=run), mock.patch.object(ship, "remove_worktrees"), \
+                mock.patch.object(ship, "wait_green", side_effect=lambda r, n, m: self.events.append(("green", r))), \
+                mock.patch.object(ship, "wait_head"), mock.patch.object(ship, "move_docs_pin", side_effect=move), \
+                mock.patch.object(ship, "rerun_failed", side_effect=lambda r, n: self.events.append(("rerun", r))):
+            return ship.main([f"{r}#{n}" for r, n in prs] + (["--go"] if go else []))
+
+    def test_any_commit_of_the_docs_pull_request_is_accepted(self) -> None:
+        self.assertEqual(self.go({("backend-service", 2): DOCS_OLDER, ("onepeek-web", 4): DOCS_HEAD}, go=False), 0)
+
+    def test_a_pin_outside_the_docs_pull_request_is_a_problem(self) -> None:
+        self.assertEqual(self.go({("backend-service", 2): "9" * 40}, go=False), 1)
+
+    def test_after_the_docs_merge_checks_rerun_then_the_pin_moves_and_it_merges_at_that_commit(self) -> None:
+        self.assertEqual(self.go({("backend-service", 2): DOCS_OLDER}), 0)
+        self.assertEqual(self.events, [
+            ("green", "onepeek-docs"), ("merge", "onepeek-docs", DOCS_HEAD),
+            ("rerun", "backend-service"),  # implicit dependency: its depends-on failed while docs was open
+            ("green", "backend-service"),
+            ("pin", "backend-service", "2" * 40, DOCS_MERGE),
+            ("merge", "backend-service", "f" * 40),  # no new CI wait: only the pin line changed
+        ])
+
+    def test_more_than_the_pin_changed_waits_for_ci(self) -> None:
+        self.assertEqual(self.go({("backend-service", 2): DOCS_OLDER}, only_pin=False), 0)
+        self.assertEqual(self.events[-3:], [("pin", "backend-service", "2" * 40, DOCS_MERGE),
+                                            ("green", "backend-service"), ("merge", "backend-service", "f" * 40)])
+
+    def test_explicit_and_implicit_dependents_are_both_re_run(self) -> None:
+        bodies = {("onepeek-web", 4): "Depends on: OnePeek/backend-service#2"}
+        self.assertEqual(self.go({("backend-service", 2): DOCS_HEAD, ("onepeek-web", 4): DOCS_HEAD}, bodies=bodies), 0)
+        reruns = [e for e in self.events if e[0] in ("rerun", "merge")]
+        self.assertEqual(reruns, [("merge", "onepeek-docs", DOCS_HEAD), ("rerun", "backend-service"), ("rerun", "onepeek-web"),
+                                  ("merge", "backend-service", "f" * 40), ("rerun", "onepeek-web"),
+                                  ("merge", "onepeek-web", "f" * 40)])
+
+
+class MoveDocsPin(unittest.TestCase):
+    """The pin commit on a real git branch (local bare origin)."""
+
+    def setUp(self) -> None:
+        self.root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        patcher = mock.patch.object(ship, "ROOT", self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.src = git_repo(self.root, "backend-service", "jobs: {}\n")
+        sh("git", "-C", str(self.src), "switch", "-q", "-c", "feat/x")
+        (self.src / "docs-version.txt").write_text(f"# docs\nonepeek-docs@{DOCS_OLDER}\n")
+        sh("git", "-C", str(self.src), "add", ".")
+        sh("git", "-C", str(self.src), "commit", "-q", "-m", "pin")
+        sh("git", "-C", str(self.src), "push", "-q", "origin", "feat/x")
+        self.green = sh("git", "-C", str(self.src), "rev-parse", "HEAD").strip()
+
+    def origin(self, *args: str) -> str:
+        return sh("git", "--git-dir", str(self.root / "origins/backend-service.git"), *args)
+
+    def test_one_commit_moves_only_the_pin_line_on_top_of_the_green_head(self) -> None:
+        new, only = ship.move_docs_pin("backend-service", "feat/x", self.green, DOCS_MERGE)
+        self.assertTrue(only)
+        self.assertEqual(self.origin("rev-parse", "feat/x").strip(), new)
+        self.assertEqual(self.origin("rev-parse", "feat/x~1").strip(), self.green)
+        self.assertEqual(self.origin("show", "feat/x:docs-version.txt"), f"# docs\nonepeek-docs@{DOCS_MERGE}\n")
+        self.assertEqual(sh("git", "-C", str(self.src), "worktree", "list").count("\n"), 1)  # nothing left behind
+
+    def test_a_pin_already_at_the_merge_commit_pushes_nothing(self) -> None:
+        self.assertEqual(ship.move_docs_pin("backend-service", "feat/x", self.green, DOCS_OLDER), (None, True))
+        self.assertEqual(self.origin("rev-parse", "feat/x").strip(), self.green)
+
+    def test_a_branch_that_moved_since_the_green_run_is_not_overwritten(self) -> None:
+        (self.src / "other.txt").write_text("x")
+        sh("git", "-C", str(self.src), "add", ".")
+        sh("git", "-C", str(self.src), "commit", "-q", "-m", "later")
+        sh("git", "-C", str(self.src), "push", "-q", "origin", "feat/x")
+        later = self.origin("rev-parse", "feat/x").strip()
+        with self.assertRaises(SystemExit):
+            ship.move_docs_pin("backend-service", "feat/x", self.green, DOCS_MERGE)
+        self.assertEqual(self.origin("rev-parse", "feat/x").strip(), later)
+
+    def test_only_pin_changed_is_false_for_any_other_change(self) -> None:
+        wt = self.src
+        (wt / "docs-version.txt").write_text(f"# docs\nonepeek-docs@{DOCS_MERGE}\n")
+        sh("git", "-C", str(wt), "commit", "-q", "-am", "pin")
+        pin_only = sh("git", "-C", str(wt), "rev-parse", "HEAD").strip()
+        self.assertTrue(ship.only_pin_changed(wt, self.green, pin_only))
+        (wt / "other.txt").write_text("x")
+        sh("git", "-C", str(wt), "add", ".")
+        sh("git", "-C", str(wt), "commit", "-q", "-m", "more")
+        self.assertFalse(ship.only_pin_changed(wt, self.green, sh("git", "-C", str(wt), "rev-parse", "HEAD").strip()))
+        (wt / "docs-version.txt").write_text(f"# docs changed\nonepeek-docs@{DOCS_MERGE}\n")
+        sh("git", "-C", str(wt), "commit", "-q", "-am", "comment")
+        self.assertFalse(ship.only_pin_changed(wt, pin_only, sh("git", "-C", str(wt), "rev-parse", "HEAD").strip()))
 
 
 if __name__ == "__main__":

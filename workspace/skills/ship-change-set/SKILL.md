@@ -11,7 +11,7 @@ A change set is merged in one sitting, in one order (`onepeek-docs/standards/dev
 1. **Ready means ready:** the review said "ready" and every pull request in the set has its last fixes pushed. Minor review findings go to a follow-up set, not into this one.
 2. **Dry run from the workspace root:**
    `python3 .github/workspace/ship_change_set.py <repo>#<n> <repo>#<n> ...` (any order).
-   It prints the merge order and stops on any problem: a closed or draft pull request, the wrong base, two docs pull requests, or a code repo whose `docs-version.txt` is not at the docs pull request's last commit.
+   It prints the merge order and stops on any problem: a closed or draft pull request, the wrong base, two docs pull requests, or a code repo whose `docs-version.txt` is not a commit of the docs pull request (any of its commits, not only the last; lesson L27).
 3. **Ship:** the same command with `--go`. It runs in order:
    1. docs into `main` with a merge commit;
    2. `.github` into `main` (squash), then waits for its release tag and moves every later pull request's `OnePeek/.github` workflow pins to that tag in one commit;
@@ -21,6 +21,8 @@ A change set is merged in one sitting, in one order (`onepeek-docs/standards/dev
    **Expand first** (`foundation-playbook.md` §8a P1, development-cycle §2a item 7): when the consumer of a strictly validated contract must merge before its producer, pass `--order repoA,repoB,...` naming every repo of the set once; it replaces the fixed order. `onepeek-docs` always stays first: an `--order` that puts it later is refused, and a docs pull request may not depend on another pull request in the set.
 
    **Declared dependencies** (§8a P1): a pull request whose body says `Depends on: OnePeek/<repo>#<n>` merges after that one (the order is otherwise kept); after the dependency merges, the dependent's failed checks (its `depends-on` job) are re-run. A listed pull request outside the set must already be merged, or the dry run stops.
+
+   **The docs pin** (lesson L27) is an implicit dependency: a code pull request pinned to a commit of the set's docs pull request has its failed checks re-run after the docs merge, like a declared dependent. Once they are green, its `docs-version.txt` moves to the docs merge commit in one commit pushed to its branch, and it is merged at that commit without waiting for a new CI run, because only that one line changed since the green run (checked; anything else changed means it waits for CI as usual).
 
    After each merge, the local worktrees of the merged branch (from `git worktree list`) are removed when they are clean; a worktree with uncommitted changes is kept and named.
    

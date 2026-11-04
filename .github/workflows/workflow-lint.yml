@@ -4,7 +4,7 @@ name: workflow-lint
 on:
   pull_request:
     branches: [main]
-    types: [opened, edited, reopened, synchronize]
+    types: [opened, reopened, synchronize]  # never edited: ship_change_set.py re-runs checks when a dependency merges
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   depends-on:
-    # Declared dependencies first (playbook §8a P1): while a `Depends on:` pull request is unmerged, nothing else runs.
+    # Dependencies first (playbook §8a P1, L26/L27): while a `Depends on:` pull request is unmerged, nothing else runs.
     uses: ./.github/workflows/depends-on.yml
     secrets:
       AGENTS_APP_CLIENT_ID: ${{ secrets.AGENTS_APP_CLIENT_ID }}
