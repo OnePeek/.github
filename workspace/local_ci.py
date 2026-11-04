@@ -6,8 +6,12 @@
 For every workflow that runs on `pull_request`, every job's `run:` steps run in order in the repo directory, with the
 job's and step's `env` (github.* and runner.* values filled in for a pull request into dev here, other expressions left out), stopping at the first failure. `uses:` steps (checkout, setup-*) are
 skipped: the laptop already has the tools; reusable-workflow jobs are listed as skipped, and the shared checks they
-stand for run here directly (actionlint with shellcheck, the runner-label lint). Steps that need GitHub's API or
+stand for run here directly (actionlint with shellcheck, the runner-label lint). A step that rewrites package.json (`npm pkg set`) has it restored afterwards. Steps that need GitHub's API or
 AWS (they read GH_TOKEN, assume a role, or call `gh api`) are skipped and listed, never run.
+
+Gap: the backend's fast tier (tests without the throwaway services) is not made honest here: its tests/service_gate.py has no
+variable that refuses connections to the service ports (it only has TEST_SERVICES_REQUIRED, which does the opposite), and
+CI has no `-m "not integration"` step, so nothing is set; that needs a backend-service change first.
 
 Exit 0 when every step ran and passed; 1 at the first failure (its output is shown); 2 bad input.
 """
@@ -20,6 +24,7 @@ import os
 import platform
 import pathlib
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -37,11 +42,12 @@ CONTEXT_REF = re.compile(r"\$\{\{\s*((?:github|runner)\.[A-Za-z0-9_.]+)\s*\}\}")
 SIBLINGS = {"_backend": "backend-service", "_web": "onepeek-web", "_infra": "onepeek-infra"}
 USES_SIBLINGS = re.compile(r"(?<![A-Za-z0-9_])_(backend|web|infra)(?![A-Za-z0-9_])")
 # Linters CI installs with a setup action; when the laptop lacks one, its step is skipped with a reason, not failed.
-OPTIONAL_TOOLS = ("tflint", "trivy")
+OPTIONAL_TOOLS = ("trivy",)
 # The versions CI pins (foundation-playbook §8a P3; scripts/test_local_ci.py keeps the shared workflows at these).
-# A different uv on the laptop fails the run with the fix; a different tflint skips its steps with the reason.
+# A different uv on the laptop fails the run with the fix; tflint runs natively at CI's version, else in CI's Docker image, else it is skipped (WARN), or FAILS under --release.
 UV_VERSION = "0.12.0"
 TFLINT_VERSION = "0.65.0"
+TFLINT_IMAGE = "ghcr.io/terraform-linters/tflint"
 # One provider cache for every local run and worktree (§8a P6), unless the laptop sets TF_PLUGIN_CACHE_DIR itself.
 SHARED_PLUGIN_CACHE = pathlib.Path.home() / ".cache" / "onepeek" / "terraform-plugins"
 REMOTE = re.compile(r"\bgh api\b|\bgh pr\b|\baws \b|GH_TOKEN|GITHUB_TOKEN|configure-aws-credentials|terraform (plan|apply)|\bgit push\b|(?m:terraform\b[^\n]*\binit\b(?![^\n]*-backend=false))|\bgit clone\b[^\n]*github\.com")
@@ -75,14 +81,35 @@ def packages_token() -> str:
     return tok.stdout.strip() if tok.returncode == 0 else ""
 
 
+def docker_ready() -> bool:
+    """True when the docker CLI is installed and its daemon answers."""
+    if not shutil.which("docker"):
+        return False
+    return subprocess.run(["docker", "info"], capture_output=True, text=True).returncode == 0
+
+
+def tflint_mode() -> str:
+    """How tflint runs here: "native" (CI's version on PATH), "docker" (CI's image; Homebrew no longer ships tflint), or ""."""
+    if tool_version("tflint") == TFLINT_VERSION:
+        return "native"
+    return "docker" if docker_ready() else ""
+
+
 def tflint_problem() -> str:
-    """Why tflint steps are skipped here (missing, or not CI's version), or ""."""
+    """Why tflint steps cannot run here (neither CI's tflint on PATH nor Docker), or ""."""
+    if tflint_mode():
+        return ""
     v = tool_version("tflint")
-    if v is None:
-        return "tflint is not installed on this laptop"
-    if v != TFLINT_VERSION:
-        return f"tflint {v} is installed; CI pins {TFLINT_VERSION}"
-    return ""
+    have = "tflint is not installed" if v is None else f"tflint {v} is installed; CI pins {TFLINT_VERSION}"
+    return f"{have} on this laptop and Docker is not available (install Docker to run CI's {TFLINT_IMAGE}:v{TFLINT_VERSION})"
+
+
+def tflint_via_docker(cmd: str, repo: pathlib.Path, cwd: pathlib.Path) -> str:
+    """The step with each line that starts with `tflint` run in CI's pinned image, the repo mounted at /data."""
+    rel = cwd.resolve().relative_to(repo.resolve())
+    workdir = "/data" if str(rel) == "." else f"/data/{rel}"
+    prefix = f"docker run --rm -v {shlex.quote(str(repo.resolve()))}:/data -w {shlex.quote(workdir)} {TFLINT_IMAGE}:v{TFLINT_VERSION}"
+    return re.sub(r"(?m)^(\s*)tflint\b", lambda m: m.group(1) + prefix, cmd)
 
 
 def plugin_cache() -> pathlib.Path:
@@ -266,6 +293,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("repo")
     ap.add_argument("--jobs", default="", help="comma-separated job ids to run (default: all)")
     ap.add_argument("--skip-docker", action="store_true", help="skip steps that call docker")
+    ap.add_argument("--release", action="store_true", help="a release run: a step that cannot run here (no tflint or Docker) fails instead of being skipped")
     ap.add_argument("--list", action="store_true", help="print the steps, run nothing")
     a = ap.parse_args(argv)
     if threading.current_thread() is threading.main_thread():
@@ -413,9 +441,19 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                 if missing:
                     skipped.append(f"{label} (SKIP: {missing[0]} is not installed on this laptop)")
                     continue
-                if re.search(r"(?m)^\s*tflint\b", cmd) and (why := tflint_problem()):
-                    skipped.append(f"{label} (SKIP: {why})")
-                    continue
+                tflint_docker = False
+                if re.search(r"(?m)^\s*tflint\b", cmd):
+                    if a.skip_docker and tflint_mode() != "native":
+                        skipped.append(f"{label} (docker)")
+                        continue
+                    if why := tflint_problem():
+                        if a.release and not a.list:
+                            print(f"FAIL  {label}: {why}")
+                            return 1
+                        print(f"WARN  {label}: {why}; CI runs it", file=sys.stderr)
+                        skipped.append(f"{label} (SKIP: {why})")
+                        continue
+                    tflint_docker = tflint_mode() == "docker"
                 if any(re.search(rf"\bmv\s+{re.escape(c)}\b", cmd) for c in checkout_paths if not c.startswith("${{")):
                     skipped.append(f"{label} (CI-only: places a checkout the laptop does not make)")
                     continue
@@ -442,10 +480,19 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                     continue
                 cwd = repo / step.get("working-directory", workdir)
                 cmd = EXPR.sub("", cmd)
+                if tflint_docker:
+                    cmd = tflint_via_docker(cmd, repo, cwd)
                 # A tool a skipped install step would have put in the working directory: use the laptop's.
                 cmd = re.sub(r"(?m)(^|\s)\./([A-Za-z0-9_-]+)\b",
                              lambda m: m.group(0) if (cwd / m.group(2)).exists() or not shutil.which(m.group(2)) else m.group(1) + m.group(2), cmd)
-                rc, out, secs = run_step(cmd, cwd, env, str(step.get("shell") or job.get("shell") or ""))
+                # `npm pkg set` (the api-client's "Version as next snapshot") rewrites package.json in the working tree: put it back.
+                pkg = cwd / "package.json"
+                keep = pkg.read_bytes() if re.search(r"\bnpm pkg (set|delete|fix)\b", cmd) and pkg.is_file() else None
+                try:
+                    rc, out, secs = run_step(cmd, cwd, env, str(step.get("shell") or job.get("shell") or ""))
+                finally:
+                    if keep is not None:
+                        pkg.write_bytes(keep)
                 envfile = run_root() / "github_env"
                 for line in envfile.read_text(encoding="utf-8").splitlines() if envfile.exists() else []:
                     if "=" in line:  # what `>> "$GITHUB_ENV"` gives the job's later steps

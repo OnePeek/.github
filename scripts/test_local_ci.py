@@ -243,12 +243,76 @@ class Versions(unittest.TestCase):
         (fake / "tflint").write_text("#!/bin/sh\necho 'TFLint version 0.50.0'\nexit 1\n")
         (fake / "tflint").chmod(0o755)
         with mock.patch.dict(os.environ, {"PATH": f"{fake}:{os.environ['PATH']}"}), \
-                mock.patch.object(lc, "uv_problem", return_value=""):
+                mock.patch.object(lc, "uv_problem", return_value=""), mock.patch.object(lc, "docker_ready", return_value=False):
             self.assertIn("CI pins 0.65.0", lc.tflint_problem())
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)  # skipped, not run (the fake would fail)
         self.assertIn("tflint 0.50.0 is installed; CI pins 0.65.0", buf.getvalue())
+
+    def _tf_repo(self) -> pathlib.Path:
+        return self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+                         "      - run: |\n          tflint --init\n          tflint --recursive\n")
+
+    def _bin(self, **scripts: str) -> pathlib.Path:
+        """A PATH folder of stub tools (name -> shell body) plus the system tools the steps need; no real tflint or docker."""
+        b = pathlib.Path(tempfile.mkdtemp())
+        for name, body in scripts.items():
+            (b / name).write_text("#!/bin/sh\n" + body)
+            (b / name).chmod(0o755)
+        for t in ("bash", "sh", "env", "git", "python3", "cat", "echo"):
+            if shutil.which(t) and not (b / t).exists():
+                (b / t).symlink_to(shutil.which(t))
+        return b
+
+    def test_without_tflint_it_runs_ci_image_in_docker_with_the_same_commands(self):
+        d = self._tf_repo()
+        log = pathlib.Path(tempfile.mkdtemp()) / "docker.log"
+        b = self._bin(docker=f'[ "$1" = info ] && exit 0\necho "$@" >> {log}\n')
+        with mock.patch.dict(os.environ, {"PATH": str(b)}), mock.patch.object(lc, "uv_problem", return_value=""):
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+        lines = log.read_text().splitlines()
+        image = f"ghcr.io/terraform-linters/tflint:v{lc.TFLINT_VERSION}"
+        self.assertEqual(len(lines), 2)
+        for line, want in zip(lines, ("--init", "--recursive")):
+            self.assertTrue(line.startswith(f"run --rm -v {d.resolve()}:/data -w /data {image} {want}"), line)
+
+    def test_without_tflint_or_docker_it_warns_and_under_release_fails(self):
+        d = self._tf_repo()
+        with mock.patch.dict(os.environ, {"PATH": str(self._bin())}), mock.patch.object(lc, "uv_problem", return_value=""):
+            err, out = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+            self.assertIn("WARN", err.getvalue())
+            self.assertIn("Docker is not available", out.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a", "--release"]), 1)
+            self.assertIn("FAIL", out.getvalue())
+
+    def test_a_step_that_runs_npm_pkg_set_leaves_package_json_unchanged(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n"
+                      "        working-directory: clients/typescript\n    steps:\n      - name: Version as next snapshot\n"
+                      "        run: |\n          npm pkg set version=9.9.9-next.1\n          grep -q 9.9.9 package.json\n")
+        pkg = d / "clients/typescript/package.json"
+        pkg.parent.mkdir(parents=True)
+        pkg.write_text('{"name": "x", "version": "1.0.0"}\n')
+        before = pkg.read_bytes()
+        if not shutil.which("npm"):
+            self.skipTest("npm is not installed")
+        with mock.patch.object(lc, "uv_problem", return_value=""):
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+        self.assertEqual(pkg.read_bytes(), before)
+
+    def test_package_json_is_restored_even_when_the_step_fails(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+                      "      - run: |\n          printf '{}' > package.json\n          npm pkg set version=2.0.0 || true\n          false\n")
+        pkg = d / "package.json"
+        pkg.write_text('{"version": "1.0.0"}\n')
+        before = pkg.read_bytes()
+        with mock.patch.object(lc, "uv_problem", return_value=""), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
+        self.assertEqual(pkg.read_bytes(), before)
 
     def test_steps_use_one_shared_provider_cache_unless_the_laptop_sets_one(self):
         home = pathlib.Path(tempfile.mkdtemp())

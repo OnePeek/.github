@@ -18,7 +18,7 @@ A check that runs only in CI, or only on a release pull request, costs a CI roun
    4. The tool versions:
       - Terraform, Python and Node must match every tracked `.terraform-version`, `.python-version` and `.node-version`;
       - uv must be CI's pinned version;
-      - tflint is CI's version, or a warning.
+      - tflint is CI's version, or runs in CI's Docker image, or a warning (a failure under `--release`).
    5. With `--release`:
       - `docs-version.txt` is on onepeek-docs `main`;
       - the agents' App grants every permission the workflows ask it for and is installed on the repos they name;
