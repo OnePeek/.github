@@ -31,6 +31,9 @@ EXEMPT_LABELS = {"onepeek-arm64", "onepeek-arm64-canary"}
 MAPPING_REPO = "OnePeek/.github"  # the only public repo whose workflow_call workflows may hold the mapping
 PROD_GUARD = "inputs.environment == 'prod' && 'ubuntu-latest' || "
 LIMITS = {"light": 30, "fast": 60, "arm-build": 60, "stateful": 150}
+# Named exceptions to rule 3 (ci-runners.md section 5.4), by (repo, workflow, job): the sandbox run lock waits up to
+# 80 minutes on the small class (sandbox.md section 7c item 4), under the spot reaper's 90-minute lifetime.
+TIMEOUT_EXCEPTIONS = {("OnePeek/onepeek-infra", "sandbox.yml", "lock"): 85}
 
 
 def _forms(var: str) -> dict[str, str]:
@@ -152,7 +155,7 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
         if (repo, name, job_id) in listed and ro != "ubuntu-latest":
             errors.append(f"{label}: rule 2: listed in github-only-jobs.yaml, so runs-on must be ubuntu-latest.")
         if cls is not None and cls != "github-only" and _names_runner(ro):
-            limit = LIMITS[cls]
+            limit = TIMEOUT_EXCEPTIONS.get((repo, name, job_id), LIMITS[cls])
             tm = job.get("timeout-minutes")
             if not isinstance(tm, int) or isinstance(tm, bool) or tm > limit:
                 errors.append(f"{label}: rule 3: timeout-minutes must be a number of at most {limit}, got {tm!r}.")
