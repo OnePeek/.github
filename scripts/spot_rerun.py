@@ -66,6 +66,17 @@ def annotations_text(repo: str, job_id: str) -> str:
     return out
 
 
+def job_log(repo: str, job_id: str) -> str:
+    """The job's log. A job log holds terminal colour codes, which newer gh refuses to print without
+    --allow-escape-sequences (L32: every CI log read failed on the runners' gh); an older gh does not know the flag."""
+    try:
+        return gh("api", "--allow-escape-sequences", f"repos/{repo}/actions/jobs/{job_id}/logs")
+    except GhError as e:
+        if "allow-escape-sequences" not in str(e) or "unknown flag" not in str(e):
+            raise
+    return gh("api", f"repos/{repo}/actions/jobs/{job_id}/logs")
+
+
 def reclaimed_jobs(repo: str, jobs: list[dict]) -> list[str]:
     """Names of the failed jobs whose log or annotations show a reclaim. A source that cannot be read counts as no
     match for that source only, and the reason goes to stderr. Logs are read in up to LOG_TRIES rounds, LOG_WAIT_SECONDS
@@ -83,7 +94,7 @@ def reclaimed_jobs(repo: str, jobs: list[dict]) -> list[str]:
     for attempt in range(LOG_TRIES):
         for job_id in [j for j in ids if j not in found]:
             try:
-                if reclaimed(gh("api", f"repos/{repo}/actions/jobs/{job_id}/logs")):
+                if reclaimed(job_log(repo, job_id)):
                     found.add(job_id)
                 else:
                     why[job_id] = "no marker in the log"
