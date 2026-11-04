@@ -130,6 +130,16 @@ class Main(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("no token to read onepeek-docs", out)
 
+    def test_with_no_pull_request_there_is_no_body_and_nothing_to_wait_for(self) -> None:
+        # push, schedule and dispatch runs: depends-on.yml skips the body step, so neither BODY_FILE nor BODY is set.
+        env = {k: v for k, v in os.environ.items() if k not in ("BODY", "BODY_FILE", "GH_TOKEN", "DOCS_TOKEN")}
+        for flag, want in (("--repos", ""), ("--docs-pin", ""), ("--check", "nothing to wait for")):
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(buf):
+                rc = cd.main([flag, "--repo-dir", str(self.dir)])
+            self.assertEqual(rc, 0, flag)
+            self.assertIn(want, buf.getvalue())
+
     def test_repos_lists_the_named_repos_for_the_token(self) -> None:
         self.assertEqual(self.run_main(["--repos"], BODY), (0, "backend-service,onepeek-web\n"))
         self.assertEqual(self.run_main(["--repos"], "no lines"), (0, "\n"))
@@ -159,7 +169,7 @@ class LiveBody(unittest.TestCase):
 class Workflow(unittest.TestCase):
     def test_the_app_token_is_only_minted_for_named_repos_with_pull_requests_read(self) -> None:
         app = next(s for s in STEPS if s.get("id") == "app")
-        self.assertEqual(app["if"], "${{ steps.deps.outputs.repos != '' }}")
+        self.assertEqual(app["if"], "${{ github.event.pull_request.number != '' && steps.deps.outputs.repos != '' }}")
         self.assertEqual(app["with"]["repositories"], "${{ steps.deps.outputs.repos }}")
         self.assertEqual(app["with"]["permission-pull-requests"], "read")
         self.assertEqual(set(k for k in app["with"] if k.startswith("permission-")), {"permission-pull-requests"})
@@ -178,11 +188,25 @@ class Workflow(unittest.TestCase):
         lint = yaml.safe_load((WORKFLOW.parent / "workflow-lint.yml").read_text(encoding="utf-8"))
         self.assertEqual(lint["jobs"]["depends-on"]["permissions"], {"contents": "read", "pull-requests": "read"})
 
+    def test_with_no_pull_request_the_job_passes_with_a_notice_and_every_other_step_is_skipped(self) -> None:
+        has_pr = "${{ github.event.pull_request.number != '' }}"
+        notice = STEPS[0]
+        self.assertEqual(notice["if"], "${{ github.event.pull_request.number == '' }}")
+        self.assertIn("::notice::not a pull request: nothing to wait for", notice["run"])
+        for step in STEPS[1:]:  # the body (gh api repos/<repo>/pulls/), both tokens, the docs wait and the check
+            guard = step.get("if", "")
+            name = step.get("name", step.get("uses"))
+            self.assertTrue(guard.startswith("${{ github.event.pull_request.number != '' ") or guard == has_pr, name)
+        self.assertEqual(next(s for s in STEPS if s.get("id") == "body")["if"], has_pr)
+        self.assertEqual(STEPS[-1]["if"], has_pr)
+        on = yaml.safe_load((WORKFLOW.parent / "workflow-lint.yml").read_text(encoding="utf-8"))[True]
+        self.assertEqual(on["push"]["branches"], ["main"])  # this repo's own caller is fine on push
+
     def test_the_docs_pin_gets_its_own_token_read_only_on_onepeek_docs(self) -> None:  # L27 (a)
         deps = next(s for s in STEPS if s.get("id") == "deps")
         self.assertIn('--docs-pin', deps["run"])
         docs = next(s for s in STEPS if s.get("id") == "docs-app")
-        self.assertEqual(docs["if"], "${{ steps.deps.outputs.docs != '' }}")
+        self.assertEqual(docs["if"], "${{ github.event.pull_request.number != '' && steps.deps.outputs.docs != '' }}")
         self.assertEqual(docs["with"]["repositories"], "onepeek-docs")
         self.assertEqual({k: v for k, v in docs["with"].items() if k.startswith("permission-")},
                          {"permission-contents": "read", "permission-pull-requests": "read"})
@@ -192,7 +216,7 @@ class Workflow(unittest.TestCase):
 
     def test_the_callers_docs_version_file_is_checked_out(self) -> None:
         # Cone-mode sparse checkout always keeps the root's files, so docs-version.txt is there; never turn cone off.
-        self.assertNotIn("sparse-checkout-cone-mode", STEPS[0]["with"])
+        self.assertNotIn("sparse-checkout-cone-mode", STEPS[1]["with"])
 
     def test_the_callers_in_this_repo_run_it_first_and_every_other_job_needs_it(self) -> None:
         jobs = yaml.safe_load((WORKFLOW.parent / "workflow-lint.yml").read_text(encoding="utf-8"))["jobs"]

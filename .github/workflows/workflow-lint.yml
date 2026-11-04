@@ -2,6 +2,8 @@
 name: workflow-lint
 
 on:
+  push:
+    branches: [main]  # depends-on passes at once with no pull request (its notice); the pins job holds the docs ancestor rule on push
   pull_request:
     branches: [main]
     types: [opened, reopened, synchronize]  # never edited: ship_change_set.py re-runs checks when a dependency merges
