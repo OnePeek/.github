@@ -81,13 +81,15 @@ def _decide(docs, action, resource, ctx):
 class FakeAws:
     """Answers the read-only IAM calls the tool makes; records every call."""
 
-    def __init__(self, managed=None, roles=None):
-        self.calls, self.managed, self.roles = [], managed or {}, roles or {}
+    def __init__(self, managed=None, roles=None, fail=()):
+        self.calls, self.managed, self.roles, self.fail = [], managed or {}, roles or {}, set(fail)
 
     def __call__(self, args):
         self.calls.append(args)
         op = args[1]
         val = lambda flag: args[args.index(flag) + 1]  # noqa: E731
+        if op in self.fail or any(a in self.fail for a in args):
+            return False, f"AccessDenied ({op})"
         if op == "simulate-custom-policy":
             return True, {"EvaluationResults": self.simulate(args)}
         if op == "get-policy":
@@ -108,7 +110,7 @@ class FakeAws:
         if op == "get-role-policy":
             return True, {"PolicyDocument": json.loads(role["inline"][val("--policy-name")])}
         if op == "list-attached-role-policies":
-            return True, {"AttachedPolicies": []}
+            return True, {"AttachedPolicies": [{"PolicyArn": a} for a in role.get("attached", [])]}
         raise AssertionError(f"unexpected AWS call {args}")
 
     @staticmethod
@@ -173,10 +175,13 @@ def node_plan(policy, health=True, boundary=None, policy_known=True):
     return plan(res, config)
 
 
-def run_iam(plans, aws, apply_role=None):
+def run_iam(plans, aws, apply_role=None, region="ap-south-1"):
+    """The report without its NOTE lines (rep.notes holds them)."""
     rep = lp.Report()
     with mock.patch("builtins.print"):
-        lp.iam_check(plans, apply_role, "ap-south-1", aws, rep)
+        lp.iam_check(plans, apply_role, region, aws, rep)
+    rep.notes = [ln for ln in rep.lines if ln[0] == "NOTE"]
+    rep.lines = [ln for ln in rep.lines if ln[0] != "NOTE"]
     return rep
 
 
@@ -232,9 +237,7 @@ class IamRoleTests(unittest.TestCase):
         self.assertIn("sqs:SendMessage", rep.lines[0][1])
 
     def test_simulation_error_fails(self):
-        rep = lp.Report()
-        with mock.patch("builtins.print"):
-            lp.iam_check([node_plan(doc(REGISTER, HEALTH))], None, "ap-south-1", lambda a: (False, "AccessDenied"), rep)
+        rep = run_iam([node_plan(doc(REGISTER, HEALTH))], lambda a: (False, "AccessDenied"))
         self.assertEqual(rep.lines[0][0], "FAIL")
         self.assertIn("AccessDenied", rep.lines[0][1])
 
@@ -262,6 +265,76 @@ class IamRoleTests(unittest.TestCase):
         run_iam([node_plan(doc(REGISTER))], aws)
         for c in aws.calls:
             self.assertTrue(c[1].startswith(("simulate-", "get-", "list-")), c)
+
+    def test_an_explicit_deny_fails_even_when_a_condition_key_is_missing(self):
+        # The reviewer's fake: an unconditioned Deny plus a region Deny in the boundary.
+        region_deny = {"Sid": "Region", "Effect": "Deny", "Action": "*", "Resource": "*",
+                       "Condition": {"StringNotEquals": {"aws:RequestedRegion": ["ap-south-1"]}}}
+        boundary = doc(allow("*"), region_deny, {"Effect": "Deny", "Action": "servicediscovery:RegisterInstance", "Resource": "*"})
+        rep = run_iam([node_plan(doc(REGISTER, HEALTH), boundary=boundary)], FakeAws())
+        self.assertEqual(rep.lines[0][0], "FAIL", rep.lines)
+        self.assertIn("servicediscovery:RegisterInstance", rep.lines[0][1].split("not judged")[0])
+        # And with a key the simulation never passes: explicitDeny with MissingContextValues is still denied.
+        vpc_deny = {"Effect": "Deny", "Action": "*", "Resource": "*", "Condition": {"StringEquals": {"aws:SourceVpc": ["vpc-1"]}}}
+        boundary = doc(allow("*"), vpc_deny, {"Effect": "Deny", "Action": "servicediscovery:RegisterInstance", "Resource": "*"})
+        rep = run_iam([node_plan(doc(REGISTER, HEALTH), boundary=boundary)], FakeAws())
+        self.assertEqual(rep.lines[0][0], "FAIL", rep.lines)
+
+    def test_judge_marks_only_an_implicit_deny_with_missing_keys_as_not_judged(self):
+        denied, unjudged = [], []
+        lp.judge([{"EvalActionName": "a:A", "EvalDecision": "explicitDeny", "MissingContextValues": ["k"]},
+                  {"EvalActionName": "a:B", "EvalDecision": "implicitDeny", "MissingContextValues": ["k"]},
+                  {"EvalActionName": "a:C", "EvalDecision": "implicitDeny"}], "w", denied, unjudged)
+        self.assertEqual([d.split(" ")[0] for d in denied], ["a:A", "a:C"])
+        self.assertEqual([u.split(" ")[0] for u in unjudged], ["a:B"])
+
+    def test_every_simulation_gets_the_requested_region_of_its_resource(self):
+        other = "arn:aws:sqs:us-east-1:%s:q" % ACCT
+        aws = FakeAws()
+        run_iam([node_plan(doc(REGISTER, HEALTH, allow("sqs:SendMessage", other, "Q")))], aws)
+        sims = [c for c in aws.calls if c[1] == "simulate-custom-policy"]
+        self.assertTrue(sims)
+        regions = {}
+        for c in sims:
+            ctx = {e["ContextKeyName"]: e["ContextKeyValues"] for e in json.loads(c[c.index("--context-entries") + 1])}
+            for r in FakeAws._list(c, "--resource-arns"):
+                regions[r] = ctx["aws:RequestedRegion"]
+        self.assertEqual(regions[SERVICE_ARN], ["ap-south-1"])
+        self.assertEqual(regions[other], ["us-east-1"])
+        self.assertEqual(regions["*"], ["ap-south-1"])  # no region in the ARN: the config region
+
+    def test_a_region_deny_in_the_boundary_is_evaluated(self):
+        region_deny = {"Effect": "Deny", "Action": "*", "Resource": "*",
+                       "Condition": {"StringNotEquals": {"aws:RequestedRegion": ["ap-south-1"]}}}
+        boundary = doc(allow("*"), region_deny)
+        rep = run_iam([node_plan(doc(REGISTER, HEALTH), boundary=boundary)], FakeAws())
+        self.assertEqual(rep.lines[0][0], "PASS", rep.lines)
+        self.assertNotIn("not judged", rep.lines[0][1])
+        rep = run_iam([node_plan(doc(REGISTER, HEALTH), boundary=boundary)], FakeAws(), region="eu-west-1")
+        self.assertEqual(rep.lines[0][0], "FAIL", rep.lines)  # route53 and ec2 (no ARN region) run in eu-west-1
+
+    def test_a_role_whose_boundary_cannot_be_read_fails_not_skips(self):
+        p = node_plan(doc(REGISTER, HEALTH))
+        p["planned_values"]["root_module"]["child_modules"][0]["resources"][0]["values"]["permissions_boundary"] = \
+            f"arn:aws:iam::{ACCT}:policy/unreadable"
+        rep = run_iam([p], FakeAws())
+        self.assertEqual(rep.lines[0][0], "FAIL", rep.lines)
+        self.assertIn("permissions boundary", rep.lines[0][1])
+
+    def test_not_action_and_not_resource_statements_are_named_not_simulated(self):
+        na = {"Sid": "Everything", "Effect": "Allow", "NotAction": "iam:*", "Resource": "*"}
+        nr = {"Sid": "Elsewhere", "Effect": "Allow", "Action": "sqs:SendMessage", "NotResource": "arn:aws:sqs:*:*:x"}
+        aws = FakeAws()
+        rep = run_iam([node_plan(doc(REGISTER, HEALTH, na, nr))], aws)
+        self.assertEqual(rep.lines[0][0], "PASS", rep.lines)
+        self.assertIn("not simulated: statement Everything (NotAction); statement Elsewhere (NotResource)", rep.lines[0][1])
+        acted = {a for c in aws.calls if c[1] == "simulate-custom-policy" for a in FakeAws._list(c, "--action-names")}
+        self.assertNotIn("sqs:SendMessage", acted)
+
+    def test_the_scp_gap_is_said(self):
+        rep = run_iam([node_plan(doc(REGISTER, HEALTH))], FakeAws())
+        self.assertEqual(rep.notes, [("NOTE", lp.SCP_NOTE)])
+        self.assertIn("does not evaluate SCPs", lp.SCP_NOTE)
 
 
 CI_SANDBOX = "onepeek-sandbox-ci-sandbox"
@@ -322,6 +395,58 @@ class ApplyRoleTests(unittest.TestCase):
         rep = run_iam([plan([])], FakeAws(), apply_role="nope")
         self.assertEqual(rep.lines[-1][0], "FAIL")
 
+    def test_any_unreadable_policy_of_the_apply_role_fails(self):
+        guard = f"arn:aws:iam::{ACCT}:policy/ci-stop-guard"
+        for fail, named in (({"get-role-policy"}, "inline policy apply"), ({"list-role-policies"}, "list-role-policies"),
+                            ({"list-attached-role-policies"}, "list-attached-role-policies"), ({guard}, guard)):
+            aws = self.aws(doc(allow("*")))
+            aws.fail = fail
+            aws.roles[CI_SANDBOX]["attached"] = [guard]
+            aws.managed[guard] = doc({"Effect": "Deny", "Action": "iam:CreateRole", "Resource": "*"})
+            rep = run_iam([apply_plan("aws_iam_role", {"name": "onepeek-sandbox-worker"})], aws, apply_role=CI_SANDBOX)
+            self.assertEqual(rep.lines[-1][0], "FAIL", (fail, rep.lines))
+            self.assertIn(named, rep.lines[-1][1])
+
+    def test_an_attached_deny_guard_is_applied(self):
+        guard = f"arn:aws:iam::{ACCT}:policy/ci-stop-guard"
+        aws = self.aws(doc(allow("*")))
+        aws.roles[CI_SANDBOX]["attached"] = [guard]
+        aws.managed[guard] = doc({"Effect": "Deny", "Action": "iam:CreateRole", "Resource": "*"})
+        rep = run_iam([apply_plan("aws_iam_role", {"name": "onepeek-sandbox-worker"})], aws, apply_role=CI_SANDBOX)
+        self.assertEqual(rep.lines[-1][0], "FAIL", rep.lines)
+
+    def test_a_topic_is_created_in_its_own_region(self):
+        aws = self.aws(doc(allow("*")))
+        run_iam([apply_plan("aws_sns_topic", {"name": "onepeek-sandbox-alerts-us-east-1", "region": "us-east-1"})], aws,
+                apply_role=CI_SANDBOX)
+        sim = next(c for c in aws.calls if c[1] == "simulate-custom-policy")
+        self.assertEqual(FakeAws._list(sim, "--resource-arns"), [f"arn:aws:sns:us-east-1:{ACCT}:onepeek-sandbox-alerts-us-east-1"])
+        ctx = {e["ContextKeyName"]: e["ContextKeyValues"] for e in json.loads(sim[sim.index("--context-entries") + 1])}
+        self.assertEqual(ctx["aws:RequestedRegion"], ["us-east-1"])
+        self.assertEqual(ctx["aws:PrincipalArn"], [f"arn:aws:iam::{ACCT}:role/{CI_SANDBOX}"])
+
+    def test_a_subscription_targets_its_topic_in_the_topics_own_region(self):
+        conf = {"aws_sns_topic_subscription.x": {"topic_arn": {"references": ["aws_sns_topic.alerts.arn"]}}}
+        p = plan([], config=conf)
+        mod = "module.stack.module.runtime"
+        p["resource_changes"] = [
+            {"address": f"{mod}.aws_sns_topic.alerts", "module_address": mod, "type": "aws_sns_topic",
+             "change": {"actions": ["no-op"], "after": {"name": "onepeek-sandbox-alerts-us-east-1", "region": "us-east-1"}}},
+            {"address": f"{mod}.aws_sns_topic_subscription.x", "module_address": mod, "type": "aws_sns_topic_subscription",
+             "change": {"actions": ["create"], "after": {"protocol": "email"}}},
+        ]
+        aws = self.aws(doc(allow("*")))
+        run_iam([p], aws, apply_role=CI_SANDBOX)
+        sim = next(c for c in aws.calls if c[1] == "simulate-custom-policy")
+        self.assertEqual(FakeAws._list(sim, "--resource-arns"), [f"arn:aws:sns:us-east-1:{ACCT}:onepeek-sandbox-alerts-us-east-1"])
+
+    def test_iam_calls_get_the_config_region(self):
+        aws = self.aws(doc(allow("*")))
+        run_iam([apply_plan("aws_iam_role", {"name": "onepeek-sandbox-worker"})], aws, apply_role=CI_SANDBOX)
+        sim = next(c for c in aws.calls if c[1] == "simulate-custom-policy")
+        ctx = {e["ContextKeyName"]: e["ContextKeyValues"] for e in json.loads(sim[sim.index("--context-entries") + 1])}
+        self.assertEqual(ctx["aws:RequestedRegion"], ["ap-south-1"])
+
 
 class MemoryTests(unittest.TestCase):
     def setUp(self):
@@ -353,6 +478,39 @@ class MemoryTests(unittest.TestCase):
         mb, why = lp.memory_limit(self.repo, "proxy", {})
         self.assertIsNone(mb)
         self.assertIn("--memory proxy=<MB>", why)
+
+    def td_plan(self, containers, task_memory=None, name="gateway"):
+        values = {"container_definitions": json.dumps(containers), **({"memory": task_memory} if task_memory else {})}
+        return plan([{"type": "aws_ecs_task_definition", "name": name, "values": values}])
+
+    def test_with_a_plan_the_limit_is_the_planned_containers_memory(self):
+        p = self.td_plan([{"name": "gateway", "image": "1.dkr.ecr/onepeek-sandbox/gateway:sha-1", "memory": 96}])
+        mb, where = lp.memory_limit(self.repo, "gateway", {}, [p])
+        self.assertEqual(mb, 96)  # not the module default of 64
+        self.assertIn("plan", where)
+
+    def test_with_a_plan_the_task_memory_is_used_when_the_container_has_none(self):
+        p = self.td_plan([{"name": "x", "image": "1.dkr.ecr/onepeek-sandbox/egress-proxy@sha256:ab"}], task_memory="1024")
+        self.assertEqual(lp.memory_limit(self.repo, "egress-proxy", {}, [p])[0], 1024)
+
+    def test_with_a_plan_an_image_no_task_definition_runs_has_no_limit(self):
+        p = self.td_plan([{"name": "gateway", "memory": 96}])
+        mb, why = lp.memory_limit(self.repo, "proxy", {}, [p])
+        self.assertIsNone(mb)
+        self.assertIn("no task definition in the plan", why)
+
+    def test_without_a_plan_the_module_default_is_used_and_said(self):
+        mb, where = lp.memory_limit(self.repo, "gateway", {})
+        self.assertEqual(mb, 64)
+        self.assertIn("no plan: module default", where)
+
+    def test_memory_check_uses_the_plan(self):
+        p = self.td_plan([{"name": "gateway", "memory": 96}])
+        rep, seen = lp.Report(), []
+        with mock.patch("builtins.print"):
+            lp.memory_check(self.repo, ["images/gateway/Dockerfile"], {}, 5, rep, running=lambda: (True, "28"),
+                            runner=lambda repo, image, mb, s: seen.append(mb) or ("PASS", "ok"), plans=[p])
+        self.assertEqual(seen, [96])
 
     def check(self, changed, running=(True, "28"), runner=None):
         rep = lp.Report()
@@ -425,6 +583,11 @@ class RunUnderLimitTests(unittest.TestCase):
         d = FakeDocker([{"Running": True}])
         self.assertEqual(self.run_it(d)[0], "PASS")
         self.assertIn(["docker", "rm", "-f", "cid123"], d.calls)
+
+    def test_exit_137_without_the_oom_flag_is_a_suspected_oom(self):
+        status, detail = self.run_it(FakeDocker([{"Running": False, "OOMKilled": False, "ExitCode": 137}]))
+        self.assertEqual(status, "FAIL")
+        self.assertIn("suspected OOM", detail)
 
     def test_exit_without_oom_passes(self):
         self.assertEqual(self.run_it(FakeDocker([{"Running": False, "OOMKilled": False, "ExitCode": 1}]))[0], "PASS")
@@ -527,6 +690,27 @@ class MainTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(out[-1], "LIVE PREFLIGHT FAILED (1 failed)")
 
+    def test_a_missing_config_region_is_an_error_not_a_fallback(self):
+        (self.repo / "config/sandbox.yaml").write_text("domain: sandbox.onepeek.xyz\n")
+        p = self.repo / "plan.json"
+        p.write_text(json.dumps(node_plan(doc(REGISTER, HEALTH))))
+        out, regions = [], []
+        with mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(a[0])):
+            rc = lp.main([str(self.repo), "--base", "dev", "--profile", "sandbox", "--plan-json", str(p), "--only", "iam"],
+                         aws_factory=lambda profile, region: regions.append(region) or FakeAws())
+        self.assertEqual(rc, 1)
+        self.assertEqual(regions, [])
+        self.assertTrue(any(o.startswith("FAIL") and "names no region" in o for o in out), out)
+
+    def test_the_plan_reaches_the_memory_check_without_a_profile(self):
+        p = self.repo / "plan.json"
+        p.write_text(json.dumps(plan([{"type": "aws_ecs_task_definition", "name": "gateway",
+                                       "values": {"container_definitions": json.dumps([{"name": "gateway", "memory": 96}])}}])))
+        seen = {}
+        with mock.patch.object(lp, "memory_check", side_effect=lambda *a, **k: seen.update(k)), mock.patch("builtins.print"):
+            lp.main([str(self.repo), "--base", "dev", "--plan-json", str(p), "--only", "memory"])
+        self.assertEqual(len(seen["plans"]), 1)
+
     def test_cli_passes_the_profile_and_region(self):
         with mock.patch.object(lp, "sh", return_value=(0, "{}")) as sh:
             lp.cli("sandbox-ro", "ap-south-1")(["iam", "get-role", "--role-name", "r"])
@@ -538,9 +722,25 @@ class MainTests(unittest.TestCase):
 
 class PreflightLiveTests(unittest.TestCase):
     def test_live_args_forward_the_options(self):
-        a = mock.Mock(profile="p", plan=None, apply_role="r", plan_json=["a.json", "b.json"])
+        a = mock.Mock(profile="p", plan=None, plan_dir=None, apply_role="r", env=None, base=None, seconds=None,
+                      plan_json=["a.json", "b.json"], memory=[])
         self.assertEqual(pf.live_args(a, pathlib.Path("/infra")),
                          ["/infra", "--profile", "p", "--apply-role", "r", "--plan-json", "a.json", "--plan-json", "b.json"])
+
+    def test_live_args_forward_memory_env_base_and_seconds(self):
+        a = pf.argparse.Namespace(profile=None, plan="x.plan", plan_dir="bootstrap", apply_role=None, env="sandbox",
+                                  base="origin/main", seconds=5.0, plan_json=[], memory=["gateway=96", "proxy=64"])
+        self.assertEqual(pf.live_args(a, pathlib.Path("/infra")),
+                         ["/infra", "--plan", "x.plan", "--plan-dir", "bootstrap", "--env", "sandbox", "--base", "origin/main",
+                          "--seconds", "5.0", "--memory", "gateway=96", "--memory", "proxy=64"])
+
+    def test_preflight_and_live_preflight_both_take_the_forwarded_flags(self):
+        for main in (pf.main, lp.main):
+            out = []
+            with mock.patch("sys.stdout.write", side_effect=out.append), self.assertRaises(SystemExit):
+                main(["--help"])
+            for flag in ("--plan-dir", "--env", "--base", "--seconds", "--memory"):
+                self.assertIn(flag, "".join(out), main.__module__)
 
     def run_live(self, rc, stdout):
         rep = pf.Report()
@@ -551,6 +751,10 @@ class PreflightLiveTests(unittest.TestCase):
 
     def test_live_ok_passes(self):
         self.assertEqual(self.run_live(0, "PASS  x\nLIVE PREFLIGHT OK\n"), [("PASS", "live: LIVE PREFLIGHT OK")])
+
+    def test_live_ok_with_a_skipped_check_warns_and_lists_it(self):
+        lines = self.run_live(0, "NOTE  iam: scp\nSKIP  iam: no plan\nPASS  memory: x\nSKIP  edge: unreachable\nLIVE PREFLIGHT OK\n")
+        self.assertEqual(lines, [("WARN", "live: LIVE PREFLIGHT OK, but 2 check(s) skipped: iam: no plan; edge: unreachable")])
 
     def test_live_failed_fails(self):
         lines = self.run_live(1, "FAIL  x\nLIVE PREFLIGHT FAILED (1 failed)\n")

@@ -17,17 +17,23 @@ iam     Needs `--profile` and a plan: `--plan-json` (the output of `terraform sh
           - for SNS actions on a topic whose policy the plan knows, that topic policy as the resource policy.
         With `--apply-role`, the role's live policies and boundary (read with iam get-role / get-role-policy /
         get-policy-version) are simulated against the calls APPLY_ACTIONS says Terraform makes to create the plan's
-        resources. A pair whose result depends on a condition key the simulation was not given is not judged (named).
-        A policy Terraform knows only after apply cannot be simulated (counted in the line).
+        resources. Every simulation gets `aws:RequestedRegion`: the resource ARN's region, else the config region
+        (config/<env>.yaml must name one). An implicit deny that depends on a condition key the simulation was not
+        given is not judged (named); an explicit deny always fails. A role whose policies or boundary cannot be read,
+        or are known only after apply, fails. A policy Terraform knows only after apply cannot be simulated (counted
+        in the line); NotAction and NotResource statements are not simulated (named in the line).
+        simulate-custom-policy does not evaluate SCPs: an SCP deny (the region SCP, the launch guard) is not checked.
 memory  For each images/<name> with a Dockerfile whose files changed against `--base`: `docker build`, then
-        `docker run` with `--memory` (and `--memory-swap`) at the task definition's hard limit (MEMORY_LIMITS, read
-        from the module's variable default or task definition; `--memory <name>=<MB>` overrides) for `--seconds`, with
-        a stub environment and no network. FAIL when `docker inspect` shows `.State.OOMKilled`. SKIP when Docker is
-        not running or the limit is unknown.
+        `docker run` with `--memory` (and `--memory-swap`) at the task definition's hard limit for `--seconds`, with a
+        stub environment and no network. The limit is read from the plan's aws_ecs_task_definition (the container's
+        `memory`, else the task's) when a plan is given; with no plan, from the module defaults (MEMORY_LIMITS), said
+        in the line; `--memory <name>=<MB>` overrides. FAIL when `docker inspect` shows `.State.OOMKilled` or exit
+        code 137 (a suspected OOM kill). SKIP when Docker is not running or the limit is unknown.
 edge    When scripts/smoke_env.py changed: its own `http_status` against https://<config domain>/api/status (the smoke
         check's URL and User-Agent); FAIL on 403.
 
-One PASS, FAIL or SKIP line per check, then `LIVE PREFLIGHT OK` or `LIVE PREFLIGHT FAILED`. Exit 1 on any FAIL.
+One PASS, FAIL or SKIP line per check (and NOTE lines), then `LIVE PREFLIGHT OK` or `LIVE PREFLIGHT FAILED`. Exit 1 on
+any FAIL. preflight.py --live shows WARN, not PASS, when any check was skipped, and lists them.
 """
 from __future__ import annotations
 
@@ -67,8 +73,8 @@ APPLY_ACTIONS = {
     "aws_sns_topic_subscription": ("sns:Subscribe", "{name}", "topic_arn"),
 }
 
-# images/<name> -> (file, variable): the hard memory limit (MB) of the container its task definition runs. A variable
-# of None reads the `memory` of the file's aws_ecs_task_definition.
+# With no plan only: images/<name> -> (file, variable), the module default of the hard memory limit (MB) of the
+# container its task definition runs. A variable of None reads the `memory` of the file's aws_ecs_task_definition.
 MEMORY_LIMITS = {
     "gateway": ("modules/aws/discovery-gateway/variables.tf", "gateway_memory_mb"),
     "pgbouncer": ("modules/aws/postgres/variables.tf", "pgbouncer_memory_mb"),
@@ -253,12 +259,17 @@ def topic_policies(plan: dict) -> dict[str, str]:
             for v in [r.get("values") or {}] if v.get("arn") and v.get("policy")}
 
 
-def pairs(role: dict, plan_facts: dict) -> list[tuple[tuple[str, ...], tuple[str, ...], str]]:
-    """(actions, resources, why) to simulate: each Allow statement's own, then the dependent actions they imply."""
+def pairs(role: dict, plan_facts: dict, skipped: list[str] | None = None) -> list[tuple[tuple[str, ...], tuple[str, ...], str]]:
+    """(actions, resources, why) to simulate: each Allow statement's own, then the dependent actions they imply.
+    An Allow with NotAction or NotResource cannot be listed as pairs: it is named in `skipped`, not simulated."""
     out, granted = [], set()
     for doc in role["policies"]:
         for st in statements(doc):
-            if st.get("Effect") != "Allow" or "NotAction" in st or "NotResource" in st:
+            if st.get("Effect") != "Allow":
+                continue
+            if "NotAction" in st or "NotResource" in st:
+                if skipped is not None:
+                    skipped.append(f"statement {st.get('Sid') or '(no Sid)'} ({'NotAction' if 'NotAction' in st else 'NotResource'})")
                 continue
             acts = tuple(a for a in as_list(st.get("Action")) if "*" not in a)
             if acts:
@@ -286,11 +297,25 @@ def simulate(aws, policies: list[str], actions, resources, boundary: str | None 
 
 
 def judge(results: list[dict], why: str, denied: list[str], unjudged: list[str]) -> None:
+    """Only an implicit deny that lacks a condition key is not judged; an explicit deny is always denied."""
     for e in results:
         if e.get("EvalDecision") == "allowed":
             continue
         line = f"{e['EvalActionName']} on {e.get('EvalResourceName', '*')} ({e['EvalDecision']}; {why})"
-        (unjudged if e.get("MissingContextValues") else denied).append(line)
+        (unjudged if e.get("EvalDecision") == "implicitDeny" and e.get("MissingContextValues") else denied).append(line)
+
+
+def region_of(arn: str, region: str) -> str:
+    """The region an ARN names, else the config region (a global resource, `*`)."""
+    parts = arn.split(":")
+    return parts[3] if len(parts) > 4 and parts[0] == "arn" and parts[3] else region
+
+
+def context(region: str, principal: str | None = None) -> list[dict]:
+    ctx = [{"ContextKeyName": "aws:RequestedRegion", "ContextKeyValues": [region], "ContextKeyType": "string"}]
+    if principal:
+        ctx.append({"ContextKeyName": "aws:PrincipalArn", "ContextKeyValues": [principal], "ContextKeyType": "string"})
+    return ctx
 
 
 def account_of(arn: str | None) -> tuple[str, str] | None:
@@ -298,27 +323,31 @@ def account_of(arn: str | None) -> tuple[str, str] | None:
     return (m.group(1), m.group(2)) if m else None
 
 
-def role_check(role: dict, plan_facts: dict, topics: dict[str, str], aws, rep: Report) -> None:
+def role_check(role: dict, plan_facts: dict, topics: dict[str, str], region: str, aws, rep: Report) -> None:
     label = f"iam: role {role['name']}"
     if not role["policies"]:
         rep.add("SKIP", f"{label}: no policy known at plan ({role['unknown']} known only after apply)")
         return
     if role["boundary_unknown"]:
-        rep.add("SKIP", f"{label}: its permissions boundary is known only after apply or cannot be read")
+        rep.add("FAIL", f"{label}: its permissions boundary is known only after apply or cannot be read, so its "
+                        "rights cannot be judged")
         return
-    denied, unjudged, errors = [], [], []
+    denied, unjudged, errors, skipped = [], [], [], []
     acct = account_of(role.get("arn"))
-    for acts, resources, why in pairs(role, plan_facts):
+    for acts, resources, why in pairs(role, plan_facts, skipped):
         sns_res = [r for r in resources if r in topics] if any(a.startswith("sns:") for a in acts) else []
-        plain = [r for r in resources if r not in sns_res]
-        if plain:
-            ok, res = simulate(aws, role["policies"], acts, plain, role["boundary"])
+        by_region: dict[str, list[str]] = {}
+        for r in resources:
+            if r not in sns_res:
+                by_region.setdefault(region_of(r, region), []).append(r)
+        for reg, plain in by_region.items():
+            ok, res = simulate(aws, role["policies"], acts, plain, role["boundary"], context=context(reg))
             if ok:
                 judge(res, why, denied, unjudged)
             else:
                 errors.append(f"{why}: {res}")
         for topic in sns_res:
-            ctx = [{"ContextKeyName": "aws:PrincipalArn", "ContextKeyValues": [role["arn"]], "ContextKeyType": "string"}]
+            ctx = context(region_of(topic, region), role["arn"])
             caller = f"arn:{acct[0]}:iam::{acct[1]}:{STUB_CALLER}" if acct else f"arn:aws:iam::{topic.split(':')[4]}:{STUB_CALLER}"
             ok, res = simulate(aws, role["policies"], acts, [topic], role["boundary"], topics[topic], caller, ctx)
             if ok:
@@ -326,6 +355,7 @@ def role_check(role: dict, plan_facts: dict, topics: dict[str, str], aws, rep: R
             else:
                 errors.append(f"{why}: {res}")
     tail = (f"; {role['unknown']} policy(ies) known only after apply" if role["unknown"] else "") + \
+           (f"; not simulated: {'; '.join(skipped)}" if skipped else "") + \
            (f"; not judged (a condition key the simulation lacks): {'; '.join(unjudged)}" if unjudged else "")
     if denied or errors:
         rep.add("FAIL", f"{label}: denied: {'; '.join(denied + errors)}{tail}")
@@ -342,25 +372,36 @@ def apply_role_check(plans: list[dict], role_name: str, region: str, aws, rep: R
         return
     role = got["Role"]
     part, acct = account_of(role["Arn"])
+    # Every policy must be read: one left out (a deny guard such as ci-stop-guard) would give a false PASS.
     policies: list[str] = []
+    unreadable: list[str] = []
     ok, names = aws(["iam", "list-role-policies", "--role-name", role_name])
+    if not ok:
+        unreadable.append(f"list-role-policies: {names}")
     for n in (names or {}).get("PolicyNames", []) if ok else []:
         ok2, p = aws(["iam", "get-role-policy", "--role-name", role_name, "--policy-name", n])
         if ok2:
             d = p["PolicyDocument"]
             policies.append(d if isinstance(d, str) else json.dumps(d))
+        else:
+            unreadable.append(f"inline policy {n}: {p}")
     ok, att = aws(["iam", "list-attached-role-policies", "--role-name", role_name])
+    if not ok:
+        unreadable.append(f"list-attached-role-policies: {att}")
     for a in (att or {}).get("AttachedPolicies", []) if ok else []:
         doc = managed_policy(a["PolicyArn"], aws, cache)
         if doc:
             policies.append(doc)
+        else:
+            unreadable.append(f"attached policy {a['PolicyArn']}")
     barn = (role.get("PermissionsBoundary") or {}).get("PermissionsBoundaryArn")
     boundary = managed_policy(barn, aws, cache) if barn else None
-    if not policies or (barn and boundary is None):
-        rep.add("FAIL", f"{label}: cannot read its policies or boundary")
+    if barn and boundary is None:
+        unreadable.append(f"boundary {barn}")
+    if unreadable or not policies:
+        rep.add("FAIL", f"{label}: cannot read its policies or boundary: {'; '.join(unreadable) or 'no policy'}")
         return
     denied, unjudged, unknown = [], [], 0
-    ctx = [{"ContextKeyName": "aws:PrincipalArn", "ContextKeyValues": [role["Arn"]], "ContextKeyType": "string"}]
     for plan in plans:
         conf = configuration(plan)
         changes = [c for c in plan.get("resource_changes") or [] if "create" in (c.get("change") or {}).get("actions", [])]
@@ -382,16 +423,18 @@ def apply_role_check(plans: list[dict], role_name: str, region: str, aws, rep: R
                 mod = strip_index(c.get("module_address", ""))
                 tkey = ref(conf.get(strip_index(c["address"]), {}), "topic_arn", mod, "aws_sns_topic")
                 if not target and tkey and after.get(tkey, {}).get("name"):
-                    target = f"arn:{part}:sns:{region}:{acct}:{after[tkey]['name']}"
+                    treg = after[tkey].get("region") or region  # the topic's own region (a us-east-1 alerts topic)
+                    target = f"arn:{part}:sns:{treg}:{acct}:{after[tkey]['name']}"
                 rp = tpol.get(tkey)
                 if tkey in tpol and rp is None:
                     unjudged.append(f"{action} on {target}: its topic policy is known only after apply")
             if not target:
                 unknown += 1
                 continue
-            arn = tmpl.format(p=part, a=acct, r=region, name=target)
+            arn = tmpl.format(p=part, a=acct, r=a.get("region") or region, name=target)  # a topic in its own region
             ok, res = simulate(aws, policies, [action], [arn], boundary, rp,
-                               f"arn:{part}:iam::{acct}:{STUB_CALLER}" if rp else None, ctx)
+                               f"arn:{part}:iam::{acct}:{STUB_CALLER}" if rp else None,
+                               context(region_of(arn, region), role["Arn"]))
             if ok:
                 judge(res, f"creates {c['address']}", denied, unjudged)
             else:
@@ -414,8 +457,13 @@ def load_plans(repo: pathlib.Path, plan_json: list[str], plan: str | None, plan_
     return plans, ""
 
 
+SCP_NOTE = ("iam: simulate-custom-policy does not evaluate SCPs: an SCP deny (the region SCP, the launch guard) is "
+            "not checked here")
+
+
 def iam_check(plans: list[dict], apply_role: str | None, region: str, aws, rep: Report) -> None:
     cache: dict = {}
+    rep.add("NOTE", SCP_NOTE)
     for plan in plans:
         res = planned(plan)
         facts = {"health_checked_service": health_checked_service(res)}
@@ -424,15 +472,43 @@ def iam_check(plans: list[dict], apply_role: str | None, region: str, aws, rep: 
         if not roles:
             rep.add("SKIP", "iam: the plan has no IAM role")
         for role in roles:
-            role_check(role, facts, topics, aws, rep)
+            role_check(role, facts, topics, region, aws, rep)
     if apply_role:
         apply_role_check(plans, apply_role, region, aws, rep, cache)
 
 
 # memory -----------------------------------------------------------------------------------------------------------
-def memory_limit(repo: pathlib.Path, image: str, overrides: dict[str, int]) -> tuple[int | None, str]:
+def plan_memory_limit(plans: list[dict], image: str) -> tuple[int | None, str]:
+    """The hard limit (MB) of the planned container that runs images/<image>: matched by container name or by the
+    image's repository name; the container's `memory`, else its task definition's `memory`."""
+    found = []
+    for plan in plans:
+        for r in planned(plan):
+            if r["type"] != "aws_ecs_task_definition":
+                continue
+            v = r.get("values") or {}
+            try:
+                containers = json.loads(v.get("container_definitions") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            for c in containers:
+                repo_name = re.split(r"[:@]", str(c.get("image") or "").rsplit("/", 1)[-1])[0]
+                if image not in (c.get("name"), repo_name):
+                    continue
+                mb = c.get("memory") or v.get("memory")
+                if mb is not None and str(mb).isdigit():
+                    found.append((int(mb), f"plan {r['address']} container {c.get('name')}"))
+    if not found:
+        return None, f"no task definition in the plan runs images/{image}; pass --memory {image}=<MB>"
+    return min(found)
+
+
+def memory_limit(repo: pathlib.Path, image: str, overrides: dict[str, int],
+                 plans: list[dict] | None = None) -> tuple[int | None, str]:
     if image in overrides:
         return overrides[image], "--memory"
+    if plans:
+        return plan_memory_limit(plans, image)
     if image not in MEMORY_LIMITS:
         return None, f"no task definition limit is known for images/{image}; pass --memory {image}=<MB>"
     path, var = MEMORY_LIMITS[image]
@@ -441,11 +517,11 @@ def memory_limit(repo: pathlib.Path, image: str, overrides: dict[str, int]) -> t
     if var:
         block = re.search(rf'variable "{var}" \{{(.*?)\n\}}', text, re.S)
         m = re.search(r"default\s*=\s*(\d+)", block.group(1)) if block else None
-        where = f"{path} {var} default"
+        where = f"no plan: module default, {path} {var}"
     else:
         block = re.search(r'resource "aws_ecs_task_definition"[^{]*\{(.*?)\n\}', text, re.S)
         m = re.search(r'\bmemory\s*=\s*"?(\d+)"?', block.group(1)) if block else None
-        where = f"{path} task definition memory"
+        where = f"no plan: module default, {path} task definition memory"
     return (int(m.group(1)), where) if m else (None, f"cannot read the limit from {where}")
 
 
@@ -475,6 +551,9 @@ def run_under_limit(repo: pathlib.Path, image: str, mb: int, seconds: float,
             state = json.loads(out)
             if state.get("OOMKilled"):
                 return "FAIL", f"OOM-killed under its {mb} MB limit (exit {state.get('ExitCode')})"
+            if not state.get("Running") and state.get("ExitCode") == 137:
+                # Some cgroup v2 setups kill without setting OOMKilled: 137 (SIGKILL) under a limit is a suspected OOM.
+                return "FAIL", f"exit 137 under its {mb} MB limit: a suspected OOM kill"
             if not state.get("Running"):
                 return "PASS", f"exited {state.get('ExitCode')} under {mb} MB without an OOM kill (stub environment)"
             if clock() >= end:
@@ -485,7 +564,7 @@ def run_under_limit(repo: pathlib.Path, image: str, mb: int, seconds: float,
 
 
 def memory_check(repo: pathlib.Path, changed: list[str], overrides: dict[str, int], seconds: float, rep: Report,
-                 running=docker_running, runner=run_under_limit) -> None:
+                 running=docker_running, runner=run_under_limit, plans: list[dict] | None = None) -> None:
     images = sorted({f.split("/")[1] for f in changed if f.startswith("images/") and f.count("/") >= 2
                      and (repo / "images" / f.split("/")[1] / "Dockerfile").exists()})
     if not images:
@@ -496,7 +575,7 @@ def memory_check(repo: pathlib.Path, changed: list[str], overrides: dict[str, in
         rep.add("SKIP", f"memory: Docker is not running ({why[:200]}); images not checked: {', '.join(images)}")
         return
     for image in images:
-        mb, where = memory_limit(repo, image, overrides)
+        mb, where = memory_limit(repo, image, overrides, plans)
         if mb is None:
             rep.add("SKIP", f"memory: images/{image}: {where}")
             continue
@@ -509,7 +588,11 @@ def edge_check(repo: pathlib.Path, changed: list[str], env: str, rep: Report, st
     if SMOKE_ENV not in changed:
         rep.add("SKIP", f"edge: {SMOKE_ENV} did not change")
         return
-    config = yaml.safe_load((repo / "config" / f"{env}.yaml").read_text(encoding="utf-8")) or {}
+    path = repo / "config" / f"{env}.yaml"
+    config = (yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else None) or {}
+    if not config.get("domain"):
+        rep.add("FAIL", f"edge: config/{env}.yaml is missing or names no domain")
+        return
     url = f"https://{config['domain']}/api/status"
     if status_of is None:
         spec = importlib.util.spec_from_file_location("smoke_env", repo / SMOKE_ENV)
@@ -562,21 +645,24 @@ def main(argv: list[str] | None = None, aws_factory=cli) -> int:
         rep.add("FAIL", f"changed files: cannot diff against {a.base}: {err[:200]}")
         changed = []
     config_file = repo / "config" / f"{a.env}.yaml"
-    config = yaml.safe_load(config_file.read_text(encoding="utf-8")) if config_file.exists() else {}
-    region = (config or {}).get("region") or "us-east-1"
+    config = (yaml.safe_load(config_file.read_text(encoding="utf-8")) if config_file.exists() else None) or {}
+    region = config.get("region")  # never a fallback: the region decides which region statements apply
+    plans: list[dict] = []
+    if (a.plan_json or a.plan) and ("iam" in only or "memory" in only):
+        plans, err = load_plans(repo, a.plan_json, a.plan, a.plan_dir)
+        if err:
+            rep.add("FAIL", f"plan: {err}")
     if "iam" in only:
         if not (a.plan_json or a.plan):
             rep.add("SKIP", "iam: no plan; pass --plan-json <terraform show -json output> or --plan <plan file>")
         elif not a.profile:
             rep.add("SKIP", "iam: no --profile for the read-only simulation")
-        else:
-            plans, err = load_plans(repo, a.plan_json, a.plan, a.plan_dir)
-            if err:
-                rep.add("FAIL", f"iam: {err}")
-            else:
-                iam_check(plans, a.apply_role, region, aws_factory(a.profile, region), rep)
+        elif not region:
+            rep.add("FAIL", f"iam: config/{a.env}.yaml is missing or names no region (aws:RequestedRegion needs it)")
+        elif plans:
+            iam_check(plans, a.apply_role, region, aws_factory(a.profile, region), rep)
     if "memory" in only:
-        memory_check(repo, changed, parse_memory(a.memory), a.seconds, rep)
+        memory_check(repo, changed, parse_memory(a.memory), a.seconds, rep, plans=plans)
     if "edge" in only:
         edge_check(repo, changed, a.env, rep)
     n = rep.failed()

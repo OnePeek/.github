@@ -2,7 +2,8 @@
 """Preflight before every push and release (onepeek-docs architecture/lld/infra/foundation-playbook.md §8a P4).
 
     python3 .github/workspace/preflight.py <repo dir> [--release] [--depends-on OnePeek/<repo>#<n> ...]
-        [--live [--profile P] [--plan-json F ...] [--plan F] [--apply-role NAME]]
+        [--live [--profile P] [--plan-json F ...] [--plan F] [--plan-dir D] [--apply-role NAME] [--env E]
+         [--base REF] [--memory IMAGE=MB ...] [--seconds S]]
 
 0. Declared dependencies (§8a P1, lesson L26): the `Depends on: OnePeek/<repo>#<n>` lines of the branch's open pull
    request, or, before it has one, each `--depends-on`. While one is unmerged preflight refuses the push (keep the
@@ -22,7 +23,8 @@
      count), or `release` itself when it is on `dev` (a fast-forward), is not an ancestor of `dev`; no merge commit
      and `release` not on `dev` also fails ("no release merge found").
 5. With `--live` (onepeek-infra, opt-in, §8a P9): `live_preflight.py <repo>` (IAM simulation of the plan, changed
-   images under their memory limit, the edge's answer to the smoke User-Agent); FAIL unless it ends `LIVE PREFLIGHT OK`.
+   images under their memory limit, the edge's answer to the smoke User-Agent); FAIL unless it ends `LIVE PREFLIGHT OK`,
+   WARN (naming them) when it ends OK but skipped any check.
 
 Each line is PASS, FAIL, WARN or UNVERIFIED; the last line is `PREFLIGHT OK` or `PREFLIGHT FAILED`. Exit 1 on any FAIL.
 Needs `gh` signed in for the pin tags and `--release`.
@@ -204,21 +206,28 @@ def uses_tflint(repo: pathlib.Path) -> bool:
 # 5. Live preflight --------------------------------------------------------------------------------------------------
 def live_args(a: argparse.Namespace, repo: pathlib.Path) -> list[str]:
     out = [str(repo)]
-    for flag, value in (("--profile", a.profile), ("--plan", a.plan), ("--apply-role", a.apply_role)):
-        if value:
-            out += [flag, value]
+    for flag, value in (("--profile", a.profile), ("--plan", a.plan), ("--plan-dir", a.plan_dir),
+                        ("--apply-role", a.apply_role), ("--env", a.env), ("--base", a.base), ("--seconds", a.seconds)):
+        if value is not None:
+            out += [flag, str(value)]
     for p in a.plan_json:
         out += ["--plan-json", p]
+    for m in a.memory:
+        out += ["--memory", m]
     return out
 
 
 def run_live(args: list[str], rep: Report) -> None:
-    """Runs live_preflight.py with its output shown; PASS only when it exits 0 and ends `LIVE PREFLIGHT OK`."""
+    """Runs live_preflight.py with its output shown; PASS only when it exits 0, ends `LIVE PREFLIGHT OK` and skipped
+    nothing; WARN, listing the skipped checks, when it ends OK having skipped any."""
     r = subprocess.run([sys.executable, str(HERE / "live_preflight.py"), *args], capture_output=True, text=True)
     out = r.stdout + r.stderr
     print(out, end="" if out.endswith("\n") else "\n", flush=True)
     last = next((ln for ln in reversed(out.splitlines()) if ln.strip()), "")
-    if r.returncode == 0 and last == "LIVE PREFLIGHT OK":
+    skipped = [ln[5:].strip() for ln in out.splitlines() if ln.startswith("SKIP ")]
+    if r.returncode == 0 and last == "LIVE PREFLIGHT OK" and skipped:
+        rep.add("WARN", f"live: LIVE PREFLIGHT OK, but {len(skipped)} check(s) skipped: {'; '.join(skipped)}")
+    elif r.returncode == 0 and last == "LIVE PREFLIGHT OK":
         rep.add("PASS", "live: LIVE PREFLIGHT OK")
     else:
         rep.add("FAIL", f"live: did not end LIVE PREFLIGHT OK (last line: {last!r})")
@@ -424,7 +433,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--profile", help="--live: the AWS profile for the read-only IAM simulation")
     ap.add_argument("--plan-json", action="append", default=[], help="--live: terraform show -json output (repeatable)")
     ap.add_argument("--plan", help="--live: a plan file")
+    ap.add_argument("--plan-dir", help="--live: where a --plan file is shown from (live_preflight's default otherwise)")
     ap.add_argument("--apply-role", help="--live: the IAM role name that applies the plan")
+    ap.add_argument("--env", help="--live: config/<env>.yaml (live_preflight's default otherwise)")
+    ap.add_argument("--base", help="--live: changed files are against this ref (live_preflight's default otherwise)")
+    ap.add_argument("--memory", action="append", default=[], metavar="IMAGE=MB", help="--live: a memory limit override")
+    ap.add_argument("--seconds", type=float, help="--live: how long each image runs (live_preflight's default otherwise)")
     a = ap.parse_args(argv)
     repo = pathlib.Path(a.repo).resolve()
     if not (repo / ".github/workflows").is_dir():
