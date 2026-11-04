@@ -2,6 +2,7 @@
 """Preflight before every push and release (onepeek-docs architecture/lld/infra/foundation-playbook.md §8a P4).
 
     python3 .github/workspace/preflight.py <repo dir> [--release] [--depends-on OnePeek/<repo>#<n> ...]
+        [--live [--profile P] [--plan-json F ...] [--plan F] [--apply-role NAME]]
 
 0. Declared dependencies (§8a P1, lesson L26): the `Depends on: OnePeek/<repo>#<n>` lines of the branch's open pull
    request, or, before it has one, each `--depends-on`. While one is unmerged preflight refuses the push (keep the
@@ -20,6 +21,8 @@
      merge commit reachable from `release` (the last dev commit merged into it; a hotfix squashed on top does not
      count), or `release` itself when it is on `dev` (a fast-forward), is not an ancestor of `dev`; no merge commit
      and `release` not on `dev` also fails ("no release merge found").
+5. With `--live` (onepeek-infra, opt-in, §8a P9): `live_preflight.py <repo>` (IAM simulation of the plan, changed
+   images under their memory limit, the edge's answer to the smoke User-Agent); FAIL unless it ends `LIVE PREFLIGHT OK`.
 
 Each line is PASS, FAIL, WARN or UNVERIFIED; the last line is `PREFLIGHT OK` or `PREFLIGHT FAILED`. Exit 1 on any FAIL.
 Needs `gh` signed in for the pin tags and `--release`.
@@ -196,6 +199,29 @@ def tool_checks(repo: pathlib.Path, rep: Report, version=installed_version) -> N
 def uses_tflint(repo: pathlib.Path) -> bool:
     return any(re.search(r"tflint|terraform-checks\.yml", f.read_text(encoding="utf-8"))
                for f in (repo / ".github/workflows").glob("*.y*ml"))
+
+
+# 5. Live preflight --------------------------------------------------------------------------------------------------
+def live_args(a: argparse.Namespace, repo: pathlib.Path) -> list[str]:
+    out = [str(repo)]
+    for flag, value in (("--profile", a.profile), ("--plan", a.plan), ("--apply-role", a.apply_role)):
+        if value:
+            out += [flag, value]
+    for p in a.plan_json:
+        out += ["--plan-json", p]
+    return out
+
+
+def run_live(args: list[str], rep: Report) -> None:
+    """Runs live_preflight.py with its output shown; PASS only when it exits 0 and ends `LIVE PREFLIGHT OK`."""
+    r = subprocess.run([sys.executable, str(HERE / "live_preflight.py"), *args], capture_output=True, text=True)
+    out = r.stdout + r.stderr
+    print(out, end="" if out.endswith("\n") else "\n", flush=True)
+    last = next((ln for ln in reversed(out.splitlines()) if ln.strip()), "")
+    if r.returncode == 0 and last == "LIVE PREFLIGHT OK":
+        rep.add("PASS", "live: LIVE PREFLIGHT OK")
+    else:
+        rep.add("FAIL", f"live: did not end LIVE PREFLIGHT OK (last line: {last!r})")
 
 
 # 4. Release prerequisites -----------------------------------------------------------------------------------------
@@ -394,6 +420,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--release", action="store_true", help="also check the prerequisites of release-only steps")
     ap.add_argument("--depends-on", action="append", default=[], metavar="OnePeek/<repo>#<n>",
                     help="a dependency of a branch with no pull request yet (repeatable)")
+    ap.add_argument("--live", action="store_true", help="also run live_preflight.py (onepeek-infra, §8a P9)")
+    ap.add_argument("--profile", help="--live: the AWS profile for the read-only IAM simulation")
+    ap.add_argument("--plan-json", action="append", default=[], help="--live: terraform show -json output (repeatable)")
+    ap.add_argument("--plan", help="--live: a plan file")
+    ap.add_argument("--apply-role", help="--live: the IAM role name that applies the plan")
     a = ap.parse_args(argv)
     repo = pathlib.Path(a.repo).resolve()
     if not (repo / ".github/workflows").is_dir():
@@ -418,6 +449,8 @@ def main(argv: list[str] | None = None) -> int:
         token_checks(texts, name, rep)
         for other in release_repos(name, texts):
             release_state(other, rep)
+    if a.live:
+        run_live(live_args(a, repo), rep)
     n = rep.failed()
     print("PREFLIGHT OK" if n == 0 else f"PREFLIGHT FAILED ({n} failed)")
     return 1 if n else 0
