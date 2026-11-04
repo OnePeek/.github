@@ -156,6 +156,58 @@ class SignOnce(unittest.TestCase):
         self.assertNotIn("release/backend/version", calls)
 
 
+class CosignArguments(unittest.TestCase):
+    """cosign v2.6.5: signatures are OCI 1.1 referrers via sign --registry-referrers-mode=oci-1-1, read by verify --experimental-oci11;
+    attest has no --registry-referrers-mode and stores its referrer with --new-bundle-format (delivery-pipelines §4 row 4, §5)."""
+
+    SIGN = "cosign sign --yes --tlog-upload=false --registry-referrers-mode=oci-1-1 --key k "
+    ATTEST = "cosign attest --yes --tlog-upload=false --new-bundle-format --type spdxjson --predicate sbom.spdx.json --key k "
+    VERIFY = "cosign verify --experimental-oci11 --insecure-ignore-tlog=true --key "
+
+    def cosign_lines(self):
+        """Every cosign command in the shared workflows, with backslash continuations joined."""
+        lines = []
+        for f in sorted(WORKFLOWS.glob("*.yml")):
+            joined = re.sub(r"\\\n\s*", "", f.read_text(encoding="utf-8"))
+            lines += [(f.name, m.group(0)) for m in re.finditer(r"\bcosign (sign|attest|verify|verify-attestation|copy)\b[^\n]*", joined)]
+        return lines
+
+    def test_signing_runs_the_exact_sign_and_attest_arguments(self):
+        out, calls, _ = SignOnce().signing(aws_stub(IN_ECR, digest="sha256:" + "c" * 64))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        cosign = [c for c in calls.splitlines() if c.startswith("cosign ")]
+        self.assertEqual(len(cosign), 2, cosign)
+        self.assertTrue(cosign[0].startswith(self.SIGN), cosign[0])
+        self.assertTrue(cosign[1].startswith(self.ATTEST), cosign[1])
+        self.assertEqual(cosign[0].removeprefix(self.SIGN), cosign[1].removeprefix(self.ATTEST), "sign and attest the same digest")
+        self.assertRegex(cosign[0].removeprefix(self.SIGN), r"^\S+@sha256:[0-9a-f]{64}$")
+
+    def test_every_signer_writes_referrers_and_every_verifier_reads_them(self):
+        lines = self.cosign_lines()
+        kinds = {line.split()[1] for _, line in lines}
+        self.assertEqual(kinds, {"sign", "attest", "verify"}, lines)
+        for name, line in lines:
+            with self.subTest(file=name, line=line):
+                if line.startswith("cosign sign "):
+                    self.assertIn("--registry-referrers-mode=oci-1-1", line.split())
+                    self.assertIn("--tlog-upload=false", line.split())
+                elif line.startswith("cosign attest "):
+                    self.assertIn("--new-bundle-format", line.split())
+                    self.assertIn("--tlog-upload=false", line.split())
+                    self.assertFalse(any(a.startswith("--registry-referrers-mode") for a in line.split()), "attest has no such flag in cosign v2.6.5")
+                else:
+                    self.assertTrue(line.startswith(self.VERIFY), line)
+
+    def test_the_referrers_mode_has_its_experimental_switch(self):
+        self.assertEqual(RELEASE["env"]["COSIGN_EXPERIMENTAL"], "1")
+
+    def test_every_job_installs_the_same_cosign(self):
+        for name in ("release-ecs.yml", "operate.yml"):
+            with self.subTest(file=name):
+                releases = set(re.findall(r"cosign-release: (\S+)", (WORKFLOWS / name).read_text(encoding="utf-8")))
+                self.assertEqual(releases, {"v2.6.5"})
+
+
 class RecordDigest(unittest.TestCase):
     script = step("record-digest", "Read the recorded digests")
 
