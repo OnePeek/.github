@@ -113,7 +113,7 @@ class Tools(Repo):
 
 
 class Tokens(unittest.TestCase):
-    TEXTS = [("w.yml", APP_STEP), ("x.yml", "jobs:\n  j:\n    env:\n      T: ${{ secrets.ORG_READ_TOKEN }}\n")]
+    TEXTS = [("w.yml", APP_STEP), ("x.yml", "jobs:\n  j:\n    env:\n      T: ${{ secrets.NPM_READ_TOKEN }}\n")]
 
     def test_the_requests_are_read_from_the_steps(self) -> None:
         (r,) = pf.app_requests(self.TEXTS, "backend-service")
@@ -128,7 +128,7 @@ class Tokens(unittest.TestCase):
         fails = [t for s, t in rep.lines if s == "FAIL"]
         self.assertEqual(len(fails), 1)
         self.assertIn("pull_requests: read (has none)", fails[0])
-        self.assertIn(("UNVERIFIED", "secrets: AGENTS_APP_CLIENT_ID, ORG_READ_TOKEN cannot be read from a laptop; "
+        self.assertIn(("UNVERIFIED", "secrets: AGENTS_APP_CLIENT_ID, NPM_READ_TOKEN cannot be read from a laptop; "
                                      "check they are set in backend-service"), rep.lines)
 
     def test_granted_and_installed_passes(self) -> None:
