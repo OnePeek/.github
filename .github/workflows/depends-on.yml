@@ -10,7 +10,9 @@
 # AGENTS_APP_PRIVATE_KEY; they are needed when the body has such a line or the repo has docs-version.txt. The logic is
 # scripts/check_depends_on.py at the caller's pin. The body is read live from the API with the job's GITHUB_TOKEN
 # (pull-requests: read, which the caller's job must grant), never from the event payload, which is the body at trigger
-# time and would miss a line added or removed after it.
+# time and would miss a line added or removed after it. With no pull request in the event (a push, schedule or dispatch run of
+# the caller) there is nothing to wait for: every step but a notice is skipped, so the job passes and the jobs that need it run;
+# the docs ancestor rule on push is the pins job's, not this one's.
 name: depends-on
 
 on:
@@ -37,7 +39,13 @@ jobs:
     runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
+      - name: Not a pull request (a push, schedule or dispatch run)
+        if: ${{ github.event.pull_request.number == '' }}
+        run: |
+          echo "::notice::not a pull request: nothing to wait for"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ github.event.pull_request.number != '' }}
         with:
           persist-credentials: false
           sparse-checkout: |
@@ -46,13 +54,14 @@ jobs:
 
       - name: This workflow's version (the caller's pin of depends-on.yml)
         id: version
+        if: ${{ github.event.pull_request.number != '' }}
         run: |
           sha=$(grep -rhoiE 'OnePeek/\.github/\.github/workflows/depends-on\.yml@[0-9a-f]{40}' .github/workflows | head -n 1 | cut -d@ -f2 || true)
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "depends-on.yml runs at ${sha:-this repo (a local call)}"
 
       - name: OnePeek/.github at that version
-        if: ${{ steps.version.outputs.sha != '' }}
+        if: ${{ github.event.pull_request.number != '' && steps.version.outputs.sha != '' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: OnePeek/.github
@@ -62,6 +71,7 @@ jobs:
 
       - name: The pull request's live body (from the API, not the event payload)
         id: body
+        if: ${{ github.event.pull_request.number != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -72,6 +82,7 @@ jobs:
 
       - name: The repos the body names, and the docs commit docs-version.txt pins
         id: deps
+        if: ${{ github.event.pull_request.number != '' }}
         env:
           SHA: ${{ steps.version.outputs.sha }}
           BODY_FILE: ${{ steps.body.outputs.file }}
@@ -85,7 +96,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: The agents' GitHub App secrets are set (a dependency in another repo, or the docs pin, is read with them)
-        if: ${{ steps.deps.outputs.repos != '' || steps.deps.outputs.docs != '' }}
+        if: ${{ github.event.pull_request.number != '' && (steps.deps.outputs.repos != '' || steps.deps.outputs.docs != '') }}
         env:
           HAS_APP: ${{ secrets.AGENTS_APP_CLIENT_ID != '' && secrets.AGENTS_APP_PRIVATE_KEY != '' }}
         run: |
@@ -96,7 +107,7 @@ jobs:
 
       - name: The agents' GitHub App token (Pull requests read on the named repos)
         id: app
-        if: ${{ steps.deps.outputs.repos != '' }}
+        if: ${{ github.event.pull_request.number != '' && steps.deps.outputs.repos != '' }}
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
@@ -107,7 +118,7 @@ jobs:
 
       - name: The agents' GitHub App token (Contents and Pull requests read on onepeek-docs, for the docs pin)
         id: docs-app
-        if: ${{ steps.deps.outputs.docs != '' }}
+        if: ${{ github.event.pull_request.number != '' && steps.deps.outputs.docs != '' }}
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
@@ -118,6 +129,7 @@ jobs:
           permission-pull-requests: read
 
       - name: Every dependency is merged (declared, and the docs pin's pull request)
+        if: ${{ github.event.pull_request.number != '' }}
         env:
           SCRIPT: ${{ steps.deps.outputs.script }}
           BODY_FILE: ${{ steps.body.outputs.file }}
