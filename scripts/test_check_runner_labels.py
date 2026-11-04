@@ -298,6 +298,14 @@ class Rule6ImageDigests(unittest.TestCase):
         self.assertEqual(self.errs(f"    container: {self.DIGEST} # 17\n"), [])
         self.assertEqual(self.errs(f"    container:\n      image: {self.DIGEST} # 17\n"), [])
 
+    def test_a_badly_written_line_fails_even_when_the_same_pin_is_written_well_elsewhere(self):
+        good = f"        image: {self.DIGEST} # 17\n"
+        bad = f"        image: {self.DIGEST}\n"
+        body = f"    services:\n      a:\n{good}      b:\n{bad}"
+        self.assertTrue(self.errs(body))
+        self.assertTrue(self.errs(f"    services:\n      b:\n{bad}      a:\n{good}"))
+        self.assertEqual(self.errs(f"    services:\n      a:\n{good}      b:\n{good}"), [])
+
     def test_a_short_or_malformed_digest_fails(self):
         self.assertTrue(self.errs("    container: node@sha256:abc\n"))
         self.assertTrue(self.errs("    container: node@sha256:" + "a" * 63 + "\n"))

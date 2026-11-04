@@ -136,7 +136,6 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
             if given is not None and given != "github":
                 errors.append(f"{where}: job {job_id}: rule 1: a public repo passes no runner other than github, got {given!r}.")
         errors += _public(where, name, doc, jobs, callable_)
-    movable = _movable_pins(text)
     for job_id, job in jobs.items():
         for image in _job_images(job):
             if CALLER_IMAGE.fullmatch(image.strip()):
@@ -144,7 +143,7 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
             if not DIGEST.search(image):
                 errors.append(f"{where}: job {job_id}: rule 6: the CI container image {image!r} is not pinned by digest "
                               "(@sha256:<64 hex>, tag in a comment); ci-image-bump.yml moves the digest weekly.")
-            elif image not in movable:
+            elif not _every_line_movable(text, image):
                 errors.append(f"{where}: job {job_id}: rule 6: the CI container image {image!r} needs its tag in a comment "
                               "on its own line, `image: <name>@sha256:<64 hex> # <tag>`, or ci-image-bump.yml cannot move it.")
     for job_id, job in jobs.items():
@@ -189,14 +188,19 @@ PIN_LINE = re.compile(
 CALLER_IMAGE = re.compile(r"\$\{\{\s*(?:inputs|matrix)\.[\w.-]+\s*\}\}")
 
 
-def _movable_pins(text: str) -> set[str]:
-    """Each `<name>@sha256:<digest>` written in the movable line form with a tag as the comment's first word."""
-    out = set()
-    for raw in text.splitlines():
+def _every_line_movable(text: str, image: str) -> bool:
+    """Each `image:`/`container:` line that writes this image is in the movable line form with a tag as the comment's first
+    word (checked per line: a badly written line fails even when the same name@digest appears correctly elsewhere), and at
+    least one such line exists."""
+    keyed = re.compile(r"^\s*(?:-\s*)?(?:image|container):")
+    lines = [raw for raw in text.splitlines() if keyed.match(raw) and image in raw]
+    if not lines:
+        return False
+    for raw in lines:
         m = PIN_LINE.match(raw)
-        if m and m["comment"].split() and m["comment"].split()[0].rsplit(":", 1)[-1]:
-            out.add(f"{m['name']}@{m['digest']}")
-    return out
+        if not (m and m["comment"].split() and m["comment"].split()[0].rsplit(":", 1)[-1]):
+            return False
+    return True
 
 
 def _job_images(job: dict) -> list[str]:

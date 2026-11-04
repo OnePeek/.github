@@ -182,7 +182,8 @@ class SharedWorkflow(unittest.TestCase):
         app = next(s for s in self.wf["jobs"]["bump"]["steps"] if "create-github-app-token" in s.get("uses", ""))
         self.assertRegex(app["uses"], r"^actions/create-github-app-token@[0-9a-f]{40}$")
         self.assertEqual(app["if"], "${{ steps.has-app.outputs.app == 'true' }}")
-        self.assertEqual(app["with"]["repositories"], "${{ github.event.repository.name }}")
+        self.assertNotIn("owner", app["with"])
+        self.assertNotIn("repositories", app["with"])  # minted for the calling repository only
         self.assertEqual({k: v for k, v in app["with"].items() if k.startswith("permission-")},
                          {"permission-contents": "write", "permission-pull-requests": "write", "permission-workflows": "write"})
         push = self.steps()["Open the pull request"]
@@ -217,6 +218,8 @@ class SharedWorkflow(unittest.TestCase):
 
     def test_the_header_has_no_stale_claims(self):
         header = self.text.split("\nname:")[0]
+        self.assertNotIn("Provisional", header)
+        self.assertNotIn("founder", self.text)
         self.assertNotIn("agents' App secrets", header)
         self.assertNotIn("closes and reopens", header)
         self.assertIn("CI_BUMP_APP_ID", header)
@@ -225,6 +228,20 @@ class SharedWorkflow(unittest.TestCase):
         step = next(s for s in self.wf["jobs"]["bump"]["steps"] if "bump_ci_images" in s.get("run", "") or "check.py" in s.get("run", ""))
         self.assertNotIn("secrets.", json.dumps(step))
         self.assertNotIn("TOKEN", json.dumps(step.get("env", {})))
+
+
+class OwnCaller(unittest.TestCase):
+    wf = yaml.safe_load((ROOT / ".github/workflows/ci-image-bump-caller.yml").read_text(encoding="utf-8"))
+
+    def test_it_runs_weekly_and_by_hand_and_calls_the_shared_workflow_on_github_runners(self):
+        on = self.wf[True]
+        self.assertEqual(set(on), {"schedule", "workflow_dispatch"})
+        self.assertEqual(len(on["schedule"]), 1)
+        job = self.wf["jobs"]["bump"]
+        self.assertEqual(job["uses"], "./.github/workflows/ci-image-bump.yml")
+        self.assertEqual(job["with"]["runner"], "github")
+        self.assertEqual(self.wf["permissions"], {"contents": "read"})
+        self.assertEqual(set(job["secrets"]), {"CI_BUMP_APP_ID", "CI_BUMP_APP_PRIVATE_KEY"})
 
 
 if __name__ == "__main__":

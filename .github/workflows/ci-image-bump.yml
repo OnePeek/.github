@@ -2,9 +2,9 @@
 # workflows) to the tag's current digest and open one pull request (foundation-playbook §12a slice 4 item 4). A caller
 # runs it on a weekly `schedule`. Registry access is read-only and anonymous: the script holds no registry credential,
 # and the step that runs it gets no token.
-# Provisional, until the founder decides how the bump pushes: every change is to a workflow file, which GITHUB_TOKEN can
-# never push (it has no `workflows` permission) and the agents' App must not (it stays read-only). So the push and the
-# pull request use a dedicated GitHub App when the caller passes CI_BUMP_APP_ID and CI_BUMP_APP_PRIVATE_KEY (a token for
+# Every change is to a workflow file, which GITHUB_TOKEN can never push (it has no `workflows` permission) and the
+# agents' App must not (it stays read-only). So the push and the pull request use the onepeek-ci-bump GitHub App
+# (onepeek-docs decision recorded in PR #183) when the caller passes CI_BUMP_APP_ID and CI_BUMP_APP_PRIVATE_KEY (a token for
 # this repo only, with contents, pull requests and workflows write); without them the job still finds and lists the
 # moves (and fails on a tag it cannot resolve or a pinned line it cannot move), and skips the push with a notice.
 # The job's own GITHUB_TOKEN stays read-only. The script is a verbatim copy of scripts/bump_ci_images.py (a test keeps
@@ -193,7 +193,7 @@ jobs:
         run: |
           echo "app=${HAS_APP}" >> "$GITHUB_OUTPUT"
           if [ "${HAS_APP}" != "true" ] && ! git diff --quiet; then
-            echo "::notice::CI_BUMP_APP_ID and CI_BUMP_APP_PRIVATE_KEY are not passed, so these moves are not pushed (the push design waits on the founder's decision):"
+            echo "::notice::CI_BUMP_APP_ID and CI_BUMP_APP_PRIVATE_KEY are not passed, so these moves are not pushed:"
             sed 's/^/::notice::/' "$RUNNER_TEMP/moves.txt"
             { echo "CI image moves found but not pushed (no CI bump App secrets):"; echo; sed 's/^/- /' "$RUNNER_TEMP/moves.txt"; } >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -205,8 +205,6 @@ jobs:
         with:
           client-id: ${{ secrets.CI_BUMP_APP_ID }}
           private-key: ${{ secrets.CI_BUMP_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
           permission-contents: write
           permission-pull-requests: write
           permission-workflows: write
