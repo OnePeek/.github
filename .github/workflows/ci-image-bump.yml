@@ -1,10 +1,14 @@
 # Shared, weekly: move the digest-pinned CI container images (`image: <name>@sha256:<digest> # <tag>` in the caller's
 # workflows) to the tag's current digest and open one pull request (foundation-playbook §12a slice 4 item 4). A caller
-# runs it on a weekly `schedule` and passes the agents' App secrets. Registry access is read-only and anonymous: the
-# script holds no registry credential, and the step that runs it gets no token. The agents' App stays read-only, so the
-# job's GITHUB_TOKEN (contents and pull-requests write, on that job only) pushes the branch and opens the pull request.
-# A pull request opened with GITHUB_TOKEN starts no checks: the coordinator closes and reopens it to start them.
-# The script is a verbatim copy of scripts/bump_ci_images.py (a test keeps them identical).
+# runs it on a weekly `schedule`. Registry access is read-only and anonymous: the script holds no registry credential,
+# and the step that runs it gets no token.
+# Provisional, until the founder decides how the bump pushes: every change is to a workflow file, which GITHUB_TOKEN can
+# never push (it has no `workflows` permission) and the agents' App must not (it stays read-only). So the push and the
+# pull request use a dedicated GitHub App when the caller passes CI_BUMP_APP_ID and CI_BUMP_APP_PRIVATE_KEY (a token for
+# this repo only, with contents, pull requests and workflows write); without them the job still finds and lists the
+# moves (and fails on a tag it cannot resolve or a pinned line it cannot move), and skips the push with a notice.
+# The job's own GITHUB_TOKEN stays read-only. The script is a verbatim copy of scripts/bump_ci_images.py (a test keeps
+# them identical).
 name: ci-image-bump
 
 on:
@@ -18,6 +22,13 @@ on:
         description: "The branch the pull request targets (the repo's integration branch)."
         type: string
         default: dev
+    secrets:
+      CI_BUMP_APP_ID:
+        description: "The CI bump GitHub App's ID (or client ID). Optional: without it and the key, nothing is pushed."
+        required: false
+      CI_BUMP_APP_PRIVATE_KEY:
+        description: "The CI bump GitHub App's private key. Optional, with CI_BUMP_APP_ID."
+        required: false
 
 permissions:
   contents: read
@@ -27,8 +38,7 @@ jobs:
     runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,7 +54,10 @@ jobs:
           .github/workflows; the comment's first word is the tag (`17`, or `postgres:17`: the part after the last colon). For each
           one this asks the registry for the tag's current digest and rewrites the line when it moved. Registry access is read-only
           and anonymous (a pull token, a manifest GET); no credentials are used or needed for the public registries CI containers
-          come from (public.ecr.aws). A tag the registry cannot resolve is an error, never a skip.
+          come from (public.ecr.aws). A tag the registry cannot resolve is an error, never a skip, and so is a pinned line this
+          cannot move (an `image:`/`container:` line naming `@sha256:` that is not in the form above, such as one with no tag
+          comment). A `:tag` written in the name (`mongo:7@sha256:...`) is dropped before the registry is asked: the digest names
+          the image, the comment names the tag.
 
           Usage: bump_ci_images.py [--check] [ROOT]   (--check lists what would move and exits 1 if anything would; default rewrites)
           Prints one `file:line: <name> <tag> <old> -> <new>` line per move.
@@ -66,6 +79,7 @@ jobs:
           ACCEPT = ", ".join([
               "application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json",
               "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"])
+          PINNED = re.compile(r"^\s*(?:-\s*)?(?:image|container):.*@sha256:")  # a pinned line: it must match LINE
           Resolver = Callable[[str, str], str]  # (name, tag) -> "sha256:<64 hex>"
 
 
@@ -73,6 +87,12 @@ jobs:
               word = comment.split()[0] if comment.split() else ""
               tag = word.rsplit(":", 1)[-1]
               return tag or None
+
+
+          def repository(name: str) -> str:
+              """The name without a `:tag` in its last path part (a registry host's `:port` stays)."""
+              head, slash, last = name.rpartition("/")
+              return f"{head}{slash}{last.split(':', 1)[0]}"
 
 
           def split_name(name: str) -> tuple[str, str]:
@@ -120,11 +140,14 @@ jobs:
               for n, raw in enumerate(lines, 1):
                   m = LINE.match(raw.rstrip("\r\n"))
                   if not m:
+                      if PINNED.match(raw):
+                          raise RuntimeError(f"{path}:{n}: a digest-pinned image this cannot move: write it "
+                                             "`image: <name>@sha256:<64 hex> # <tag>` on one line")
                       continue
                   tag = tag_of(m["comment"])
                   if tag is None:
                       raise RuntimeError(f"{path}:{n}: the comment after the digest must start with the tag")
-                  new = resolve(m["name"], tag)
+                  new = resolve(repository(m["name"]), tag)
                   if new != m["digest"]:
                       moved.append(f"{path}:{n}: {m['name']} {tag} {m['digest']} -> {new}")
                       lines[n - 1] = raw.replace(m["digest"], new, 1)
@@ -163,9 +186,36 @@ jobs:
           PY
           python3 "$RUNNER_TEMP/bump.py" . | tee "$RUNNER_TEMP/moves.txt"
 
-      - name: Open the pull request
+      - name: The CI bump App's secrets are set
+        id: has-app
         env:
-          GH_TOKEN: ${{ github.token }}
+          HAS_APP: ${{ secrets.CI_BUMP_APP_ID != '' && secrets.CI_BUMP_APP_PRIVATE_KEY != '' }}
+        run: |
+          echo "app=${HAS_APP}" >> "$GITHUB_OUTPUT"
+          if [ "${HAS_APP}" != "true" ] && ! git diff --quiet; then
+            echo "::notice::CI_BUMP_APP_ID and CI_BUMP_APP_PRIVATE_KEY are not passed, so these moves are not pushed (the push design waits on the founder's decision):"
+            sed 's/^/::notice::/' "$RUNNER_TEMP/moves.txt"
+            { echo "CI image moves found but not pushed (no CI bump App secrets):"; echo; sed 's/^/- /' "$RUNNER_TEMP/moves.txt"; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: The CI bump App's token (this repo only; contents, pull requests and workflows write)
+        id: app
+        if: ${{ steps.has-app.outputs.app == 'true' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.CI_BUMP_APP_ID }}
+          private-key: ${{ secrets.CI_BUMP_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Open the pull request
+        if: ${{ steps.has-app.outputs.app == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
           BASE: ${{ inputs.base }}
           REPO: ${{ github.repository }}
         run: |
@@ -174,12 +224,14 @@ jobs:
             exit 0
           fi
           branch="ci-image-bump"
-          git config user.name "onepeek-agents[bot]"
-          git config user.email "onepeek-agents[bot]@users.noreply.github.com"
+          gh auth setup-git   # git uses gh as its credential helper: the token is never in a URL or an argument
+          bot_id=$(gh api "users/${SLUG}%5Bbot%5D" --jq .id)   # the commit is the App's own bot user
+          git config user.name "${SLUG}[bot]"
+          git config user.email "${bot_id}+${SLUG}[bot]@users.noreply.github.com"
           git switch -c "${branch}"
           git add .github/workflows
           git commit -q -m "ci: move the CI container image digests to their tags' current digests"
-          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "${branch}"
+          git push --force origin "${branch}"
           if [ -z "$(gh pr list --repo "${REPO}" --head "${branch}" --base "${BASE}" --state open --json number --jq '.[].number')" ]; then
             {
               echo "The weekly CI image bump (foundation-playbook §12a slice 4 item 4). Each digest-pinned \`image:\` moved to the current digest of the tag in its comment:"

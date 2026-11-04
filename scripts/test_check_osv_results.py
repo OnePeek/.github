@@ -34,10 +34,12 @@ def results(vulns, score=None):
         {"package": {"name": "left-pad", "version": "1.0.0"}, "vulnerabilities": vulns, "groups": groups}]}]}
 
 
-def run(res=None, toml=None, today=TODAY):
+def run(res=None, toml=None, today=TODAY, scan_exit=None):
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
-        args = ["--today", today.isoformat(), str(d)]
+        if scan_exit is None:
+            scan_exit = 1 if any(p.get("vulnerabilities") for r in (res or {}).get("results") or [] for p in r.get("packages") or []) else 0
+        args = ["--scan-exit", str(scan_exit), "--today", today.isoformat(), str(d)]
         if res is not None:
             (d / "osv-results.json").write_text(json.dumps(res))
         args = ["--results", str(d / "osv-results.json"), *args]
@@ -78,6 +80,35 @@ class Findings(unittest.TestCase):
 
     def test_boundary_just_under_high_passes(self):
         self.assertEqual(run(results([vuln(fixed=False)], score="6.9"))[0], 0)
+
+    def test_a_scanner_exit_other_than_0_or_1_fails_even_with_empty_results(self):
+        for code in (2, 127, 128):
+            got, out = run({"results": []}, scan_exit=code)
+            self.assertEqual(got, 1, code)
+            self.assertIn(f"osv-scanner exited {code}", out)
+        self.assertEqual(run({"results": []}, scan_exit=0)[0], 0)
+        self.assertEqual(run(results([vuln(fixed=False)]), scan_exit=1)[0], 0)
+
+    def test_the_scan_exit_is_required(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            osv.main(["--results", "x.json"])
+
+    def test_another_packages_fix_does_not_count(self):
+        v = vuln(fixed=False)
+        v["affected"].append({"package": {"name": "other-pkg"}, "ranges": [{"events": [{"introduced": "0"}, {"fixed": "1"}]}]})
+        self.assertEqual(run(results([v]))[0], 0)
+
+    def test_a_name_that_matches_no_affected_entry_has_no_fix(self):
+        v = vuln()
+        v["affected"][0]["package"]["name"] = "something-else"
+        self.assertFalse(osv.has_fix(v, {"name": "left-pad"}))
+
+    def test_pypi_names_are_normalised(self):
+        v = {"id": "PYSEC-1", "affected": [{"package": {"name": "Zope.Interface", "ecosystem": "PyPI"},
+                                            "ranges": [{"events": [{"introduced": "0"}, {"fixed": "6"}]}]}]}
+        self.assertTrue(osv.has_fix(v, {"name": "zope-interface", "ecosystem": "PyPI"}))
+        self.assertTrue(osv.has_fix(v, {"name": "zope_interface", "ecosystem": "PyPI"}))
+        self.assertFalse(osv.has_fix(v, {"name": "zope-interfaces", "ecosystem": "PyPI"}))
 
     def test_missing_results_fails(self):
         code, out = run(None)
@@ -126,20 +157,43 @@ class SharedWorkflow(unittest.TestCase):
         self.assertEqual(classify(job["runs-on"], "inputs.runner", True), "light")
         self.assertLessEqual(job["timeout-minutes"], 30)
 
-    def test_the_scanner_is_pinned_by_a_full_commit_sha_with_a_version_comment(self):
-        uses = re.findall(r"uses: (google/osv-scanner-action/\S+@\S+) # (v\d+\.\d+\.\d+)", self.text)
-        self.assertEqual(len(uses), 1)
-        self.assertRegex(uses[0][0], r"@[0-9a-f]{40}$")
+    def test_the_scanner_image_is_pinned_by_digest_in_the_form_the_bump_moves(self):
+        import bump_ci_images as bump
+        lines = [ln for ln in self.text.splitlines() if "osv-scanner-action@" in ln]
+        self.assertEqual(len(lines), 1)
+        m = bump.LINE.match(lines[0])
+        self.assertIsNotNone(m, lines[0])
+        self.assertEqual((m["name"], bump.tag_of(m["comment"])), ("ghcr.io/google/osv-scanner-action", "v2.7.0"))
+        self.assertNotIn("uses: google/osv-scanner-action", self.text)
 
     def test_it_embeds_the_script_verbatim(self):
         src = (ROOT / "scripts/check_osv_results.py").read_text(encoding="utf-8")
         indented = "\n".join(("          " + line) if line else "" for line in src.splitlines())
         self.assertIn(indented, self.text)
 
-    def test_a_failed_scan_does_not_stop_the_decision_step(self):
+    def test_the_scan_exit_code_reaches_the_decision_step(self):
         steps = self.wf["jobs"]["osv-scan"]["steps"]
-        scan = next(s for s in steps if "osv-scanner-action" in s.get("uses", ""))
-        self.assertIs(scan.get("continue-on-error"), True)
+        scan = next(s for s in steps if s.get("id") == "scan")
+        self.assertTrue(scan["run"].startswith("set +e\n"))
+        self.assertIn('echo "exit=$?" >> "$GITHUB_OUTPUT"', scan["run"])
+        decide = steps[steps.index(scan) + 1]
+        self.assertEqual(decide["env"]["SCAN_EXIT"], "${{ steps.scan.outputs.exit }}")
+        self.assertIn('--scan-exit "${SCAN_EXIT}"', decide["run"])
+
+    def test_the_scan_step_records_the_scanners_real_exit_code(self):
+        import os
+        import stat
+        import subprocess
+        scan = next(s for s in self.wf["jobs"]["osv-scan"]["steps"] if s.get("id") == "scan")
+        for code in (0, 1, 128):
+            with tempfile.TemporaryDirectory() as d:
+                d = Path(d)
+                (d / "docker").write_text(f"#!/bin/bash\nexit {code}\n")
+                (d / "docker").chmod(stat.S_IRWXU)
+                env = {**os.environ, "PATH": f"{d}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(d / "out"), "image": "x"}
+                r = subprocess.run(["bash", "-eo", "pipefail", "-c", scan["run"]], cwd=d, env=env, capture_output=True)
+                self.assertEqual(r.returncode, 0)
+                self.assertEqual((d / "out").read_text(), f"exit={code}\n")
 
 
 if __name__ == "__main__":

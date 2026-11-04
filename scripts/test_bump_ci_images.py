@@ -73,10 +73,28 @@ class Rewrite(unittest.TestCase):
         self.assertIn(f"mongo@sha256:{'1' * 64}", text)
         self.assertIn(f"{PG}@sha256:{'2' * 64}", text)
 
-    def test_an_image_without_a_tag_comment_or_digest_is_left_alone(self):
-        text = f"jobs:\n  t:\n    services:\n      a:\n        image: {PG}@{OLD}\n      b:\n        image: {PG}:17\n"
-        d = tree(text)
+    def test_an_image_by_tag_only_is_left_alone(self):
+        d = tree(f"jobs:\n  t:\n    services:\n      b:\n        image: {PG}:17\n")
         self.assertEqual(bump.bump(d, lambda n, t: NEW), [])
+
+    def test_a_pinned_line_it_cannot_move_fails_loudly(self):
+        # The form onepeek-infra's ci-runner-canary.yml used: a digest and no tag comment.
+        for line in (f"image: {PG}:17@{OLD}", f"image: {PG}@{OLD}", f"container: {{image: {PG}@{OLD}}} # 17"):
+            d = tree(f"jobs:\n  t:\n    services:\n      a:\n        {line}\n")
+            with self.assertRaisesRegex(RuntimeError, "cannot move"):
+                bump.bump(d, lambda n, t: NEW)
+
+    def test_a_tag_written_in_the_name_is_dropped_before_resolving(self):
+        d, calls = tree(f"jobs:\n  t:\n    services:\n      m:\n        image: public.ecr.aws/docker/library/mongo:7@{OLD} # 7\n"), []
+        moved = bump.bump(d, lambda n, t: calls.append((n, t)) or NEW)
+        self.assertEqual(calls, [("public.ecr.aws/docker/library/mongo", "7")])
+        self.assertIn(f"mongo:7@{NEW} # 7", (d / ".github/workflows/ci.yml").read_text())
+        self.assertEqual(len(moved), 1)
+
+    def test_repository_keeps_a_registry_port(self):
+        self.assertEqual(bump.repository("localhost:5000/x:1"), "localhost:5000/x")
+        self.assertEqual(bump.repository("mongo:7"), "mongo")
+        self.assertEqual(bump.repository(PG), PG)
 
     def test_a_tag_that_cannot_be_resolved_is_an_error_not_a_skip(self):
         def boom(n, t):
@@ -148,15 +166,60 @@ class SharedWorkflow(unittest.TestCase):
         indented = "\n".join(("          " + line) if line else "" for line in src.splitlines())
         self.assertIn(indented, self.text)
 
-    def test_write_access_is_on_the_job_only_and_uses_github_token_not_the_app(self):
-        self.assertEqual(self.wf["permissions"], {"contents": "read"})
-        self.assertEqual(self.wf["jobs"]["bump"]["permissions"], {"contents": "write", "pull-requests": "write"})
-        self.assertNotIn("create-github-app-token", self.text)
-        self.assertNotIn("AGENTS_APP", self.text)
-        self.assertIn("GH_TOKEN: ${{ github.token }}", self.text)
+    def steps(self):
+        return {s.get("name", ""): s for s in self.wf["jobs"]["bump"]["steps"]}
 
-    def test_the_header_says_the_pull_request_needs_a_close_and_reopen(self):
-        self.assertIn("closes and reopens", self.text)
+    def test_github_token_stays_read_only_and_the_agents_app_is_not_used(self):
+        self.assertEqual(self.wf["permissions"], {"contents": "read"})
+        self.assertEqual(self.wf["jobs"]["bump"]["permissions"], {"contents": "read"})
+        self.assertNotIn("AGENTS_APP", self.text)
+        self.assertNotIn("github.token", self.text)
+
+    def test_the_push_uses_the_optional_ci_bump_app_pinned_by_sha(self):
+        secrets = self.wf[True]["workflow_call"]["secrets"]
+        self.assertEqual(set(secrets), {"CI_BUMP_APP_ID", "CI_BUMP_APP_PRIVATE_KEY"})
+        self.assertFalse(any(s["required"] for s in secrets.values()))
+        app = next(s for s in self.wf["jobs"]["bump"]["steps"] if "create-github-app-token" in s.get("uses", ""))
+        self.assertRegex(app["uses"], r"^actions/create-github-app-token@[0-9a-f]{40}$")
+        self.assertEqual(app["if"], "${{ steps.has-app.outputs.app == 'true' }}")
+        self.assertEqual(app["with"]["repositories"], "${{ github.event.repository.name }}")
+        self.assertEqual({k: v for k, v in app["with"].items() if k.startswith("permission-")},
+                         {"permission-contents": "write", "permission-pull-requests": "write", "permission-workflows": "write"})
+        push = self.steps()["Open the pull request"]
+        self.assertEqual(push["if"], "${{ steps.has-app.outputs.app == 'true' }}")
+        self.assertEqual(push["env"]["GH_TOKEN"], "${{ steps.app.outputs.token }}")
+
+    def test_the_token_never_goes_in_a_url_and_git_uses_gh(self):
+        run = self.steps()["Open the pull request"]["run"]
+        self.assertIn("gh auth setup-git", run)
+        self.assertNotIn("x-access-token", self.text)
+        self.assertNotRegex(run, r"https://[^\s]*@github\.com")
+        self.assertIn('git push --force origin "${branch}"', run)
+
+    def test_without_the_app_the_push_is_skipped_with_a_notice(self):
+        import subprocess
+        step = self.steps()["The CI bump App's secrets are set"]
+        self.assertIn("secrets.CI_BUMP_APP_ID != ''", step["env"]["HAS_APP"])
+        self.assertIn("secrets.CI_BUMP_APP_PRIVATE_KEY != ''", step["env"]["HAS_APP"])
+        d = tree()
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "add", "."], cwd=d, check=True)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-qm", "x"], cwd=d, check=True)
+        (d / ".github/workflows/ci.yml").write_text(CI.replace(OLD, NEW))
+        (d / "moves.txt").write_text("ci.yml:5: pg 17 a -> b\n")
+        env = {"PATH": "/usr/bin:/bin", "HAS_APP": "false", "RUNNER_TEMP": str(d), "GITHUB_OUTPUT": str(d / "out"),
+               "GITHUB_STEP_SUMMARY": str(d / "summary")}
+        r = subprocess.run(["bash", "-eo", "pipefail", "-c", step["run"]], cwd=d, env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("::notice::CI_BUMP_APP_ID and CI_BUMP_APP_PRIVATE_KEY are not passed", r.stdout)
+        self.assertIn("ci.yml:5: pg 17 a -> b", (d / "summary").read_text())
+        self.assertEqual((d / "out").read_text(), "app=false\n")
+
+    def test_the_header_has_no_stale_claims(self):
+        header = self.text.split("\nname:")[0]
+        self.assertNotIn("agents' App secrets", header)
+        self.assertNotIn("closes and reopens", header)
+        self.assertIn("CI_BUMP_APP_ID", header)
 
     def test_the_registry_step_carries_no_credentials(self):
         step = next(s for s in self.wf["jobs"]["bump"]["steps"] if "bump_ci_images" in s.get("run", "") or "check.py" in s.get("run", ""))

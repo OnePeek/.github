@@ -4,9 +4,13 @@ Blocks on: a finding of high or critical severity (CVSS 7.0 or more, or the data
 with an available fix (an affected range that names a `fixed` version). Waivers live in the caller's `osv-scanner.toml`
 (osv-scanner itself skips a waived id) as `[[IgnoredVulns]]` with `id`, `ignoreUntil` (a date) and `reason`; a waiver
 with no reason, no valid date, or a date in the past fails, so a waiver always ends. A missing results file fails: a
-scan that wrote none did not run.
+scan that wrote none did not run. So does a scanner exit other than 0 (nothing found) or 1 (findings), passed as
+`--scan-exit` (127, a general error; 128, no lockfile found): its results cannot be trusted.
 
-Usage: check_osv_results.py [--results osv-results.json] [--today YYYY-MM-DD] [ROOT]
+A finding's fix is looked up in the affected entries for its own package only (names compared case-blind, and for PyPI
+with runs of `-`, `_` and `.` as one `-`, PEP 503); another package's fix never counts.
+
+Usage: check_osv_results.py --scan-exit N [--results osv-results.json] [--today YYYY-MM-DD] [ROOT]
 Exit status 1 when anything blocks.
 """
 from __future__ import annotations
@@ -14,6 +18,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -68,10 +73,15 @@ def severity(vuln: dict, group_scores: dict[str, float]) -> str:
     return "other"
 
 
-def has_fix(vuln: dict, package: dict) -> bool:
+def package_name(package: dict) -> str:
     name = str(package.get("name") or "").lower()
-    affected = vuln.get("affected") or []
-    mine = [a for a in affected if str((a.get("package") or {}).get("name") or "").lower() == name] or affected
+    return re.sub(r"[-_.]+", "-", name) if str(package.get("ecosystem") or "").lower() == "pypi" else name
+
+
+def has_fix(vuln: dict, package: dict) -> bool:
+    name = package_name(package)
+    mine = [a for a in vuln.get("affected") or [] if package_name(
+        {"ecosystem": package.get("ecosystem"), **(a.get("package") or {})}) == name]
     return any("fixed" in event for a in mine for r in a.get("ranges") or [] for event in r.get("events") or [])
 
 
@@ -97,11 +107,15 @@ def findings(results: dict) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scan-exit", type=int, required=True, help="osv-scanner's exit code")
     ap.add_argument("--results", type=Path, default=Path("osv-results.json"))
     ap.add_argument("--today", type=datetime.date.fromisoformat, default=datetime.date.today())
     ap.add_argument("root", nargs="?", type=Path, default=Path("."))
     a = ap.parse_args(argv)
     errors = waiver_errors(a.root, a.today)
+    if a.scan_exit not in (0, 1):
+        errors.append(f"osv-scanner exited {a.scan_exit} (0 is nothing found, 1 is findings): the scan failed, so its "
+                      "results cannot be trusted (128: no lockfile found; see the scan step).")
     if not a.results.is_file():
         errors.append(f"{a.results}: osv-scanner wrote no results, so the scan did not run (is there a lockfile? see the scan step).")
         blocked: list[str] = []

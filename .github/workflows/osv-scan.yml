@@ -3,8 +3,11 @@
 # Blocks on a high or critical finding, or any finding with a fix. Waivers go in the caller's osv-scanner.toml as
 # [[IgnoredVulns]] with id, reason and ignoreUntil (a date); an expired or reasonless waiver fails.
 # The decision script below is a verbatim copy of scripts/check_osv_results.py (a test keeps them identical), so the
-# check runs exactly at the commit the caller pinned. The scanner is Google's action, pinned by full commit SHA at
-# v2.7.0 (published 2026-10-12, over 7 days old: code-guidelines section 10); Dependabot moves the pin.
+# check runs exactly at the commit the caller pinned. The scanner is Google's osv-scanner image (the one
+# google/osv-scanner-action v2.7.0 runs, published 2026-10-12, over 7 days old: code-guidelines section 10), run
+# directly and pinned by digest: the action runs that image by tag and hides the scanner's exit code, which the decision
+# needs (0 nothing found, 1 findings, anything else a failed scan, which fails). The weekly ci-image-bump.yml moves the
+# digest of the `image:` line below like any CI image; a new scanner version is a change of the tag in its comment.
 name: osv-scan
 
 on:
@@ -28,17 +31,19 @@ jobs:
           persist-credentials: false
 
       - name: Scan the lockfiles
-        # osv-scanner exits non-zero when it finds anything; the next step decides, from the results file.
-        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
-        continue-on-error: true
-        with:
-          scan-args: |-
-            --output=osv-results.json
-            --format=json
-            --recursive
-            ./
+        id: scan
+        # osv-scanner exits 1 when it finds anything; its exit code goes to the next step, which decides.
+        env:
+          image: ghcr.io/google/osv-scanner-action@sha256:d54770fe0b09493894e76a02aaed9f51a0513fa57c5186452a755d257b0068a6 # v2.7.0
+        run: |
+          set +e
+          docker run --rm -v "${PWD}:/src" -w /src --entrypoint osv-scanner "${image}" \
+            --format=json --output=osv-results.json --recursive ./
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
 
-      - name: Block on high or critical, or any finding with a fix; check the waivers
+      - name: Block on a failed scan, on high or critical, or on any finding with a fix; check the waivers
+        env:
+          SCAN_EXIT: ${{ steps.scan.outputs.exit }}
         run: |
           cat > "$RUNNER_TEMP/check.py" <<'PY'
           """Decide an OSV scan (foundation-playbook §12a slice 4 item 1): read osv-scanner's JSON results and the caller's waivers.
@@ -47,9 +52,13 @@ jobs:
           with an available fix (an affected range that names a `fixed` version). Waivers live in the caller's `osv-scanner.toml`
           (osv-scanner itself skips a waived id) as `[[IgnoredVulns]]` with `id`, `ignoreUntil` (a date) and `reason`; a waiver
           with no reason, no valid date, or a date in the past fails, so a waiver always ends. A missing results file fails: a
-          scan that wrote none did not run.
+          scan that wrote none did not run. So does a scanner exit other than 0 (nothing found) or 1 (findings), passed as
+          `--scan-exit` (127, a general error; 128, no lockfile found): its results cannot be trusted.
 
-          Usage: check_osv_results.py [--results osv-results.json] [--today YYYY-MM-DD] [ROOT]
+          A finding's fix is looked up in the affected entries for its own package only (names compared case-blind, and for PyPI
+          with runs of `-`, `_` and `.` as one `-`, PEP 503); another package's fix never counts.
+
+          Usage: check_osv_results.py --scan-exit N [--results osv-results.json] [--today YYYY-MM-DD] [ROOT]
           Exit status 1 when anything blocks.
           """
           from __future__ import annotations
@@ -57,6 +66,7 @@ jobs:
           import argparse
           import datetime
           import json
+          import re
           import sys
           import tomllib
           from pathlib import Path
@@ -111,10 +121,15 @@ jobs:
               return "other"
 
 
-          def has_fix(vuln: dict, package: dict) -> bool:
+          def package_name(package: dict) -> str:
               name = str(package.get("name") or "").lower()
-              affected = vuln.get("affected") or []
-              mine = [a for a in affected if str((a.get("package") or {}).get("name") or "").lower() == name] or affected
+              return re.sub(r"[-_.]+", "-", name) if str(package.get("ecosystem") or "").lower() == "pypi" else name
+
+
+          def has_fix(vuln: dict, package: dict) -> bool:
+              name = package_name(package)
+              mine = [a for a in vuln.get("affected") or [] if package_name(
+                  {"ecosystem": package.get("ecosystem"), **(a.get("package") or {})}) == name]
               return any("fixed" in event for a in mine for r in a.get("ranges") or [] for event in r.get("events") or [])
 
 
@@ -140,11 +155,15 @@ jobs:
 
           def main(argv: list[str] | None = None) -> int:
               ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+              ap.add_argument("--scan-exit", type=int, required=True, help="osv-scanner's exit code")
               ap.add_argument("--results", type=Path, default=Path("osv-results.json"))
               ap.add_argument("--today", type=datetime.date.fromisoformat, default=datetime.date.today())
               ap.add_argument("root", nargs="?", type=Path, default=Path("."))
               a = ap.parse_args(argv)
               errors = waiver_errors(a.root, a.today)
+              if a.scan_exit not in (0, 1):
+                  errors.append(f"osv-scanner exited {a.scan_exit} (0 is nothing found, 1 is findings): the scan failed, so its "
+                                "results cannot be trusted (128: no lockfile found; see the scan step).")
               if not a.results.is_file():
                   errors.append(f"{a.results}: osv-scanner wrote no results, so the scan did not run (is there a lockfile? see the scan step).")
                   blocked: list[str] = []
@@ -162,4 +181,4 @@ jobs:
           if __name__ == "__main__":
               sys.exit(main())
           PY
-          python3 "$RUNNER_TEMP/check.py" --results osv-results.json .
+          python3 "$RUNNER_TEMP/check.py" --scan-exit "${SCAN_EXIT}" --results osv-results.json .

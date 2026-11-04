@@ -4,7 +4,10 @@ A CI image is written `image: <name>@sha256:<64 hex> # <tag>` (or `container: ..
 .github/workflows; the comment's first word is the tag (`17`, or `postgres:17`: the part after the last colon). For each
 one this asks the registry for the tag's current digest and rewrites the line when it moved. Registry access is read-only
 and anonymous (a pull token, a manifest GET); no credentials are used or needed for the public registries CI containers
-come from (public.ecr.aws). A tag the registry cannot resolve is an error, never a skip.
+come from (public.ecr.aws). A tag the registry cannot resolve is an error, never a skip, and so is a pinned line this
+cannot move (an `image:`/`container:` line naming `@sha256:` that is not in the form above, such as one with no tag
+comment). A `:tag` written in the name (`mongo:7@sha256:...`) is dropped before the registry is asked: the digest names
+the image, the comment names the tag.
 
 Usage: bump_ci_images.py [--check] [ROOT]   (--check lists what would move and exits 1 if anything would; default rewrites)
 Prints one `file:line: <name> <tag> <old> -> <new>` line per move.
@@ -26,6 +29,7 @@ LINE = re.compile(
 ACCEPT = ", ".join([
     "application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json",
     "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"])
+PINNED = re.compile(r"^\s*(?:-\s*)?(?:image|container):.*@sha256:")  # a pinned line: it must match LINE
 Resolver = Callable[[str, str], str]  # (name, tag) -> "sha256:<64 hex>"
 
 
@@ -33,6 +37,12 @@ def tag_of(comment: str) -> str | None:
     word = comment.split()[0] if comment.split() else ""
     tag = word.rsplit(":", 1)[-1]
     return tag or None
+
+
+def repository(name: str) -> str:
+    """The name without a `:tag` in its last path part (a registry host's `:port` stays)."""
+    head, slash, last = name.rpartition("/")
+    return f"{head}{slash}{last.split(':', 1)[0]}"
 
 
 def split_name(name: str) -> tuple[str, str]:
@@ -80,11 +90,14 @@ def bump_file(path: Path, resolve: Resolver, write: bool) -> list[str]:
     for n, raw in enumerate(lines, 1):
         m = LINE.match(raw.rstrip("\r\n"))
         if not m:
+            if PINNED.match(raw):
+                raise RuntimeError(f"{path}:{n}: a digest-pinned image this cannot move: write it "
+                                   "`image: <name>@sha256:<64 hex> # <tag>` on one line")
             continue
         tag = tag_of(m["comment"])
         if tag is None:
             raise RuntimeError(f"{path}:{n}: the comment after the digest must start with the tag")
-        new = resolve(m["name"], tag)
+        new = resolve(repository(m["name"]), tag)
         if new != m["digest"]:
             moved.append(f"{path}:{n}: {m['name']} {tag} {m['digest']} -> {new}")
             lines[n - 1] = raw.replace(m["digest"], new, 1)

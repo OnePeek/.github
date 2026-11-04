@@ -12,9 +12,11 @@
   4. No `pull_request_target`; no `workflow_run` job on `onepeek-*`.
   5. Private repos: a workflow triggered by `push` to `dev` that calls release-ecs.yml with `environment: preprod` sets
      `deploy-from-dev: true`; deploying preprod from dev stays off until the launch switch-over (foundation-playbook §5.4).
-  6. Every repo: a job's `services:` or `container:` `image:` names a digest (`@sha256:<64 hex>`), with the tag in a
-     comment, so a moved tag cannot change a CI container; the weekly ci-image-bump.yml workflow moves the digests
-     (foundation-playbook §12a slice 4 item 4).
+  6. Every repo: a job's `services:` or `container:` `image:` names a digest (`@sha256:<64 hex>`), written on its own
+     line as `image: <name>@sha256:<64 hex> # <tag>` (the form ci-image-bump.yml can move; YAML drops comments, so the
+     raw line is read), so a moved tag cannot change a CI container; the weekly ci-image-bump.yml workflow moves the
+     digests (foundation-playbook §12a slice 4 item 4). An image that is exactly one `${{ inputs.* }}` or
+     `${{ matrix.* }}` expression passes: the caller names, and pins, the image.
 
 Usage: check_runner_labels.py --kind public|private --repo OnePeek/<name> [--list FILE] WORKFLOW_DIR
 Exit status 1 when any rule is broken.
@@ -115,7 +117,8 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
     errors: list[str] = []
     name = path.name
     where = f"{repo}:{name}"
-    doc = yaml.safe_load(path.read_text()) or {}
+    text = path.read_text()
+    doc = yaml.safe_load(text) or {}
     triggers = _triggers(doc)
     callable_ = "workflow_call" in triggers
     if "pull_request_target" in triggers:
@@ -133,11 +136,17 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
             if given is not None and given != "github":
                 errors.append(f"{where}: job {job_id}: rule 1: a public repo passes no runner other than github, got {given!r}.")
         errors += _public(where, name, doc, jobs, callable_)
+    movable = _movable_pins(text)
     for job_id, job in jobs.items():
         for image in _job_images(job):
+            if CALLER_IMAGE.fullmatch(image.strip()):
+                continue
             if not DIGEST.search(image):
                 errors.append(f"{where}: job {job_id}: rule 6: the CI container image {image!r} is not pinned by digest "
                               "(@sha256:<64 hex>, tag in a comment); ci-image-bump.yml moves the digest weekly.")
+            elif image not in movable:
+                errors.append(f"{where}: job {job_id}: rule 6: the CI container image {image!r} needs its tag in a comment "
+                              "on its own line, `image: <name>@sha256:<64 hex> # <tag>`, or ci-image-bump.yml cannot move it.")
     for job_id, job in jobs.items():
         if "runs-on" not in job:
             continue
@@ -173,6 +182,21 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
 
 
 DIGEST = re.compile(r"@sha256:[0-9a-f]{64}(?![0-9a-f])")
+# The line form ci-image-bump.yml moves: scripts/bump_ci_images.py LINE, the same pattern (a test keeps them equal).
+PIN_LINE = re.compile(
+    r"^(?P<head>\s*(?:-\s*)?(?:image|container):\s*)(?P<q>['\"]?)(?P<name>[^\s'\"@#]+)@(?P<digest>sha256:[0-9a-f]{64})(?P=q)"
+    r"(?P<gap>\s+)#\s*(?P<comment>.*?)\s*$")
+CALLER_IMAGE = re.compile(r"\$\{\{\s*(?:inputs|matrix)\.[\w.-]+\s*\}\}")
+
+
+def _movable_pins(text: str) -> set[str]:
+    """Each `<name>@sha256:<digest>` written in the movable line form with a tag as the comment's first word."""
+    out = set()
+    for raw in text.splitlines():
+        m = PIN_LINE.match(raw)
+        if m and m["comment"].split() and m["comment"].split()[0].rsplit(":", 1)[-1]:
+            out.add(f"{m['name']}@{m['digest']}")
+    return out
 
 
 def _job_images(job: dict) -> list[str]:
