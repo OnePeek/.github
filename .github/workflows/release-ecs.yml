@@ -74,8 +74,8 @@ on:
         default: ""
     secrets:
       INFRA_READ_TOKEN:
-        description: Fine-grained token with Contents read on onepeek-infra (provisional; replaces the GitHub App of delivery-pipelines §10 until its package access is proven, aws-stack §16 first preprod run).
-        required: true
+        description: The old fallback for reading onepeek-infra in db-bootstrap, forwarded only while a caller still passes it; the AGENTS_APP_* secrets replace it (playbook §8a S6). Callers drop it, then it is removed.
+        required: false
       NPM_READ_TOKEN:
         description: Classic token with read:packages for the @onepeek packages (web build only; provisional, same reason).
         required: false
@@ -726,7 +726,9 @@ jobs:
       role-to-assume: ${{ inputs.db-bootstrap-role }}
       signing-key: ${{ inputs.signing-key }}
     secrets:
-      INFRA_READ_TOKEN: ${{ secrets.INFRA_READ_TOKEN }}
+      AGENTS_APP_CLIENT_ID: ${{ secrets.AGENTS_APP_CLIENT_ID }}
+      AGENTS_APP_PRIVATE_KEY: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
+      INFRA_READ_TOKEN: ${{ secrets.INFRA_READ_TOKEN }} # fallback only, until no caller passes it (playbook §8a S6)
 
   migrate:
     needs: [lock, version, record-digest, db-bootstrap]
