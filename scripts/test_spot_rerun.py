@@ -56,10 +56,10 @@ class FakeGh:
         return [c for c in self.calls if c[0] == "run"]
 
 
-def go(fake: FakeGh, run_id="42", repo="OnePeek/x") -> tuple[int, str]:
+def go(fake: FakeGh, run_id="42", repo="OnePeek/x", workflow="", rerun_all="") -> tuple[int, str]:
     out = io.StringIO()
     with mock.patch.object(sr, "gh", fake), mock.patch.object(sr, "LOG_WAIT_SECONDS", 0), contextlib.redirect_stdout(out):
-        return sr.run(run_id, repo), out.getvalue()
+        return sr.run(run_id, repo, workflow, rerun_all), out.getvalue()
 
 
 class Decision(unittest.TestCase):
@@ -111,6 +111,21 @@ class Decision(unittest.TestCase):
     def test_second_attempt_stays_failed(self) -> None:
         fake = FakeGh(attempt=2, logs={1: SHUTDOWN})
         go(fake)
+        self.assertEqual(fake.reruns(), [])
+
+    def test_a_listed_workflow_is_rerun_whole(self) -> None:
+        fake = FakeGh(logs={1: SHUTDOWN})
+        go(fake, workflow="sandbox", rerun_all="sandbox other")
+        self.assertEqual(fake.reruns(), [("run", "rerun", "42", "--repo", "OnePeek/x")])
+
+    def test_an_unlisted_workflow_reruns_only_the_failed_jobs(self) -> None:
+        fake = FakeGh(logs={1: SHUTDOWN})
+        go(fake, workflow="checks", rerun_all="sandbox")
+        self.assertEqual(fake.reruns(), [("run", "rerun", "42", "--failed", "--repo", "OnePeek/x")])
+
+    def test_a_listed_workflow_without_a_reclaim_is_not_rerun(self) -> None:
+        fake = FakeGh(logs={1: "plain failure"})
+        go(fake, workflow="sandbox", rerun_all="sandbox")
         self.assertEqual(fake.reruns(), [])
 
     def test_ordinary_failure_is_not_rerun(self) -> None:

@@ -27,6 +27,7 @@
 #         contents: read
 #       with:
 #         runner: ${{ vars.RUNNER || 'github' }}
+#         rerun_all_workflows: sandbox   # optional: workflows re-run whole, not only the failed jobs
 name: spot-rerun
 
 on:
@@ -36,6 +37,10 @@ on:
         description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
         type: string
         default: github
+      rerun_all_workflows:
+        description: "Space-separated names of the caller's workflows that are re-run whole (every job) instead of only the failed jobs, for a workflow whose jobs share a lock or state per attempt (onepeek-infra's sandbox, sandbox.md section 7c item 10)."
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -72,10 +77,12 @@ jobs:
           path: _shared
           persist-credentials: false
 
-      - name: Re-run the failed jobs once when a spot reclaim caused the failure
+      - name: Re-run once (the failed jobs, or the whole run when listed) when a spot reclaim caused the failure
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW: ${{ github.event.workflow_run.name }}
+          RERUN_ALL: ${{ inputs.rerun_all_workflows }}
           REPO: ${{ github.repository }}
           SHA: ${{ steps.version.outputs.sha }}
         run: |
