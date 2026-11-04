@@ -31,9 +31,6 @@ on:
       AGENTS_APP_PRIVATE_KEY:
         description: The agents' GitHub App private key (with AGENTS_APP_CLIENT_ID).
         required: false
-      ORG_READ_TOKEN:
-        description: "Deprecated fallback, accepted for one version until the callers' pin move (playbook §8a S6): fine-grained token with Contents read and Pull requests read on the three repos. Used only when the App secrets are not passed."
-        required: false
 
 permissions:
   contents: read
@@ -43,22 +40,18 @@ jobs:
     runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
-      - name: A token to read the other repos is passed (the App, or the ORG_READ_TOKEN fallback)
+      - name: The agents' App secrets are passed
         id: tokens
         env:
           HAS_APP: ${{ secrets.AGENTS_APP_CLIENT_ID != '' && secrets.AGENTS_APP_PRIVATE_KEY != '' }}
-          HAS_ORG_READ_TOKEN: ${{ secrets.ORG_READ_TOKEN != '' }}
         run: |
-          if [ "${HAS_APP}" != "true" ] && [ "${HAS_ORG_READ_TOKEN}" != "true" ]; then
+          if [ "${HAS_APP}" != "true" ]; then
             echo "::error::Pass AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY (playbook §8a S6): the contract job reads the other repos."
             exit 1
           fi
-          echo "app=${HAS_APP}" >> "$GITHUB_OUTPUT"
-          [ "${HAS_APP}" = "true" ] || echo "::warning::ORG_READ_TOKEN is deprecated: pass the agents' App secrets instead (playbook §8a S6)."
 
       - name: The agents' GitHub App token (Contents and Pull requests read on the three repos)
         id: app
-        if: ${{ steps.tokens.outputs.app == 'true' }}
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
@@ -75,7 +68,7 @@ jobs:
           BASE_REF: ${{ inputs.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
           OWNER: ${{ github.repository_owner }}
-          GH_TOKEN: ${{ steps.app.outputs.token || secrets.ORG_READ_TOKEN }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           case "${ROLE}" in backend|web|infra) ;; *) echo "::error::role must be backend, web or infra, not '${ROLE}'."; exit 1 ;; esac
           case "${BASE_REF}" in dev|release) ;; *) echo "::error::base_ref must be dev or release, not '${BASE_REF}'."; exit 1 ;; esac
@@ -118,7 +111,7 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/onepeek-infra
           ref: ${{ steps.ref.outputs.infra }}
-          token: ${{ steps.app.outputs.token || secrets.ORG_READ_TOKEN }}
+          token: ${{ steps.app.outputs.token }}
           path: _infra
           persist-credentials: false
 
@@ -128,7 +121,7 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/backend-service
           ref: ${{ steps.ref.outputs.backend }}
-          token: ${{ steps.app.outputs.token || secrets.ORG_READ_TOKEN }}
+          token: ${{ steps.app.outputs.token }}
           path: _backend
           persist-credentials: false
 
@@ -138,7 +131,7 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/onepeek-web
           ref: ${{ steps.ref.outputs.web }}
-          token: ${{ steps.app.outputs.token || secrets.ORG_READ_TOKEN }}
+          token: ${{ steps.app.outputs.token }}
           path: _web
           persist-credentials: false
 
