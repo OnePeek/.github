@@ -1,8 +1,9 @@
 # Shared, weekly: move the digest-pinned CI container images (`image: <name>@sha256:<digest> # <tag>` in the caller's
 # workflows) to the tag's current digest and open one pull request (foundation-playbook §12a slice 4 item 4). A caller
 # runs it on a weekly `schedule` and passes the agents' App secrets. Registry access is read-only and anonymous: the
-# script holds no registry credential, and the step that runs it gets no token. The App token (contents and pull
-# requests write, this repository only) is used only to push the branch and open the pull request, so CI runs on it.
+# script holds no registry credential, and the step that runs it gets no token. The agents' App stays read-only, so the
+# job's GITHUB_TOKEN (contents and pull-requests write, on that job only) pushes the branch and opens the pull request.
+# A pull request opened with GITHUB_TOKEN starts no checks: the coordinator closes and reopens it to start them.
 # The script is a verbatim copy of scripts/bump_ci_images.py (a test keeps them identical).
 name: ci-image-bump
 
@@ -17,11 +18,6 @@ on:
         description: "The branch the pull request targets (the repo's integration branch)."
         type: string
         default: dev
-    secrets:
-      AGENTS_APP_CLIENT_ID:
-        required: true
-      AGENTS_APP_PRIVATE_KEY:
-        required: true
 
 permissions:
   contents: read
@@ -30,18 +26,10 @@ jobs:
   bump:
     runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
-      - name: The agents' GitHub App token (this repository only)
-        id: app
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
-          private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-          permission-contents: write
-          permission-pull-requests: write
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.base }}
@@ -177,7 +165,7 @@ jobs:
 
       - name: Open the pull request
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           BASE: ${{ inputs.base }}
           REPO: ${{ github.repository }}
         run: |

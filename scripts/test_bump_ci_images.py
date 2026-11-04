@@ -148,10 +148,15 @@ class SharedWorkflow(unittest.TestCase):
         indented = "\n".join(("          " + line) if line else "" for line in src.splitlines())
         self.assertIn(indented, self.text)
 
-    def test_the_default_token_is_read_only_and_the_pull_request_uses_the_app_token(self):
+    def test_write_access_is_on_the_job_only_and_uses_github_token_not_the_app(self):
         self.assertEqual(self.wf["permissions"], {"contents": "read"})
-        self.assertEqual(self.wf["jobs"]["bump"].get("permissions", {"contents": "read"}), {"contents": "read"})
-        self.assertIn("create-github-app-token@", self.text)
+        self.assertEqual(self.wf["jobs"]["bump"]["permissions"], {"contents": "write", "pull-requests": "write"})
+        self.assertNotIn("create-github-app-token", self.text)
+        self.assertNotIn("AGENTS_APP", self.text)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", self.text)
+
+    def test_the_header_says_the_pull_request_needs_a_close_and_reopen(self):
+        self.assertIn("closes and reopens", self.text)
 
     def test_the_registry_step_carries_no_credentials(self):
         step = next(s for s in self.wf["jobs"]["bump"]["steps"] if "bump_ci_images" in s.get("run", "") or "check.py" in s.get("run", ""))
