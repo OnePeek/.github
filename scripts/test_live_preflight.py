@@ -473,6 +473,15 @@ class MemoryTests(unittest.TestCase):
     def test_limit_from_the_task_definition(self):
         self.assertEqual(lp.memory_limit(self.repo, "egress-proxy", {})[0], 512)
 
+    def test_container_memory_wins_over_the_task_memory(self):
+        defs = json.dumps([{"name": "gateway", "image": "x/gateway:1", "memory": 128}])
+        plans = [plan([{"name": "t", "type": "aws_ecs_task_definition",
+                        "values": {"memory": "512", "container_definitions": defs}}])]
+        self.assertEqual(lp.plan_memory_limit(plans, "gateway")[0], 128)
+        defs = json.dumps([{"name": "gateway", "image": "x/gateway:1"}])
+        plans[0]["planned_values"]["root_module"]["child_modules"][0]["resources"][0]["values"]["container_definitions"] = defs
+        self.assertEqual(lp.plan_memory_limit(plans, "gateway")[0], 512)
+
     def test_override_wins_and_unknown_image_has_no_limit(self):
         self.assertEqual(lp.memory_limit(self.repo, "gateway", {"gateway": 128}), (128, "--memory"))
         mb, why = lp.memory_limit(self.repo, "proxy", {})
@@ -623,6 +632,12 @@ class EdgeTests(unittest.TestCase):
     def test_non_403_passes(self):
         self.assertEqual(self.edge([lp.SMOKE_ENV], lambda url: 503)[0][0], "PASS")
 
+    def test_a_missing_domain_or_config_is_a_fail_not_a_skip(self):
+        (self.repo / "config/sandbox.yaml").write_text("region: ap-south-1\n")
+        self.assertEqual(self.edge([lp.SMOKE_ENV], lambda url: 200)[0][0], "FAIL")
+        (self.repo / "config/sandbox.yaml").unlink()
+        self.assertEqual(self.edge([lp.SMOKE_ENV], lambda url: 200)[0][0], "FAIL")
+
     def test_unchanged_smoke_env_is_a_skip(self):
         self.assertEqual(self.edge(["scripts/other.py"], lambda url: 403)[0][0], "SKIP")
 
@@ -755,6 +770,29 @@ class PreflightLiveTests(unittest.TestCase):
     def test_live_ok_with_a_skipped_check_warns_and_lists_it(self):
         lines = self.run_live(0, "NOTE  iam: scp\nSKIP  iam: no plan\nPASS  memory: x\nSKIP  edge: unreachable\nLIVE PREFLIGHT OK\n")
         self.assertEqual(lines, [("WARN", "live: LIVE PREFLIGHT OK, but 2 check(s) skipped: iam: no plan; edge: unreachable")])
+
+    def test_exit_0_with_another_last_line_fails(self):
+        lines = self.run_live(0, "PASS  x\nsomething else\n")
+        self.assertEqual(lines[0][0], "FAIL")
+        self.assertIn("something else", lines[0][1])
+        self.assertEqual(self.run_live(0, "")[0][0], "FAIL")
+        self.assertEqual(self.run_live(1, "PASS  x\nLIVE PREFLIGHT OK\n")[0][0], "FAIL")
+
+    def test_main_with_live_calls_run_live_with_the_forwarded_arguments(self):
+        import shutil
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / ".github/workflows").mkdir(parents=True)
+        with mock.patch.object(pf, "run_local_ci", return_value=(True, "LOCAL CI OK (1s)")), \
+                mock.patch.object(pf, "dependency_check", return_value=True), \
+                mock.patch.object(pf, "pin_checks"), mock.patch.object(pf, "tool_checks"), \
+                mock.patch.object(pf, "run_live") as live, mock.patch("builtins.print"):
+            self.assertEqual(pf.main([str(d), "--live", "--profile", "p"]), 0)
+            live.assert_called_once()
+            self.assertEqual(live.call_args[0][0][:3], [str(d.resolve()), "--profile", "p"])
+            live.reset_mock()
+            pf.main([str(d)])
+            live.assert_not_called()
 
     def test_live_failed_fails(self):
         lines = self.run_live(1, "FAIL  x\nLIVE PREFLIGHT FAILED (1 failed)\n")
