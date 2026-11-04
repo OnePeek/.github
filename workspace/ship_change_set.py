@@ -283,19 +283,23 @@ def move_docs_pin(repo: str, branch: str, green: str, merge_sha: str) -> tuple[s
 
 
 def tested_bases(repo: str, n: int) -> set[str]:
-    """The base-branch commits the pull request's current check runs tested (each run's pull_requests[].base.sha for
-    this pull request); empty when a run does not say, which callers treat as unknown."""
+    """The base-branch commits the pull request's current GitHub Actions runs tested (each run's
+    pull_requests[].base.sha for this pull request; equivalent to the merge commit's first parent, since the base only
+    moves forward and the merge commit is built at trigger time). Checks without an Actions run link (CodeRabbit and
+    other apps) are ignored, as checks() ignores them; empty when no run says, which callers treat as unknown."""
     out: set[str] = set()
+    runs = 0
     for c in read_checks(repo, n, False):
         m = re.search(r"/runs/(\d+)", c.get("link") or "")
         if not m:
-            return set()
+            continue
+        runs += 1
         prs = json.loads(gh("api", f"repos/{ORG}/{repo}/actions/runs/{m.group(1)}", "--jq", ".pull_requests") or "[]")
         shas = {p["base"]["sha"] for p in prs if p.get("number") == n}
         if not shas:
             return set()
         out |= shas
-    return out
+    return out if runs else set()
 
 
 def base_head(repo: str, branch: str) -> str:

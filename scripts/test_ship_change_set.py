@@ -632,6 +632,16 @@ class MoveDocsPin(unittest.TestCase):
         with mock.patch.object(ship, "read_checks", return_value=chk), mock.patch.object(ship, "gh", return_value="[]"):
             self.assertEqual(ship.tested_bases("backend-service", 2), set())
 
+    def test_tested_bases_ignores_checks_without_an_actions_run_and_needs_one_run(self) -> None:
+        # CodeRabbit and other apps link outside Actions; they must not make the base "unknown" (review of #35).
+        run = {"name": "x", "bucket": "pass", "link": "https://github.com/OnePeek/r/actions/runs/9/job/1"}
+        bot = {"name": "CodeRabbit", "bucket": "pass", "link": "https://coderabbit.ai?utm_source=x"}
+        with mock.patch.object(ship, "read_checks", return_value=[bot, run]), \
+                mock.patch.object(ship, "gh", return_value='[{"number": 2, "base": {"sha": "%s"}}]' % ("b" * 40)):
+            self.assertEqual(ship.tested_bases("backend-service", 2), {"b" * 40})
+        with mock.patch.object(ship, "read_checks", return_value=[bot]), mock.patch.object(ship, "gh", return_value="[]"):
+            self.assertEqual(ship.tested_bases("backend-service", 2), set())  # no Actions run at all: unknown
+
     def test_only_pin_changed_is_false_for_any_other_change(self) -> None:
         wt = self.src
         (wt / "docs-version.txt").write_text(f"# docs\nonepeek-docs@{DOCS_MERGE}\n")
