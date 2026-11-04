@@ -17,14 +17,20 @@ import spot_rerun as sr
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/spot-rerun.yml").read_text(encoding="utf-8"))
 SHUTDOWN = "2026-11-04T10:00:00Z The runner has received a shutdown signal. This can happen when the runner is reclaimed.\n"
-LOST = "The self-hosted runner lost communication with the server. Verify the machine is running.\n"
+LOST = ("The self-hosted runner: onepeek-arm64-abc123 lost communication with the server. Verify the machine is "
+        "running and has a healthy network connection. Anything in your workflow that terminates the runner process, "
+        "starves it for CPU/Memory, or blocks its network access can cause this error.\n")
+SHUTDOWN_REAL = ("The runner has received a shutdown signal. This can happen when the runner service is stopped, or a "
+                 "manually started runner is canceled.\n")
+CANCELED = "The operation was canceled."
 
 
 class FakeGh:
-    def __init__(self, attempt=1, conclusion="failure", jobs=None, logs=None):
+    def __init__(self, attempt=1, conclusion="failure", jobs=None, logs=None, notes=None):
         self.attempt, self.conclusion = attempt, conclusion
         self.jobs = jobs if jobs is not None else [(1, "tests", "failure"), (2, "lint", "success")]
         self.logs = logs or {}
+        self.notes = notes or {}
         self.calls: list[tuple] = []
 
     def __call__(self, *args: str) -> str:
@@ -32,6 +38,11 @@ class FakeGh:
         path = next((a for a in args[1:] if not a.startswith("--")), "") if args[0] == "api" else ""
         if args[0] == "run":
             return ""
+        if path.startswith("repos/") and "/check-runs/" in path:
+            job = int(path.split("/check-runs/")[1].split("/")[0])
+            if job not in self.notes:
+                raise sr.GhError("403")
+            return "".join(m + "\n" for m in self.notes[job])
         if path.endswith("/logs"):
             job = int(path.split("/")[-2])
             if job not in self.logs:
@@ -63,6 +74,39 @@ class Decision(unittest.TestCase):
         fake = FakeGh(logs={1: LOST})
         go(fake)
         self.assertEqual(len(fake.reruns()), 1)
+
+    def test_real_log_wording_in_the_log_only(self) -> None:
+        fake = FakeGh(logs={1: SHUTDOWN_REAL}, notes={1: [CANCELED]})
+        go(fake)
+        self.assertEqual(len(fake.reruns()), 1)
+
+    def test_marker_only_in_annotation_with_no_log(self) -> None:
+        fake = FakeGh(logs={}, notes={1: [LOST]})
+        _, out = go(fake)
+        self.assertEqual(len(fake.reruns()), 1)
+        self.assertIn("tests", out)
+
+    def test_both_sources_unreadable_is_no_reclaim(self) -> None:
+        fake = FakeGh(logs={}, notes={})
+        go(fake)
+        self.assertEqual(fake.reruns(), [])
+
+    def test_one_job_readable_and_one_with_no_log(self) -> None:
+        fake = FakeGh(jobs=[(1, "a", "failure"), (2, "b", "failure")], logs={1: "plain failure"}, notes={2: [LOST]})
+        _, out = go(fake)
+        self.assertEqual(len(fake.reruns()), 1)
+        self.assertIn("reclaim in b.", out)
+
+    def test_operation_was_canceled_alone_is_not_rerun(self) -> None:
+        fake = FakeGh(logs={1: "plain failure"}, notes={1: [CANCELED]})
+        go(fake)
+        self.assertEqual(fake.reruns(), [])
+
+    def test_job_printing_the_marker_forces_at_most_one_extra_rerun(self) -> None:
+        # A job that prints a marker itself triggers a re-run on attempt 1 only; attempt 2 stays failed (bounded).
+        fake = FakeGh(attempt=2, logs={1: SHUTDOWN_REAL})
+        go(fake)
+        self.assertEqual(fake.reruns(), [])
 
     def test_second_attempt_stays_failed(self) -> None:
         fake = FakeGh(attempt=2, logs={1: SHUTDOWN})
@@ -134,8 +178,8 @@ class Workflow(unittest.TestCase):
         self.assertIn("onepeek-arm64-small", self.job["runs-on"])
         self.assertLessEqual(self.job["timeout-minutes"], 30)
 
-    def test_permissions_are_actions_only(self) -> None:
-        self.assertEqual(self.job["permissions"], {"actions": "write", "contents": "read"})
+    def test_permissions_are_actions_and_checks_only(self) -> None:
+        self.assertEqual(self.job["permissions"], {"actions": "write", "checks": "read", "contents": "read"})
 
     def test_run_id_and_repo_come_only_from_the_event_and_the_repository(self) -> None:
         step = next(s for s in self.job["steps"] if "spot_rerun" in s.get("run", ""))
@@ -153,7 +197,7 @@ class Workflow(unittest.TestCase):
         self.assertEqual(on["workflow_run"]["types"], ["completed"])
         job = caller["jobs"]["spot-rerun"]
         self.assertIn("conclusion == 'failure'", job["if"])
-        self.assertEqual(job["permissions"], {"actions": "write", "contents": "read"})
+        self.assertEqual(job["permissions"], {"actions": "write", "checks": "read", "contents": "read"})
 
 
 if __name__ == "__main__":

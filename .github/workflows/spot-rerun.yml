@@ -23,6 +23,7 @@
 #       uses: OnePeek/.github/.github/workflows/spot-rerun.yml@<commit SHA> # v<tag>
 #       permissions:
 #         actions: write   # read the run's jobs and logs, and re-run the failed jobs
+#         checks: read     # the job's annotations (where a lost runner is reported)
 #         contents: read
 #       with:
 #         runner: ${{ vars.RUNNER || 'github' }}
@@ -45,6 +46,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       actions: write  # read the run's jobs and logs; re-run the failed jobs
+      checks: read    # the job's annotations (where a lost runner is reported)
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

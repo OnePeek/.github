@@ -18,6 +18,7 @@ jobs:
     uses: ./.github/workflows/spot-rerun.yml
     permissions:
       actions: write  # read the run's jobs and logs, and re-run the failed jobs
+      checks: read    # the job's annotations (where a lost runner is reported)
       contents: read
     with:
       runner: github

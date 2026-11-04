@@ -2,15 +2,16 @@
 """Automatic re-run after a spot reclaim (onepeek-docs architecture/lld/infra/ci-runners.md section 4, row R1).
 
 A caller runs spot-rerun.yml on `workflow_run: completed` with conclusion `failure`. This script reads the failed jobs
-of that run and the log of each. When a failed job's log holds the runner's shutdown line ("The runner has received a
-shutdown signal") or GitHub's "lost communication with the server", and the run is on its first attempt, it re-runs
+of that run, the log of each and the check-run annotations of each. When either holds the runner's shutdown line ("The
+runner has received a shutdown signal", in the log) or GitHub's "lost communication with the server" (usually an
+annotation with no log), and the run is on its first attempt, it re-runs
 the failed jobs once (`gh run rerun <id> --failed`) and writes the reason (the job names) to the step summary.
 Otherwise it does nothing: a second reclaim, or an ordinary failure, stays failed and visible.
 
     RUN_ID=<github.event.workflow_run.id> REPO=<github.repository> python3 spot_rerun.py
 
-RUN_ID and REPO are checked strictly (digits only; owner/name). The token is GH_TOKEN (actions: read, and actions:
-write to re-run). Standard library only; the `gh` CLI does the API calls.
+RUN_ID and REPO are checked strictly (digits only; owner/name). The token is GH_TOKEN (actions: read, checks: read, and
+actions: write to re-run). Standard library only; the `gh` CLI does the API calls.
 """
 from __future__ import annotations
 
@@ -51,22 +52,32 @@ def failed_jobs(repo: str, run_id: str) -> list[dict]:
     return [j for j in jobs if j.get("conclusion") == "failure"]
 
 
-def reclaimed(log: str) -> bool:
-    return any(m in log for m in MARKERS)
+def reclaimed(text: str) -> bool:
+    return any(m in text for m in MARKERS)
+
+
+def annotations_text(repo: str, job_id: str) -> str:
+    """The messages of the job's check-run annotations. "The operation was canceled." is not a marker (too generic)."""
+    out = gh("api", "--paginate", f"repos/{repo}/check-runs/{job_id}/annotations?per_page=100", "--jq", ".[].message")
+    return out
 
 
 def reclaimed_jobs(repo: str, jobs: list[dict]) -> list[str]:
-    """Names of the failed jobs whose log shows a reclaim. A log that cannot be read counts as no reclaim."""
+    """Names of the failed jobs whose log or annotations show a reclaim. A source that cannot be read counts as no
+    match for that source only. A job that prints a marker itself can force at most one extra re-run (attempt 1 only)."""
     names: list[str] = []
     for job in jobs:
         job_id = str(job.get("id", ""))
         if not RUN_ID.fullmatch(job_id):
             continue
-        try:
-            log = gh("api", f"repos/{repo}/actions/jobs/{job_id}/logs")
-        except GhError:
-            continue
-        if reclaimed(log):
+        found = False
+        for read in (lambda: gh("api", f"repos/{repo}/actions/jobs/{job_id}/logs"),
+                     lambda: annotations_text(repo, job_id)):
+            try:
+                found = found or reclaimed(read())
+            except GhError:
+                pass
+        if found:
             names.append(str(job.get("name", job_id)))
     return names
 
