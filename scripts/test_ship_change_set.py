@@ -774,23 +774,205 @@ class RefreshDocsPin(unittest.TestCase):
                 ship.no_conflicts([("backend-service", 2)], lambda r, n: None)
         self.assertIn("not mergeable", str(stop.exception))
 
+    INFO = {"state": "OPEN", "headRefName": "feat/x", "baseRefName": "dev", "headRefOid": "4" * 40,
+            "isCrossRepository": False, "headRepositoryOwner": {"login": "OnePeek"}}
+
+    def refresh(self, info=None, state="CONFLICTING", found=(7,), result="f" * 40):
+        with mock.patch.object(ship, "pr_info", return_value={**self.INFO, **(info or {})}), \
+                mock.patch.object(ship, "mergeable", return_value=state), \
+                mock.patch.object(ship, "branch_pin", return_value=DOCS_HEAD), \
+                mock.patch.object(ship.subprocess, "run", side_effect=lambda cmd, **kw: done(0, "tok\n")), \
+                mock.patch.object(ship.depends_on, "open_docs_prs", return_value=list(found)), \
+                mock.patch.object(ship, "refresh_docs_pin", return_value=result) as rf:
+            try:
+                rc = ship.main(["--refresh", "backend-service#2"])
+            except SystemExit as e:
+                return e, rf
+            return rc, rf
+
     def test_refresh_flag_finds_the_docs_pull_request_from_the_pin_and_refreshes(self) -> None:
-        info = {"headRefName": "feat/x", "baseRefName": "dev", "headRefOid": "4" * 40}
-        with mock.patch.object(ship, "pr_info", return_value=info), \
-                mock.patch.object(ship.subprocess, "run", side_effect=lambda cmd, **kw: done(0, f"onepeek-docs@{DOCS_HEAD}\n")), \
-                mock.patch.object(ship.depends_on, "open_docs_prs", return_value=[7]), \
-                mock.patch.object(ship, "refresh_docs_pin", return_value="f" * 40) as rf:
-            self.assertEqual(ship.main(["--refresh", "backend-service#2"]), 0)
+        rc, rf = self.refresh()
+        self.assertEqual(rc, 0)
         rf.assert_called_once_with("backend-service", "feat/x", "dev", "onepeek-docs#7", "4" * 40)
 
     def test_refresh_flag_stops_when_another_file_conflicts(self) -> None:
-        info = {"headRefName": "feat/x", "baseRefName": "dev", "headRefOid": "4" * 40}
-        with mock.patch.object(ship, "pr_info", return_value=info), \
-                mock.patch.object(ship.subprocess, "run", side_effect=lambda cmd, **kw: done(0, f"onepeek-docs@{DOCS_HEAD}\n")), \
-                mock.patch.object(ship.depends_on, "open_docs_prs", return_value=[7]), \
-                mock.patch.object(ship, "refresh_docs_pin", return_value=None):
-            with self.assertRaises(SystemExit):
-                ship.main(["--refresh", "backend-service#2"])
+        rc, _ = self.refresh(result=None)
+        self.assertIsInstance(rc, SystemExit)
+
+    def test_refresh_flag_stops_when_no_open_docs_pull_request_holds_the_pin(self) -> None:
+        rc, rf = self.refresh(found=())
+        self.assertIn("no open onepeek-docs pull request", str(rc))
+        rf.assert_not_called()
+
+    def test_refresh_flag_stops_when_several_open_docs_pull_requests_hold_the_pin(self) -> None:
+        rc, rf = self.refresh(found=(7, 9))
+        self.assertIn("2 open onepeek-docs pull requests", str(rc))
+        rf.assert_not_called()
+
+    def test_refresh_flag_needs_an_open_conflicting_pull_request_of_this_repository(self) -> None:
+        for kwargs in ({"info": {"state": "MERGED"}}, {"state": "MERGEABLE"}, {"info": {"isCrossRepository": True}},
+                       {"info": {"headRepositoryOwner": {"login": "someone"}}},
+                       {"info": {"headRefName": "dev"}}, {"info": {"headRefName": "main", "baseRefName": "main"}}):
+            rc, rf = self.refresh(**kwargs)
+            self.assertIsInstance(rc, SystemExit, kwargs)
+            rf.assert_not_called()
+
+    def test_a_branch_that_is_a_base_branch_is_never_pushed_to(self) -> None:  # a fork's `dev` would be the base `dev`
+        before = self.origin("rev-parse", "dev").strip()
+        self.advance_dev({"docs-version.txt": f"# docs\nonepeek-docs@{DOCS_MERGE}\n"})
+        before = self.origin("rev-parse", "dev").strip()
+        for fn, args in ((ship.refresh_docs_pin, ("backend-service", "dev", "dev", "onepeek-docs#7", "4" * 40)),
+                         (ship.bump_pins, ("backend-service", "dev", "v1.0.0", "a" * 40)),
+                         (ship.move_docs_pin, ("backend-service", "dev", before, DOCS_MERGE))):
+            with self.assertRaises(SystemExit) as stop:
+                fn(*args)
+            self.assertIn("a base branch", str(stop.exception))
+        self.assertEqual(self.origin("rev-parse", "dev").strip(), before)
+
+    def test_a_clean_merge_leaves_docs_version_as_merged(self) -> None:
+        self.advance_dev({"new.txt": "x"})
+        new = ship.refresh_docs_pin("backend-service", "feat/x", "dev", "onepeek-docs#7", "4" * 40)
+        self.assertTrue(new)
+        self.assertEqual(self.origin("show", "feat/x:docs-version.txt"), f"# docs\nonepeek-docs@{DOCS_HEAD}\n")
+
+    def test_a_clean_merge_of_docs_version_keeps_the_base_other_lines_and_is_not_overwritten(self) -> None:
+        sh("git", "-C", str(self.src), "switch", "-q", "feat/x")
+        (self.src / "docs-version.txt").write_text(f"# docs\n# a\n# b\n# c\nonepeek-docs@{DOCS_HEAD}\n")
+        commit_all(self.src, "mine")
+        sh("git", "-C", str(self.src), "push", "-q", "origin", "feat/x")
+        sh("git", "-C", str(self.src), "switch", "-q", "dev")
+        self.advance_dev({"docs-version.txt": f"# theirs\n# docs\nonepeek-docs@{DOCS_OLDER}\n"})
+        ship.refresh_docs_pin("backend-service", "feat/x", "dev", "onepeek-docs#7", "4" * 40)
+        text = self.origin("show", "feat/x:docs-version.txt")
+        self.assertIn(f"onepeek-docs@{DOCS_HEAD}", text)  # not overwritten by the docs head
+        self.assertIn("# theirs", text)
+
+
+class ReadErrors(unittest.TestCase):
+    def pins(self, rc: int, stderr: str) -> list[str]:
+        with mock.patch.object(ship.subprocess, "run", return_value=done(rc, "", stderr)):
+            return ship.docs_pin_problems("backend-service", 2, "feat/x")
+
+    def test_only_a_404_means_no_pin(self) -> None:
+        self.assertEqual(self.pins(1, "gh: Not Found (HTTP 404)"), [])
+        for bad in ("gh: Bad gateway (HTTP 502)", "gh: Forbidden (HTTP 403)"):
+            out = self.pins(1, bad)
+            self.assertEqual(len(out), 1, bad)
+            self.assertIn("cannot read docs-version.txt", out[0])
+
+
+class ConflictFlow(DocsPin):
+    """main() with conflicting pull requests: when the refresh may run, and what it must not touch."""
+
+    def flow(self, pins: dict, conflicting=(), go: bool = True, drafts=(), cross=(), only_files=None,
+             after_refresh: str = "MERGEABLE", loop_conflict=(), with_docs: bool = True):
+        prs, pr_info, gh, run = self.harness(pins)
+        if not with_docs:
+            prs = prs[1:]
+        self.refreshed, self.waited = [], []
+        state = {c: "CONFLICTING" for c in loop_conflict}
+
+        def info(r, n):
+            i = pr_info(r, n)
+            if (r, n) in conflicting:
+                i["mergeable"] = "CONFLICTING"
+            i["isDraft"] = (r, n) in drafts
+            if (r, n) in cross:
+                i["isCrossRepository"] = True
+            return i
+
+        def refresh(repo, branch, base, label, head, push=True):
+            self.refreshed.append((repo, label, push))
+            state[(repo, 2)] = after_refresh
+            return "f" * 40 if push else ""
+
+        def merge_state(r, n):
+            return state.get((r, n), "MERGEABLE")
+        out = []
+        with mock.patch.object(ship, "pr_info", side_effect=info), mock.patch.object(ship, "gh", side_effect=gh), \
+                mock.patch.object(ship.subprocess, "run", side_effect=run), mock.patch.object(ship, "remove_worktrees"), \
+                mock.patch.object(ship, "wait_green"), mock.patch.object(ship, "tested_bases", return_value={"b" * 40}), \
+                mock.patch.object(ship, "base_head", return_value="b" * 40), mock.patch.object(ship, "rerun_failed"), \
+                mock.patch.object(ship, "wait_head", side_effect=lambda r, n, s: self.waited.append((r, n))), \
+                mock.patch.object(ship, "move_docs_pin", return_value=("f" * 40, True)), \
+                mock.patch.object(ship, "mergeable", side_effect=merge_state), \
+                mock.patch.object(ship, "pr_files", return_value=only_files or ["standards/x.md"]), \
+                mock.patch.object(ship, "refresh_docs_pin", side_effect=refresh), \
+                mock.patch.object(ship, "say", side_effect=out.append):
+            rc = ship.main([f"{r}#{n}" for r, n in prs] + (["--go"] if go else []))
+        return rc, out
+
+    PIN_OK = {("backend-service", 2): DOCS_OLDER}
+    CONF = {("backend-service", 2)}
+
+    def test_a_dry_run_only_says_it_would_refresh(self) -> None:  # kills push=a.go -> True
+        rc, out = self.flow(self.PIN_OK, self.CONF, go=False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.refreshed, [("backend-service", "onepeek-docs#1", False)])
+        self.assertTrue(any(o.startswith("would refresh backend-service#2") for o in out), out)
+
+    def test_go_refreshes_waits_for_the_head_and_reads_the_state_again(self) -> None:
+        rc, _ = self.flow(self.PIN_OK, self.CONF)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.refreshed, [("backend-service", "onepeek-docs#1", True)])
+        self.assertIn(("backend-service", 2), self.waited)
+
+    def test_still_conflicting_after_the_refresh_stops(self) -> None:  # kills replacing the re-check by MERGEABLE
+        rc, out = self.flow(self.PIN_OK, self.CONF, after_refresh="CONFLICTING")
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.events, [])  # nothing merged
+        self.assertTrue(any("after the refresh" in o for o in out), out)
+
+    def test_no_refresh_while_any_other_problem_is_open(self) -> None:  # B1
+        rc, _ = self.flow(self.PIN_OK, self.CONF, drafts={("backend-service", 2)})
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.refreshed, [])
+
+    def test_a_pin_that_is_not_a_commit_of_the_docs_pull_request_is_reported_not_repinned(self) -> None:  # B1
+        rc, out = self.flow({("backend-service", 2): "9" * 40}, self.CONF)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.refreshed, [])
+        self.assertTrue(any("not a commit of onepeek-docs#1" in o for o in out), out)
+
+    def test_a_fork_pull_request_is_never_refreshed(self) -> None:  # B2
+        rc, _ = self.flow(self.PIN_OK, self.CONF, cross=self.CONF)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.refreshed, [])
+
+    def test_a_pin_round_is_not_refreshed(self) -> None:  # S5
+        rc, _ = self.flow(self.PIN_OK, self.CONF, only_files=[".github/workflows/checks.yml"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.refreshed, [])
+
+    def test_the_docs_pull_request_itself_is_never_refreshed(self) -> None:  # kills dropping the guard
+        rc, out = self.flow(self.PIN_OK, {("onepeek-docs", 1)})
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.refreshed, [])
+        self.assertTrue(any("resolve conflicts before any check is waited on" in o for o in out), out)
+
+    def test_a_conflict_that_appears_in_the_merge_loop_is_refreshed(self) -> None:  # kills dropping resolve_pin there
+        rc, _ = self.flow(self.PIN_OK, loop_conflict={("backend-service", 2)})
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.refreshed, [("backend-service", "onepeek-docs#1", True)])
+        self.assertIn(("backend-service", 2), self.waited)
+
+    def test_the_merge_loop_never_refreshes_the_docs_pull_request(self) -> None:  # S2
+        with self.assertRaises(SystemExit):
+            self.flow(self.PIN_OK, loop_conflict={("onepeek-docs", 1)})
+        self.assertEqual(self.refreshed, [])
+
+    def test_with_no_docs_pull_request_the_strict_check_runs_unpatched(self) -> None:  # kills `if not docs` -> False
+        prs, pr_info, gh, run = self.harness({("backend-service", 2): DOCS_OLDER})
+
+        def sub(cmd, **kw):
+            return done(0, "tok\n") if cmd[1] == "auth" else done(0, f"onepeek-docs@{DOCS_OLDER}\n")
+        with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship.subprocess, "run", side_effect=sub), \
+                mock.patch.object(ship.check_pins, "compare_status", return_value="diverged"), \
+                mock.patch.object(ship.depends_on, "open_docs_prs", return_value=[145]):
+            self.assertEqual(ship.main(["backend-service#2"]), 1)  # a pin in an open docs pull request outside the set
+        with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship.subprocess, "run", side_effect=sub), \
+                mock.patch.object(ship.check_pins, "compare_status", return_value="ahead"):
+            self.assertEqual(ship.main(["backend-service#2"]), 0)  # on docs main: fine
 
 
 if __name__ == "__main__":

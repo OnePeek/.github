@@ -296,6 +296,27 @@ class DocsWait(Repo):
     def test_a_pin_in_no_pull_request_fails_either_way(self) -> None:
         self.assertEqual(self.check(False, "diverged", []), ["FAIL"])
 
+    def test_an_api_error_is_unverified_not_an_abort(self) -> None:  # S6
+        d = self.repo({".github/workflows/w.yml": "jobs: {}\n", "docs-version.txt": f"onepeek-docs@{self.PIN}\n"})
+        rep = pf.Report()
+
+        def boom(s):
+            raise SystemExit("cannot compare: HTTP 401")
+        pf.docs_wait_check(d, rep, False, status=boom, prs=lambda s: [])
+        self.assertEqual(statuses(rep), ["UNVERIFIED"])
+
+    def test_main_is_strict_only_with_release(self) -> None:  # kills strict=a.release -> False
+        d = self.repo({".github/workflows/w.yml": "jobs: {}\n"})
+        for flags, strict in (([], False), (["--release"], True)):
+            with mock.patch.object(pf, "dependency_check", return_value=True), \
+                    mock.patch.object(pf, "run_local_ci", return_value=(True, "LOCAL CI OK")), \
+                    mock.patch.object(pf, "pin_checks"), mock.patch.object(pf, "tool_checks"), \
+                    mock.patch.object(pf, "docs_check"), mock.patch.object(pf, "token_checks"), \
+                    mock.patch.object(pf, "release_repos", return_value=[]), \
+                    mock.patch.object(pf, "docs_wait_check") as dw:
+                pf.main([str(d), *flags])
+            self.assertEqual(dw.call_args.kwargs["strict"], strict, flags)
+
     def test_a_pin_on_main_prints_nothing(self) -> None:
         self.assertEqual(self.check(True, "ahead", []), [])
 

@@ -75,6 +75,25 @@ TAG_TIMEOUT_S = 10 * 60
 POLL_S = 20
 
 
+PROTECTED = {"main", "dev", "release"}
+
+
+def own_branch_problem(repo: str, n: int, i: dict) -> str | None:
+    """Why this tool must not push to the pull request's head branch: it is from a fork, or is the base branch itself."""
+    owner = (i.get("headRepositoryOwner") or {}).get("login")
+    if i.get("isCrossRepository") or (owner and owner.lower() != ORG.lower()):
+        return f"{repo}#{n} is from a fork ({owner or 'another repository'}); this tool never pushes to a fork's branch"
+    if i["headRefName"] == i["baseRefName"] or i["headRefName"] in PROTECTED:
+        return f"{repo}#{n}'s head branch {i['headRefName']} is a base branch; this tool never pushes to one"
+    return None
+
+
+def refuse_protected(repo: str, branch: str, base: str | None = None) -> None:
+    """Defence in depth under every function that pushes to a pull request's branch."""
+    if branch in PROTECTED or branch == base:
+        raise SystemExit(f"STOP {repo}: refusing to push to {branch}, a base branch")
+
+
 def run(cmd: list[str]) -> str:
     """Run a command; on failure stop with its own error text, not a bare traceback."""
     r = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -122,7 +141,7 @@ def parse(item: str) -> tuple[str, int]:
 
 def pr_info(repo: str, n: int) -> dict:
     return json.loads(gh("pr", "view", str(n), "-R", f"{ORG}/{repo}", "--json",
-                         "state,baseRefName,headRefName,headRefOid,mergeCommit,isDraft,mergeable,body"))
+                         "state,baseRefName,headRefName,headRefOid,mergeCommit,isDraft,mergeable,body,isCrossRepository,headRepositoryOwner"))
 
 
 def read_checks(repo: str, n: int, required: bool) -> list[dict]:
@@ -180,6 +199,7 @@ def refresh_docs_pin(repo: str, branch: str, base: str, docs_label: str, docs_he
     request's head `docs_head`, committing "Merge <base>; docs-version to <docs_label> head" and pushing it as a
     fast-forward. Returns the pushed commit; "" when nothing needed pushing (or `push` is false and the conflict is
     only the pin); None when another file conflicts (nothing is changed, the caller stops as for any conflict)."""
+    refuse_protected(repo, branch, base)
     src = ROOT / repo
     git(src, "fetch", "-q", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
         f"+refs/heads/{base}:refs/remotes/origin/{base}")
@@ -197,21 +217,21 @@ def refresh_docs_pin(repo: str, branch: str, base: str, docs_label: str, docs_he
                 return None
             if not push:
                 return ""
-            ours = subprocess.run(["git", "-C", str(wt), "show", "HEAD:docs-version.txt"], capture_output=True, text=True,
-                                  check=False).stdout
-            at = pin_at(ours)
-            if at is None:
-                say(f"{repo}: docs-version.txt at {branch} holds no onepeek-docs@<sha> line; not refreshing")
-                return None
-            lines = ours.splitlines(keepends=True)
-            lines[at[0]] = lines[at[0]].replace(f"onepeek-docs@{at[1]}", f"onepeek-docs@{docs_head}", 1)
-            (wt / "docs-version.txt").write_text("".join(lines), encoding="utf-8")
-            git(wt, "add", "--", "docs-version.txt")
-            merging = (pathlib.Path(git(wt, "rev-parse", "--git-path", "MERGE_HEAD").strip()))
+            if unmerged:  # docs-version.txt truly conflicts: take the branch's side, with the pin moved to the docs head
+                ours = subprocess.run(["git", "-C", str(wt), "show", "HEAD:docs-version.txt"], capture_output=True,
+                                      text=True, check=False).stdout
+                at = pin_at(ours)
+                if at is None:
+                    say(f"{repo}: docs-version.txt at {branch} holds no onepeek-docs@<sha> line; not refreshing")
+                    return None
+                lines = ours.splitlines(keepends=True)
+                lines[at[0]] = lines[at[0]].replace(f"onepeek-docs@{at[1]}", f"onepeek-docs@{docs_head}", 1)
+                (wt / "docs-version.txt").write_text("".join(lines), encoding="utf-8")
+                git(wt, "add", "--", "docs-version.txt")
+            merging = pathlib.Path(git(wt, "rev-parse", "--git-path", "MERGE_HEAD").strip())
             merging = merging if merging.is_absolute() else wt / merging
-            if not merging.exists() and subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--quiet"],
-                                                       check=False).returncode == 0:
-                say(f"{repo}: {branch} is up to date with {base} and already pins {docs_head[:7]}")
+            if not merging.exists():
+                say(f"{repo}: {branch} is up to date with {base}; nothing to refresh")
                 return ""
             git(wt, "commit", "-q", "-m", f"Merge {base}; docs-version to {docs_label} head")
             new = git(wt, "rev-parse", "HEAD").strip()
@@ -270,6 +290,7 @@ def wait_tag(sha: str) -> tuple[str, str]:
 
 def bump_pins(repo: str, branch: str, tag: str, sha: str) -> str | None:
     """Move every OnePeek/.github workflow pin on the branch to the tag, in one ordinary commit (hooks run)."""
+    refuse_protected(repo, branch)
     src = ROOT / repo
     git(src, "fetch", "-q", "origin", branch)
     with tempfile.TemporaryDirectory(prefix=f"ship-{repo}-") as tmp:
@@ -329,6 +350,7 @@ def move_docs_pin(repo: str, branch: str, green: str, merge_sha: str) -> tuple[s
     """Move the branch's docs-version.txt pin to the docs merge commit, in one commit on top of the green head
     `green`, pushed as an ordinary fast-forward (it fails if the branch moved). Returns (the pushed commit or None when
     the pin is already there, whether only the pin line changed since `green`)."""
+    refuse_protected(repo, branch)
     src = ROOT / repo
     git(src, "fetch", "-q", "origin", branch)
     with tempfile.TemporaryDirectory(prefix=f"docs-pin-{repo}-") as tmp:
@@ -566,12 +588,26 @@ def remove_worktrees(repo: str, branch: str) -> None:
         say(f"{repo}: {'removed' if r.returncode == 0 else 'could not remove'} worktree {wt}")
 
 
-def docs_pin_problems(repo: str, n: int, branch: str) -> list[str]:
-    """Strict form of the implicit docs wait for a pull request whose docs pull request is not in the set: its pin must
-    be on docs main (check_depends_on.docs_waiting with strict, so a pin in an open docs pull request fails too)."""
+def branch_pin(repo: str, branch: str) -> str | None:
+    """The docs commit docs-version.txt names on the branch; None when the file or the line is not there (a 404).
+    Any other read error stops the run: it is not "no pin"."""
     r = subprocess.run(["gh", "api", f"repos/{ORG}/{repo}/contents/docs-version.txt?ref={branch}",
                         "-H", "Accept: application/vnd.github.raw"], capture_output=True, text=True, check=False)
-    pin = pin_line(r.stdout) if r.returncode == 0 else None
+    if r.returncode == 0:
+        return pin_line(r.stdout)
+    if "404" in r.stderr:
+        return None
+    raise SystemExit(f"STOP {repo}: cannot read docs-version.txt on {branch}: {(r.stderr or r.stdout).strip()[:200]}")
+
+
+def docs_pin_problems(repo: str, n: int, branch: str) -> list[str]:
+    """Strict form of the implicit docs wait for a pull request whose docs pull request is not in the set: its pin must
+    be on docs main (check_depends_on.docs_waiting with strict, so a pin in an open docs pull request fails too). Only
+    a missing file or line (404) means no pin; any other read error is a problem."""
+    try:
+        pin = branch_pin(repo, branch)
+    except SystemExit as e:
+        return [str(e)]
     if not pin:
         return []
     token = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, check=False).stdout.strip()
@@ -585,9 +621,20 @@ def docs_head(n: int) -> str:
 
 
 def resolve_pin(repo: str, n: int, push: bool = True) -> str | None:
-    """refresh_docs_pin for a code pull request of the set, against the set's docs pull request (the only open one
-    named in `DOCS_PR`, set by main)."""
+    """refresh_docs_pin for a code pull request of the set, against the set's docs pull request (`DOCS_PR`, set by
+    main; empty for a set with none or a pin round). None (not refreshed) for the docs and .github pull requests, a
+    fork or base-branch head, a branch pin that is not a commit of that docs pull request, or another conflicting file."""
+    if repo in (DOCS, ".github") or not DOCS_PR:
+        return None
     i = pr_info(repo, n)
+    why = own_branch_problem(repo, n, i)
+    if why:
+        say(why)
+        return None
+    pin = branch_pin(repo, i["headRefName"])
+    if pin not in pr_commits(DOCS, DOCS_PR[0]):
+        say(f"{repo}#{n}: docs pin {(pin or 'none')[:7]} is not a commit of {DOCS}#{DOCS_PR[0]}; not re-pinning it")
+        return None
     return refresh_docs_pin(repo, i["headRefName"], i["baseRefName"], f"{DOCS}#{DOCS_PR[0]}", docs_head(DOCS_PR[0]), push)
 
 
@@ -600,20 +647,29 @@ DOCS_PR: list[int] = []
 
 
 def refresh_one(repo: str, n: int) -> int:
-    """`--refresh`: only the docs-pin refresh, for one pull request; its docs pull request is the open one holding
-    its pin."""
+    """`--refresh`: only the docs-pin refresh, for one open, conflicting pull request of this repository; its docs pull
+    request is the one open docs pull request holding its pin."""
     if not (ROOT / repo / ".git").exists():
         raise SystemExit(f"run from the workspace root (the folder holding the repos); {ROOT} is not it")
     i = pr_info(repo, n)
-    raw = subprocess.run(["gh", "api", f"repos/{ORG}/{repo}/contents/docs-version.txt?ref={i['headRefName']}",
-                          "-H", "Accept: application/vnd.github.raw"], capture_output=True, text=True, check=False)
-    pin = pin_line(raw.stdout) if raw.returncode == 0 else None
+    if i["state"] != "OPEN":
+        raise SystemExit(f"STOP {repo}#{n} is {i['state']}")
+    why = own_branch_problem(repo, n, i)
+    if why:
+        raise SystemExit(f"STOP {why}")
+    state = mergeable(repo, n)
+    if state != "CONFLICTING":
+        raise SystemExit(f"STOP {repo}#{n} is {state}, not CONFLICTING; nothing to refresh")
+    pin = branch_pin(repo, i["headRefName"])
     if not pin:
         raise SystemExit(f"STOP {repo}#{n}: no readable docs pin on {i['headRefName']}")
     token = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, check=False).stdout.strip()
     found = depends_on.open_docs_prs(pin, token)
     if not found:
         raise SystemExit(f"STOP {repo}#{n}: pin {pin[:7]} is in no open {DOCS} pull request; nothing to refresh to")
+    if len(found) > 1:
+        raise SystemExit(f"STOP {repo}#{n}: pin {pin[:7]} is in {len(found)} open {DOCS} pull requests {found}; "
+                         "cannot tell which is its change set")
     sha = refresh_docs_pin(repo, i["headRefName"], i["baseRefName"], f"{DOCS}#{found[0]}", docs_head(found[0]))
     if sha is None:
         raise SystemExit(f"STOP {repo}#{n}: conflicts in more than docs-version.txt; resolve them by hand")
@@ -647,6 +703,7 @@ def main(argv: list[str]) -> int:
         for d in ds:
             if d not in info and pr_info(*d)["state"] != "MERGED":
                 problems.append(f"{p[0]}#{p[1]} depends on {d[0]}#{d[1]}, which is neither in the set nor merged")
+    conflicting: list[tuple[str, int]] = []
     for (repo, n), i in info.items():
         want = BASE.get(repo, "dev")
         if i["state"] != "OPEN":
@@ -655,12 +712,13 @@ def main(argv: list[str]) -> int:
             problems.append(f"{repo}#{n} targets {i['baseRefName']}, not {want}")
         if i["isDraft"]:
             problems.append(f"{repo}#{n} is a draft")
+        why = own_branch_problem(repo, n, i)
+        if why:
+            problems.append(why)
         state = mergeable(repo, n) if i["mergeable"] == "UNKNOWN" else i["mergeable"]
-        if state == "CONFLICTING" and docs and repo not in (DOCS, ".github"):
-            sha = resolve_pin(repo, n, push=a.go)  # only docs-version.txt conflicting: refresh it (not in a dry run)
-            if sha is not None:
-                state = conflict_after(repo, n, sha) if sha else "MERGEABLE"
-        if state != "MERGEABLE":
+        if state == "CONFLICTING" and docs and repo not in (DOCS, ".github") and not why:
+            conflicting.append((repo, n))  # maybe only docs-version.txt: refreshed below, once nothing else is wrong
+        elif state != "MERGEABLE":
             problems.append(f"{repo}#{n} is {state}: resolve conflicts before any check is waited on")
     if len(docs) > 1:
         problems.append("a change set has one docs pull request")
@@ -669,6 +727,9 @@ def main(argv: list[str]) -> int:
     workflow_only = bool(files) and all(f.startswith(".github/") for f in files)
     if workflow_only:  # a pin round's docs pull request changes no docs content: no code pin needs to be its commit (L31)
         say(f"{docs[0][0]}#{docs[0][1]} changes only .github/ (a pin round): code pins are not checked against it")
+        DOCS_PR[:] = []  # and no pin is moved to its head
+        problems += [f"{r}#{n} is CONFLICTING: resolve conflicts before any check is waited on" for r, n in conflicting]
+        conflicting = []
     if docs and not workflow_only:  # every code pin must be a commit of the set's docs pull request (§2a step 2, L27 b)
         commits = pr_commits(*docs[0])
         for repo, n in prs:
@@ -698,13 +759,26 @@ def main(argv: list[str]) -> int:
         say(f"problem: {p}")
     if problems:
         return 1
+    for repo, n in conflicting:  # only now, with every other check passed: a conflict in docs-version.txt alone
+        sha = resolve_pin(repo, n, push=a.go)
+        if sha is None:
+            say(f"problem: {repo}#{n} is CONFLICTING and cannot be refreshed: resolve conflicts, push, run again")
+            return 1
+        if not a.go:
+            say(f"would refresh {repo}#{n}: merge {info[(repo, n)]['baseRefName']} into its branch, "
+                f"docs pin -> {DOCS}#{docs[0][1]} head (add --go)")
+            continue
+        state = conflict_after(repo, n, sha) if sha else mergeable(repo, n)
+        if state != "MERGEABLE":
+            say(f"problem: {repo}#{n} is {state} after the refresh: resolve conflicts, push, run again")
+            return 1
     if not a.go:
         say("dry run: add --go to merge")
         return 0
 
     merged_any, tag, moved, docs_merge = False, None, set(), None
     for k, (repo, n) in enumerate(prs):
-        no_conflicts(prs[k:], resolve_pin if docs else None)
+        no_conflicts(prs[k:], resolve_pin)
         if tag and repo not in (DOCS, ".github"):
             pushed = bump_pins(repo, info[(repo, n)]["headRefName"], *tag)
             moved.add(repo)  # its pins are at the tag inside the set (moved now, or already there)

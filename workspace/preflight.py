@@ -386,7 +386,11 @@ def docs_wait_check(repo: pathlib.Path, rep: Report, strict: bool, status=None, 
     token = os.environ.get("GH_TOKEN") or sh(["gh", "auth", "token"])[1]
     status = status or (lambda s: check_pins.compare_status(s, token))
     prs = prs or (lambda s: depends_on.open_docs_prs(s, token))
-    problems, notes = depends_on.docs_waiting(pin, status, prs, strict)
+    try:
+        problems, notes = depends_on.docs_waiting(pin, status, prs, strict)
+    except (SystemExit, OSError) as e:  # an API error (sign-in, 5xx, network): report it, never abort preflight
+        rep.add("UNVERIFIED", f"docs wait: cannot read onepeek-docs ({e})")
+        return
     for p in problems:
         rep.add("FAIL", f"docs wait: {p}")
     for n in notes:
