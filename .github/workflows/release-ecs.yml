@@ -74,7 +74,7 @@ on:
         default: ""
     secrets:
       NPM_READ_TOKEN:
-        description: Classic token with read:packages for the @onepeek packages (web build only; provisional, same reason).
+        description: Retired and ignored (foundation-playbook §12a slice 3). The build reads @onepeek packages with the run's GITHUB_TOKEN (packages read). Kept optional only so a caller that still passes it does not fail; delete it once onepeek-web stops passing it.
         required: false
       AGENTS_APP_CLIENT_ID:
         description: The agents' GitHub App (playbook §5.3, §5.4). Required. Its token, with Actions read, lets a waiting run see that another repo's lock holder has finished; without it such a lock could never be taken over.
@@ -457,6 +457,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      packages: read # @onepeek/* from GitHub Packages for the web build
     strategy:
       fail-fast: true
       matrix:
@@ -484,7 +485,7 @@ jobs:
           MAIN: ${{ inputs.image }}
           VERSION: ${{ needs.version.outputs.version }}
           COMMIT: ${{ needs.version.outputs.commit }}
-          NPM_TOKEN: ${{ secrets.NPM_READ_TOKEN }}
+          NPM_TOKEN: ${{ github.token }} # packages: read on this job; each package grants this repo Actions read access
         run: |
           if [ "${IMAGE}" != "${MAIN}" ]; then
             echo "::error::No Dockerfile location is defined for the extra image '${IMAGE}' (delivery-pipelines §16: the sandbox image waits for document parsing)."

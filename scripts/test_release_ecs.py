@@ -305,6 +305,20 @@ class DbBootstrap(unittest.TestCase):
         self.assertIn("!inputs.dry-run", self.job["if"])
 
 
+class PackageRead(unittest.TestCase):
+    def test_the_build_reads_packages_with_the_run_token_and_only_it_has_packages_read(self):
+        build = RELEASE["jobs"]["build"]
+        self.assertEqual(build["permissions"], {"contents": "read", "id-token": "write", "packages": "read"})
+        push = next(s for s in build["steps"] if s.get("name", "").startswith("Build for ARM64"))
+        self.assertEqual(push["env"]["NPM_TOKEN"].split(" #")[0], "${{ github.token }}")
+        reads = {n for n, j in RELEASE["jobs"].items() if (j.get("permissions") or {}).get("packages") == "read"}
+        self.assertEqual(reads, {"build"})
+
+    def test_npm_read_token_is_ignored_and_optional(self):
+        self.assertFalse(RELEASE[True]["workflow_call"]["secrets"]["NPM_READ_TOKEN"]["required"])
+        self.assertNotIn("secrets.NPM_READ_TOKEN", TEXT)
+
+
 class Migrate(unittest.TestCase):
     script = step("migrate", "Verify, render, register and run")
 
