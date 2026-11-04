@@ -277,5 +277,28 @@ class DependsOn(Repo):
         lci.assert_not_called()
 
 
+class DocsWait(Repo):
+    """Lesson L27 (a): the docs-pin wait is a note locally, a failure with --release; a pin in no pull request fails."""
+    PIN = "a" * 40
+
+    def check(self, strict: bool, status: str, prs: list[int]) -> list[str]:
+        d = self.repo({".github/workflows/w.yml": "jobs: {}\n", "docs-version.txt": f"onepeek-docs@{self.PIN}\n"})
+        rep = pf.Report()
+        pf.docs_wait_check(d, rep, strict, status=lambda s: status, prs=lambda s: prs)
+        return statuses(rep)
+
+    def test_waiting_for_the_open_docs_pull_request_is_a_note(self) -> None:
+        self.assertEqual(self.check(False, "diverged", [145]), ["NOTE"])
+
+    def test_with_release_it_fails(self) -> None:
+        self.assertEqual(self.check(True, "diverged", [145]), ["FAIL"])
+
+    def test_a_pin_in_no_pull_request_fails_either_way(self) -> None:
+        self.assertEqual(self.check(False, "diverged", []), ["FAIL"])
+
+    def test_a_pin_on_main_prints_nothing(self) -> None:
+        self.assertEqual(self.check(True, "ahead", []), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -21,7 +21,10 @@
      count), or `release` itself when it is on `dev` (a fast-forward), is not an ancestor of `dev`; no merge commit
      and `release` not on `dev` also fails ("no release merge found").
 
-Each line is PASS, FAIL, WARN or UNVERIFIED; the last line is `PREFLIGHT OK` or `PREFLIGHT FAILED`. Exit 1 on any FAIL.
+The docs pin's wait (docs-version.txt names a commit of an open docs pull request, the normal state of a change set)
+prints as a NOTE; with `--release` it fails, and a pin in no open docs pull request always fails.
+
+Each line is PASS, FAIL, WARN, NOTE or UNVERIFIED; the last line is `PREFLIGHT OK` or `PREFLIGHT FAILED`. Exit 1 on any FAIL.
 Needs `gh` signed in for the pin tags and `--release`.
 """
 from __future__ import annotations
@@ -373,6 +376,23 @@ def release_state(repo: str, rep: Report, api=gh_json) -> None:
                         "the check would compare against code dev no longer builds on; rebuild release from dev")
 
 
+def docs_wait_check(repo: pathlib.Path, rep: Report, strict: bool, status=None, prs=None) -> None:
+    """The implicit docs dependency (lesson L27 a), as depends-on.yml reports it: a pin in an open docs pull request is a
+    NOTE locally (the normal state of a change set), a FAIL with `strict` (--release); a pin in no open docs pull
+    request always fails. `status` and `prs` are the API reads, replaceable in tests."""
+    _, pin = check_pins.docs_pin(repo)
+    if not pin:
+        return
+    token = os.environ.get("GH_TOKEN") or sh(["gh", "auth", "token"])[1]
+    status = status or (lambda s: check_pins.compare_status(s, token))
+    prs = prs or (lambda s: depends_on.open_docs_prs(s, token))
+    problems, notes = depends_on.docs_waiting(pin, status, prs, strict)
+    for p in problems:
+        rep.add("FAIL", f"docs wait: {p}")
+    for n in notes:
+        rep.add("NOTE", f"docs wait: {n}")
+
+
 def docs_check(repo: pathlib.Path, rep: Report) -> None:
     token = os.environ.get("GH_TOKEN") or sh(["gh", "auth", "token"])[1]
     has, _ = check_pins.docs_pin(repo)
@@ -410,6 +430,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     rep.add("PASS", "local CI: LOCAL CI OK")
     pin_checks(repo, rep)
+    docs_wait_check(repo, rep, strict=a.release)
     tool_checks(repo, rep)
     if a.release:
         name = repo_name(repo)

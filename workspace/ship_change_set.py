@@ -1,8 +1,18 @@
 """Merge one change set in the fixed order, waiting only on required checks (onepeek-docs development-cycle §2a).
 
     python3 .github/workspace/ship_change_set.py onepeek-docs#116 .github#22 onepeek-infra#76 backend-service#59
+    python3 .github/workspace/ship_change_set.py --refresh backend-service#59   # only refresh a conflicting docs pin
     python3 .github/workspace/ship_change_set.py ... --go     # merge; without --go it only prints the plan and checks
     python3 .github/workspace/ship_change_set.py ... --order backend-service,onepeek-infra   # expand first (§8a P1)
+
+A code pull request that conflicts with its base only in `docs-version.txt` (every change set edits that one line, so
+each merge conflicts the others) is refreshed automatically: the base is merged into its branch in a temporary worktree,
+the pin is set to the change set's docs pull request head, and the merge is pushed ("Merge <base>; docs-version to
+<docs>#<n> head"); any other conflicting file still stops the run. `--refresh <repo>#<n>` does only that, for one pull
+request (its docs pull request is the open one containing its pin).
+
+The docs pin is also a wait, not a failure, in the pull request's own `depends-on` check, but here it is strict: a code
+pull request whose pin is neither a commit of the set's docs pull request nor on docs main stops the run.
 
 Conflicts are checked first: a pull request that conflicts with its base stops the run before any wait, and
 every pull request still to merge is checked again after each merge.
@@ -143,13 +153,73 @@ def mergeable(repo: str, n: int) -> str:
     return "UNKNOWN"
 
 
-def no_conflicts(prs: list[tuple[str, int]]) -> None:
+def conflict_state(repo: str, n: int, resolve=None) -> str:
+    """The pull request's mergeable state; a CONFLICTING one that `resolve(repo, n)` fixes (it returns the pushed
+    commit, or None when it cannot) is waited on and read again."""
+    state = mergeable(repo, n)
+    if state == "CONFLICTING" and resolve:
+        sha = resolve(repo, n)
+        if sha:
+            wait_head(repo, n, sha)
+            state = mergeable(repo, n)
+    return state
+
+
+def no_conflicts(prs: list[tuple[str, int]], resolve=None) -> None:
     """Stop before any wait if a pull request still to merge conflicts with its base (often after an earlier merge),
-    or if GitHub cannot say yet: an unknown state is not taken as clean."""
-    states = {f"{r}#{n}": mergeable(r, n) for r, n in prs}
+    or if GitHub cannot say yet: an unknown state is not taken as clean. `resolve` (see conflict_state) refreshes a
+    code pull request whose only conflict is docs-version.txt."""
+    states = {f"{r}#{n}": conflict_state(r, n, resolve) for r, n in prs}
     bad = [p for p, st in states.items() if st != "MERGEABLE"]
     if bad:
         raise SystemExit(f"STOP: not mergeable {[(p, states[p]) for p in bad]}; resolve conflicts, push, run again")
+
+
+def refresh_docs_pin(repo: str, branch: str, base: str, docs_label: str, docs_head: str, push: bool = True) -> str | None:
+    """Merge `base` into the pull request's branch in a temporary worktree and set docs-version.txt to the docs pull
+    request's head `docs_head`, committing "Merge <base>; docs-version to <docs_label> head" and pushing it as a
+    fast-forward. Returns the pushed commit; "" when nothing needed pushing (or `push` is false and the conflict is
+    only the pin); None when another file conflicts (nothing is changed, the caller stops as for any conflict)."""
+    src = ROOT / repo
+    git(src, "fetch", "-q", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+        f"+refs/heads/{base}:refs/remotes/origin/{base}")
+    with tempfile.TemporaryDirectory(prefix=f"refresh-{repo}-") as tmp:
+        wt = pathlib.Path(tmp) / "wt"
+        git(src, "worktree", "add", "-q", "--detach", str(wt), f"origin/{branch}")
+        try:
+            r = subprocess.run(["git", "-C", str(wt), "merge", "--no-commit", "--no-ff", f"origin/{base}"],
+                               capture_output=True, text=True, check=False)
+            unmerged = git(wt, "diff", "--name-only", "--diff-filter=U").split()
+            if r.returncode != 0 and not unmerged:
+                raise SystemExit(f"STOP {repo}: merging {base} into {branch} failed: {(r.stderr or r.stdout).strip()[:300]}")
+            if unmerged and unmerged != ["docs-version.txt"]:
+                say(f"{repo}: {branch} also conflicts with {base} in {[u for u in unmerged if u != 'docs-version.txt']}; not refreshing")
+                return None
+            if not push:
+                return ""
+            ours = subprocess.run(["git", "-C", str(wt), "show", "HEAD:docs-version.txt"], capture_output=True, text=True,
+                                  check=False).stdout
+            at = pin_at(ours)
+            if at is None:
+                say(f"{repo}: docs-version.txt at {branch} holds no onepeek-docs@<sha> line; not refreshing")
+                return None
+            lines = ours.splitlines(keepends=True)
+            lines[at[0]] = lines[at[0]].replace(f"onepeek-docs@{at[1]}", f"onepeek-docs@{docs_head}", 1)
+            (wt / "docs-version.txt").write_text("".join(lines), encoding="utf-8")
+            git(wt, "add", "--", "docs-version.txt")
+            merging = (pathlib.Path(git(wt, "rev-parse", "--git-path", "MERGE_HEAD").strip()))
+            merging = merging if merging.is_absolute() else wt / merging
+            if not merging.exists() and subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--quiet"],
+                                                       check=False).returncode == 0:
+                say(f"{repo}: {branch} is up to date with {base} and already pins {docs_head[:7]}")
+                return ""
+            git(wt, "commit", "-q", "-m", f"Merge {base}; docs-version to {docs_label} head")
+            new = git(wt, "rev-parse", "HEAD").strip()
+            git(wt, "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+            say(f"{repo}: merged {base} into {branch}; docs pin -> {docs_head[:7]} ({docs_label} head)")
+            return new
+        finally:
+            git(src, "worktree", "remove", "--force", str(wt))
 
 
 def wait_green(repo: str, n: int, may_rerun: bool) -> None:
@@ -496,12 +566,72 @@ def remove_worktrees(repo: str, branch: str) -> None:
         say(f"{repo}: {'removed' if r.returncode == 0 else 'could not remove'} worktree {wt}")
 
 
+def docs_pin_problems(repo: str, n: int, branch: str) -> list[str]:
+    """Strict form of the implicit docs wait for a pull request whose docs pull request is not in the set: its pin must
+    be on docs main (check_depends_on.docs_waiting with strict, so a pin in an open docs pull request fails too)."""
+    r = subprocess.run(["gh", "api", f"repos/{ORG}/{repo}/contents/docs-version.txt?ref={branch}",
+                        "-H", "Accept: application/vnd.github.raw"], capture_output=True, text=True, check=False)
+    pin = pin_line(r.stdout) if r.returncode == 0 else None
+    if not pin:
+        return []
+    token = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, check=False).stdout.strip()
+    problems, _ = depends_on.docs_waiting(pin, lambda s: check_pins.compare_status(s, token),
+                                          lambda s: depends_on.open_docs_prs(s, token), strict=True)
+    return [f"{repo}#{n}: {p}; add its docs pull request to the set" for p in problems]
+
+
+def docs_head(n: int) -> str:
+    return pr_info(DOCS, n)["headRefOid"]
+
+
+def resolve_pin(repo: str, n: int, push: bool = True) -> str | None:
+    """refresh_docs_pin for a code pull request of the set, against the set's docs pull request (the only open one
+    named in `DOCS_PR`, set by main)."""
+    i = pr_info(repo, n)
+    return refresh_docs_pin(repo, i["headRefName"], i["baseRefName"], f"{DOCS}#{DOCS_PR[0]}", docs_head(DOCS_PR[0]), push)
+
+
+def conflict_after(repo: str, n: int, sha: str) -> str:
+    wait_head(repo, n, sha)
+    return mergeable(repo, n)
+
+
+DOCS_PR: list[int] = []
+
+
+def refresh_one(repo: str, n: int) -> int:
+    """`--refresh`: only the docs-pin refresh, for one pull request; its docs pull request is the open one holding
+    its pin."""
+    if not (ROOT / repo / ".git").exists():
+        raise SystemExit(f"run from the workspace root (the folder holding the repos); {ROOT} is not it")
+    i = pr_info(repo, n)
+    raw = subprocess.run(["gh", "api", f"repos/{ORG}/{repo}/contents/docs-version.txt?ref={i['headRefName']}",
+                          "-H", "Accept: application/vnd.github.raw"], capture_output=True, text=True, check=False)
+    pin = pin_line(raw.stdout) if raw.returncode == 0 else None
+    if not pin:
+        raise SystemExit(f"STOP {repo}#{n}: no readable docs pin on {i['headRefName']}")
+    token = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, check=False).stdout.strip()
+    found = depends_on.open_docs_prs(pin, token)
+    if not found:
+        raise SystemExit(f"STOP {repo}#{n}: pin {pin[:7]} is in no open {DOCS} pull request; nothing to refresh to")
+    sha = refresh_docs_pin(repo, i["headRefName"], i["baseRefName"], f"{DOCS}#{found[0]}", docs_head(found[0]))
+    if sha is None:
+        raise SystemExit(f"STOP {repo}#{n}: conflicts in more than docs-version.txt; resolve them by hand")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("prs", nargs="+", help="<repo>#<number>, any order")
+    ap.add_argument("prs", nargs="*", help="<repo>#<number>, any order")
+    ap.add_argument("--refresh", metavar="REPO#N", help="only merge the base into that pull request's branch and set "
+                    "docs-version.txt to its docs pull request head (for a conflict in docs-version.txt alone)")
     ap.add_argument("--go", action="store_true", help="merge (default: print the plan and the up-front checks)")
     ap.add_argument("--order", default="", help="repoA,repoB,...: merge in this order instead of the fixed one (§8a P1)")
     a = ap.parse_args(argv)
+    if a.refresh:
+        return refresh_one(*parse(a.refresh))
+    if not a.prs:
+        ap.error("give the pull requests of the change set, or --refresh <repo>#<n>")
 
     prs = ordered([parse(p) for p in a.prs], a.order)
     local = any(r == ".github" for r, _ in prs) or (any(r == DOCS for r, _ in prs) and len(prs) > 1)
@@ -511,6 +641,8 @@ def main(argv: list[str]) -> int:
     deps = {p: depends_on.parse(i.get("body")) for p, i in info.items()}
     prs = with_dependencies(prs, deps)
     problems = []
+    docs = [p for p in prs if p[0] == "onepeek-docs"]
+    DOCS_PR[:] = [docs[0][1]] if docs else []
     for p, ds in deps.items():
         for d in ds:
             if d not in info and pr_info(*d)["state"] != "MERGED":
@@ -524,9 +656,12 @@ def main(argv: list[str]) -> int:
         if i["isDraft"]:
             problems.append(f"{repo}#{n} is a draft")
         state = mergeable(repo, n) if i["mergeable"] == "UNKNOWN" else i["mergeable"]
+        if state == "CONFLICTING" and docs and repo not in (DOCS, ".github"):
+            sha = resolve_pin(repo, n, push=a.go)  # only docs-version.txt conflicting: refresh it (not in a dry run)
+            if sha is not None:
+                state = conflict_after(repo, n, sha) if sha else "MERGEABLE"
         if state != "MERGEABLE":
             problems.append(f"{repo}#{n} is {state}: resolve conflicts before any check is waited on")
-    docs = [p for p in prs if p[0] == "onepeek-docs"]
     if len(docs) > 1:
         problems.append("a change set has one docs pull request")
     pinned = set()  # code pull requests whose docs pin is a commit of the set's docs pull request (lesson L27 b)
@@ -552,6 +687,11 @@ def main(argv: list[str]) -> int:
                 pinned.add((repo, n))
                 deps.setdefault((repo, n), []).append(docs[0])  # implicit: re-run its checks after the docs merge
 
+    if not docs:  # no docs pull request in the set: every code pin must already be on docs main (strict wait, L27 a)
+        for repo, n in prs:
+            if repo != ".github":
+                problems += docs_pin_problems(repo, n, info[(repo, n)]["headRefName"])
+
     say("plan: " + " -> ".join(f"{r}#{n} ({'merge' if r == 'onepeek-docs' else 'squash'} into {BASE.get(r, 'dev')})"
                                for r, n in prs))
     for p in problems:
@@ -564,7 +704,7 @@ def main(argv: list[str]) -> int:
 
     merged_any, tag, moved, docs_merge = False, None, set(), None
     for k, (repo, n) in enumerate(prs):
-        no_conflicts(prs[k:])
+        no_conflicts(prs[k:], resolve_pin if docs else None)
         if tag and repo not in (DOCS, ".github"):
             pushed = bump_pins(repo, info[(repo, n)]["headRefName"], *tag)
             moved.add(repo)  # its pins are at the tag inside the set (moved now, or already there)

@@ -6,14 +6,17 @@ A pull request whose CI needs another repo's unmerged change says so in its body
     Depends on: OnePeek/<repo>#<n>
 
 A repo's `docs-version.txt` is an implicit dependency (lesson L27, item a): when it names a onepeek-docs commit that is
-not on docs `main`, the open onepeek-docs pull request whose commits include it is waited for like a declared one, with
-no line needed; when no open docs pull request contains it, the check fails.
+not on docs `main` but is a commit of an open onepeek-docs pull request, that is the normal state of a change set until
+the merge (`ship_change_set.py` merges docs first), so `--check` prints a GitHub Actions notice and passes. With
+`--strict` (callers that gate a merge) that wait fails as a declared one does. When no open docs pull request contains
+the pin, the check fails in both modes; so does a declared `Depends on:` line that is unmerged or closed unmerged.
 
     python3 check_depends_on.py --repos        # reads the body (BODY_FILE, else BODY); prints the named repos, comma-separated (for the App token)
     python3 check_depends_on.py --docs-pin     # prints the docs commit docs-version.txt names, or nothing
     python3 check_depends_on.py --check        # reads the body, GH_TOKEN and DOCS_TOKEN; exit 1 "waiting for <repo>#<n>"
-                                               # while one is unmerged (DOCS_TOKEN: Contents and Pull requests read
-                                               # on onepeek-docs, used only when docs-version.txt names a commit)
+                                               # while a declared one is unmerged (DOCS_TOKEN: Contents and Pull requests
+                                               # read on onepeek-docs, used only when docs-version.txt names a commit)
+    python3 check_depends_on.py --check --strict   # the docs-pin wait fails too
 
 The body is the pull request's live body, fetched by depends-on.yml through the API into BODY_FILE (the event payload
 holds the body as of the trigger, so a body edited after it would be ignored); BODY is the fallback for other callers.
@@ -92,17 +95,20 @@ def open_docs_prs(sha: str, token: str) -> list[int]:
     return sorted(pr["number"] for pr in prs if pr.get("state") == "open")
 
 
-def docs_waiting(sha: str | None, status, prs) -> list[str]:
-    """The implicit docs dependency (lesson L27 a): nothing when there is no pin or it is on docs main; otherwise
-    "waiting for onepeek-docs#N" for the open docs pull request containing it, or a failure when none does.
+def docs_waiting(sha: str | None, status, prs, strict: bool = False) -> tuple[list[str], list[str]]:
+    """The implicit docs dependency (lesson L27 a) as (problems, notes). Nothing when there is no pin or it is on docs
+    main. A pin in an open docs pull request is a note ("waiting for onepeek-docs#N ..."), the normal state of a change
+    set, or a problem when `strict`; a pin in no open docs pull request is always a problem.
     `status(sha)` is the compare status of main against sha, `prs(sha)` the open docs pull requests containing it."""
     if not sha or status(sha) in ("ahead", "identical"):
-        return []
+        return [], []
     found = prs(sha)
+    if found and strict:
+        return [f"waiting for {DOCS}#{found[0]} (docs-version.txt pins {sha[:7]}, a commit of that open pull request)"], []
     if found:
-        return [f"waiting for {DOCS}#{found[0]} (docs-version.txt pins {sha[:7]}, a commit of that open pull request)"]
+        return [], [f"waiting for {DOCS}#{found[0]} (docs-version.txt pins {sha[:7]}); ship_change_set.py merges it first"]
     return [f"docs pin {sha[:7]} not on main and in no open docs PR; move docs-version.txt to a commit on main "
-            "or of the change set's docs pull request"]
+            "or of the change set's docs pull request"], []
 
 
 def waiting(deps: list[tuple[str, int]], state) -> list[str]:
@@ -122,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--repos", action="store_true")
     g.add_argument("--docs-pin", action="store_true")
     g.add_argument("--check", action="store_true")
+    ap.add_argument("--strict", action="store_true", help="with --check: waiting for the docs pull request fails")
     ap.add_argument("--repo-dir", default=".", help="the caller repo's checkout (its docs-version.txt)")
     a = ap.parse_args(argv)
     deps = parse(read_body())
@@ -132,20 +139,24 @@ def main(argv: list[str] | None = None) -> int:
     if a.docs_pin:
         print(pin or "")
         return 0
-    problems = []
+    problems, waiting_docs = [], False
     if pin:
         docs_token = os.environ.get("DOCS_TOKEN", "")
         if not docs_token:
             problems.append("no token to read onepeek-docs (pass the agents' App secrets, playbook §8a S6)")
         else:
-            problems += docs_waiting(pin, lambda s: check_pins.compare_status(s, docs_token),
-                                     lambda s: open_docs_prs(s, docs_token))
-            if not problems:
+            found, notes = docs_waiting(pin, lambda s: check_pins.compare_status(s, docs_token),
+                                        lambda s: open_docs_prs(s, docs_token), a.strict)
+            problems += found
+            for note in notes:
+                print(f"::notice title=depends-on::{note}")
+            waiting_docs = bool(notes)
+            if not problems and not notes:
                 print(f"docs-version.txt pins {pin[:7]}, on onepeek-docs main.")
     if deps:
         token = os.environ.get("GH_TOKEN", "")
         problems += waiting(deps, lambda r, n: api_state(r, n, token))
-    elif not problems:
+    elif not problems and not waiting_docs:
         print("No `Depends on:` lines: nothing to wait for.")
     for p in problems:
         print(f"::error::{p}")
