@@ -305,6 +305,16 @@ class DocsWait(Repo):
         pf.docs_wait_check(d, rep, False, status=boom, prs=lambda s: [])
         self.assertEqual(statuses(rep), ["UNVERIFIED"])
 
+    def test_with_release_a_read_error_fails(self) -> None:  # R2-3
+        d = self.repo({".github/workflows/w.yml": "jobs: {}\n", "docs-version.txt": f"onepeek-docs@{self.PIN}\n"})
+
+        def boom(s):
+            raise SystemExit("cannot compare: HTTP 502")
+        for strict, want in ((False, ["UNVERIFIED"]), (True, ["FAIL"])):
+            rep = pf.Report()
+            pf.docs_wait_check(d, rep, strict, status=boom, prs=lambda s: [])
+            self.assertEqual(statuses(rep), want)
+
     def test_main_is_strict_only_with_release(self) -> None:  # kills strict=a.release -> False
         d = self.repo({".github/workflows/w.yml": "jobs: {}\n"})
         for flags, strict in (([], False), (["--release"], True)):

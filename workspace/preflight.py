@@ -389,7 +389,7 @@ def docs_wait_check(repo: pathlib.Path, rep: Report, strict: bool, status=None, 
     try:
         problems, notes = depends_on.docs_waiting(pin, status, prs, strict)
     except (SystemExit, OSError) as e:  # an API error (sign-in, 5xx, network): report it, never abort preflight
-        rep.add("UNVERIFIED", f"docs wait: cannot read onepeek-docs ({e})")
+        rep.add("FAIL" if strict else "UNVERIFIED", f"docs wait: cannot read onepeek-docs ({e})")
         return
     for p in problems:
         rep.add("FAIL", f"docs wait: {p}")

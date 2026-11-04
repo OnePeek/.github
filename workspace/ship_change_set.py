@@ -217,17 +217,22 @@ def refresh_docs_pin(repo: str, branch: str, base: str, docs_label: str, docs_he
                 return None
             if not push:
                 return ""
-            if unmerged:  # docs-version.txt truly conflicts: take the branch's side, with the pin moved to the docs head
-                ours = subprocess.run(["git", "-C", str(wt), "show", "HEAD:docs-version.txt"], capture_output=True,
+            if unmerged:  # docs-version.txt truly conflicts: start from the branch's side
+                text = subprocess.run(["git", "-C", str(wt), "show", "HEAD:docs-version.txt"], capture_output=True,
                                       text=True, check=False).stdout
-                at = pin_at(ours)
-                if at is None:
-                    say(f"{repo}: docs-version.txt at {branch} holds no onepeek-docs@<sha> line; not refreshing")
-                    return None
-                lines = ours.splitlines(keepends=True)
-                lines[at[0]] = lines[at[0]].replace(f"onepeek-docs@{at[1]}", f"onepeek-docs@{docs_head}", 1)
-                (wt / "docs-version.txt").write_text("".join(lines), encoding="utf-8")
-                git(wt, "add", "--", "docs-version.txt")
+            else:  # merged cleanly: keep the merge result, with only the pin line moved
+                text = (wt / "docs-version.txt").read_text(encoding="utf-8") if (wt / "docs-version.txt").exists() else ""
+            at = pin_at(text)
+            if at is None:
+                say(f"{repo}: docs-version.txt at {branch} holds no onepeek-docs@<sha> line; not refreshing")
+                return None
+            lines = text.splitlines(keepends=True)
+            lines[at[0]] = lines[at[0]].replace(f"onepeek-docs@{at[1]}", f"onepeek-docs@{docs_head}", 1)
+            (wt / "docs-version.txt").write_text("".join(lines), encoding="utf-8")
+            check = pin_at((wt / "docs-version.txt").read_text(encoding="utf-8"))
+            if check is None or check[1] != docs_head:
+                raise SystemExit(f"STOP {repo}: docs-version.txt does not name {docs_head[:7]} after the merge; not pushing")
+            git(wt, "add", "--", "docs-version.txt")
             merging = pathlib.Path(git(wt, "rev-parse", "--git-path", "MERGE_HEAD").strip())
             merging = merging if merging.is_absolute() else wt / merging
             if not merging.exists():
