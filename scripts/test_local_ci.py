@@ -296,7 +296,9 @@ class Versions(unittest.TestCase):
         if not lc.docker_ready():
             self.skipTest("docker is not available")
         aws = ('plugin "aws" {\n  enabled = true\n  version = "0.40.0"\n  source = "github.com/terraform-linters/tflint-ruleset-aws"\n}\n')
-        for hcl in (aws, ""):  # a declared plugin needs --init's download to reach --recursive (needs the network)
+        bundled = 'plugin "terraform" {\n  enabled = true\n  preset  = "all"\n}\nrule "terraform_standard_module_structure" {\n  enabled = false\n}\n'  # ships inside tflint: no download
+        # The aws plugin needs --init's download to reach --recursive; GitHub's API may rate-limit that download (then it is skipped).
+        for hcl in (bundled, "", aws):
             d = self._tf_repo()
             (d / "main.tf").write_text('terraform {\n  required_version = ">= 1.0"\n}\n\nvariable "x" {\n  description = "x"\n  type        = string\n}\n\noutput "x" {\n  description = "x"\n  value       = var.x\n}\n')
             (d / ".tflint.hcl").write_text(hcl)
@@ -304,9 +306,12 @@ class Versions(unittest.TestCase):
             out = io.StringIO()
             with mock.patch.object(lc, "tflint_mode", return_value="docker"), mock.patch.object(lc, "TFLINT_CACHE", cache), \
                     mock.patch.object(lc, "uv_problem", return_value=""), contextlib.redirect_stdout(out):
-                self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0, out.getvalue())
+                rc = lc.main([str(d), "--jobs", "a"])
+            if hcl is aws and "rate limit" in out.getvalue():
+                self.skipTest("GitHub rate-limited the plugin download")
+            self.assertEqual(rc, 0, out.getvalue())
             self.assertIn("PASS", out.getvalue())
-            self.assertEqual(bool(hcl), any(cache.rglob("tflint-ruleset-aws*")), out.getvalue())
+            self.assertEqual(hcl is aws, any(cache.rglob("tflint-ruleset-aws*")), out.getvalue())
 
     def test_tflint_calls_are_found_anywhere_in_a_step_but_not_other_tools(self):
         for yes in ("tflint --init", "  tflint", "cd x && tflint -f json", "if tflint; then :; fi", "a; tflint", "(tflint)", "a | tflint"):
@@ -370,12 +375,31 @@ class Versions(unittest.TestCase):
 
     def test_an_unmerged_file_is_reported_once(self):
         d = self.repo("on: [pull_request]\njobs: {}\n")
-        g = lambda *a: subprocess.run(["git", "-C", str(d), "-c", "user.name=t", "-c", "user.email=t@t", *a], check=True, capture_output=True)
+        home = tempfile.mkdtemp()  # no git settings of the machine (identity, default branch, conflict style) reach the fixture
+        env = {**os.environ, "HOME": home, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+        flags = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main", "-c", "merge.conflictStyle=merge",
+                 "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
+        g = lambda *a, check=True: subprocess.run(["git", "-C", str(d), *flags, *a], check=check, capture_output=True, text=True, env=env)
         (d / "f.txt").write_text("base\n"); g("add", "-A"); g("commit", "-qm", "base"); g("branch", "-M", "main")
         g("checkout", "-qb", "other"); (d / "f.txt").write_text("other\n"); g("commit", "-qam", "o")
         g("checkout", "-q", "main"); (d / "f.txt").write_text("main\n"); g("commit", "-qam", "m")
-        subprocess.run(["git", "-C", str(d), "merge", "other"], capture_output=True)
+        self.assertNotEqual(g("merge", "other", check=False).returncode, 0)
+        self.assertEqual(len(g("ls-files", "-u").stdout.splitlines()), 3)  # really mid-merge: three index stages
+        self.assertIn("<" * 7, (d / "f.txt").read_text())
         self.assertEqual(lc.conflict_markers(d), ["f.txt:1"])
+
+    def test_conflict_scan_falls_back_when_git_lacks_deduplicate(self):
+        d = self.repo("on: [pull_request]\njobs: {}\n")
+        (d / "f.txt").write_text("<" * 7 + " HEAD\n")
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True)
+        real = subprocess.run
+
+        def fake(argv, *a, **k):
+            if "--deduplicate" in argv:
+                return subprocess.CompletedProcess(argv, 129, b"", b"unknown option")
+            return real(argv, *a, **k)
+        with mock.patch.object(lc.subprocess, "run", side_effect=fake):
+            self.assertEqual(lc.conflict_markers(d), ["f.txt:1"])
 
     def test_without_tflint_or_docker_it_warns_and_under_release_fails(self):
         d = self._tf_repo()

@@ -87,8 +87,10 @@ def conflict_markers(repo: pathlib.Path) -> list[str]:
 
     A bare `=======` is a Markdown heading underline, so it counts only as the middle of a conflict, never alone."""
     r = subprocess.run(["git", "-C", str(repo), "ls-files", "-z", "--deduplicate"], capture_output=True)
+    if r.returncode:  # a git without --deduplicate (before 2.31): list every index stage and deduplicate here
+        r = subprocess.run(["git", "-C", str(repo), "ls-files", "-z"], capture_output=True)
     found = []
-    for rel in filter(None, r.stdout.decode("utf-8", "replace").split("\0")):
+    for rel in dict.fromkeys(filter(None, r.stdout.decode("utf-8", "replace").split("\0"))):
         f = repo / rel
         if rel in CONFLICT_MARKER_ALLOW or not f.is_file() or f.is_symlink():
             continue
