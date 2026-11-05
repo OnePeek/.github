@@ -16,6 +16,7 @@ the pin, the check fails in both modes; so does a declared `Depends on:` line th
     python3 check_depends_on.py --check        # reads the body, GH_TOKEN and DOCS_TOKEN; exit 1 "waiting for <repo>#<n>"
                                                # while a declared one is unmerged (DOCS_TOKEN: Contents and Pull requests
                                                # read on onepeek-docs, used only when docs-version.txt names a commit)
+    IS_DRAFT=false python3 check_depends_on.py --check   # also a notice while an open dependency's pull request is not a draft
     python3 check_depends_on.py --check --strict   # the docs-pin wait fails too
 
 The body is the pull request's live body, fetched by depends-on.yml through the API into BODY_FILE (the event payload
@@ -122,6 +123,16 @@ def waiting(deps: list[tuple[str, int]], state) -> list[str]:
     return out
 
 
+def draft_gate(deps: list[tuple[str, int]], is_draft: bool | None, state) -> list[str]:
+    """development-cycle §2c step 2: a pull request with an open dependency is a draft. One message per open dependency
+    when it is not (empty when `is_draft` is unknown, or the pull request is a draft); `state(repo, n)` returns
+    (state, merged). A notice for the author; the merge tool (ship_change_set.py) enforces it."""
+    if is_draft is None or is_draft:
+        return []
+    return [f"{repo}#{n} is still open: raise this pull request as a draft marked `depends on {repo}#{n}` until it merges"
+            for repo, n in deps if not state(repo, n)[1]]
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     g = ap.add_mutually_exclusive_group(required=True)
@@ -160,6 +171,9 @@ def main(argv: list[str] | None = None) -> int:
         print("No `Depends on:` lines: nothing to wait for.")
     for p in problems:
         print(f"::error::{p}")
+    if deps and os.environ.get("IS_DRAFT", "") in ("true", "false"):  # the pull request's draft flag, from depends-on.yml
+        for note in draft_gate(deps, os.environ["IS_DRAFT"] == "true", lambda r, n: api_state(r, n, os.environ.get("GH_TOKEN", ""))):
+            print(f"::notice title=depends-on::{note}")
     if deps and not problems:
         print("Every declared dependency is merged: " + ", ".join(f"{r}#{n}" for r, n in deps))
     return 1 if problems else 0

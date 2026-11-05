@@ -43,6 +43,7 @@ Run it from the workspace root (the folder holding the repos side by side). Need
 from __future__ import annotations
 
 import argparse
+import datetime
 import importlib.util
 import json
 import pathlib
@@ -75,6 +76,9 @@ TAG_TIMEOUT_S = 10 * 60
 POLL_S = 20
 
 
+CHAIN = ["onepeek-infra", "backend-service", "onepeek-web"]  # release order (development-cycle §2c step 4)
+RELEASE_BASE = "release"
+RELEASE_ENV = "preprod"  # until launch release = preprod (the release branch deploys it)
 PROTECTED = {"main", "dev", "release"}
 
 
@@ -130,6 +134,69 @@ def ordered(prs: list[tuple[str, int]], order: str) -> list[tuple[str, int]]:
     if DOCS in names and names[0] != DOCS:
         raise SystemExit(f"--order must keep {DOCS} first (§8a P2): got {names}")
     return sorted(prs, key=lambda p: names.index(p[0]))
+
+
+def release_lock(env: str, profile: str, aws=subprocess.run) -> dict | None:
+    """The environment's release lock, read as release-lock.yml reads it (s3://onepeek-<env>-deploy/locks/release.json):
+    the holder record, or None when only NoSuchKey answered. Anything else (no profile, no credentials, AccessDenied,
+    an unreadable record) stops the run: the lock is never assumed free."""
+    bucket = f"onepeek-{env}-deploy"
+    with tempfile.TemporaryDirectory() as d:
+        out = pathlib.Path(d, "lock.json")
+        cmd = ["aws", "s3api", "get-object", "--bucket", bucket, "--key", "locks/release.json", str(out), "--query", "ETag", "--output", "text"]
+        if profile:
+            cmd += ["--profile", profile]
+        try:
+            r = aws(cmd, capture_output=True, text=True, check=False)
+        except OSError as e:
+            raise SystemExit(f"STOP: cannot check the release lock of {env} (aws is not runnable: {e}); pass --aws-profile and try again")
+        if r.returncode != 0:
+            if "(NoSuchKey)" in (r.stderr or ""):
+                return None
+            raise SystemExit(f"STOP: cannot check the release lock of {env} (s3://{bucket}/locks/release.json): "
+                             f"{(r.stderr or r.stdout).strip()[:300]}; pass --aws-profile for the {env} account")
+        try:
+            held = json.loads(out.read_text())
+        except (OSError, ValueError):
+            raise SystemExit(f"STOP: cannot check the release lock of {env}: the lock record is unreadable")
+        return held if isinstance(held, dict) else {"holder": str(held)}
+
+
+def lock_problem(env: str, held: dict | None) -> str | None:
+    if held is None:
+        return None
+    who = ", ".join(f"{k}={held[k]}" for k in ("repo", "run_id", "run_attempt") if k in held) or "an unnamed run"
+    return f"the {env} release lock is held by another run ({who}); wait for it to finish"
+
+
+def _when(stamp: str) -> datetime.datetime:
+    return datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+
+
+def chain_problem(repo: str, release_prs: list[str], read=None) -> str | None:
+    """development-cycle §2c step 4: the earlier release of the chain (infra, backend-service, onepeek-web) must have
+    succeeded: the latest release.yml run on that repo's `release` branch is `success` and newer than the repo's last
+    merge to `release`. `read(prev)` -> (latest run dict or None, last merge date); fakeable."""
+    if repo not in CHAIN or CHAIN.index(repo) == 0:
+        return None
+    prev = CHAIN[CHAIN.index(repo) - 1]
+    if prev in release_prs:
+        return f"{prev} releases in this set: merge it, wait for its release run to succeed, then ship {repo}"
+    run_, merged = (read or release_run)(prev)
+    if run_ is None:
+        return f"no release.yml run on {prev}'s release branch: {prev} has not released"
+    if run_.get("status") != "completed" or run_.get("conclusion") != "success":
+        return f"the latest {prev} release run is {run_.get('conclusion') or run_.get('status')}, not success"
+    if _when(run_["createdAt"]) < _when(merged):
+        return f"the latest {prev} release run ({run_['createdAt']}) is older than its last merge to release ({merged}): the release has not run yet"
+    return None
+
+
+def release_run(prev: str) -> tuple[dict | None, str]:
+    runs = json.loads(gh("run", "list", "-R", f"{ORG}/{prev}", "--workflow", "release.yml", "--branch", RELEASE_BASE,
+                         "--limit", "1", "--json", "status,conclusion,createdAt"))
+    merged = gh("api", f"repos/{ORG}/{prev}/commits/{RELEASE_BASE}", "--jq", ".commit.committer.date").strip()
+    return (runs[0] if runs else None), merged
 
 
 def parse(item: str) -> tuple[str, int]:
@@ -688,6 +755,8 @@ def main(argv: list[str]) -> int:
                     "docs-version.txt to its docs pull request head (for a conflict in docs-version.txt alone)")
     ap.add_argument("--go", action="store_true", help="merge (default: print the plan and the up-front checks)")
     ap.add_argument("--order", default="", help="repoA,repoB,...: merge in this order instead of the fixed one (§8a P1)")
+    ap.add_argument("--aws-profile", default="", help="AWS profile that can read s3://onepeek-<env>-deploy (release pull requests)")
+    ap.add_argument("--no-chain", metavar="REASON", default="", help="release pull requests: skip the chain check, with the reason")
     a = ap.parse_args(argv)
     if a.refresh:
         return refresh_one(*parse(a.refresh))
@@ -702,15 +771,29 @@ def main(argv: list[str]) -> int:
     deps = {p: depends_on.parse(i.get("body")) for p, i in info.items()}
     prs = with_dependencies(prs, deps)
     problems = []
+    release_prs = [r for (r, _), i in info.items() if i["baseRefName"] == RELEASE_BASE and r in CHAIN]
+    if release_prs:  # release pull requests (§2c steps 3 and 4): the lock, then the chain
+        why = lock_problem(RELEASE_ENV, release_lock(RELEASE_ENV, a.aws_profile))
+        if why:
+            problems.append(why)
+        if a.order or a.no_chain:
+            say(f"chain check skipped ({'--order' if a.order else '--no-chain: ' + a.no_chain})")
+        else:
+            for r in release_prs:
+                why = chain_problem(r, release_prs)
+                if why:
+                    problems.append(why + " (override with --order or --no-chain REASON)")
     docs = [p for p in prs if p[0] == "onepeek-docs"]
     DOCS_PR[:] = [docs[0][1]] if docs else []
     for p, ds in deps.items():
         for d in ds:
             if d not in info and pr_info(*d)["state"] != "MERGED":
                 problems.append(f"{p[0]}#{p[1]} depends on {d[0]}#{d[1]}, which is neither in the set nor merged")
+                if not info[p]["isDraft"]:  # §2c step 2: a pull request with an open dependency is a draft
+                    problems += depends_on.draft_gate([d], False, lambda r, n: (None, False))
     conflicting: list[tuple[str, int]] = []
     for (repo, n), i in info.items():
-        want = BASE.get(repo, "dev")
+        want = RELEASE_BASE if i["baseRefName"] == RELEASE_BASE and repo in CHAIN else BASE.get(repo, "dev")
         if i["state"] != "OPEN":
             problems.append(f"{repo}#{n} is {i['state']}")
         if i["baseRefName"] != want:

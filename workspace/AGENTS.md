@@ -10,6 +10,7 @@ This folder holds the OnePeek repositories side by side. It is not itself a repo
    - The skills are linked into this folder by `setup.py`. The shared ones are written once in `.github/workspace/skills/` and synced into each repo: `build-from-lld`, `review-spec` and `fix-docs-gap`; `ship-change-set` is linked into this root only. The repo-specific ones are `build-module` (backend) and `refine-lld` (docs).
    - So are the agents: `builder` and `spec-reviewer` (shared), and `module-builder` (backend).
    - A packet for any repo: `python3 ../.github/workspace/packet.py <unit>` from inside that repo (the backend also has `uv run app context`).
+   - **State the lane** (`standards/development-cycle.md` §2b): a `Lane: feature|hotfix` line in the task or pull request body, feature when absent. The packet prints it as its first line, `lane: <lane>` (`packet.py --task <file>` or `--pr <repo>#<n>` reads the line), and the builder's first report line repeats it.
 4. **For work in one repo,** starting your tool inside that repo loads its rules from the first message. Use this root for work that spans repos.
 
 ## Running agents (AI tools)

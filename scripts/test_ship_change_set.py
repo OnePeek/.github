@@ -1020,3 +1020,114 @@ class ConflictFlow(DocsPin):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReleaseGates(unittest.TestCase):
+    """development-cycle §2c steps 3 and 4: a release pull request waits on the release lock and on the earlier release."""
+
+    OK = {"status": "completed", "conclusion": "success", "createdAt": "2026-11-05T12:00:00Z"}
+    MERGED = "2026-11-05T11:00:00Z"
+
+    def aws(self, code: int = 0, stderr: str = "", record: str = "") -> mock.Mock:
+        def run(cmd, **kw):
+            if code == 0 and record:
+                pathlib.Path(cmd[cmd.index("--key") + 2]).write_text(record)
+            return done(code, "etag", stderr)
+        return mock.Mock(side_effect=run)
+
+    def test_a_free_lock_is_only_the_answer_no_such_key(self) -> None:
+        self.assertIsNone(ship.release_lock("preprod", "p", self.aws(254, "An error occurred (NoSuchKey) when calling")))
+
+    def test_any_other_aws_answer_stops_and_never_assumes_free(self) -> None:
+        for code, err in ((254, "An error occurred (AccessDenied)"), (255, "Unable to locate credentials"), (254, "")):
+            with self.assertRaises(SystemExit) as stop:
+                ship.release_lock("preprod", "p", self.aws(code, err))
+            self.assertIn("cannot check the release lock", str(stop.exception))
+        with self.assertRaises(SystemExit) as stop:
+            ship.release_lock("preprod", "p", mock.Mock(side_effect=FileNotFoundError("aws")))
+        self.assertIn("cannot check the release lock", str(stop.exception))
+        with self.assertRaises(SystemExit):
+            ship.release_lock("preprod", "p", self.aws(0, "", "not json"))
+
+    def test_the_lock_is_read_from_the_environments_bucket_with_the_profile(self) -> None:
+        aws = self.aws(0, "", '{"repo": "backend-service", "run_id": "7"}')
+        held = ship.release_lock("preprod", "founder", aws)
+        cmd = aws.call_args[0][0]
+        self.assertEqual(held["run_id"], "7")
+        self.assertIn("onepeek-preprod-deploy", cmd)
+        self.assertIn("locks/release.json", cmd)
+        self.assertEqual(cmd[cmd.index("--profile") + 1], "founder")
+        self.assertIn("backend-service", ship.lock_problem("preprod", held))
+        self.assertIsNone(ship.lock_problem("preprod", None))
+
+    def test_the_chain_needs_the_previous_release_to_have_succeeded_after_its_last_merge(self) -> None:
+        for repo, run, merged, ok in (
+            ("backend-service", self.OK, self.MERGED, True),
+            ("backend-service", None, self.MERGED, False),
+            ("backend-service", {**self.OK, "conclusion": "failure"}, self.MERGED, False),
+            ("backend-service", {**self.OK, "status": "in_progress", "conclusion": ""}, self.MERGED, False),
+            ("backend-service", self.OK, "2026-11-05T13:00:00Z", False),  # merged after the run: not released yet
+            ("onepeek-web", self.OK, self.MERGED, True),
+            ("onepeek-infra", None, self.MERGED, True),  # head of the chain
+            ("onepeek-docs", None, self.MERGED, True),  # not in the chain
+        ):
+            why = ship.chain_problem(repo, [repo], lambda prev: (run, merged))
+            self.assertEqual(why is None, ok, (repo, run, merged, why))
+
+    def test_the_previous_release_in_the_same_set_must_go_first(self) -> None:
+        why = ship.chain_problem("onepeek-web", ["backend-service", "onepeek-web"], lambda prev: (self.OK, self.MERGED))
+        self.assertIn("backend-service releases in this set", why)
+
+    def test_run_list_and_merge_date_are_read_with_gh(self) -> None:
+        seen = []
+
+        def gh(*args):
+            seen.append(args)
+            return '[{"status":"completed","conclusion":"success","createdAt":"x"}]' if args[0] == "run" else "2026-11-05T11:00:00Z\n"
+        with mock.patch.object(ship, "gh", side_effect=gh):
+            run, merged = ship.release_run("onepeek-infra")
+        self.assertEqual((run["conclusion"], merged), ("success", self.MERGED))
+        self.assertIn("release.yml", seen[0])
+        self.assertIn("release", seen[0])
+
+    def main_with(self, argv, lock=None, run=None, draft=False):
+        def pr_info(r, n):
+            return {"state": "OPEN", "baseRefName": "release", "isDraft": draft, "mergeable": "MERGEABLE", "headRefName": f"b{n}",
+                    "headRefOid": "c" * 40, "body": "", "mergeCommit": None}
+        with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "docs_pin_problems", return_value=[]), \
+                mock.patch.object(ship, "release_lock", return_value=lock), \
+                mock.patch.object(ship, "release_run", return_value=(run, self.MERGED)):
+            return ship.main(argv)
+
+    def test_a_release_pull_request_is_refused_while_the_lock_is_held_or_the_chain_is_unmet(self) -> None:
+        self.assertEqual(self.main_with(["backend-service#5"], None, self.OK), 0)
+        self.assertEqual(self.main_with(["backend-service#5"], {"repo": "onepeek-web"}, self.OK), 1)
+        self.assertEqual(self.main_with(["backend-service#5"], None, None), 1)
+        self.assertEqual(self.main_with(["backend-service#5"], None, {**self.OK, "conclusion": "failure"}), 1)
+
+    def test_order_or_no_chain_with_a_reason_overrides_the_chain_but_never_the_lock(self) -> None:
+        self.assertEqual(self.main_with(["backend-service#5", "--no-chain", "web does not use infra"], None, None), 0)
+        self.assertEqual(self.main_with(["backend-service#5", "--order", "backend-service"], None, None), 0)
+        self.assertEqual(self.main_with(["backend-service#5", "--no-chain", "reason"], {"repo": "x"}, None), 1)
+
+    def test_a_non_release_pull_request_reads_neither_lock_nor_chain(self) -> None:
+        def pr_info(r, n):
+            return {"state": "OPEN", "baseRefName": "dev", "isDraft": False, "mergeable": "MERGEABLE", "headRefName": f"b{n}",
+                    "headRefOid": "c" * 40, "body": "", "mergeCommit": None}
+        with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "docs_pin_problems", return_value=[]), \
+                mock.patch.object(ship, "release_lock", side_effect=AssertionError("no lock read")):
+            self.assertEqual(ship.main(["backend-service#5"]), 0)
+
+
+class OpenDependencyNeedsADraft(unittest.TestCase):
+    def test_a_non_draft_with_an_open_dependency_outside_the_set_is_refused_with_the_draft_rule(self) -> None:
+        def pr_info(r, n):
+            if r == "backend-service":
+                return {"state": "OPEN"}
+            return {"state": "OPEN", "baseRefName": "dev", "isDraft": False, "mergeable": "MERGEABLE", "headRefName": "b",
+                    "headRefOid": "c" * 40, "body": "Depends on: OnePeek/backend-service#73", "mergeCommit": None}
+        lines = []
+        with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "docs_pin_problems", return_value=[]), \
+                mock.patch.object(ship, "say", side_effect=lines.append):
+            self.assertEqual(ship.main(["onepeek-infra#3"]), 1)
+        self.assertTrue(any("as a draft" in l for l in lines), lines)
