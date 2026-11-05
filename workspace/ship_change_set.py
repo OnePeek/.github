@@ -199,6 +199,12 @@ def release_run(prev: str) -> tuple[dict | None, str]:
     return (runs[0] if runs else None), merged
 
 
+def merge_method(repo: str, base: str) -> str:
+    """docs, and every pull request into `release` (dev to release), merge with a merge commit; squash would break the
+    release branch's history and release-please. Everything else squashes into dev."""
+    return "--merge" if repo == DOCS or base == RELEASE_BASE else "--squash"
+
+
 def parse(item: str) -> tuple[str, int]:
     m = re.fullmatch(r"([\w.-]+)#(\d+)", item)
     if not m:
@@ -886,7 +892,7 @@ def main(argv: list[str]) -> int:
                     head = green_head(repo, n, may_rerun=False)
                 else:
                     say(f"{repo}#{n}: only the docs pin changed and the green run tested the current base; merging without a new CI run")
-        method = "--merge" if repo == "onepeek-docs" else "--squash"
+        method = merge_method(repo, info[(repo, n)]["baseRefName"])
         gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, "--delete-branch", "--match-head-commit", head)
         merged = pr_info(repo, n)
         if merged["state"] != "MERGED":

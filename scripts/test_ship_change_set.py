@@ -1119,6 +1119,39 @@ class ReleaseGates(unittest.TestCase):
             self.assertEqual(ship.main(["backend-service#5"]), 0)
 
 
+class ReleaseMergeMethod(unittest.TestCase):
+    """dev to release merges with a merge commit, never a squash (release-please and the release history)."""
+
+    def test_method_by_base(self) -> None:
+        self.assertEqual(ship.merge_method("backend-service", "release"), "--merge")
+        self.assertEqual(ship.merge_method("onepeek-docs", "main"), "--merge")
+        self.assertEqual(ship.merge_method("backend-service", "dev"), "--squash")
+
+    def test_go_merges_a_release_pull_request_with_a_merge_commit(self) -> None:
+        state = {"s": "OPEN"}
+
+        def pr_info(r, n):
+            return {"state": state["s"], "baseRefName": "release", "isDraft": False, "mergeable": "MERGEABLE", "headRefName": "dev",
+                    "headRefOid": "c" * 40, "body": "", "mergeCommit": {"oid": "d" * 40}}
+        calls = []
+
+        def gh(*args):
+            calls.append(args)
+            if args[:2] == ("pr", "merge"):
+                state["s"] = "MERGED"
+            return ""
+        run = mock.Mock(return_value={"status": "completed", "conclusion": "success", "createdAt": "2026-11-05T12:00:00Z"})
+        with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "gh", side_effect=gh), \
+                mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "release_lock", return_value=None), \
+                mock.patch.object(ship, "release_run", return_value=(run.return_value, "2026-11-05T11:00:00Z")), \
+                mock.patch.object(ship, "green_head", return_value="c" * 40), mock.patch.object(ship, "no_conflicts"), \
+                mock.patch.object(ship, "remove_worktrees"), mock.patch.object(ship, "own_branch_problem", return_value=None):
+            self.assertEqual(ship.main(["backend-service#5", "--no-chain", "test", "--go"]), 0)
+        merge = next(c for c in calls if c[:2] == ("pr", "merge"))
+        self.assertIn("--merge", merge)
+        self.assertNotIn("--squash", merge)
+
+
 class OpenDependencyNeedsADraft(unittest.TestCase):
     def test_a_non_draft_with_an_open_dependency_outside_the_set_is_refused_with_the_draft_rule(self) -> None:
         def pr_info(r, n):
