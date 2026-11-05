@@ -1184,6 +1184,14 @@ class JobGraph(unittest.TestCase):
         self.assertGreater(job["timeout-minutes"], sum(s.get("timeout-minutes", 0) for s in steps))
         self.assertGreaterEqual(job["timeout-minutes"], 55)
 
+    def test_every_deploy_step_has_a_limit_and_the_job_limit_exceeds_them_all(self):
+        # A job timeout ends deploy as cancelled, and verify (the rollback) runs only after a failed deploy.
+        job = RELEASE["jobs"]["deploy"]
+        for s in job["steps"]:
+            if "run" in s and not s.get("name", "").startswith("This run attempt holds"):
+                self.assertIn("timeout-minutes", s, s.get("name"))
+        self.assertGreater(job["timeout-minutes"], sum(s.get("timeout-minutes", 0) for s in job["steps"]))
+
     def test_no_step_gating_a_change_runs_after_a_failure(self):
         # No always() or cancelled() in the build, deploy or verify steps before the rollback, so the lock-attempt
         # check (and every earlier step) gates every change.

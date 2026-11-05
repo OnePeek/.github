@@ -537,7 +537,7 @@ jobs:
           digest=$(python3 -c "import json;print(json.load(open('meta.json'))['containerimage.digest'])")
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           echo "${IMAGE}=${digest}" > "digest-${IMAGE}.txt"
-      - name: Registry login for the scanner
+      - name: The scanned image reference (registry, repository and digest)
         id: login
         if: ${{ !inputs.dry-run }}
         env:
@@ -684,7 +684,7 @@ jobs:
     needs: [prepare, build-image, build-web, db-bootstrap]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.build-image.result == 'success' || needs.build-web.result == 'success') && (!inputs.migrate || inputs.dry-run || needs.db-bootstrap.result == 'success') }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 60
+    timeout-minutes: 110   # above the sum of its step limits (99): a hang ends as a failed step, so verify still rolls back (a job timeout is 'cancelled' and it would not)
     permissions:
       contents: read
       id-token: write
@@ -719,6 +719,7 @@ jobs:
         with:
           cosign-release: v2.6.5
       - name: Pinned tools (PyYAML for the services file and ops, uv for the gateway routes) in a virtual environment
+        timeout-minutes: 5
         run: |
           python3 -m venv "${RUNNER_TEMP}/tools"
           "${RUNNER_TEMP}/tools/bin/pip" install --quiet pyyaml==6.0.3 uv==0.12.0
@@ -866,6 +867,7 @@ jobs:
         with:
           platforms: arm64
       - name: The services file's services for this image, for E7
+        timeout-minutes: 2
         id: file
         env:
           IMAGE: ${{ inputs.image }}
@@ -885,6 +887,7 @@ jobs:
           print("services=" + json.dumps(names))
           PY
       - name: E7. The services file must only name services the image can run (backend only)
+        timeout-minutes: 10
         if: ${{ inputs.image == 'backend' }}
         env:
           SERVICES: ${{ steps.file.outputs.services }}
@@ -899,6 +902,7 @@ jobs:
           if missing:
               raise SystemExit('The services file names services this image cannot run: ' + ', '.join(missing))"
       - name: The families this image rolls, in order (taskdef/index.json, aws-stack §6.3 "Task definition index")
+        timeout-minutes: 2
         id: index
         env:
           IMAGE: ${{ inputs.image }}
@@ -929,6 +933,7 @@ jobs:
           print("services=" + json.dumps([s for g in groups for s in g]))
           PY
       - name: The gateway routes (backend only, additive within a release; the gateway reloads within 30 s)
+        timeout-minutes: 5
         if: ${{ inputs.image == 'backend' && !inputs.dry-run }}
         run: |
           # `app api routes` reads the same services file the release read above (platform/api.md §16 `--services-file`).
@@ -936,6 +941,7 @@ jobs:
           # No encryption flags: the bucket default applies (aws-stack §16). `--sse aws:kms` alone would ask for the AWS-managed key.
           aws s3 cp gateway-routes.json "s3://${NAME}-deploy/gateway-routes.json" --only-show-errors
       - name: Record every service's current task definition (for the rollback)
+        timeout-minutes: 5
         id: previous
         env:
           SERVICES: ${{ steps.index.outputs.services }}
@@ -1046,6 +1052,7 @@ jobs:
           done 3< groups.txt
           echo "stable-at=$(date +%s)" >> "$GITHUB_OUTPUT"   # merge-to-running time in the notice (delivery-pipelines §12, §14)
       - name: Lambda sandbox functions, new version, move the live alias (only when sandbox is released)
+        timeout-minutes: 10
         if: ${{ !inputs.dry-run && contains(inputs.extra-images, 'sandbox') }}
         env:
           SANDBOX_REF: ${{ env.REGISTRY }}/onepeek-${{ inputs.environment }}/sandbox@${{ fromJSON(env.DIGESTS).sandbox }}
@@ -1377,8 +1384,9 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - name: Release the release lock
-        # Runs even when the guard failed (a re-run of only some jobs): safe, because the release only removes a lock
-        # whose record carries exactly this token, and a run that did not take the lock has none.
+        # Runs even when the guard failed (a re-run of only some jobs). A partial re-run carries attempt 1's token
+        # through prepare's outputs; what keeps this safe is the token match (only a lock record with exactly this token
+        # is removed) plus attempt 1 having finished, so nothing it still needs is released.
         if: ${{ always() }}
         env:
           LOCK_TOKEN: ${{ needs.prepare.outputs.token }}
