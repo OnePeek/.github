@@ -136,4 +136,5 @@ jobs:
           BODY_FILE: ${{ steps.body.outputs.file }}
           GH_TOKEN: ${{ steps.app.outputs.token }}
           DOCS_TOKEN: ${{ steps.docs-app.outputs.token }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
         run: python3 "${SCRIPT}" --check
