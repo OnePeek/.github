@@ -43,7 +43,6 @@ Run it from the workspace root (the folder holding the repos side by side). Need
 from __future__ import annotations
 
 import argparse
-import datetime
 import importlib.util
 import json
 import pathlib
@@ -87,7 +86,8 @@ def own_branch_problem(repo: str, n: int, i: dict) -> str | None:
     owner = (i.get("headRepositoryOwner") or {}).get("login")
     if i.get("isCrossRepository") or (owner and owner.lower() != ORG.lower()):
         return f"{repo}#{n} is from a fork ({owner or 'another repository'}); this tool never pushes to a fork's branch"
-    if i["headRefName"] == i["baseRefName"] or i["headRefName"] in PROTECTED:
+    release = i["baseRefName"] == RELEASE_BASE and i["headRefName"] == "dev"  # dev to release: the head is `dev` by design,
+    if not release and (i["headRefName"] == i["baseRefName"] or i["headRefName"] in PROTECTED):  # but nothing is ever pushed to it
         return f"{repo}#{n}'s head branch {i['headRefName']} is a base branch; this tool never pushes to one"
     return None
 
@@ -136,67 +136,59 @@ def ordered(prs: list[tuple[str, int]], order: str) -> list[tuple[str, int]]:
     return sorted(prs, key=lambda p: names.index(p[0]))
 
 
-def release_lock(env: str, profile: str, aws=subprocess.run) -> dict | None:
-    """The environment's release lock, read as release-lock.yml reads it (s3://onepeek-<env>-deploy/locks/release.json):
-    the holder record, or None when only NoSuchKey answered. Anything else (no profile, no credentials, AccessDenied,
-    an unreadable record) stops the run: the lock is never assumed free."""
+def release_lock(env: str, profile: str, aws=subprocess.run) -> str | None:
+    """Whether the environment's release lock (s3://onepeek-<env>-deploy/locks/release.json, as release-lock.yml keeps it)
+    is held: its LastModified time when it is, None when it is not. Only `head-object` is used, so the lock's token is
+    never read. Only a 404 / NotFound means free; no profile, no credentials, AccessDenied or anything else stops the
+    run: the lock is never assumed free."""
     bucket = f"onepeek-{env}-deploy"
-    with tempfile.TemporaryDirectory() as d:
-        out = pathlib.Path(d, "lock.json")
-        cmd = ["aws", "s3api", "get-object", "--bucket", bucket, "--key", "locks/release.json", str(out), "--query", "ETag", "--output", "text"]
-        if profile:
-            cmd += ["--profile", profile]
-        try:
-            r = aws(cmd, capture_output=True, text=True, check=False)
-        except OSError as e:
-            raise SystemExit(f"STOP: cannot check the release lock of {env} (aws is not runnable: {e}); pass --aws-profile and try again")
-        if r.returncode != 0:
-            if "(NoSuchKey)" in (r.stderr or ""):
-                return None
-            raise SystemExit(f"STOP: cannot check the release lock of {env} (s3://{bucket}/locks/release.json): "
-                             f"{(r.stderr or r.stdout).strip()[:300]}; pass --aws-profile for the {env} account")
-        try:
-            held = json.loads(out.read_text())
-        except (OSError, ValueError):
-            raise SystemExit(f"STOP: cannot check the release lock of {env}: the lock record is unreadable")
-        return held if isinstance(held, dict) else {"holder": str(held)}
-
-
-def lock_problem(env: str, held: dict | None) -> str | None:
-    if held is None:
+    cmd = ["aws", "s3api", "head-object", "--bucket", bucket, "--key", "locks/release.json", "--query", "LastModified", "--output", "text"]
+    if profile:
+        cmd += ["--profile", profile]
+    try:
+        r = aws(cmd, capture_output=True, text=True, check=False)
+    except OSError as e:
+        raise SystemExit(f"STOP: cannot check the release lock of {env} (aws is not runnable: {e}); pass --aws-profile and try again")
+    if r.returncode == 0:
+        since = (r.stdout or "").strip()
+        if not since or since == "None":
+            raise SystemExit(f"STOP: cannot check the release lock of {env}: head-object gave no LastModified")
+        return since
+    err = r.stderr or ""
+    if "(404)" in err or "NotFound" in err:
         return None
-    who = ", ".join(f"{k}={held[k]}" for k in ("repo", "run_id", "run_attempt") if k in held) or "an unnamed run"
-    return f"the {env} release lock is held by another run ({who}); wait for it to finish"
+    raise SystemExit(f"STOP: cannot check the release lock of {env} (s3://{bucket}/locks/release.json): "
+                     f"{(err or r.stdout).strip()[:300]}; pass --aws-profile for the {env} account")
 
 
-def _when(stamp: str) -> datetime.datetime:
-    return datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+def lock_problem(env: str, since: str | None) -> str | None:
+    return None if since is None else f"the {env} release lock is held since {since}; wait for it to be released"
 
 
 def chain_problem(repo: str, release_prs: list[str], read=None) -> str | None:
     """development-cycle §2c step 4: the earlier release of the chain (infra, backend-service, onepeek-web) must have
-    succeeded: the latest release.yml run on that repo's `release` branch is `success` and newer than the repo's last
-    merge to `release`. `read(prev)` -> (latest run dict or None, last merge date); fakeable."""
+    succeeded: the latest release.yml run of that repo has `headSha` equal to the repo's current `release` head, is
+    completed and is `success`. `read(prev)` -> (latest run dict or None, release head sha); fakeable."""
     if repo not in CHAIN or CHAIN.index(repo) == 0:
         return None
     prev = CHAIN[CHAIN.index(repo) - 1]
     if prev in release_prs:
         return f"{prev} releases in this set: merge it, wait for its release run to succeed, then ship {repo}"
-    run_, merged = (read or release_run)(prev)
+    run_, head = (read or release_run)(prev)
     if run_ is None:
         return f"no release.yml run on {prev}'s release branch: {prev} has not released"
+    if run_.get("headSha") != head:
+        return f"the latest {prev} release run is for {str(run_.get('headSha'))[:7]}, not the current release head {head[:7]}: it has not released yet"
     if run_.get("status") != "completed" or run_.get("conclusion") != "success":
         return f"the latest {prev} release run is {run_.get('conclusion') or run_.get('status')}, not success"
-    if _when(run_["createdAt"]) < _when(merged):
-        return f"the latest {prev} release run ({run_['createdAt']}) is older than its last merge to release ({merged}): the release has not run yet"
     return None
 
 
 def release_run(prev: str) -> tuple[dict | None, str]:
     runs = json.loads(gh("run", "list", "-R", f"{ORG}/{prev}", "--workflow", "release.yml", "--branch", RELEASE_BASE,
-                         "--limit", "1", "--json", "status,conclusion,createdAt"))
-    merged = gh("api", f"repos/{ORG}/{prev}/commits/{RELEASE_BASE}", "--jq", ".commit.committer.date").strip()
-    return (runs[0] if runs else None), merged
+                         "--limit", "1", "--json", "status,conclusion,headSha"))
+    head = gh("api", f"repos/{ORG}/{prev}/commits/{RELEASE_BASE}", "--jq", ".sha").strip()
+    return (runs[0] if runs else None), head
 
 
 def merge_method(repo: str, base: str) -> str:
@@ -762,7 +754,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--go", action="store_true", help="merge (default: print the plan and the up-front checks)")
     ap.add_argument("--order", default="", help="repoA,repoB,...: merge in this order instead of the fixed one (§8a P1)")
     ap.add_argument("--aws-profile", default="", help="AWS profile that can read s3://onepeek-<env>-deploy (release pull requests)")
-    ap.add_argument("--no-chain", metavar="REASON", default="", help="release pull requests: skip the chain check, with the reason")
+    ap.add_argument("--no-chain", metavar="REASON", default="", help="release pull requests: skip the chain check (never the lock), with the reason")
     a = ap.parse_args(argv)
     if a.refresh:
         return refresh_one(*parse(a.refresh))
@@ -782,13 +774,13 @@ def main(argv: list[str]) -> int:
         why = lock_problem(RELEASE_ENV, release_lock(RELEASE_ENV, a.aws_profile))
         if why:
             problems.append(why)
-        if a.order or a.no_chain:
-            say(f"chain check skipped ({'--order' if a.order else '--no-chain: ' + a.no_chain})")
+        if a.no_chain:
+            say(f"chain check skipped (--no-chain: {a.no_chain}); the lock is still checked")
         else:
             for r in release_prs:
                 why = chain_problem(r, release_prs)
                 if why:
-                    problems.append(why + " (override with --order or --no-chain REASON)")
+                    problems.append(why + " (override with --no-chain REASON)")
     docs = [p for p in prs if p[0] == "onepeek-docs"]
     DOCS_PR[:] = [docs[0][1]] if docs else []
     for p, ds in deps.items():
@@ -847,7 +839,7 @@ def main(argv: list[str]) -> int:
             if repo != ".github":
                 problems += docs_pin_problems(repo, n, info[(repo, n)]["headRefName"])
 
-    say("plan: " + " -> ".join(f"{r}#{n} ({'merge' if r == 'onepeek-docs' else 'squash'} into {BASE.get(r, 'dev')})"
+    say("plan: " + " -> ".join(f"{r}#{n} ({merge_method(r, info[(r, n)]['baseRefName'])[2:]} into {info[(r, n)]['baseRefName']})"
                                for r, n in prs))
     for p in problems:
         say(f"problem: {p}")
@@ -893,14 +885,21 @@ def main(argv: list[str]) -> int:
                 else:
                     say(f"{repo}#{n}: only the docs pin changed and the green run tested the current base; merging without a new CI run")
         method = merge_method(repo, info[(repo, n)]["baseRefName"])
-        gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, "--delete-branch", "--match-head-commit", head)
+        base_ref = info[(repo, n)]["baseRefName"]
+        if base_ref == RELEASE_BASE and repo in CHAIN:  # the lock again, right before the merge (§2c step 3)
+            why = lock_problem(RELEASE_ENV, release_lock(RELEASE_ENV, a.aws_profile))
+            if why:
+                raise SystemExit(f"STOP {repo}#{n}: {why}")
+        keep = [] if base_ref == RELEASE_BASE else ["--delete-branch"]  # a release pull request's head is `dev`: never deleted
+        gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, *keep, "--match-head-commit", head)
         merged = pr_info(repo, n)
         if merged["state"] != "MERGED":
             raise SystemExit(f"STOP {repo}#{n}: merge did not complete ({merged['state']})")
         say(f"{repo}#{n}: merged {merged['mergeCommit']['oid'][:7]}")
         if repo == DOCS:
             docs_merge = merged["mergeCommit"]["oid"]
-        remove_worktrees(repo, info[(repo, n)]["headRefName"])
+        if base_ref != RELEASE_BASE:  # never touch the worktrees of `dev`, the head of a release pull request
+            remove_worktrees(repo, info[(repo, n)]["headRefName"])
         for later in prs[k + 1:]:
             if (repo, n) in deps.get(later, []):
                 rerun_failed(*later)

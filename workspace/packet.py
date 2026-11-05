@@ -26,20 +26,24 @@ def run(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, capture_output=True, text=True, check=False)
 
 
-LANE = re.compile(r"^[ \t]*Lane:[ \t]*(\S+)[ \t]*$", re.M | re.I)
+LANE = re.compile(r"^.*\bLane:(.*)$", re.M | re.I)
 LANES = ("feature", "hotfix")
 
 
 def lane_of(text: str | None) -> str:
-    """The lane a task or pull request states in a `Lane: feature|hotfix` line (development-cycle §2b); feature when it
-    says none. Any other value is an error, never silently the default."""
-    found = LANE.findall(text or "")
+    """The lane a task or pull request states in a line containing `Lane:` (a bullet and bold are fine:
+    `- **Lane:** hotfix`), `feature` or `hotfix` (development-cycle §2b); feature when it says none. The first word after
+    it is the value, so `Lane: hotfix (preprod down)` is hotfix; `hot fix`, an empty value or any other word is an
+    error, never silently the default."""
+    found = []
+    for m in LANE.finditer(text or ""):
+        words = m.group(1).replace("*", " ").replace("`", " ").split()
+        found.append(words[0].lower() if words else "")
     if not found:
         return "feature"
-    lanes = {f.lower() for f in found}
-    if len(lanes) > 1 or not lanes <= set(LANES):
-        raise ValueError(f"Lane must be one of {', '.join(LANES)} (one line), got: {', '.join(found)}")
-    return lanes.pop()
+    if len(set(found)) > 1 or found[0] not in LANES:
+        raise ValueError(f"Lane must be one of {', '.join(LANES)}, got: {', '.join(repr(f) for f in found)}")
+    return found[0]
 
 
 def main() -> int:

@@ -292,3 +292,19 @@ class DraftGate(unittest.TestCase):
     def test_the_workflow_passes_the_draft_flag(self) -> None:
         step = next(s for s in STEPS if s.get("name", "").startswith("Every dependency is merged"))
         self.assertIn("github.event.pull_request.draft", step["env"]["IS_DRAFT"])
+
+    def test_an_api_error_in_the_notice_path_never_fails_the_job(self) -> None:
+        env = {"BODY": "Depends on: OnePeek/backend-service#73", "IS_DRAFT": "false", "GH_TOKEN": "t"}
+        calls = iter([("closed", True)])  # the wait sees it merged; the notice path's own read then fails
+
+        def state(r, n, t):
+            try:
+                return next(calls)
+            except StopIteration:
+                raise SystemExit("::error::cannot read backend-service#73: HTTP 502")
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(cd, "api_state", side_effect=state), \
+                contextlib.redirect_stdout(out), tempfile.TemporaryDirectory() as d:
+            code = cd.main(["--check", "--repo-dir", d])
+        self.assertEqual(code, 0)
+        self.assertIn("draft check skipped", out.getvalue())

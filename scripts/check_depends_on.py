@@ -172,8 +172,11 @@ def main(argv: list[str] | None = None) -> int:
     for p in problems:
         print(f"::error::{p}")
     if deps and os.environ.get("IS_DRAFT", "") in ("true", "false"):  # the pull request's draft flag, from depends-on.yml
-        for note in draft_gate(deps, os.environ["IS_DRAFT"] == "true", lambda r, n: api_state(r, n, os.environ.get("GH_TOKEN", ""))):
-            print(f"::notice title=depends-on::{note}")
+        try:  # a notice only: an API error here never fails the job (the dependency wait above reports it)
+            for note in draft_gate(deps, os.environ["IS_DRAFT"] == "true", lambda r, n: api_state(r, n, os.environ.get("GH_TOKEN", ""))):
+                print(f"::notice title=depends-on::{note}")
+        except SystemExit as e:
+            print(f"::notice title=depends-on::draft check skipped: {e}")
     if deps and not problems:
         print("Every declared dependency is merged: " + ", ".join(f"{r}#{n}" for r, n in deps))
     return 1 if problems else 0
