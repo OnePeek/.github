@@ -244,6 +244,79 @@ class Rule5DeployFromDev(unittest.TestCase):
         self.assertEqual(self.rule5(caller("{push: {branches: [dev]}}"), kind="public"), [])
 
 
+class Rule6ImageDigests(unittest.TestCase):
+    DIGEST = "public.ecr.aws/docker/library/postgres@sha256:" + "a" * 64
+
+    def job(self, body):
+        return f"on: [pull_request]\njobs:\n  t:\n    runs-on: ubuntu-latest\n{body}    steps: [{{run: echo}}]\n"
+
+    def errs(self, body, kind="private"):
+        return [e for e in run(kind, "OnePeek/x", "a.yml", self.job(body)) if "rule 6" in e]
+
+    def test_a_service_image_by_digest_passes(self):
+        self.assertEqual(self.errs(f"    services:\n      pg:\n        image: {self.DIGEST} # 17\n"), [])
+        self.assertEqual(self.errs(f"    services:\n      pg:\n        image: \"{self.DIGEST}\" # postgres:17\n"), [])
+
+    def test_a_service_image_by_tag_fails(self):
+        self.assertTrue(self.errs("    services:\n      pg:\n        image: public.ecr.aws/docker/library/postgres:17\n"))
+
+    def test_one_unpinned_service_among_pinned_ones_fails(self):
+        body = f"    services:\n      pg:\n        image: {self.DIGEST} # 17\n      mongo:\n        image: mongo:7\n"
+        self.assertEqual(len(self.errs(body)), 1)
+
+    def test_a_digest_without_the_tag_comment_fails(self):
+        # onepeek-infra's ci-runner-canary.yml form: `name:17@sha256:...` and no comment; the bump cannot move it.
+        for line in (f"image: {self.DIGEST}", f"image: {self.DIGEST.replace('@', ':17@')}", f"image: {self.DIGEST} #"):
+            errs = self.errs(f"    services:\n      pg:\n        {line}\n")
+            self.assertEqual(len(errs), 1, line)
+            self.assertIn("tag in a comment", errs[0])
+
+    def test_a_digest_in_a_flow_mapping_fails(self):
+        self.assertTrue(self.errs(f"    container: {{image: {self.DIGEST}}} # 17\n"))
+
+    def test_a_tag_in_the_name_with_the_comment_passes(self):
+        self.assertEqual(self.errs(f"    services:\n      pg:\n        image: {self.DIGEST.replace('@', ':17@')} # 17\n"), [])
+
+    def test_an_image_from_the_caller_passes(self):
+        self.assertEqual(self.errs("    container: ${{ inputs.image }}\n"), [])
+        self.assertEqual(self.errs("    container:\n      image: ${{ matrix.c }}\n"), [])
+        self.assertEqual(self.errs("    services:\n      db:\n        image: ${{ inputs.db-image }}\n"), [])
+
+    def test_other_expressions_still_fail(self):
+        self.assertTrue(self.errs("    container: ${{ vars.IMAGE }}\n"))
+        self.assertTrue(self.errs("    container: node:${{ inputs.v }}\n"))
+
+    def test_the_lint_and_the_bump_share_one_line_form(self):
+        import bump_ci_images as bump
+        self.assertEqual(lint.PIN_LINE.pattern, bump.LINE.pattern)
+
+    def test_a_container_mapping_or_string_by_tag_fails(self):
+        self.assertTrue(self.errs("    container:\n      image: node:22\n"))
+        self.assertTrue(self.errs("    container: node:22\n"))
+
+    def test_a_container_by_digest_passes(self):
+        self.assertEqual(self.errs(f"    container: {self.DIGEST} # 17\n"), [])
+        self.assertEqual(self.errs(f"    container:\n      image: {self.DIGEST} # 17\n"), [])
+
+    def test_a_badly_written_line_fails_even_when_the_same_pin_is_written_well_elsewhere(self):
+        good = f"        image: {self.DIGEST} # 17\n"
+        bad = f"        image: {self.DIGEST}\n"
+        body = f"    services:\n      a:\n{good}      b:\n{bad}"
+        self.assertTrue(self.errs(body))
+        self.assertTrue(self.errs(f"    services:\n      b:\n{bad}      a:\n{good}"))
+        self.assertEqual(self.errs(f"    services:\n      a:\n{good}      b:\n{good}"), [])
+
+    def test_a_short_or_malformed_digest_fails(self):
+        self.assertTrue(self.errs("    container: node@sha256:abc\n"))
+        self.assertTrue(self.errs("    container: node@sha256:" + "a" * 63 + "\n"))
+
+    def test_it_applies_in_public_repos_too(self):
+        self.assertTrue(self.errs("    container: node:22\n", kind="public"))
+
+    def test_a_job_with_no_container_is_untouched(self):
+        self.assertEqual(self.errs(""), [])
+
+
 class SharedWorkflows(unittest.TestCase):
     def test_this_repos_workflows_pass_the_public_rules(self):
         root = Path(__file__).resolve().parents[1]

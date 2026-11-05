@@ -4,6 +4,13 @@
 #  - npm: one entry per directory (Dependabot allows one entry per ecosystem + directory + target branch).
 #    @onepeek/* packages come daily as one group; every other package weekly would need a second entry, so they share
 #    this entry and are simply excluded from that group (they get their own grouped pull request).
+#  - docker: Dockerfile `FROM` lines (write the base image inline in `FROM` so Dependabot sees it; foundation-playbook
+#    §12a slice 4 item 5). CI service containers in workflows are not Dependabot's: they are digest-pinned with the tag
+#    in a comment and moved by the weekly shared ci-image-bump.yml. Delete the docker entry in a repo with no Dockerfile.
+#    The entry covers the Dockerfile at `/` only: a repo whose Dockerfiles live in their own folders (onepeek-infra's
+#    images/<name>) needs the docker entry to name each folder (one entry per directory).
+#  - cooldown: no version is proposed until it is 7 days old (code-guidelines section 10); security updates skip it, and our own
+#    `OnePeek/.github*` workflows and `@onepeek/*` packages are excluded.
 # Set target-branch to the repo's integration branch (dev). The npm registry needs the DEPENDABOT_PACKAGES_TOKEN
 # Dependabot secret (a token with read:packages). Delete the npm entry in a repo with no package.json.
 version: 2
@@ -17,6 +24,7 @@ updates:
     directory: /
     target-branch: dev
     schedule: { interval: daily }
+    cooldown: { default-days: 7, exclude: ['OnePeek/.github*'] }
     groups:
       onepeek-shared-workflows:
         patterns: ['OnePeek/.github*']
@@ -28,9 +36,15 @@ updates:
     target-branch: dev
     registries: [github-packages]
     schedule: { interval: daily }
+    cooldown: { default-days: 7, exclude: ['@onepeek/*'] }
     groups:
       onepeek-packages:
         patterns: ['@onepeek/*']
       npm-dependencies:
         patterns: ['*']
         exclude-patterns: ['@onepeek/*']
+  - package-ecosystem: docker
+    directory: /
+    target-branch: dev
+    schedule: { interval: weekly }
+    cooldown: { default-days: 7 }

@@ -1,0 +1,25 @@
+# This repo's own weekly caller of ci-image-bump.yml (the example for every other repo): moves the osv-scanner image pin
+# in osv-scan.yml and every other digest-pinned CI image line in this repo's workflows to the tag's current digest, and
+# opens one pull request when the onepeek-ci-bump App secrets are set. This repo is public, so it runs on GitHub-hosted
+# runners and pins the shared workflow as the repo itself does for spot-rerun-caller.yml (the local path of this commit).
+name: ci-image-bump-caller
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"  # Mondays, 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    uses: ./.github/workflows/ci-image-bump.yml
+    permissions:
+      contents: read
+    with:
+      runner: github
+      base: main
+    secrets:
+      CI_BUMP_APP_ID: ${{ secrets.CI_BUMP_APP_ID }}
+      CI_BUMP_APP_PRIVATE_KEY: ${{ secrets.CI_BUMP_APP_PRIVATE_KEY }}
