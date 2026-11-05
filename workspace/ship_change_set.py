@@ -145,7 +145,13 @@ def release_lock(env: str, profile: str, aws=subprocess.run) -> str | None:
     cmd = ["aws", "s3api", "head-object", "--bucket", bucket, "--key", "locks/release.json", "--query", "LastModified", "--output", "text"]
     if profile:
         cmd += ["--profile", profile]
+    profile_args = ["--profile", profile] if profile else []
     try:
+        # The bucket first: a missing or misnamed bucket must stop here, never read as a free lock.
+        b = aws(["aws", "s3api", "head-bucket", "--bucket", bucket, *profile_args], capture_output=True, text=True, check=False)
+        if b.returncode != 0:
+            raise SystemExit(f"STOP: cannot check the release lock of {env} (bucket {bucket}: {((b.stderr or b.stdout) or '').strip()[:300]}); "
+                             f"pass --aws-profile for the {env} account")
         r = aws(cmd, capture_output=True, text=True, check=False)
     except OSError as e:
         raise SystemExit(f"STOP: cannot check the release lock of {env} (aws is not runnable: {e}); pass --aws-profile and try again")
@@ -770,7 +776,11 @@ def main(argv: list[str]) -> int:
     prs = with_dependencies(prs, deps)
     problems = []
     release_prs = [r for (r, _), i in info.items() if i["baseRefName"] == RELEASE_BASE and r in CHAIN]
-    if release_prs:  # release pull requests (§2c steps 3 and 4): the lock, then the chain
+    if release_prs:  # release pull requests (§2c steps 3 and 4): their own set, then the lock, then the chain
+        mixed = [r for r, _ in prs if r in (DOCS, ".github")]
+        if mixed:
+            say(f"problem: release pull requests ship in their own set, after the dependencies have merged; this set also holds {', '.join(mixed)}")
+            return 1
         why = lock_problem(RELEASE_ENV, release_lock(RELEASE_ENV, a.aws_profile))
         if why:
             problems.append(why)

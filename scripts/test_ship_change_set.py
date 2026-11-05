@@ -1030,8 +1030,11 @@ class ReleaseGates(unittest.TestCase):
 
     OK = {"status": "completed", "conclusion": "success", "headSha": HEAD}
 
-    def aws(self, code: int = 0, stderr: str = "", stdout: str = "2026-11-05T10:00:00+00:00") -> mock.Mock:
-        return mock.Mock(return_value=done(code, stdout, stderr))
+    def aws(self, code: int = 0, stderr: str = "", stdout: str = "2026-11-05T10:00:00+00:00", bucket: int = 0) -> mock.Mock:
+        def run(cmd, **kw):
+            return done(bucket, "", "An error occurred (404) when calling the HeadBucket operation: Not Found") if "head-bucket" in cmd \
+                else done(code, stdout, stderr)
+        return mock.Mock(side_effect=run)
 
     def test_a_free_lock_is_only_a_404_not_found(self) -> None:
         for err in ("An error occurred (404) when calling the HeadObject operation: Not Found", "NotFound"):
@@ -1046,6 +1049,27 @@ class ReleaseGates(unittest.TestCase):
         with self.assertRaises(SystemExit) as stop:
             ship.release_lock("preprod", "p", mock.Mock(side_effect=FileNotFoundError("aws")))
         self.assertIn("cannot check the release lock", str(stop.exception))
+
+    def test_a_missing_or_misnamed_bucket_stops_and_never_reads_as_free(self) -> None:
+        aws = self.aws(254, "An error occurred (404) when calling the HeadObject operation: Not Found", "", bucket=254)
+        with self.assertRaises(SystemExit) as stop:
+            ship.release_lock("preprod", "p", aws)
+        self.assertIn("cannot check the release lock", str(stop.exception))
+        self.assertTrue(all("head-object" not in c[0][0] for c in aws.call_args_list))  # never got as far as the lock
+        ship.release_lock("preprod", "p", (m := self.aws()))
+        self.assertIn("head-bucket", m.call_args_list[0][0][0])
+
+    def test_a_release_pull_request_ships_in_its_own_set_not_with_docs_or_dot_github(self) -> None:
+        root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        for r in ("onepeek-docs", ".github", "backend-service"):
+            (root / r / ".git").mkdir(parents=True)
+        for other in (("onepeek-docs", 1), (".github", 2)):
+            with mock.patch.object(ship, "pr_info", side_effect=lambda r, n: {**self.pr_info()(r, n), "baseRefName": "release" if r == "backend-service" else ship.BASE.get(r, "dev"),
+                                                                                "headRefName": "dev" if r == "backend-service" else f"b{n}"}), \
+                    mock.patch.object(ship, "ROOT", root), \
+                    mock.patch.object(ship, "release_lock", side_effect=AssertionError("refused before any lock read")):
+                self.assertEqual(ship.main(["backend-service#5", f"{other[0]}#{other[1]}"]), 1, other)
 
     def test_the_lock_is_checked_with_head_object_never_its_token(self) -> None:
         aws = self.aws()

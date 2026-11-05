@@ -26,7 +26,8 @@ def run(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, capture_output=True, text=True, check=False)
 
 
-LANE = re.compile(r"^.*\bLane:(.*)$", re.M | re.I)
+LANE = re.compile(r"^[ \t]*(?:[-*+][ \t]+)?(?:#+[ \t]+)?(?:\*\*|__)?Lane:(?:\*\*|__)?[ \t]*(.*)$", re.M | re.I)
+COMMENT = re.compile(r"<!--.*?-->", re.S)  # a template's `<!-- Lane: feature|hotfix -->` hint is not a statement
 LANES = ("feature", "hotfix")
 
 
@@ -36,7 +37,7 @@ def lane_of(text: str | None) -> str:
     it is the value, so `Lane: hotfix (preprod down)` is hotfix; `hot fix`, an empty value or any other word is an
     error, never silently the default."""
     found = []
-    for m in LANE.finditer(text or ""):
+    for m in LANE.finditer(COMMENT.sub("", text or "")):
         words = m.group(1).replace("*", " ").replace("`", " ").split()
         found.append(words[0].lower() if words else "")
     if not found:

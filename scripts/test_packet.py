@@ -15,6 +15,7 @@ class Lane(unittest.TestCase):
         self.assertEqual(packet.lane_of(""), "feature")
         self.assertEqual(packet.lane_of(None), "feature")
         self.assertEqual(packet.lane_of("Build identity.\nNo lane stated here"), "feature")
+        self.assertEqual(packet.lane_of("Build identity.\nNo lane here, Lane: hotfix mentioned inline"), "feature")
 
     def test_a_lane_line_sets_it_in_any_case(self) -> None:
         self.assertEqual(packet.lane_of("fix it\nLane: hotfix\n"), "hotfix")
@@ -24,6 +25,12 @@ class Lane(unittest.TestCase):
         for text in ("- **Lane:** hotfix", "* Lane: hotfix (preprod down)", "Lane: **hotfix**", "x\n  - lane: HOTFIX - restores the release"):
             self.assertEqual(packet.lane_of(text), "hotfix", text)
         self.assertEqual(packet.lane_of("- **Lane:** feature (default)"), "feature")
+
+    def test_an_html_comment_is_ignored_also_beside_a_real_line(self) -> None:
+        hint = "<!-- Lane: feature|hotfix -->"
+        self.assertEqual(packet.lane_of(hint), "feature")
+        self.assertEqual(packet.lane_of(f"{hint}\nLane: hotfix"), "hotfix")
+        self.assertEqual(packet.lane_of("<!--\nLane: feature|hotfix\n-->\nLane: hotfix"), "hotfix")
 
     def test_an_unknown_or_conflicting_lane_is_an_error_never_the_default(self) -> None:
         for text in ("Lane: urgent", "Lane: hot fix", "Lane:", "Lane: hotfix\nLane: feature"):
