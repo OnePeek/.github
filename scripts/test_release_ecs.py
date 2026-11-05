@@ -3,6 +3,7 @@ Run: python -m unittest discover -s scripts -p 'test_*.py'"""
 
 import json
 import os
+import pathlib
 import re
 import stat
 import subprocess
@@ -979,6 +980,33 @@ class OneServicesFile(unittest.TestCase):
         self.assertFalse([s for s in steps if "onepeek-infra" in str(s.get("with", {}).get("repository", ""))])
         self.assertNotIn("_infra", json.dumps(steps))
 
+
+
+class CosignRegistryLogin(unittest.TestCase):
+    """Every cosign verify runs after an ECR login that is unconditional within its job (first live release: 401)."""
+
+    @staticmethod
+    def _code_lines(run: str) -> list[str]:
+        return [ln.strip() for ln in run.splitlines() if ln.strip() and not ln.strip().startswith(("#", ": "))]
+
+    def test_every_cosign_verify_comes_after_an_unconditional_ecr_login_in_its_job(self):
+        import yaml  # noqa: PLC0415
+        login_re = re.compile(r"^aws ecr get-login-password \| (cosign|docker) login\b")
+        root = pathlib.Path(__file__).resolve().parent.parent / ".github" / "workflows"
+        for name in ("release-ecs.yml", "operate.yml"):
+            wf = yaml.safe_load((root / name).read_text(encoding="utf-8"))
+            for job_id, job in wf["jobs"].items():
+                job_login = False  # an earlier, unconditional step logged in
+                for st in job.get("steps", []):
+                    step_login = False  # a login earlier in this same step
+                    for line in self._code_lines(str(st.get("run", ""))):
+                        if login_re.match(line):
+                            step_login = True
+                        if line.startswith("cosign verify"):
+                            self.assertTrue(job_login or step_login,
+                                            f"{name}:{job_id}: cosign verify without an ECR login before it")
+                    if step_login and st.get("if") is None:
+                        job_login = True
 
 if __name__ == "__main__":
     unittest.main()
