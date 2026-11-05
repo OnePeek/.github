@@ -9,10 +9,6 @@ skipped: the laptop already has the tools; reusable-workflow jobs are listed as 
 stand for run here directly (actionlint with shellcheck, the runner-label lint). A step that rewrites package.json (`npm pkg set`) has it restored afterwards. Steps that need GitHub's API or
 AWS (they read GH_TOKEN, assume a role, or call `gh api`) are skipped and listed, never run.
 
-Gap: the backend's fast tier (tests without the throwaway services) is not made honest here: its tests/service_gate.py has no
-variable that refuses connections to the service ports (it only has TEST_SERVICES_REQUIRED, which does the opposite), and
-CI has no `-m "not integration"` step, so nothing is set; that needs a backend-service change first.
-
 Exit 0 when every step ran and passed; 1 at the first failure (its output is shown); 2 bad input.
 """
 from __future__ import annotations
@@ -83,14 +79,14 @@ def packages_token() -> str:
 
 # Tracked files that deliberately hold conflict markers (none today); repo-relative paths.
 CONFLICT_MARKER_ALLOW: tuple[str, ...] = ()
-_MARKER = re.compile(r"^(<{7} |>{7} )", re.M)
+_MARKER = re.compile(r"^(?:<{7}|>{7})(?:[ \t\r]|$)", re.M)
 
 
 def conflict_markers(repo: pathlib.Path) -> list[str]:
     """`path:line` of each unresolved merge conflict marker (`<<<<<<< ` or `>>>>>>> ` at a line start) in tracked text files.
 
     A bare `=======` is a Markdown heading underline, so it counts only as the middle of a conflict, never alone."""
-    r = subprocess.run(["git", "-C", str(repo), "ls-files", "-z"], capture_output=True)
+    r = subprocess.run(["git", "-C", str(repo), "ls-files", "-z", "--deduplicate"], capture_output=True)
     found = []
     for rel in filter(None, r.stdout.decode("utf-8", "replace").split("\0")):
         f = repo / rel
@@ -106,35 +102,46 @@ def conflict_markers(repo: pathlib.Path) -> list[str]:
     return found
 
 
+_DOCKER: bool | None = None  # `docker info` answers once per run
+
+
 def docker_ready() -> bool:
-    """True when the docker CLI is installed and its daemon answers."""
-    if not shutil.which("docker"):
-        return False
-    return subprocess.run(["docker", "info"], capture_output=True, text=True).returncode == 0
+    """True when the docker CLI is installed and its daemon answers (asked once per run)."""
+    global _DOCKER
+    if _DOCKER is None:
+        _DOCKER = bool(shutil.which("docker")) and subprocess.run(["docker", "info"], capture_output=True, text=True).returncode == 0
+    return _DOCKER
 
 
-def tflint_mode() -> str:
+# A tflint command anywhere in a step: at a line start or after `;`, `&&`, `||`, `|`, `(`, `if`, `then`, `do`; not `tflint-foo`.
+TFLINT_CALL = re.compile(r"(?:^|[;&|(]|\b(?:if|then|do|while)\b)\s*tflint(?![\w.-])", re.M)
+
+
+def tflint_mode(allow_docker: bool = True) -> str:
     """How tflint runs here: "native" (CI's version on PATH), "docker" (CI's image; Homebrew no longer ships tflint), or ""."""
     if tool_version("tflint") == TFLINT_VERSION:
         return "native"
-    return "docker" if docker_ready() else ""
+    return "docker" if allow_docker and docker_ready() else ""
 
 
-def tflint_problem() -> str:
+def tflint_problem(allow_docker: bool = True) -> str:
     """Why tflint steps cannot run here (neither CI's tflint on PATH nor Docker), or ""."""
-    if tflint_mode():
+    if tflint_mode(allow_docker):
         return ""
     v = tool_version("tflint")
     have = "tflint is not installed" if v is None else f"tflint {v} is installed; CI pins {TFLINT_VERSION}"
-    return f"{have} on this laptop and Docker is not available (install Docker to run CI's {TFLINT_IMAGE}:v{TFLINT_VERSION})"
+    return f"{have} on this laptop and Docker is {'not used (--skip-docker)' if not allow_docker else 'not available'} (CI runs {TFLINT_IMAGE}:v{TFLINT_VERSION})"
 
 
-def tflint_via_docker(cmd: str, repo: pathlib.Path, cwd: pathlib.Path) -> str:
-    """The step with each line that starts with `tflint` run in CI's pinned image, the repo mounted at /data."""
-    rel = cwd.resolve().relative_to(repo.resolve())
+def tflint_via_docker(cmd: str, repo: pathlib.Path, cwd: pathlib.Path, env: dict[str, str]) -> str:
+    """The whole step in one container of CI's pinned tflint image (so `--init`'s plugins reach `--recursive`), the repo mounted
+    at /data; GITHUB_TOKEN, TFLINT_* and the step's own variables are passed by name, never by value."""
+    rel = cwd.resolve().relative_to(repo.resolve())  # ValueError when outside: the caller fails the step first
     workdir = "/data" if str(rel) == "." else f"/data/{rel}"
-    prefix = f"docker run --rm -v {shlex.quote(str(repo.resolve()))}:/data -w {shlex.quote(workdir)} {TFLINT_IMAGE}:v{TFLINT_VERSION}"
-    return re.sub(r"(?m)^(\s*)tflint\b", lambda m: m.group(1) + prefix, cmd)
+    names = sorted(k for k in env if k == "GITHUB_TOKEN" or k.startswith("TFLINT_"))
+    flags = " ".join(f"-e {shlex.quote(k)}" for k in names)
+    return (f"docker run --rm -v {shlex.quote(str(repo.resolve()))}:/data -w {shlex.quote(workdir)} {flags} "
+            f"{TFLINT_IMAGE}:v{TFLINT_VERSION} sh -ec {shlex.quote(cmd)}")
 
 
 def plugin_cache() -> pathlib.Path:
@@ -318,7 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("repo")
     ap.add_argument("--jobs", default="", help="comma-separated job ids to run (default: all)")
     ap.add_argument("--skip-docker", action="store_true", help="skip steps that call docker")
-    ap.add_argument("--release", action="store_true", help="a release run: a step that cannot run here (no tflint or Docker) fails instead of being skipped")
+    ap.add_argument("--release", action="store_true", help="a release run: a step that needs an optional tool the laptop lacks (trivy; tflint without Docker) fails instead of being skipped, even with --skip-docker")
     ap.add_argument("--list", action="store_true", help="print the steps, run nothing")
     a = ap.parse_args(argv)
     if threading.current_thread() is threading.main_thread():
@@ -336,6 +343,8 @@ def main(argv: list[str] | None = None) -> int:
     started = time.time()
     ctx = contexts(repo, name)
     a.ctx, a.own = ctx, name
+    global _DOCKER
+    _DOCKER = None
     if not a.list and (problem := uv_problem()):
         print(f"FAIL  {problem}")
         return 1
@@ -467,22 +476,27 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                     skipped.append(f"{label} (tool install; the laptop has its own)")
                     continue
                 missing = [t for t in OPTIONAL_TOOLS if re.search(rf"(?m)^\s*{t}\b", cmd) and not shutil.which(t)]
+                if missing and a.release and not a.list:
+                    print(f"FAIL  {label}: {missing[0]} is not installed on this laptop (--release does not skip it)")
+                    return 1
                 if missing:
                     skipped.append(f"{label} (SKIP: {missing[0]} is not installed on this laptop)")
                     continue
                 tflint_docker = False
-                if re.search(r"(?m)^\s*tflint\b", cmd):
-                    if a.skip_docker and tflint_mode() != "native":
-                        skipped.append(f"{label} (docker)")
-                        continue
-                    if why := tflint_problem():
+                if TFLINT_CALL.search(cmd):
+                    try:
+                        (repo / step.get("working-directory", workdir)).resolve().relative_to(repo.resolve())
+                    except ValueError:
+                        print(f"FAIL  {label}: working-directory is outside the repository")
+                        return 1
+                    if why := tflint_problem(not a.skip_docker):
                         if a.release and not a.list:
                             print(f"FAIL  {label}: {why}")
                             return 1
                         print(f"WARN  {label}: {why}; CI runs it", file=sys.stderr)
                         skipped.append(f"{label} (SKIP: {why})")
                         continue
-                    tflint_docker = tflint_mode() == "docker"
+                    tflint_docker = tflint_mode(not a.skip_docker) == "docker"
                 if any(re.search(rf"\bmv\s+{re.escape(c)}\b", cmd) for c in checkout_paths if not c.startswith("${{")):
                     skipped.append(f"{label} (CI-only: places a checkout the laptop does not make)")
                     continue
@@ -510,7 +524,7 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                 cwd = repo / step.get("working-directory", workdir)
                 cmd = EXPR.sub("", cmd)
                 if tflint_docker:
-                    cmd = tflint_via_docker(cmd, repo, cwd)
+                    cmd = tflint_via_docker(cmd, repo, cwd, env)
                 # A tool a skipped install step would have put in the working directory: use the laptop's.
                 cmd = re.sub(r"(?m)(^|\s)\./([A-Za-z0-9_-]+)\b",
                              lambda m: m.group(0) if (cwd / m.group(2)).exists() or not shutil.which(m.group(2)) else m.group(1) + m.group(2), cmd)

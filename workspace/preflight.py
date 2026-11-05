@@ -193,7 +193,7 @@ def tool_checks(repo: pathlib.Path, rep: Report, version=installed_version) -> N
     rep.add("FAIL" if uv else "PASS", f"tools: {uv or 'uv ' + local_ci.UV_VERSION + ' (CI pin)'}")
     if uses_tflint(repo):
         why = local_ci.tflint_problem()
-        rep.add("WARN" if why else "PASS", f"tools: {why + '; local CI skips tflint' if why else 'tflint ' + local_ci.TFLINT_VERSION + (' (CI pin)' if local_ci.tflint_mode() == 'native' else ' (CI pin, via Docker)')}")
+        rep.add("WARN" if why else "PASS", f"tools: {why + '; local CI skips tflint (CI runs it), and --release fails' if why else 'tflint ' + local_ci.TFLINT_VERSION + (' (CI pin)' if local_ci.tflint_mode() == 'native' else ' (CI pin, via Docker)')}")
 
 
 def uses_tflint(repo: pathlib.Path) -> bool:

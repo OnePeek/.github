@@ -265,17 +265,93 @@ class Versions(unittest.TestCase):
                 (b / t).symlink_to(shutil.which(t))
         return b
 
-    def test_without_tflint_it_runs_ci_image_in_docker_with_the_same_commands(self):
-        d = self._tf_repo()
+    def test_without_tflint_the_whole_step_runs_in_one_container_of_ci_image(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n        working-directory: sub\n"
+                      "    steps:\n      - env:\n          TFLINT_LOG: debug\n        run: |\n          tflint --init\n          cd . && tflint --recursive\n")
+        (d / "sub").mkdir()
+        (d / "sub/.tflint.hcl").write_text('plugin "aws" {\n  enabled = true\n  version = "0.30.0"\n  source = "github.com/terraform-linters/tflint-ruleset-aws"\n}\n')
         log = pathlib.Path(tempfile.mkdtemp()) / "docker.log"
         b = self._bin(docker=f'[ "$1" = info ] && exit 0\necho "$@" >> {log}\n')
         with mock.patch.dict(os.environ, {"PATH": str(b)}), mock.patch.object(lc, "uv_problem", return_value=""):
             self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
-        lines = log.read_text().splitlines()
-        image = f"ghcr.io/terraform-linters/tflint:v{lc.TFLINT_VERSION}"
-        self.assertEqual(len(lines), 2)
-        for line, want in zip(lines, ("--init", "--recursive")):
-            self.assertTrue(line.startswith(f"run --rm -v {d.resolve()}:/data -w /data {image} {want}"), line)
+        text = log.read_text()
+        self.assertEqual(text.count("run --rm"), 1)  # one container: the plugins --init installs are there for --recursive
+        line = text
+        self.assertTrue(line.startswith(f"run --rm -v {d.resolve()}:/data -w /data/sub "), line)
+        self.assertIn("-e TFLINT_LOG", line)
+        self.assertNotIn("debug", line)  # passed by name, never by value
+        self.assertIn(f"ghcr.io/terraform-linters/tflint:v{lc.TFLINT_VERSION} sh -ec", line)
+        self.assertIn("tflint --init", line)
+        self.assertIn("cd . && tflint --recursive", line)
+
+    def test_tflint_calls_are_found_anywhere_in_a_step_but_not_other_tools(self):
+        for yes in ("tflint --init", "  tflint", "cd x && tflint -f json", "if tflint; then :; fi", "a; tflint", "(tflint)", "a | tflint"):
+            self.assertTrue(lc.TFLINT_CALL.search(yes), yes)
+        for no in ("tflint-foo --x", "echo tflint", "mytflint", "tflint.sh"):
+            self.assertFalse(lc.TFLINT_CALL.search(no), no)
+
+    def test_a_working_directory_outside_the_repo_fails_the_tflint_step(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - working-directory: ../elsewhere\n        run: tflint\n")
+        with mock.patch.dict(os.environ, {"PATH": str(self._bin(docker="exit 0\n"))}), mock.patch.object(lc, "uv_problem", return_value=""):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
+        self.assertIn("outside the repository", out.getvalue())
+
+    def test_native_tflint_at_ci_version_runs_without_docker(self):
+        d = self._tf_repo()
+        log = pathlib.Path(tempfile.mkdtemp()) / "t.log"
+        b = self._bin(tflint=f'[ "$1" = --version ] && echo "TFLint version {lc.TFLINT_VERSION}" && exit 0\necho "$@" >> {log}\n',
+                      docker="exit 9\n")
+        with mock.patch.dict(os.environ, {"PATH": str(b)}), mock.patch.object(lc, "uv_problem", return_value=""):
+            self.assertEqual(lc.tflint_mode(), "native")
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+        self.assertEqual(log.read_text().splitlines(), ["--init", "--recursive"])
+
+    def test_skip_docker_leaves_tflint_to_ci_but_release_still_fails(self):
+        d = self._tf_repo()
+        b = self._bin(docker=f"exit 0\n")  # a working docker that --skip-docker must not use
+        with mock.patch.dict(os.environ, {"PATH": str(b)}), mock.patch.object(lc, "uv_problem", return_value=""):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(lc.main([str(d), "--jobs", "a", "--skip-docker"]), 0)
+            self.assertIn("WARN", err.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a", "--skip-docker", "--release"]), 1)
+            self.assertIn("FAIL", out.getvalue())
+
+    def test_release_fails_on_a_missing_trivy_too(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: trivy config .\n")
+        with mock.patch.dict(os.environ, {"PATH": str(self._bin())}), mock.patch.object(lc, "uv_problem", return_value=""):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a", "--release"]), 1)
+            self.assertIn("trivy", out.getvalue())
+
+    def test_conflict_marker_forms_and_exclusions(self):
+        d = self.repo("on: [pull_request]\njobs: {}\n")
+        L, R = "<" * 7, ">" * 7
+        cases = {"open.md": f"a\n{L} HEAD\n", "close.md": f"a\n{R} dev\n", "bare_open.md": f"a\n{L}\n", "bare_close.md": f"a\r\n{R}\r\n"}
+        for n, body in cases.items():
+            (d / n).write_text(body)
+        (d / "midline.md").write_text(f"see {L} here\n")
+        (d / "eight.md").write_text("<" * 8 + "x\n")
+        (d / "bin.dat").write_bytes(b"\0" + f"\n{L} HEAD\n".encode())
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True)
+        got = lc.conflict_markers(d)
+        self.assertEqual(sorted(g.split(":")[0] for g in got), ["bare_close.md", "bare_open.md", "close.md", "open.md"])
+
+    def test_an_unmerged_file_is_reported_once(self):
+        d = self.repo("on: [pull_request]\njobs: {}\n")
+        g = lambda *a: subprocess.run(["git", "-C", str(d), "-c", "user.name=t", "-c", "user.email=t@t", *a], check=True, capture_output=True)
+        (d / "f.txt").write_text("base\n"); g("add", "-A"); g("commit", "-qm", "base"); g("branch", "-M", "main")
+        g("checkout", "-qb", "other"); (d / "f.txt").write_text("other\n"); g("commit", "-qam", "o")
+        g("checkout", "-q", "main"); (d / "f.txt").write_text("main\n"); g("commit", "-qam", "m")
+        subprocess.run(["git", "-C", str(d), "merge", "other"], capture_output=True)
+        self.assertEqual(lc.conflict_markers(d), ["f.txt:1"])
 
     def test_without_tflint_or_docker_it_warns_and_under_release_fails(self):
         d = self._tf_repo()
