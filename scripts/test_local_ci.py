@@ -2,6 +2,7 @@
 import contextlib
 import importlib.util
 import io
+import re
 import os
 import pathlib
 import shutil
@@ -17,6 +18,15 @@ spec = importlib.util.spec_from_file_location("local_ci", ROOT / "workspace/loca
 lc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lc)
 
+
+
+def plugin_download_unreachable(text: str) -> bool:
+    """The tflint plugin download (`tflint --init` fetching a GitHub release) could not reach GitHub's API: rate limited, a
+    network timeout, DNS or connection failure. Environment trouble, not a defect in the image or the config, so the
+    test skips (the network is not under test); any other failure is still a failure."""
+    if "rate limit" in text:
+        return True
+    return bool(re.search(r"Failed to fetch GitHub releases.*?(timeout|timed out|deadline exceeded|no such host|connection (reset|refused)|\bEOF\b)", text, re.S | re.I))
 
 class LocalCi(unittest.TestCase):
     def repo(self, workflow: str) -> pathlib.Path:
@@ -292,6 +302,16 @@ class Versions(unittest.TestCase):
                 self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
         self.assertIn("needs tflint", out.getvalue())
 
+    def test_a_failed_plugin_download_is_a_skip_only_when_github_was_unreachable(self):
+        base = 'Failed to install a plugin; Failed to fetch GitHub releases: Get "https://api.github.com/x": '
+        for why in ("net/http: TLS handshake timeout", "dial tcp: lookup api.github.com: no such host", "context deadline exceeded (Client.Timeout exceeded)",
+                    "read: connection reset by peer", "unexpected EOF"):
+            self.assertTrue(plugin_download_unreachable(base + why), why)
+        self.assertTrue(plugin_download_unreachable("API rate limit exceeded for 1.2.3.4"))
+        # A real problem with the plugin or the config stays a failure.
+        for text in ("", "Failed to install a plugin; checksum mismatch", base + "404 Not Found", "rule violation: terraform_unused_declarations"):
+            self.assertFalse(plugin_download_unreachable(text), text)
+
     def test_the_pinned_image_really_runs_on_a_plugin_fixture_and_a_clean_one(self):
         if not lc.docker_ready():
             self.skipTest("docker is not available")
@@ -307,8 +327,8 @@ class Versions(unittest.TestCase):
             with mock.patch.object(lc, "tflint_mode", return_value="docker"), mock.patch.object(lc, "TFLINT_CACHE", cache), \
                     mock.patch.object(lc, "uv_problem", return_value=""), contextlib.redirect_stdout(out):
                 rc = lc.main([str(d), "--jobs", "a"])
-            if hcl is aws and "rate limit" in out.getvalue():
-                self.skipTest("GitHub rate-limited the plugin download")
+            if hcl is aws and plugin_download_unreachable(out.getvalue()):
+                self.skipTest("GitHub's API could not be reached for the plugin download (rate limit or network)")
             self.assertEqual(rc, 0, out.getvalue())
             self.assertIn("PASS", out.getvalue())
             self.assertEqual(hcl is aws, any(cache.rglob("tflint-ruleset-aws*")), out.getvalue())

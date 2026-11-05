@@ -260,3 +260,51 @@ class Workflow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DraftGate(unittest.TestCase):
+    """development-cycle §2c step 2: a pull request with an open dependency is a draft (a notice; ship_change_set.py enforces)."""
+
+    OPEN, MERGED = staticmethod(lambda r, n: ("open", False)), staticmethod(lambda r, n: ("closed", True))
+
+    def test_a_non_draft_with_an_open_dependency_gets_one_message_per_dependency(self) -> None:
+        deps = [("backend-service", 73), ("onepeek-web", 5)]
+        out = cd.draft_gate(deps, False, self.OPEN)
+        self.assertEqual(len(out), 2)
+        self.assertIn("backend-service#73", out[0])
+        self.assertIn("draft", out[0])
+
+    def test_a_draft_a_merged_dependency_or_an_unknown_flag_is_quiet(self) -> None:
+        deps = [("backend-service", 73)]
+        self.assertEqual(cd.draft_gate(deps, True, self.OPEN), [])
+        self.assertEqual(cd.draft_gate(deps, False, self.MERGED), [])
+        self.assertEqual(cd.draft_gate(deps, None, self.OPEN), [])
+
+    def test_check_prints_it_as_a_notice_and_still_passes_only_on_its_own_merits(self) -> None:
+        env = {"BODY": "Depends on: OnePeek/backend-service#73", "IS_DRAFT": "false", "GH_TOKEN": "t"}
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(cd, "api_state", return_value=("open", False)), \
+                contextlib.redirect_stdout(out), tempfile.TemporaryDirectory() as d:
+            code = cd.main(["--check", "--repo-dir", d])
+        self.assertEqual(code, 1)  # waiting for the dependency fails as before
+        self.assertIn("::notice title=depends-on::backend-service#73 is still open", out.getvalue())
+
+    def test_the_workflow_passes_the_draft_flag(self) -> None:
+        step = next(s for s in STEPS if s.get("name", "").startswith("Every dependency is merged"))
+        self.assertIn("github.event.pull_request.draft", step["env"]["IS_DRAFT"])
+
+    def test_an_api_error_in_the_notice_path_never_fails_the_job(self) -> None:
+        env = {"BODY": "Depends on: OnePeek/backend-service#73", "IS_DRAFT": "false", "GH_TOKEN": "t"}
+        calls = iter([("closed", True)])  # the wait sees it merged; the notice path's own read then fails
+
+        def state(r, n, t):
+            try:
+                return next(calls)
+            except StopIteration:
+                raise SystemExit("::error::cannot read backend-service#73: HTTP 502")
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(cd, "api_state", side_effect=state), \
+                contextlib.redirect_stdout(out), tempfile.TemporaryDirectory() as d:
+            code = cd.main(["--check", "--repo-dir", d])
+        self.assertEqual(code, 0)
+        self.assertIn("draft check skipped", out.getvalue())

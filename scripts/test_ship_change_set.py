@@ -1020,3 +1020,219 @@ class ConflictFlow(DocsPin):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+HEAD = "a" * 40
+
+
+class ReleaseGates(unittest.TestCase):
+    """development-cycle §2c steps 3 and 4: a release pull request waits on the release lock and on the earlier release."""
+
+    OK = {"status": "completed", "conclusion": "success", "headSha": HEAD}
+
+    def aws(self, code: int = 0, stderr: str = "", stdout: str = "2026-11-05T10:00:00+00:00", bucket: int = 0) -> mock.Mock:
+        def run(cmd, **kw):
+            return done(bucket, "", "An error occurred (404) when calling the HeadBucket operation: Not Found") if "head-bucket" in cmd \
+                else done(code, stdout, stderr)
+        return mock.Mock(side_effect=run)
+
+    def test_a_free_lock_is_only_a_404_not_found(self) -> None:
+        for err in ("An error occurred (404) when calling the HeadObject operation: Not Found", "NotFound"):
+            self.assertIsNone(ship.release_lock("preprod", "p", self.aws(254, err, "")))
+
+    def test_any_other_aws_answer_stops_and_never_assumes_free(self) -> None:
+        for code, err in ((254, "An error occurred (403) when calling the HeadObject operation: Forbidden"),
+                          (255, "Unable to locate credentials"), (254, ""), (0, "")):
+            with self.assertRaises(SystemExit) as stop:
+                ship.release_lock("preprod", "p", self.aws(code, err, "" if code == 0 else "x"))
+            self.assertIn("cannot check the release lock", str(stop.exception))
+        with self.assertRaises(SystemExit) as stop:
+            ship.release_lock("preprod", "p", mock.Mock(side_effect=FileNotFoundError("aws")))
+        self.assertIn("cannot check the release lock", str(stop.exception))
+
+    def test_a_missing_or_misnamed_bucket_stops_and_never_reads_as_free(self) -> None:
+        aws = self.aws(254, "An error occurred (404) when calling the HeadObject operation: Not Found", "", bucket=254)
+        with self.assertRaises(SystemExit) as stop:
+            ship.release_lock("preprod", "p", aws)
+        self.assertIn("cannot check the release lock", str(stop.exception))
+        self.assertTrue(all("head-object" not in c[0][0] for c in aws.call_args_list))  # never got as far as the lock
+        ship.release_lock("preprod", "p", (m := self.aws()))
+        self.assertIn("head-bucket", m.call_args_list[0][0][0])
+
+    def test_a_release_pull_request_ships_in_its_own_set_not_with_docs_or_dot_github(self) -> None:
+        root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        for r in ("onepeek-docs", ".github", "backend-service"):
+            (root / r / ".git").mkdir(parents=True)
+        for other in (("onepeek-docs", 1), (".github", 2)):
+            with mock.patch.object(ship, "pr_info", side_effect=lambda r, n: {**self.pr_info()(r, n), "baseRefName": "release" if r == "backend-service" else ship.BASE.get(r, "dev"),
+                                                                                "headRefName": "dev" if r == "backend-service" else f"b{n}"}), \
+                    mock.patch.object(ship, "ROOT", root), \
+                    mock.patch.object(ship, "release_lock", side_effect=AssertionError("refused before any lock read")):
+                self.assertEqual(ship.main(["backend-service#5", f"{other[0]}#{other[1]}"]), 1, other)
+
+    def test_the_lock_is_checked_with_head_object_never_its_token(self) -> None:
+        aws = self.aws()
+        since = ship.release_lock("preprod", "founder", aws)
+        cmd = aws.call_args[0][0]
+        self.assertEqual(since, "2026-11-05T10:00:00+00:00")
+        self.assertIn("head-object", cmd)
+        self.assertNotIn("get-object", cmd)
+        self.assertIn("onepeek-preprod-deploy", cmd)
+        self.assertIn("locks/release.json", cmd)
+        self.assertEqual(cmd[cmd.index("--profile") + 1], "founder")
+        self.assertIn("held since 2026-11-05T10:00:00+00:00", ship.lock_problem("preprod", since))
+        self.assertIsNone(ship.lock_problem("preprod", None))
+
+    def test_the_chain_needs_the_previous_release_run_for_the_current_release_head_and_a_success(self) -> None:
+        for repo, run, ok in (
+            ("backend-service", self.OK, True),
+            ("backend-service", None, False),
+            ("backend-service", {**self.OK, "conclusion": "failure"}, False),
+            ("backend-service", {**self.OK, "status": "in_progress", "conclusion": ""}, False),
+            ("backend-service", {**self.OK, "headSha": "b" * 40}, False),  # an older release's run: this head has not released
+            ("onepeek-web", self.OK, True),
+            ("onepeek-infra", None, True),  # head of the chain
+            ("onepeek-docs", None, True),  # not in the chain
+        ):
+            why = ship.chain_problem(repo, [repo], lambda prev: (run, HEAD))
+            self.assertEqual(why is None, ok, (repo, run, why))
+
+    def test_the_previous_release_in_the_same_set_must_go_first(self) -> None:
+        why = ship.chain_problem("onepeek-web", ["backend-service", "onepeek-web"], lambda prev: (self.OK, HEAD))
+        self.assertIn("backend-service releases in this set", why)
+
+    def test_run_list_and_release_head_are_read_with_gh(self) -> None:
+        seen = []
+
+        def gh(*args):
+            seen.append(args)
+            return f'[{{"status":"completed","conclusion":"success","headSha":"{HEAD}"}}]' if args[0] == "run" else HEAD + "\n"
+        with mock.patch.object(ship, "gh", side_effect=gh):
+            run, head = ship.release_run("onepeek-infra")
+        self.assertEqual((run["conclusion"], head), ("success", HEAD))
+        self.assertIn("release.yml", seen[0])
+        self.assertIn("release", seen[0])
+
+    def pr_info(self, draft=False):
+        def pr_info(r, n):  # a real release pull request: head dev, base release
+            return {"state": "OPEN", "baseRefName": "release", "isDraft": draft, "mergeable": "MERGEABLE", "headRefName": "dev",
+                    "headRefOid": "c" * 40, "body": "", "mergeCommit": {"oid": "d" * 40}, "isCrossRepository": False,
+                    "headRepositoryOwner": {"login": "OnePeek"}}
+        return pr_info
+
+    def main_with(self, argv, lock=None, run=None):
+        with mock.patch.object(ship, "pr_info", side_effect=self.pr_info()), mock.patch.object(ship, "docs_pin_problems", return_value=[]), \
+                mock.patch.object(ship, "release_lock", return_value=lock), \
+                mock.patch.object(ship, "release_run", return_value=(run, HEAD)):
+            return ship.main(argv)
+
+    def test_a_release_pull_request_is_refused_while_the_lock_is_held_or_the_chain_is_unmet(self) -> None:
+        self.assertEqual(self.main_with(["backend-service#5"], None, self.OK), 0)  # head dev is accepted for base release
+        self.assertEqual(self.main_with(["backend-service#5"], "2026-11-05T10:00:00+00:00", self.OK), 1)
+        self.assertEqual(self.main_with(["backend-service#5"], None, None), 1)
+        self.assertEqual(self.main_with(["backend-service#5"], None, {**self.OK, "conclusion": "failure"}), 1)
+
+    def test_only_no_chain_with_a_reason_overrides_the_chain_and_never_the_lock(self) -> None:
+        self.assertEqual(self.main_with(["backend-service#5", "--no-chain", "web does not use infra"], None, None), 0)
+        self.assertEqual(self.main_with(["backend-service#5", "--order", "backend-service"], None, None), 1)  # --order does not skip it
+        self.assertEqual(self.main_with(["backend-service#5", "--no-chain", "reason"], "2026-11-05T10:00:00+00:00", None), 1)
+
+    def test_head_dev_is_accepted_only_for_a_release_base_and_is_never_pushed_to(self) -> None:
+        i = {"headRefName": "dev", "baseRefName": "release", "isCrossRepository": False, "headRepositoryOwner": {"login": "OnePeek"}}
+        self.assertIsNone(ship.own_branch_problem("backend-service", 5, i))
+        self.assertIsNotNone(ship.own_branch_problem("backend-service", 5, {**i, "baseRefName": "main"}))
+        self.assertIsNotNone(ship.own_branch_problem("backend-service", 5, {**i, "headRefName": "main"}))
+        with self.assertRaises(SystemExit):
+            ship.refuse_protected("backend-service", "dev", "release")
+
+    def test_a_non_release_pull_request_reads_neither_lock_nor_chain(self) -> None:
+        def pr_info(r, n):
+            return {"state": "OPEN", "baseRefName": "dev", "isDraft": False, "mergeable": "MERGEABLE", "headRefName": f"b{n}",
+                    "headRefOid": "c" * 40, "body": "", "mergeCommit": None}
+        with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "docs_pin_problems", return_value=[]), \
+                mock.patch.object(ship, "release_lock", side_effect=AssertionError("no lock read")):
+            self.assertEqual(ship.main(["backend-service#5"]), 0)
+
+
+class ReleaseMergeMethod(unittest.TestCase):
+    """dev to release merges with a merge commit, never a squash, never deleting the head `dev`, lock re-checked first."""
+
+    def test_method_by_base(self) -> None:
+        self.assertEqual(ship.merge_method("backend-service", "release"), "--merge")
+        self.assertEqual(ship.merge_method("onepeek-docs", "main"), "--merge")
+        self.assertEqual(ship.merge_method("backend-service", "dev"), "--squash")
+
+    def go(self, locks):
+        gates = ReleaseGates()
+        state = {"s": "OPEN"}
+        base = gates.pr_info()
+        calls, say = [], []
+
+        def pr_info(r, n):
+            return {**base(r, n), "state": state["s"]}
+
+        def gh(*args):
+            calls.append(args)
+            if args[:2] == ("pr", "merge"):
+                state["s"] = "MERGED"
+            return ""
+        removed = []
+        with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "gh", side_effect=gh), \
+                mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "release_lock", side_effect=locks), \
+                mock.patch.object(ship, "release_run", return_value=(ReleaseGates.OK, HEAD)), \
+                mock.patch.object(ship, "green_head", return_value="c" * 40), mock.patch.object(ship, "no_conflicts"), \
+                mock.patch.object(ship, "remove_worktrees", side_effect=lambda r, b: removed.append(b)), \
+                mock.patch.object(ship, "say", side_effect=say.append):
+            code = ship.main(["backend-service#5", "--go"])
+        return code, calls, say, removed
+
+    def test_go_merges_a_release_pull_request_with_a_merge_commit_and_keeps_dev(self) -> None:
+        code, calls, say, removed = self.go([None, None])
+        self.assertEqual(code, 0)
+        merge = next(c for c in calls if c[:2] == ("pr", "merge"))
+        self.assertIn("--merge", merge)
+        self.assertNotIn("--squash", merge)
+        self.assertNotIn("--delete-branch", merge)
+        self.assertEqual(removed, [])
+        self.assertTrue(any("merge into release" in s for s in say), say)
+
+    def test_the_lock_is_checked_again_right_before_the_merge(self) -> None:
+        with self.assertRaises(SystemExit) as stop:
+            self.go([None, "2026-11-05T10:00:00+00:00"])  # free at plan time, taken before the merge
+        self.assertIn("held since", str(stop.exception))
+
+    def test_a_dev_pull_request_still_squashes_and_deletes_its_branch(self) -> None:
+        def pr_info(r, n):
+            return {"state": "OPEN", "baseRefName": "dev", "isDraft": False, "mergeable": "MERGEABLE", "headRefName": "feat",
+                    "headRefOid": "c" * 40, "body": "", "mergeCommit": {"oid": "d" * 40}}
+        calls, state = [], {"merged": False}
+
+        def info(r, n):
+            return {**pr_info(r, n), "state": "MERGED" if state["merged"] else "OPEN"}
+
+        def gh(*args):
+            calls.append(args)
+            state["merged"] = state["merged"] or args[:2] == ("pr", "merge")
+            return ""
+        with mock.patch.object(ship, "pr_info", side_effect=info), mock.patch.object(ship, "gh", side_effect=gh), \
+                mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "green_head", return_value="c" * 40), \
+                mock.patch.object(ship, "no_conflicts"), mock.patch.object(ship, "remove_worktrees"), mock.patch.object(ship, "say"):
+            self.assertEqual(ship.main(["backend-service#5", "--go"]), 0)
+        merge = next(c for c in calls if c[:2] == ("pr", "merge"))
+        self.assertIn("--squash", merge)
+        self.assertIn("--delete-branch", merge)
+
+
+class OpenDependencyNeedsADraft(unittest.TestCase):
+    def test_a_non_draft_with_an_open_dependency_outside_the_set_is_refused_with_the_draft_rule(self) -> None:
+        def pr_info(r, n):
+            if r == "backend-service":
+                return {"state": "OPEN"}
+            return {"state": "OPEN", "baseRefName": "dev", "isDraft": False, "mergeable": "MERGEABLE", "headRefName": "b",
+                    "headRefOid": "c" * 40, "body": "Depends on: OnePeek/backend-service#73", "mergeCommit": None}
+        lines = []
+        with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "docs_pin_problems", return_value=[]), \
+                mock.patch.object(ship, "say", side_effect=lines.append):
+            self.assertEqual(ship.main(["onepeek-infra#3"]), 1)
+        self.assertTrue(any("as a draft" in l for l in lines), lines)
