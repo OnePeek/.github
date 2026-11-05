@@ -9,7 +9,9 @@
      onepeek-infra's ci-runner-canary.yml and ci-runner-image.yml, which name `onepeek-arm64` and
      `onepeek-arm64-canary` directly.
   3. Every job that can run on `onepeek-*` sets `timeout-minutes`: at most 60 (fast, arm-build), 150 (stateful), or its
-     named TIMEOUT_EXCEPTIONS entry. An expression (for example one that depends on an input) is read as its larger value.
+     named TIMEOUT_EXCEPTIONS entry. An expression (for example one that depends on an input) is read as its larger value,
+     and only when it is made of `inputs.*` comparisons with a literal, `&&`, `||`, parentheses and bare integer
+     literals; any other context, function or quoted value is refused, so no expression hides a larger limit.
   4. No `pull_request_target`; no `workflow_run` job on `onepeek-*`.
   5. Private repos: a workflow triggered by `push` to `dev` that calls release-ecs.yml with `environment: preprod` sets
      `deploy-from-dev: true`; deploying preprod from dev stays off until the launch switch-over (foundation-playbook §5.4).
@@ -50,17 +52,78 @@ TIMEOUT_EXCEPTIONS = {
     ("OnePeek/.github", "operate.yml", "unlock"): 60,
     ("OnePeek/.github", "release-lock.yml", "lock"): 135,
 }
-EXPRESSION_NUMBER = re.compile(r"(?<![\w.'])\d+(?![\w.'])")
+TOKEN = re.compile(r"\s*(?:(?P<op>&&|\|\||==|!=|\(|\))|(?P<input>inputs\.[A-Za-z_][\w-]*)|(?P<int>\d+)|(?P<str>'[^']*'))")
+
+
+def _tokens(expr: str) -> list[tuple[str, str]] | None:
+    """The expression's tokens, or None when it holds anything else (another context, a function, a float, ...)."""
+    found, at = [], 0
+    while at < len(expr.rstrip()):
+        m = TOKEN.match(expr, at)
+        if not m or m.end() == at:
+            return None
+        kind = m.lastgroup or ""
+        found.append((kind, m.group(kind)))
+        at = m.end()
+    return found
+
+
+def _parse(tokens: list[tuple[str, str]]) -> list[int] | None:
+    """The integers an expression of `inputs.*` comparisons, `&&`, `||`, parentheses and integers can give, or None when
+    it is not of that form. A comparison gives only true or false, so a quoted value or an integer inside one never
+    counts; an integer or a quoted value anywhere else is a value it may give, and a quoted one is refused."""
+    at = 0
+
+    def peek() -> tuple[str, str]:
+        return tokens[at] if at < len(tokens) else ("", "")
+
+    def take() -> tuple[str, str]:
+        nonlocal at
+        token = peek()
+        at += 1
+        return token
+
+    def either() -> list[int] | None:   # either := both ('||' both)*
+        values = both()
+        while values is not None and peek() == ("op", "||"):
+            take()
+            more = both()
+            values = None if more is None else values + more
+        return values
+
+    def both() -> list[int] | None:   # both := atom ('&&' atom)*
+        values = atom()
+        while values is not None and peek() == ("op", "&&"):
+            take()
+            more = atom()
+            values = None if more is None else values + more
+        return values
+
+    def atom() -> list[int] | None:   # atom := '(' either ')' | INT | inputs.x ('=='|'!=') (STR|INT)
+        kind, text = take()
+        if (kind, text) == ("op", "("):
+            values = either()
+            return values if values is not None and take() == ("op", ")") else None
+        if kind == "int":
+            return [int(text)]
+        if kind == "input" and peek() in (("op", "=="), ("op", "!=")):
+            take()
+            return [] if take()[0] in ("str", "int") else None
+        return None
+
+    values = either()
+    return values if values is not None and at == len(tokens) else None  # nothing may follow
 
 
 def timeout_minutes(value: object) -> int | None:
-    """A job's timeout-minutes as a number: an int as it is, an expression `${{ ... }}` as the largest number in it."""
+    """A job's timeout-minutes as a number: an int as it is; an expression `${{ ... }}` of the allowed form (rule 3) as
+    the largest integer it can give; anything else None (refused)."""
     if isinstance(value, int) and not isinstance(value, bool):
         return value
-    if isinstance(value, str) and value.strip().startswith("${{") and value.strip().endswith("}}"):
-        numbers = [int(n) for n in EXPRESSION_NUMBER.findall(value)]
-        return max(numbers) if numbers else None
-    return None
+    m = re.fullmatch(r"\$\{\{(.*)\}\}", value.strip(), re.S) if isinstance(value, str) else None
+    tokens = _tokens(m.group(1)) if m else None
+    values = _parse(tokens) if tokens else None
+    return max(values) if values else None
 
 
 def _forms(var: str) -> dict[str, str]:

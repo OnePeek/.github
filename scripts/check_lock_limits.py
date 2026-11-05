@@ -6,7 +6,9 @@ that fit the runners"; ci-runners.md §5.4 rule 3).
 
 Fails when, for any waiting job of the shared workflows:
   - its job limit is below its wait cap plus its other steps' limits, or above its TIMEOUT_EXCEPTIONS entry or its
-    class's lint cap;
+    class's lint cap. The steps' limits are read from their own `timeout-minutes`; the table adds only what no step
+    limit bounds (`untimed`). A waiting step with its own limit counts with that limit, which must hold its wait cap and
+    the work after the wait in the same step (`inner`, the put-back);
   - its job limit is above its class's reaper lifetime less 20 minutes, read from onepeek-infra config/ci.yaml
     (runner.max_lifetime_minutes; on-demand for stateful, spot for every other class; the class from the job's runs-on
     mapping, as the lint reads it);
@@ -31,14 +33,15 @@ from check_runner_labels import LIMITS, MAPPING_REPO, TIMEOUT_EXCEPTIONS, classi
 CREDENTIAL_MINUTES = 60  # a deploy role's OIDC session and an App installation token (playbook §5.4a)
 BOOT_AND_IDLE = 20  # the reaper lifetime less 20 minutes for boot and an idle machine
 WAITING = ("lock_take", "lock_finish")
-# Every waiting job (playbook §5.4a "Every wait and its limit"): its wait cap, the workflow env that sets it, and the
-# sum of its other steps' limits, in minutes.
+# Every waiting job (playbook §5.4a "Every wait and its limit"), in minutes: its wait cap and the workflow env that sets
+# it; `inner`, the work after the wait inside the waiting step (the put-back, 20); and `untimed`, what the steps that set
+# no `timeout-minutes` may take. Every other step limit is read from the workflow.
 TABLE: dict[tuple[str, str], dict] = {
-    ("release-ecs.yml", "prepare"): {"cap": 120, "cap_env": "LOCK_WAIT_CAP_SECONDS", "other": 15},  # order check, take, version
-    ("release-ecs.yml", "finish"): {"cap": 15, "cap_env": "LOCK_MIGRATE_WAIT_SECONDS", "other": 30},  # put-back 20, deployment record 10
-    ("operate.yml", "lock"): {"cap": 120, "cap_env": "LOCK_WAIT_CAP_SECONDS", "other": 15},
-    ("operate.yml", "unlock"): {"cap": 15, "cap_env": "LOCK_MIGRATE_WAIT_SECONDS", "other": 20},  # put-back 20
-    ("release-lock.yml", "lock"): {"cap": 120, "cap_env": "LOCK_WAIT_CAP_SECONDS", "other": 15},
+    ("release-ecs.yml", "prepare"): {"cap": 120, "cap_env": "LOCK_WAIT_CAP_SECONDS", "inner": 0, "untimed": 15},  # order check, take, version
+    ("release-ecs.yml", "finish"): {"cap": 15, "cap_env": "LOCK_MIGRATE_WAIT_SECONDS", "inner": 20, "untimed": 0},
+    ("operate.yml", "lock"): {"cap": 120, "cap_env": "LOCK_WAIT_CAP_SECONDS", "inner": 0, "untimed": 15},
+    ("operate.yml", "unlock"): {"cap": 15, "cap_env": "LOCK_MIGRATE_WAIT_SECONDS", "inner": 20, "untimed": 0},
+    ("release-lock.yml", "lock"): {"cap": 120, "cap_env": "LOCK_WAIT_CAP_SECONDS", "inner": 0, "untimed": 15},
 }
 
 
@@ -52,12 +55,33 @@ def lifetimes(infra_config: Path) -> dict[str, int]:
 BLOCK = re.compile(r"# --- release-lock begin.*?# --- release-lock end ---", re.S)
 
 
+def waits(step: dict) -> bool:
+    """A step that calls a waiting lock function (outside the shared block, which only defines them)."""
+    code = BLOCK.sub("", str(step.get("run", "")))
+    return any(re.search(r"(^|[\s;|&(])" + w + r"\b", code) for w in WAITING)
+
+
 def waiting_jobs(doc: dict) -> list[str]:
-    """Jobs with a step that calls a waiting lock function (outside the shared block, which only defines them)."""
-    def calls(step: dict) -> bool:
-        code = BLOCK.sub("", str(step.get("run", "")))
-        return any(re.search(r"(^|[\s;|&(])" + w + r"\b", code) for w in WAITING)
-    return [job_id for job_id, job in (doc.get("jobs") or {}).items() if any(calls(s) for s in job.get("steps") or [])]
+    """Jobs with a step that waits."""
+    return [job_id for job_id, job in (doc.get("jobs") or {}).items() if any(waits(s) for s in job.get("steps") or [])]
+
+
+def step_limits(job: dict, row: dict) -> tuple[int, list[str]]:
+    """The minutes a job's steps may take: each waiting step's own limit (or its cap plus `inner` when it sets none),
+    every other step's limit, and the row's `untimed`; with the problems of a waiting step's own limit."""
+    total, problems = row["untimed"], []
+    for step in job.get("steps") or []:
+        own = timeout_minutes(step.get("timeout-minutes")) if "timeout-minutes" in step else None
+        if "timeout-minutes" in step and own is None:
+            problems.append(f"step {step.get('name') or step.get('uses')!r}: no readable timeout-minutes ({step['timeout-minutes']!r}).")
+        if waits(step):
+            need = row["cap"] + row["inner"]
+            if own is not None and own < need:
+                problems.append(f"step {step.get('name')!r}: timeout-minutes {own} is below its wait cap {row['cap']} plus {row['inner']} after it.")
+            total += own if own is not None else need
+        elif own is not None:
+            total += own
+    return total, problems
 
 
 def check(workflows: Path, life: dict[str, int], table: dict | None = None) -> list[str]:
@@ -83,8 +107,10 @@ def check(workflows: Path, life: dict[str, int], table: dict | None = None) -> l
             set_cap = env.get(row["cap_env"])
             if str(set_cap) != str(row["cap"] * 60):
                 problems.append(f"{where}: {row['cap_env']} is {set_cap!r}, but its wait cap is {row['cap']} minutes ({row['cap'] * 60}).")
-            if limit < row["cap"] + row["other"]:
-                problems.append(f"{where}: timeout-minutes {limit} is below its wait cap {row['cap']} plus its other steps {row['other']}.")
+            steps, step_problems = step_limits(job, row)
+            problems += [f"{where}: {p}" for p in step_problems]
+            if limit < steps:
+                problems.append(f"{where}: timeout-minutes {limit} is below its wait cap and its other steps' limits, {steps} in all.")
             exception = TIMEOUT_EXCEPTIONS.get((MAPPING_REPO, path.name, job_id))
             if exception is None:
                 problems.append(f"{where}: not a named TIMEOUT_EXCEPTIONS entry (ci-runners.md §5.4 rule 3).")
