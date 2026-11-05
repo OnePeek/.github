@@ -65,7 +65,7 @@ BUILT = '{"containerimage.digest": "sha256:' + "b" * 64 + '"}'
 
 class BuildReuse(unittest.TestCase):
     """Playbook §5.2: the preprod image is keyed on the commit; a re-run of the same commit reuses its image."""
-    script = step("build", "Build for ARM64")
+    script = step("build-image", "Build for ARM64")
 
     def test_this_commits_image_is_looked_up_by_sha_12_and_reused_without_a_build(self):
         out, calls, output = run_step(self.script, aws_stub(IN_ECR))
@@ -303,6 +303,48 @@ class DbBootstrap(unittest.TestCase):
 
     def test_it_never_runs_in_a_dry_run(self):
         self.assertIn("!inputs.dry-run", self.job["if"])
+
+
+class PackageRead(unittest.TestCase):
+    """Least privilege: only the web build's token reads packages, and only the web image gets the npm_token secret."""
+    jobs = RELEASE["jobs"]
+    push = next(s for s in RELEASE["jobs"]["build-web"]["steps"] if s.get("name", "").startswith("Build for ARM64"))
+
+    def test_only_build_web_has_packages_read_and_it_runs_only_for_web(self):
+        reads = {n for n, j in self.jobs.items() if (j.get("permissions") or {}).get("packages") == "read"}
+        self.assertEqual(reads, {"build-web"})
+        self.assertEqual(self.jobs["build-web"]["permissions"], {"contents": "read", "id-token": "write", "packages": "read"})
+        self.assertEqual(self.jobs["build-image"]["permissions"], {"contents": "read", "id-token": "write"})
+        self.assertIn("inputs.image == 'web'", self.jobs["build-web"]["if"])
+        self.assertIn("inputs.image != 'web'", self.jobs["build-image"]["if"])
+        self.assertEqual(self.jobs["build-web"]["steps"], self.jobs["build-image"]["steps"])  # one set of steps
+
+    def test_the_npm_token_is_the_run_token_for_the_web_image_only(self):
+        self.assertEqual(self.push["env"]["NPM_TOKEN"], "${{ matrix.image == 'web' && github.token || '' }}")
+
+    def test_the_backend_build_gets_no_npm_secret(self):
+        out, calls, _ = run_step(self.push["run"], aws_stub(NOT_IN_ECR), {"NPM_TOKEN": ""}, files={"meta.json": BUILT})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("npm_token", calls)
+        out, calls, _ = run_step(self.push["run"], aws_stub(NOT_IN_ECR), {"IMAGE": "web", "MAIN": "web", "NPM_TOKEN": "t"}, files={"meta.json": BUILT})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("--secret id=npm_token,env=NPM_TOKEN", calls)
+
+    def test_later_jobs_need_the_join_and_it_passes_only_when_exactly_one_build_succeeded(self):
+        join = self.jobs["build"]
+        self.assertEqual(join["needs"], ["build-image", "build-web"])
+        self.assertEqual(join["permissions"], {})
+        script = join["steps"][0]["run"]
+        for image, web, code in [("success", "skipped", 0), ("skipped", "success", 0), ("failure", "skipped", 1),
+                                 ("skipped", "failure", 1), ("skipped", "skipped", 1), ("cancelled", "skipped", 1)]:
+            out, _, _ = run_step(script, "", {"IMAGE_RESULT": image, "WEB_RESULT": web})
+            self.assertEqual(out.returncode, code, (image, web))
+        for job in ("scan", "sbom-sign", "record-digest"):
+            self.assertIn("build", self.jobs[job]["needs"])
+
+    def test_npm_read_token_is_ignored_and_optional(self):
+        self.assertFalse(RELEASE[True]["workflow_call"]["secrets"]["NPM_READ_TOKEN"]["required"])
+        self.assertNotIn("secrets.NPM_READ_TOKEN", TEXT)
 
 
 class Migrate(unittest.TestCase):
