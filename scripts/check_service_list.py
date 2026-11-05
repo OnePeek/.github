@@ -5,7 +5,7 @@
 Fails if the `service` choice list in .github/workflows/operate.yml is not `all` plus the services file's
 long-running services, in file order. `--write` regenerates the list. It also fails if the task-definition
 render function differs between release-ecs.yml and operate.yml (one function, delivery-pipelines §5), or if the
-release-lock functions differ between release-ecs.yml (lock and unlock jobs), operate.yml (lock and unlock jobs) and
+release-lock functions differ between release-ecs.yml (prepare and finish jobs), operate.yml (lock and unlock jobs) and
 release-lock.yml (one lock, foundation-playbook §5.4).
 """
 

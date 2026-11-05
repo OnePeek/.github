@@ -1,10 +1,13 @@
 # Shared release workflow (onepeek-docs architecture/lld/infra/delivery-pipelines.md UC-DEL-001, UC-DEL-005, §5).
 # Called by backend-service and onepeek-web on a push to the branch their preprod deploy runs from (release until launch,
 # dev after the switch-over; playbook §5.4); prod is promote-only (promote.yml, UC-DEL-003), so this workflow refuses
-# environment prod. The caller only passes inputs. Jobs, in order:
-# lock (the cross-repo release lock and the order check, playbook §5.4), version, build (build-image, or build-web for web,
-# joined by build), scan, sbom-sign, record-digest, db-bootstrap, migrate, assets, rollout, register-one-offs, smoke,
-# watch, rollback (only on failure), notify, unlock (always), api-client. Nobody deploys from a laptop.
+# environment prod. The caller only passes inputs. Five stages (foundation-reset W2.1: each job waits about a minute for
+# a runner, so the steps are grouped by stage, not one job per step), in order:
+# prepare (the cross-repo release lock and the order check, playbook §5.4; the version), build (build-image, or
+# build-web for web: build, scan, SBOM and sign, read back and verify the recorded digest), db-bootstrap (backend only;
+# a call of infra's reusable workflow under its own role, so it stays a job of its own), deploy (migrate, assets, the
+# rollout, the ops registration), verify (smoke, watch, and the rollback on a failed rollout, smoke or watch) and finish
+# (the deployment record, the unlock, always, and the API client). Nobody deploys from a laptop.
 # Every preprod artefact is keyed on the commit, sha-<12> (foundation-playbook §5.2, decision 159): the image tag, the
 # web-assets folder, the SSM release record and the task-definition tags. The release-please version is image metadata
 # only; the v<version> tag, the git tag and the GitHub release are made on promotion (promote.yml, UC-DEL-003).
@@ -97,13 +100,13 @@ env:
   LOCK_POLL_SECONDS: "30" # polling every 30 s
 
 jobs:
-  lock:
-    # The cross-repo release lock (foundation-playbook §5.4; UC-DEL-001; E5), taken by the first job, before any build:
-    # one release per environment at a time across infra, backend, web and MCP. No `concurrency` group: GitHub keeps
-    # one pending run per group and cancels the older one (playbook §5.1 step 7). The unlock job releases it, always.
-    # Then the order check: a release of a commit older than what runs is a skip.
+  prepare:
+    # The cross-repo release lock (foundation-playbook §5.4; UC-DEL-001; E5), taken by the first step of the first job,
+    # before any build: one release per environment at a time across infra, backend, web and MCP. No `concurrency` group:
+    # GitHub keeps one pending run per group and cancels the older one (playbook §5.1 step 7). The finish job releases
+    # it, always. Then the order check: a release of a commit older than what runs is a skip. Then row 1, the version.
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 35
+    timeout-minutes: 40
     permissions:
       contents: read
       id-token: write
@@ -112,6 +115,10 @@ jobs:
       attempt: ${{ steps.take.outputs.attempt }}
       token: ${{ steps.take.outputs.token }}
       skip: ${{ steps.order.outputs.skip }}
+      version: ${{ steps.v.outputs.version }}
+      commit: ${{ steps.v.outputs.commit }}
+      images: ${{ steps.v.outputs.images }}
+      started: ${{ steps.v.outputs.started }}
     steps:
       - name: Prod is promote-only (promote.yml, UC-DEL-003); this workflow deploys preprod
         env:
@@ -404,21 +411,8 @@ jobs:
             esac
           done
           echo "skip=${skip}" >> "$GITHUB_OUTPUT"
-
-  version:
-    needs: lock
-    if: ${{ needs.lock.outputs.skip != 'true' }}
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    outputs:
-      version: ${{ steps.v.outputs.version }}
-      commit: ${{ steps.v.outputs.commit }}
-      images: ${{ steps.v.outputs.images }}
-      started: ${{ steps.v.outputs.started }}
-    steps:
       - name: Refuse at once a migrating release with no db-bootstrap role
+        if: ${{ steps.order.outputs.skip != 'true' }}
         env:
           MIGRATE: ${{ inputs.migrate }}
           DRY_RUN: ${{ inputs.dry-run }}
@@ -430,11 +424,9 @@ jobs:
             echo "::error::db-bootstrap-role is empty. Set the backend repository variable AWS_DB_BOOTSTRAP_ROLE_${upper} to the onepeek-${ENVIRONMENT_NAME}-db-bootstrap role ARN and pass it as db-bootstrap-role."
             exit 1
           fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
       - name: Record the commit sha-<12>, and read the next version as image metadata only
         id: v
+        if: ${{ steps.order.outputs.skip != 'true' }}
         env:
           IMAGE: ${{ inputs.image }}
           EXTRA: ${{ inputs.extra-images }}
@@ -449,21 +441,35 @@ jobs:
           echo "Release of ${commit} (next version ${version}) to ${ENVIRONMENT} started." >> "$GITHUB_STEP_SUMMARY"
 
   build-image:
-    # Every image but web. arm-build class: the hosted fallback stays ubuntu-latest with QEMU (today's behaviour) instead
-    # of ubuntu-24.04-arm until hosted ARM is proven on a private repo (ci-runners.md section 5.3 lists ubuntu-24.04-arm).
-    # Its token has no packages scope: only the web build reads @onepeek packages (least privilege).
-    needs: version
-    if: ${{ !inputs.dry-run && inputs.image != 'web' }}
+    # Rows 2 to 4 and the digest record in one job: build and push sha-<12>, scan, SBOM and sign, then read back the
+    # signed digest recorded in SSM and verify its signature; the later jobs use only these outputs. In a dry run only
+    # the read-back runs: the digests are those of the latest release. Every image but web. arm-build class: the hosted
+    # fallback stays ubuntu-latest with QEMU (today's behaviour) instead of ubuntu-24.04-arm until hosted ARM is proven
+    # on a private repo (ci-runners.md section 5.3 lists ubuntu-24.04-arm). Its token has no packages scope: only the web
+    # build reads @onepeek packages (least privilege, foundation-playbook §12a slice 2), which is why the web build is a
+    # second job with the same steps; one of the two is always skipped and takes no runner.
+    needs: prepare
+    if: ${{ needs.prepare.outputs.skip != 'true' && inputs.image != 'web' }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
-    timeout-minutes: 20
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write
-    strategy:
-      fail-fast: true
-      matrix:
-        image: ${{ fromJSON(needs.version.outputs.images) }}
+    outputs: &build-outputs
+      digests: ${{ steps.record.outputs.digests }}
+      digest: ${{ steps.record.outputs.digest }}
+      image-ref: ${{ steps.record.outputs.image-ref }}
+      registry: ${{ steps.record.outputs.registry }}
+      commit: ${{ steps.record.outputs.commit }}
     steps: &build-steps
+      - name: This run attempt holds the release lock (a re-run of only some jobs does not)
+        env:
+          LOCKED_ATTEMPT: ${{ needs.prepare.outputs.attempt }}
+        run: |
+          if [ "${LOCKED_ATTEMPT}" != "${GITHUB_RUN_ATTEMPT}" ]; then
+            echo "::error::Attempt ${GITHUB_RUN_ATTEMPT} did not take the release lock (attempt '${LOCKED_ATTEMPT}' did). Re-run all jobs, not only the failed ones."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -473,27 +479,30 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-        if: ${{ runner.arch != 'ARM64' }}
+        if: ${{ !inputs.dry-run && runner.arch != 'ARM64' }}
         with:
           platforms: arm64
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: ${{ !inputs.dry-run }}
       - name: Build for ARM64 and push sha-<12>
         id: push
+        if: ${{ !inputs.dry-run }}
+        timeout-minutes: 20
         env:
-          IMAGE: ${{ matrix.image }}
-          MAIN: ${{ inputs.image }}
-          VERSION: ${{ needs.version.outputs.version }}
-          COMMIT: ${{ needs.version.outputs.commit }}
-          NPM_TOKEN: ${{ matrix.image == 'web' && github.token || '' }} # web only; packages: read on build-web, each package grants this repo Actions read access
+          IMAGE: ${{ inputs.image }}
+          EXTRA: ${{ inputs.extra-images }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          NPM_TOKEN: ${{ inputs.image == 'web' && github.token || '' }} # web only; packages: read on build-web, each package grants this repo Actions read access
         run: |
-          if [ "${IMAGE}" != "${MAIN}" ]; then
-            echo "::error::No Dockerfile location is defined for the extra image '${IMAGE}' (delivery-pipelines §16: the sandbox image waits for document parsing)."
+          if [ -n "$(echo "${EXTRA:-}" | tr -d ' ,')" ]; then
+            echo "::error::No Dockerfile location is defined for the extra images '${EXTRA}' (delivery-pipelines §16: the sandbox image waits for document parsing)."
             exit 1
           fi
           registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
           repo="${registry}/${NAME}/${IMAGE}"
           # A re-run of this commit: sha-<12> is immutable in ECR and names this commit's build, so the image already
-          # there is reused (UC-DEL-001 row 2). It is scanned again, and sbom-sign signs it if it was never recorded.
+          # there is reused (UC-DEL-001 row 2). It is scanned again, and signed if it was never recorded.
           ecr_error=$(mktemp)   # outside the workspace: it is the Docker build context
           if found=$(aws ecr describe-images --repository-name "${NAME}/${IMAGE}" --image-ids "imageTag=${COMMIT}" --query 'imageDetails[0].imageDigest' --output text 2>"${ecr_error}"); then
             echo "Reusing ${IMAGE}:${COMMIT} (${found}): this commit was built before."
@@ -528,89 +537,23 @@ jobs:
           digest=$(python3 -c "import json;print(json.load(open('meta.json'))['containerimage.digest'])")
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           echo "${IMAGE}=${digest}" > "digest-${IMAGE}.txt"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: digest-${{ matrix.image }}
-          path: digest-${{ matrix.image }}.txt
-          retention-days: 1
-
-  build-web:
-    # The web image: the same steps as build-image, and the only job whose token reads packages (@onepeek/* from
-    # GitHub Packages, a BuildKit secret in the build). Same runner class as build-image.
-    needs: version
-    if: ${{ !inputs.dry-run && inputs.image == 'web' }}
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      id-token: write
-      packages: read # @onepeek/* from GitHub Packages for the web build
-    strategy:
-      fail-fast: true
-      matrix:
-        image: ${{ fromJSON(needs.version.outputs.images) }}
-    steps: *build-steps
-
-  build:
-    # Joins build-image and build-web so the later jobs need one name: it passes only when exactly one of them ran and
-    # succeeded, and fails otherwise (a failed or cancelled build stops the release here).
-    needs: [build-image, build-web]
-    if: ${{ !inputs.dry-run && !cancelled() }}
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
-    timeout-minutes: 5
-    permissions: {}
-    steps:
-      - name: Exactly one build job succeeded
-        env:
-          IMAGE_RESULT: ${{ needs.build-image.result }}
-          WEB_RESULT: ${{ needs.build-web.result }}
-        run: |
-          case "${IMAGE_RESULT}/${WEB_RESULT}" in
-            success/skipped|skipped/success) echo "Build done (build-image ${IMAGE_RESULT}, build-web ${WEB_RESULT})." ;;
-            *) echo "::error::The build did not succeed (build-image ${IMAGE_RESULT}, build-web ${WEB_RESULT})."; exit 1 ;;
-          esac
-
-  scan:
-    needs: [version, build]
-    # One of build-image and build-web is always skipped, and GitHub skips every job below a skipped one unless its
-    # condition calls a status function, so this job (and sbom-sign) checks the joined build result itself.
-    if: ${{ !cancelled() && !inputs.dry-run && needs.build.result == 'success' }}
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      id-token: write
-    strategy:
-      matrix:
-        image: ${{ fromJSON(needs.version.outputs.images) }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: digest-${{ matrix.image }}
-      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ inputs.role-to-assume }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
-      - name: Registry login for the scanner
+      - name: The scanned image reference (registry, repository and digest)
         id: login
+        if: ${{ !inputs.dry-run }}
         env:
-          IMAGE: ${{ matrix.image }}
+          IMAGE: ${{ inputs.image }}
         run: |
           registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
           digest=$(cut -d= -f2 "digest-${IMAGE}.txt")
           echo "ref=${registry}/${NAME}/${IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
-          password=$(aws ecr get-login-password)
-          echo "::add-mask::${password}"
-          { echo "TRIVY_USERNAME=AWS"; echo "TRIVY_PASSWORD=${password}"; } >> "$GITHUB_ENV"
       - name: The waiver file, only if the repository has one
         id: waiver
+        if: ${{ !inputs.dry-run }}
         run: |
           if [ -f .trivyignore.yaml ]; then echo "file=.trivyignore.yaml" >> "$GITHUB_OUTPUT"; else echo "file=" >> "$GITHUB_OUTPUT"; fi
       - name: Trivy, a critical finding blocks (DP5). Waivers only in .trivyignore.yaml, with a reason and an expiry date
+        if: ${{ !inputs.dry-run }}
+        timeout-minutes: 15
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ steps.login.outputs.ref }}
@@ -621,43 +564,17 @@ jobs:
           version: v0.76.1
         env:
           TRIVY_PLATFORM: linux/arm64
-
-  sbom-sign:
-    needs: [lock, version, build, scan]
-    if: ${{ !cancelled() && !inputs.dry-run && needs.build.result == 'success' && needs.scan.result == 'success' }}
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      id-token: write
-    strategy:
-      matrix:
-        image: ${{ fromJSON(needs.version.outputs.images) }}
-    steps:
-      - name: This run attempt holds the release lock (a re-run of only some jobs does not)
-        env:
-          LOCKED_ATTEMPT: ${{ needs.lock.outputs.attempt }}
-        run: |
-          if [ "${LOCKED_ATTEMPT}" != "${GITHUB_RUN_ATTEMPT}" ]; then
-            echo "::error::Attempt ${GITHUB_RUN_ATTEMPT} did not take the release lock (attempt '${LOCKED_ATTEMPT}' did). Re-run all jobs, not only the failed ones."
-            exit 1
-          fi
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: digest-${{ matrix.image }}
-      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ inputs.role-to-assume }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+          # No registry password: Trivy reads the AWS credentials configure-aws-credentials exported (ecr:GetAuthorizationToken).
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v2.6.5
       - name: Syft SPDX SBOM, then sign and attest (no public transparency log; OCI 1.1 referrers)
+        if: ${{ !inputs.dry-run }}
+        timeout-minutes: 15
         env:
-          IMAGE: ${{ matrix.image }}
+          IMAGE: ${{ inputs.image }}
           SIGNING_KEY: ${{ inputs.signing-key }}
-          COMMIT: ${{ needs.version.outputs.commit }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
           registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
           digest=$(cut -d= -f2 "digest-${IMAGE}.txt")
@@ -673,7 +590,7 @@ jobs:
           echo "${syft_sha}  syft.tgz" | sha256sum -c -
           tar -xzf syft.tgz syft
           ./syft "registry:${ref}" -o spdx-json=sbom.spdx.json
-          # A reused image was signed and attested before its digest was recorded; record-digest verifies the signature again.
+          # A reused image was signed and attested before its digest was recorded; the record step verifies the signature again.
           recorded_digest=$(aws ssm get-parameter --name "/onepeek/${ENVIRONMENT}/release/${IMAGE}/digest" --query Parameter.Value --output text 2>/dev/null || true)
           recorded_commit=$(aws ssm get-parameter --name "/onepeek/${ENVIRONMENT}/release/${IMAGE}/commit" --query Parameter.Value --output text 2>/dev/null || true)
           if [ "${recorded_digest}" = "${digest}" ] && [ "${recorded_commit}" = "${COMMIT}" ]; then
@@ -687,43 +604,20 @@ jobs:
           aws ssm put-parameter --name "/onepeek/${ENVIRONMENT}/release/${IMAGE}/digest" --type String --overwrite --value "${digest}" >/dev/null
           aws ssm put-parameter --name "/onepeek/${ENVIRONMENT}/release/${IMAGE}/commit" --type String --overwrite --value "${COMMIT}" >/dev/null
           mv sbom.spdx.json "sbom-${IMAGE}.spdx.json"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - if: ${{ !inputs.dry-run }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: sbom-${{ matrix.image }}
-          path: sbom-${{ matrix.image }}.spdx.json
+          name: sbom-${{ inputs.image }}
+          path: sbom-${{ inputs.image }}.spdx.json
           retention-days: 7
-
-  record-digest:
-    # Reads back the signed digest that step 4 recorded in SSM and checks its signature. Every later job uses these
-    # digests; in a dry run they are simply the digests of the latest release. Nothing is registered here.
-    needs: [version, build, scan, sbom-sign]
-    # Outside a dry run the image must have been signed in this run, or there is no recorded digest to read back.
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (inputs.dry-run || needs.sbom-sign.result == 'success') }}
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      id-token: write
-    outputs:
-      digests: ${{ steps.read.outputs.digests }}
-      registry: ${{ steps.read.outputs.registry }}
-      commit: ${{ steps.read.outputs.commit }}
-    steps:
-      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ inputs.role-to-assume }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: v2.6.5
       - name: Read the recorded digests and verify each signature
-        id: read
+        id: record
+        timeout-minutes: 10
         env:
-          IMAGES: ${{ needs.version.outputs.images }}
+          IMAGES: ${{ needs.prepare.outputs.images }}
           MAIN_IMAGE: ${{ inputs.image }}
           SIGNING_KEY: ${{ inputs.signing-key }}
-          RELEASE_COMMIT: ${{ needs.version.outputs.commit }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
           DRY_RUN: ${{ inputs.dry-run }}
         run: |
           registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
@@ -740,7 +634,23 @@ jobs:
           done
           commit="${RELEASE_COMMIT}"
           if [ "${DRY_RUN}" = "true" ]; then commit=$(aws ssm get-parameter --name "/onepeek/${ENVIRONMENT}/release/${MAIN_IMAGE}/commit" --query Parameter.Value --output text); fi
-          { echo "digests=${digests}"; echo "registry=${registry}"; echo "commit=${commit}"; } >> "$GITHUB_OUTPUT"
+          main=$(echo "${digests}" | python3 -c "import json,sys;print(json.load(sys.stdin)['${MAIN_IMAGE}'])")
+          { echo "digests=${digests}"; echo "registry=${registry}"; echo "commit=${commit}"; echo "digest=${main}"
+            echo "image-ref=${registry}/${NAME}/${MAIN_IMAGE}@${main}"; } >> "$GITHUB_OUTPUT"
+
+  build-web:
+    # The web image: the same steps and outputs as build-image, and the only job whose token reads packages (@onepeek/*
+    # from GitHub Packages, a BuildKit secret in the build). Same runner class as build-image.
+    needs: prepare
+    if: ${{ needs.prepare.outputs.skip != 'true' && inputs.image == 'web' }}
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+      packages: read # @onepeek/* from GitHub Packages for the web build
+    outputs: *build-outputs
+    steps: *build-steps
 
   db-bootstrap:
     # Step 4b (decision 148). Infra's reviewed workflow on its release branch registers and runs db-bootstrap with this
@@ -748,41 +658,58 @@ jobs:
     # logins and first values, and changes nothing once they exist. A failure stops the release before migrate.
     # Pinned to infra's release branch on purpose: the role trusts only job_workflow_ref
     # OnePeek/onepeek-infra/.github/workflows/db-bootstrap.yml@refs/heads/release (aws-stack §12).
-    # Only in the attempt that took the release lock: a re-run of only some jobs skips it, and migrate and rollout then
-    # fail on their own lock check.
-    needs: [lock, version, record-digest]
-    if: ${{ !cancelled() && needs.record-digest.result == 'success' && inputs.migrate && !inputs.dry-run && needs.lock.outputs.attempt == format('{0}', github.run_attempt) }}
+    # Only in the attempt that took the release lock: a re-run of only some jobs skips it, and deploy is then skipped too.
+    # One of build-image and build-web is always skipped, so this job (and every later one) calls a status function.
+    needs: [prepare, build-image, build-web]
+    if: ${{ !cancelled() && (needs.build-image.result == 'success' || needs.build-web.result == 'success') && inputs.migrate && !inputs.dry-run && needs.prepare.outputs.attempt == format('{0}', github.run_attempt) }}
     permissions:
       contents: read
       id-token: write
     uses: OnePeek/onepeek-infra/.github/workflows/db-bootstrap.yml@release # zizmor: ignore[unpinned-uses] the role's trust names this ref
     with:
       environment: ${{ inputs.environment }}
-      digest: ${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
-      version: ${{ needs.record-digest.outputs.commit }} # the commit sha-<12>: preprod artefacts carry no version (playbook §5.2)
+      digest: ${{ needs.build-image.outputs.digest || needs.build-web.outputs.digest }}
+      version: ${{ needs.build-image.outputs.commit || needs.build-web.outputs.commit }} # the commit sha-<12>: preprod artefacts carry no version (playbook §5.2)
       role-to-assume: ${{ inputs.db-bootstrap-role }}
       signing-key: ${{ inputs.signing-key }}
     secrets:
       AGENTS_APP_CLIENT_ID: ${{ secrets.AGENTS_APP_CLIENT_ID }}
       AGENTS_APP_PRIVATE_KEY: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
 
-  migrate:
-    needs: [lock, version, record-digest, db-bootstrap]
-    if: ${{ !cancelled() && needs.record-digest.result == 'success' && inputs.migrate && (needs.db-bootstrap.result == 'success' || inputs.dry-run) }}
+  deploy:
+    # Rows 5, 6 and 6b (and UC-DEL-005's assets) in one job, each a step with its own time limit: migrate (backend), the
+    # web assets (web), the rollout, then the ops registration (backend; migrate is registered by its own step,
+    # db-bootstrap by infra's db-bootstrap workflow, 4b, and db-rotate only by ci-apply). A failed step stops every step
+    # after it, as a failed job stopped the jobs after it; the verify job rolls back once `previous` is recorded.
+    needs: [prepare, build-image, build-web, db-bootstrap]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.build-image.result == 'success' || needs.build-web.result == 'success') && (!inputs.migrate || inputs.dry-run || needs.db-bootstrap.result == 'success') }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 15
+    timeout-minutes: 110   # above the sum of its step limits (99): a hang ends as a failed step, so verify still rolls back (a job timeout is 'cancelled' and it would not)
     permissions:
       contents: read
       id-token: write
+    env:
+      # The digest the build job signed, recorded and verified (its record step); every render fills this image.
+      IMAGE_REF: ${{ needs.build-image.outputs.image-ref || needs.build-web.outputs.image-ref }}
+      REGISTRY: ${{ needs.build-image.outputs.registry || needs.build-web.outputs.registry }}
+      DIGESTS: ${{ needs.build-image.outputs.digests || needs.build-web.outputs.digests }}
+      COMMIT: ${{ needs.build-image.outputs.commit || needs.build-web.outputs.commit }}
+    outputs:
+      previous: ${{ steps.previous.outputs.previous }}
+      services: ${{ steps.index.outputs.services }}
+      stable-at: ${{ steps.roll.outputs.stable-at }}
     steps:
       - name: This run attempt holds the release lock (a re-run of only some jobs does not)
         env:
-          LOCKED_ATTEMPT: ${{ needs.lock.outputs.attempt }}
+          LOCKED_ATTEMPT: ${{ needs.prepare.outputs.attempt }}
         run: |
           if [ "${LOCKED_ATTEMPT}" != "${GITHUB_RUN_ATTEMPT}" ]; then
             echo "::error::Attempt ${GITHUB_RUN_ATTEMPT} did not take the release lock (attempt '${LOCKED_ATTEMPT}' did). Re-run all jobs, not only the failed ones."
             exit 1
           fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ inputs.role-to-assume }}
@@ -791,11 +718,17 @@ jobs:
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v2.6.5
+      - name: Pinned tools (PyYAML for the services file and ops, uv for the gateway routes) in a virtual environment
+        timeout-minutes: 5
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/tools"
+          "${RUNNER_TEMP}/tools/bin/pip" install --quiet pyyaml==6.0.3 uv==0.12.0
+          echo "${RUNNER_TEMP}/tools/bin" >> "$GITHUB_PATH"
       - name: Verify, render, register and run the migrate task (the running version is untouched on failure)
+        if: ${{ inputs.migrate }}
+        timeout-minutes: 15
         env:
-          IMAGE_REF: ${{ needs.record-digest.outputs.registry }}/onepeek-${{ inputs.environment }}/${{ inputs.image }}@${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
           SIGNING_KEY: ${{ inputs.signing-key }}
-          COMMIT: ${{ needs.record-digest.outputs.commit }}
           VERSION: "" # the version tag is added only on promotion to prod (playbook §5.2)
           DRY_RUN: ${{ inputs.dry-run }}
         run: |
@@ -891,35 +824,10 @@ jobs:
               --query 'events[].[message]' --output text || echo "No output could be read: the container may never have started."
             exit 1
           fi
-
-  assets:
-    # UC-DEL-005: between sbom-sign and rollout. The files are the exact bytes of the built image.
-    needs: [lock, version, record-digest]
-    if: ${{ !cancelled() && needs.record-digest.result == 'success' && inputs.assets }}
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: This run attempt holds the release lock (a re-run of only some jobs does not)
-        env:
-          LOCKED_ATTEMPT: ${{ needs.lock.outputs.attempt }}
-        run: |
-          if [ "${LOCKED_ATTEMPT}" != "${GITHUB_RUN_ATTEMPT}" ]; then
-            echo "::error::Attempt ${GITHUB_RUN_ATTEMPT} did not take the release lock (attempt '${LOCKED_ATTEMPT}' did). Re-run all jobs, not only the failed ones."
-            exit 1
-          fi
-      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ inputs.role-to-assume }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - name: Copy /app/dist/assets to web-assets/sha-<12>/ (never overwrite) and prune old folders
+        if: ${{ inputs.assets }}
+        timeout-minutes: 15
         env:
-          IMAGE_REF: ${{ needs.record-digest.outputs.registry }}/onepeek-${{ inputs.environment }}/${{ inputs.image }}@${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
-          REGISTRY: ${{ needs.record-digest.outputs.registry }}
-          COMMIT: ${{ needs.record-digest.outputs.commit }}
           DRY_RUN: ${{ inputs.dry-run }}
         run: |
           bucket="${NAME}-web-assets"
@@ -954,49 +862,12 @@ jobs:
                   subprocess.run(["aws", "s3", "rm", "s3://%s/%s/" % (bucket, folder), "--recursive", "--only-show-errors"], check=True)
                   print("Deleted old assets folder", folder)
           PY
-
-  rollout:
-    needs: [lock, version, record-digest, db-bootstrap, migrate, assets]
-    if: ${{ !cancelled() && needs.record-digest.result == 'success' && !contains(needs.*.result, 'failure') }}
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      id-token: write
-    outputs:
-      previous: ${{ steps.previous.outputs.previous }}
-      services: ${{ steps.index.outputs.services }}
-      stable-at: ${{ steps.roll.outputs.stable-at }}
-    steps:
-      - name: This run attempt holds the release lock (a re-run of only some jobs does not)
-        env:
-          LOCKED_ATTEMPT: ${{ needs.lock.outputs.attempt }}
-        run: |
-          if [ "${LOCKED_ATTEMPT}" != "${GITHUB_RUN_ATTEMPT}" ]; then
-            echo "::error::Attempt ${GITHUB_RUN_ATTEMPT} did not take the release lock (attempt '${LOCKED_ATTEMPT}' did). Re-run all jobs, not only the failed ones."
-            exit 1
-          fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ inputs.role-to-assume }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: v2.6.5
-      - name: Pinned tools (PyYAML for the services file, uv for the gateway routes) in a virtual environment
-        run: |
-          python3 -m venv "${RUNNER_TEMP}/tools"
-          "${RUNNER_TEMP}/tools/bin/pip" install --quiet pyyaml==6.0.3 uv==0.12.0
-          echo "${RUNNER_TEMP}/tools/bin" >> "$GITHUB_PATH"
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         if: ${{ inputs.image == 'backend' && runner.arch != 'ARM64' }}
         with:
           platforms: arm64
       - name: The services file's services for this image, for E7
+        timeout-minutes: 2
         id: file
         env:
           IMAGE: ${{ inputs.image }}
@@ -1016,11 +887,10 @@ jobs:
           print("services=" + json.dumps(names))
           PY
       - name: E7. The services file must only name services the image can run (backend only)
+        timeout-minutes: 10
         if: ${{ inputs.image == 'backend' }}
         env:
-          IMAGE_REF: ${{ needs.record-digest.outputs.registry }}/onepeek-${{ inputs.environment }}/${{ inputs.image }}@${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
           SERVICES: ${{ steps.file.outputs.services }}
-          REGISTRY: ${{ needs.record-digest.outputs.registry }}
         run: |
           aws ecr get-login-password | docker login --username AWS --password-stdin "${REGISTRY}"
           docker pull --platform linux/arm64 "${IMAGE_REF}" >/dev/null
@@ -1032,6 +902,7 @@ jobs:
           if missing:
               raise SystemExit('The services file names services this image cannot run: ' + ', '.join(missing))"
       - name: The families this image rolls, in order (taskdef/index.json, aws-stack §6.3 "Task definition index")
+        timeout-minutes: 2
         id: index
         env:
           IMAGE: ${{ inputs.image }}
@@ -1062,6 +933,7 @@ jobs:
           print("services=" + json.dumps([s for g in groups for s in g]))
           PY
       - name: The gateway routes (backend only, additive within a release; the gateway reloads within 30 s)
+        timeout-minutes: 5
         if: ${{ inputs.image == 'backend' && !inputs.dry-run }}
         run: |
           # `app api routes` reads the same services file the release read above (platform/api.md §16 `--services-file`).
@@ -1069,6 +941,7 @@ jobs:
           # No encryption flags: the bucket default applies (aws-stack §16). `--sse aws:kms` alone would ask for the AWS-managed key.
           aws s3 cp gateway-routes.json "s3://${NAME}-deploy/gateway-routes.json" --only-show-errors
       - name: Record every service's current task definition (for the rollback)
+        timeout-minutes: 5
         id: previous
         env:
           SERVICES: ${{ steps.index.outputs.services }}
@@ -1084,10 +957,9 @@ jobs:
           PY
       - name: Verify, render, register and update each order's services in parallel, waiting for each order to be stable
         id: roll
+        timeout-minutes: 20
         env:
-          IMAGE_REF: ${{ needs.record-digest.outputs.registry }}/onepeek-${{ inputs.environment }}/${{ inputs.image }}@${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
           SIGNING_KEY: ${{ inputs.signing-key }}
-          COMMIT: ${{ needs.record-digest.outputs.commit }}
           VERSION: "" # the version tag is added only on promotion to prod (playbook §5.2)
           ORDERS: ${{ steps.index.outputs.groups }}
           ALLOW_DROP: ${{ inputs.allow-drop }}
@@ -1180,9 +1052,10 @@ jobs:
           done 3< groups.txt
           echo "stable-at=$(date +%s)" >> "$GITHUB_OUTPUT"   # merge-to-running time in the notice (delivery-pipelines §12, §14)
       - name: Lambda sandbox functions, new version, move the live alias (only when sandbox is released)
+        timeout-minutes: 10
         if: ${{ !inputs.dry-run && contains(inputs.extra-images, 'sandbox') }}
         env:
-          SANDBOX_REF: ${{ needs.record-digest.outputs.registry }}/onepeek-${{ inputs.environment }}/sandbox@${{ fromJSON(needs.record-digest.outputs.digests).sandbox }}
+          SANDBOX_REF: ${{ env.REGISTRY }}/onepeek-${{ inputs.environment }}/sandbox@${{ fromJSON(env.DIGESTS).sandbox }}
         run: |
           for fn in parse fetch; do
             aws lambda update-function-code --function-name "${NAME}-sandbox-${fn}" \
@@ -1191,42 +1064,11 @@ jobs:
             ver=$(aws lambda publish-version --function-name "${NAME}-sandbox-${fn}" --query Version --output text)
             aws lambda update-alias --function-name "${NAME}-sandbox-${fn}" --name live --function-version "${ver}" >/dev/null
           done
-
-  register-one-offs:
-    # 6b. The ops family only. Nothing is run. migrate is registered in its own job, db-bootstrap by infra's db-bootstrap workflow (4b), db-rotate only by ci-apply.
-    needs: [lock, version, record-digest, rollout]
-    if: ${{ !cancelled() && needs.rollout.result == 'success' && inputs.image == 'backend' }}
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: This run attempt holds the release lock (a re-run of only some jobs does not)
+      - name: Verify, render, check the launch settings, register ops and record its revision (6b; nothing is run)
+        if: ${{ inputs.image == 'backend' }}
+        timeout-minutes: 10
         env:
-          LOCKED_ATTEMPT: ${{ needs.lock.outputs.attempt }}
-        run: |
-          if [ "${LOCKED_ATTEMPT}" != "${GITHUB_RUN_ATTEMPT}" ]; then
-            echo "::error::Attempt ${GITHUB_RUN_ATTEMPT} did not take the release lock (attempt '${LOCKED_ATTEMPT}' did). Re-run all jobs, not only the failed ones."
-            exit 1
-          fi
-      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ inputs.role-to-assume }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: v2.6.5
-      - name: Pinned PyYAML in a virtual environment
-        run: |
-          python3 -m venv "${RUNNER_TEMP}/tools"
-          "${RUNNER_TEMP}/tools/bin/pip" install --quiet pyyaml==6.0.3
-      - name: Verify, render, check the launch settings, register ops and record its revision
-        env:
-          IMAGE_REF: ${{ needs.record-digest.outputs.registry }}/onepeek-${{ inputs.environment }}/${{ inputs.image }}@${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
           SIGNING_KEY: ${{ inputs.signing-key }}
-          COMMIT: ${{ needs.record-digest.outputs.commit }}
           VERSION: "" # the version tag is added only on promotion to prod (playbook §5.2)
           DRY_RUN: ${{ inputs.dry-run }}
         run: |
@@ -1307,24 +1149,50 @@ jobs:
           aws ssm put-parameter --name "/onepeek/${ENVIRONMENT}/release/backend/one_off/ops" --type String --overwrite --value "${arn}" >/dev/null
           echo "Registered ${arn##*/} (not run)."
 
-  smoke:
-    needs: [version, record-digest, rollout, register-one-offs]
-    if: ${{ !cancelled() && !inputs.dry-run && needs.rollout.result == 'success' && !contains(needs.*.result, 'failure') }}
+  verify:
+    # Rows 7 to 9 in one job: smoke, the 10-minute watch, and the rollback when the rollout, the ops registration, smoke
+    # or watch failed (E2, E3). It also runs after a deploy job that failed once the rollout had started (`previous`
+    # recorded), and then only rolls back. Outputs: the watch and rollback outcomes, for the notice and the API client.
+    needs: [prepare, build-image, build-web, deploy]
+    if: ${{ !cancelled() && !inputs.dry-run && (needs.deploy.result == 'success' || (needs.deploy.result == 'failure' && needs.deploy.outputs.previous != '')) }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 10
+    timeout-minutes: 60   # above the sum of its step limits (10 + 5 + 10 + 12 + 20), so a hang ends as a failed step and the rollback still runs
     permissions:
       contents: read
       id-token: write
+      issues: write
+    outputs:
+      watch: ${{ steps.watch.outcome }}
+      rollback: ${{ steps.rollback.outcome }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      - name: This run attempt holds the release lock (a re-run of only some jobs does not)
+        id: guard
+        env:
+          LOCKED_ATTEMPT: ${{ needs.prepare.outputs.attempt }}
+        run: |
+          if [ "${LOCKED_ATTEMPT}" != "${GITHUB_RUN_ATTEMPT}" ]; then
+            echo "::error::Attempt ${GITHUB_RUN_ATTEMPT} did not take the release lock (attempt '${LOCKED_ATTEMPT}' did). Re-run all jobs, not only the failed ones."
+            exit 1
+          fi
+      - id: creds
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ inputs.role-to-assume }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+      - name: The deploy job finished its rollout (if it failed, only the rollback runs)
+        env:
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+        run: |
+          if [ "${DEPLOY_RESULT}" != "success" ]; then
+            echo "::error::The deploy job failed after the rollout started (${DEPLOY_RESULT}): no smoke or watch; every service is put back."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Baseline readiness through the edge (backend /api/status, web /sign-in), always
+        timeout-minutes: 10
         env:
           DOMAIN: ${{ inputs.domain }}
           IMAGE: ${{ inputs.image }}
@@ -1332,9 +1200,10 @@ jobs:
           if [ "${IMAGE}" = "backend" ]; then path="/api/status"; else path="/sign-in"; fi
           curl --fail --silent --show-error --max-time 10 --retry 6 --retry-delay 10 --retry-all-errors "https://${DOMAIN}${path}" >/dev/null
       - name: Every service's task definition carries this release's image digest (describe-services; no ecs:ListTasks)
+        timeout-minutes: 5
         env:
-          DIGEST: ${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}
-          SERVICES: ${{ needs.rollout.outputs.services }}
+          DIGEST: ${{ needs.build-image.outputs.digest || needs.build-web.outputs.digest }}
+          SERVICES: ${{ needs.deploy.outputs.services }}
         run: |
           for svc in $(echo "${SERVICES}" | python3 -c "import json,sys;print(' '.join(json.load(sys.stdin)))"); do
             td=$(aws ecs describe-services --cluster "${NAME}" --services "${svc}" --query 'services[0].taskDefinition' --output text)
@@ -1345,6 +1214,7 @@ jobs:
             fi
           done
       - name: The repo's own smoke checks against the domain, in addition (UC-DEL-001 row 7; @smoke journeys)
+        timeout-minutes: 10
         env:
           SCRIPT: ${{ inputs.smoke-script }}
           DOMAIN: ${{ inputs.domain }}
@@ -1360,24 +1230,11 @@ jobs:
           # Without the deploy role's credentials or the means to request them again: black-box probes only.
           env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
             -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN bash "${SCRIPT}"
-
-  watch:
-    needs: [version, rollout, smoke]
-    if: ${{ !cancelled() && needs.smoke.result == 'success' }}
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 12
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ inputs.role-to-assume }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - name: 10 minutes after stable, poll the rolled services' deploy alarms every 30 s
+        id: watch
+        timeout-minutes: 12
         env:
-          SERVICES: ${{ needs.rollout.outputs.services }}
+          SERVICES: ${{ needs.deploy.outputs.services }}
         run: |
           # aws-stack §10.4: each service has exactly two deploy alarms, onepeek-<env>-deploy-<service>-errors and
           # -latency; this release watches only those of the services it rolled (by exact name: a prefix for `api` would
@@ -1413,33 +1270,14 @@ jobs:
             sleep 30
           done
           echo "No deploy alarm in 10 minutes."
-
-  rollback:
-    needs: [lock, version, record-digest, rollout, register-one-offs, smoke, watch]
-    if: ${{ always() && !inputs.dry-run && (needs.rollout.result == 'failure' || needs.register-one-offs.result == 'failure' || needs.smoke.result == 'failure' || needs.watch.result == 'failure') }}
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      id-token: write
-      issues: write
-    steps:
-      - name: This run attempt holds the release lock (a re-run of only some jobs does not)
-        env:
-          LOCKED_ATTEMPT: ${{ needs.lock.outputs.attempt }}
-        run: |
-          if [ "${LOCKED_ATTEMPT}" != "${GITHUB_RUN_ATTEMPT}" ]; then
-            echo "::error::Attempt ${GITHUB_RUN_ATTEMPT} did not take the release lock (attempt '${LOCKED_ATTEMPT}' did). Re-run all jobs, not only the failed ones."
-            exit 1
-          fi
-      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ inputs.role-to-assume }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - name: Put every service back on the revision recorded before the rollout (versions stay aligned, E2/E3)
+        id: rollback
+        # On a failed rollout or ops registration (deploy failed after recording previous), smoke or watch: the
+        # watch is the last check, so anything but its success rolls back. Never after a failed lock check.
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.creds.outcome == 'success' && steps.watch.outcome != 'success' }}
+        timeout-minutes: 20
         env:
-          PREVIOUS: ${{ needs.rollout.outputs.previous }}
+          PREVIOUS: ${{ needs.deploy.outputs.previous }}
           HAS_SANDBOX: ${{ contains(inputs.extra-images, 'sandbox') && 'yes' || '' }}
         run: |
           if [ -z "${PREVIOUS}" ]; then echo "Nothing was recorded; the rollout never started."; exit 0; fi
@@ -1457,43 +1295,53 @@ jobs:
             done
           fi
       - name: Open an issue naming the failure
+        if: ${{ !cancelled() && steps.rollback.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          COMMIT: ${{ needs.version.outputs.commit }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
           gh issue create --repo "${GITHUB_REPOSITORY}" --title "Release ${COMMIT} to ${ENVIRONMENT} rolled back" \
             --body "The release failed and every service was put back. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
-  notify:
-    # Step 10, after every run that got past `version`, whatever the result (delivery-pipelines §12: every run writes a
-    # GitHub deployment). No git tag and no GitHub release in preprod: promote.yml creates v<version> (playbook §5.2).
-    needs: [lock, version, record-digest, rollout, smoke, watch, rollback]
-    if: ${{ always() && !inputs.dry-run && needs.version.result == 'success' }}
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
-    timeout-minutes: 10
+  finish:
+    # Rows 10 and 11 and the unlock, after every run that took the lock, whatever happened. In order: the deployment
+    # record and notice; the unlock (always, only with the token the prepare job took the lock with; if this job itself
+    # is lost, the next release that waits sees this run has finished and takes the lock over). No packages scope: the
+    # API client publish is the api-client job after it.
+    needs: [prepare, build-image, build-web, db-bootstrap, deploy, verify]
+    if: ${{ always() && needs.prepare.result != 'skipped' && inputs.environment != 'prod' }}
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
+    timeout-minutes: 30
     permissions:
       contents: read
+      id-token: write
       deployments: write
     steps:
       - name: This run attempt holds the release lock (a re-run of only some jobs does not)
+        id: guard
+        if: ${{ always() }}
         env:
-          LOCKED_ATTEMPT: ${{ needs.lock.outputs.attempt }}
+          LOCKED_ATTEMPT: ${{ needs.prepare.outputs.attempt }}
         run: |
           if [ "${LOCKED_ATTEMPT}" != "${GITHUB_RUN_ATTEMPT}" ]; then
             echo "::error::Attempt ${GITHUB_RUN_ATTEMPT} did not take the release lock (attempt '${LOCKED_ATTEMPT}' did). Re-run all jobs, not only the failed ones."
             exit 1
           fi
       - name: Deployment record and the team notice in the run summary (commit, services, result, durations)
+        # Row 10, after every run that got past the version, whatever the result (delivery-pipelines §12: every run
+        # writes a GitHub deployment). No git tag and no GitHub release in preprod: promote.yml creates v<version>.
+        if: ${{ always() && steps.guard.outcome == 'success' && !inputs.dry-run && needs.prepare.outputs.commit != '' }}
+        timeout-minutes: 10
         env:
           GH_TOKEN: ${{ github.token }}
-          COMMIT: ${{ needs.version.outputs.commit }}
-          NEXT_VERSION: ${{ needs.version.outputs.version }}
-          DIGESTS: ${{ needs.record-digest.outputs.digests }}
-          SERVICES: ${{ needs.rollout.outputs.services }}
-          WATCH: ${{ needs.watch.result }}
-          ROLLBACK: ${{ needs.rollback.result }}
-          STARTED: ${{ needs.version.outputs.started }}
-          STABLE_AT: ${{ needs.rollout.outputs.stable-at }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          NEXT_VERSION: ${{ needs.prepare.outputs.version }}
+          DIGESTS: ${{ needs.build-image.outputs.digests || needs.build-web.outputs.digests }}
+          SERVICES: ${{ needs.deploy.outputs.services }}
+          WATCH: ${{ needs.verify.outputs.watch }}
+          ROLLBACK: ${{ needs.verify.outputs.rollback }}
+          STARTED: ${{ needs.prepare.outputs.started }}
+          STABLE_AT: ${{ needs.deploy.outputs.stable-at }}
           MERGED_AT: ${{ github.event.head_commit.timestamp }}
         run: |
           python3 - <<'PY'
@@ -1529,27 +1377,19 @@ jobs:
           PY
           id=$(gh api "repos/${GITHUB_REPOSITORY}/deployments" --input deployment.json --jq .id)
           gh api "repos/${GITHUB_REPOSITORY}/deployments/${id}/statuses" --input status.json >/dev/null
-
-  unlock:
-    # Releases the release lock whatever happened, only with the token the lock job took it with (playbook §5.4); never
-    # for prod, which the lock job refuses. If this job itself is lost, the next release that waits sees this run has
-    # finished and takes the lock over.
-    needs: [lock, version, build-image, build-web, build, scan, sbom-sign, record-digest, db-bootstrap, migrate, assets, rollout, register-one-offs, smoke, watch, rollback, notify]
-    if: ${{ always() && needs.lock.result != 'skipped' && inputs.environment != 'prod' }}
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      - if: ${{ always() }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ inputs.role-to-assume }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - name: Release the release lock
+        # Runs even when the guard failed (a re-run of only some jobs). A partial re-run carries attempt 1's token
+        # through prepare's outputs; what keeps this safe is the token match (only a lock record with exactly this token
+        # is removed) plus attempt 1 having finished, so nothing it still needs is released.
+        if: ${{ always() }}
         env:
-          LOCK_TOKEN: ${{ needs.lock.outputs.token }}
+          LOCK_TOKEN: ${{ needs.prepare.outputs.token }}
         run: |
           # --- release-lock begin (identical in release-ecs.yml, operate.yml and release-lock.yml; checked by scripts/check_service_list.py) ---
           # The cross-repo release lock (foundation-playbook §5.4): one per environment, s3://onepeek-<env>-deploy/locks/release.json,
@@ -1756,10 +1596,12 @@ jobs:
           lock_release
 
   api-client:
-    # Backend only: publish @onepeek/api-client, generated from the committed OpenAPI file, to GitHub Packages, as the
-    # prerelease <next>-dev.<sha7> under the next dist-tag (UC-DEL-001 row 11); promote.yml publishes <version> under latest.
-    needs: [version, watch, notify]
-    if: ${{ !cancelled() && !inputs.dry-run && inputs.image == 'backend' && needs.watch.result == 'success' }}
+    # Backend only, after a clean watch: @onepeek/api-client, generated from the committed OpenAPI file, published to
+    # GitHub Packages as the prerelease <next>-dev.<sha7> under the next dist-tag (UC-DEL-001 row 11); promote.yml
+    # publishes <version> under latest. Its own job so that only this one holds packages: write (least privilege), and
+    # after finish so the unlock never waits for the npm publish. Never for prod, which the prepare job refuses.
+    needs: [prepare, verify, finish]
+    if: ${{ !cancelled() && !inputs.dry-run && inputs.image == 'backend' && needs.verify.outputs.watch == 'success' }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 15
     permissions:
@@ -1790,7 +1632,7 @@ jobs:
       - name: Publish the prerelease under next
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.version.outputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           version="${VERSION}-dev.${GITHUB_SHA::7}"
           name=$(npm pkg get name | tr -d '"')
