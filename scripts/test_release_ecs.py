@@ -27,6 +27,11 @@ def step(job: str, name: str) -> str:
     return next(s["run"] for s in RELEASE["jobs"][job]["steps"] if s.get("name", "").startswith(name))
 
 
+def needs_of(job: str) -> list[str]:
+    n = RELEASE["jobs"][job].get("needs", [])
+    return [n] if isinstance(n, str) else n
+
+
 def run_step(script: str, aws: str, extra_env: dict[str, str] | None = None, files: dict[str, str] | None = None,
              extra_stubs: dict[str, str] | None = None, with_summary: bool = False):
     """Returns the result, every stub call, and what the step wrote to GITHUB_OUTPUT (and GITHUB_STEP_SUMMARY)."""
@@ -104,6 +109,16 @@ class BuildReuse(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn(f"--build-arg RELEASE={COMMIT}", calls)
 
+    def test_extra_images_are_refused_until_their_dockerfile_location_exists(self):
+        # delivery-pipelines §16: the sandbox image waits for document parsing; extra-images stays empty until then.
+        for extra in ("sandbox", "sandbox, other"):
+            out, calls, _ = run_step(self.script, aws_stub(IN_ECR), {"EXTRA": extra})
+            self.assertEqual(out.returncode, 1, extra)
+            self.assertIn("No Dockerfile location is defined for the extra images", out.stdout)
+            self.assertNotIn("aws ", calls)
+        for extra in ("", " ", ","):
+            self.assertEqual(run_step(self.script, aws_stub(IN_ECR), {"EXTRA": extra})[0].returncode, 0, repr(extra))
+
     def test_any_other_ecr_answer_stops(self):
         out, calls, _ = run_step(self.script, aws_stub('echo "AccessDeniedException" >&2; exit 254'))
         self.assertEqual(out.returncode, 1)
@@ -111,7 +126,7 @@ class BuildReuse(unittest.TestCase):
 
 
 class Version(unittest.TestCase):
-    script = step("version", "Record the commit")
+    script = step("prepare", "Record the commit")
 
     def test_the_commit_is_recorded_and_an_existing_version_tag_does_not_stop_preprod(self):
         out, calls, output = run_step(self.script, "", {"VERSION_FILE": "m.json", "EXTRA": ""}, files={"m.json": '{".": "1.2.3"}'}, extra_stubs={"git": "exit 0"})
@@ -127,7 +142,7 @@ class Version(unittest.TestCase):
 
 
 class SignOnce(unittest.TestCase):
-    script = step("sbom-sign", "Syft SPDX SBOM")
+    script = step("build-image", "Syft SPDX SBOM")
 
     def signing(self, aws):
         script = re.sub(r"^.*(curl|grep |tar -xzf|\./syft).*$", "", self.script, flags=re.M)
@@ -210,7 +225,7 @@ class CosignArguments(unittest.TestCase):
 
 
 class RecordDigest(unittest.TestCase):
-    script = step("record-digest", "Read the recorded digests")
+    script = step("build-image", "Read the recorded digests")
 
     def read(self, commit: str, dry: str = "false"):
         return run_step(self.script, aws_stub(IN_ECR, commit=commit), {"IMAGES": '["backend"]', "MAIN_IMAGE": "backend", "SIGNING_KEY": "k", "RELEASE_COMMIT": COMMIT, "DRY_RUN": dry})
@@ -220,6 +235,9 @@ class RecordDigest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("cosign verify", calls)
         self.assertIn(f"commit={COMMIT}", output)
+        # The main image's digest and reference, for db-bootstrap, the deploy job's renders and the smoke digest check.
+        self.assertIn(f"digest={DIGEST}\n", output)
+        self.assertIn(f"image-ref=111111111111.dkr.ecr.ap-south-1.amazonaws.com/onepeek-preprod/backend@{DIGEST}\n", output)
 
     def test_a_record_of_another_commit_refuses(self):
         out, _, _ = self.read("sha-" + "0" * 12)
@@ -244,7 +262,7 @@ class ArchitectureAwareTools(unittest.TestCase):
         self.assertNotIn("syft.checksums", self.text)
 
     def test_syft_asset_follows_the_architecture_and_unknown_stops(self):
-        script = re.sub(r"^.*\./syft.*$", "", step("sbom-sign", "Syft SPDX SBOM"), flags=re.M)
+        script = re.sub(r"^.*\./syft.*$", "", step("build-image", "Syft SPDX SBOM"), flags=re.M)
         files = {"digest-backend.txt": f"backend={DIGEST}\n", "sbom.spdx.json": "{}"}
         for arch, asset, rc in (("X64", "linux_amd64", 0), ("ARM64", "linux_arm64", 0), ("RISCV", "", 1)):
             out, calls, _ = run_step(script, aws_stub(IN_ECR), {"SIGNING_KEY": "k", "RUNNER_ARCH": arch}, files)
@@ -281,8 +299,9 @@ class DbBootstrap(unittest.TestCase):
 
     def test_it_calls_infras_reusable_workflow_on_release_with_the_signed_digest(self):
         self.assertEqual(self.job["uses"], "OnePeek/onepeek-infra/.github/workflows/db-bootstrap.yml@release")
-        self.assertEqual(self.job["with"]["digest"], "${{ fromJSON(needs.record-digest.outputs.digests)[inputs.image] }}")
-        self.assertIn("record-digest", self.job["needs"])
+        self.assertEqual(self.job["with"]["digest"], "${{ needs.build-image.outputs.digest || needs.build-web.outputs.digest }}")
+        self.assertEqual(RELEASE["jobs"]["build-image"]["outputs"]["digest"], "${{ steps.record.outputs.digest }}")
+        self.assertEqual(self.job["needs"], ["prepare", "build-image", "build-web"])
         self.assertEqual(self.job["with"]["role-to-assume"], "${{ inputs.db-bootstrap-role }}")
 
     def test_secrets_and_permissions_are_explicit(self):
@@ -296,11 +315,14 @@ class DbBootstrap(unittest.TestCase):
         self.assertEqual({n for n, j in RELEASE["jobs"].items() if "INFRA_READ_TOKEN" in str(j)}, set())
 
     def test_it_runs_before_migrate_and_a_failure_stops_the_release(self):
-        migrate, rollout = RELEASE["jobs"]["migrate"], RELEASE["jobs"]["rollout"]
-        self.assertIn("db-bootstrap", migrate["needs"])
-        self.assertIn("needs.db-bootstrap.result == 'success'", migrate["if"])
-        self.assertIn("db-bootstrap", rollout["needs"])
-        self.assertIn("!contains(needs.*.result, 'failure')", rollout["if"])
+        deploy = RELEASE["jobs"]["deploy"]
+        self.assertIn("db-bootstrap", deploy["needs"])
+        self.assertIn("(!inputs.migrate || inputs.dry-run || needs.db-bootstrap.result == 'success')", deploy["if"])
+        self.assertIn("!contains(needs.*.result, 'failure')", deploy["if"])
+
+    def test_it_is_the_only_job_that_is_not_a_job_of_ours(self):
+        # A reusable-workflow call under its own role cannot be a step, so it stays a job (foundation-reset W2.1).
+        self.assertEqual({n for n, j in RELEASE["jobs"].items() if "uses" in j}, {"db-bootstrap"})
 
     def test_it_never_runs_in_a_dry_run(self):
         self.assertIn("!inputs.dry-run", self.job["if"])
@@ -321,7 +343,7 @@ class PackageRead(unittest.TestCase):
         self.assertEqual(self.jobs["build-web"]["steps"], self.jobs["build-image"]["steps"])  # one set of steps
 
     def test_the_npm_token_is_the_run_token_for_the_web_image_only(self):
-        self.assertEqual(self.push["env"]["NPM_TOKEN"], "${{ matrix.image == 'web' && github.token || '' }}")
+        self.assertEqual(self.push["env"]["NPM_TOKEN"], "${{ inputs.image == 'web' && github.token || '' }}")
 
     def test_the_backend_build_gets_no_npm_secret(self):
         out, calls, _ = run_step(self.push["run"], aws_stub(NOT_IN_ECR), {"NPM_TOKEN": ""}, files={"meta.json": BUILT})
@@ -331,17 +353,16 @@ class PackageRead(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("--secret id=npm_token,env=NPM_TOKEN", calls)
 
-    def test_later_jobs_need_the_join_and_it_passes_only_when_exactly_one_build_succeeded(self):
-        join = self.jobs["build"]
-        self.assertEqual(join["needs"], ["build-image", "build-web"])
-        self.assertEqual(join["permissions"], {})
-        script = join["steps"][0]["run"]
-        for image, web, code in [("success", "skipped", 0), ("skipped", "success", 0), ("failure", "skipped", 1),
-                                 ("skipped", "failure", 1), ("skipped", "skipped", 1), ("cancelled", "skipped", 1)]:
-            out, _, _ = run_step(script, "", {"IMAGE_RESULT": image, "WEB_RESULT": web})
-            self.assertEqual(out.returncode, code, (image, web))
-        for job in ("scan", "sbom-sign", "record-digest"):
-            self.assertIn("build", self.jobs[job]["needs"])
+    def test_the_two_build_jobs_are_exclusive_and_later_jobs_need_one_to_succeed(self):
+        # No join job: each later job needs both and requires one of them to have succeeded (a failed, cancelled or
+        # doubly skipped build stops the release there).
+        self.assertNotIn("build", self.jobs)
+        self.assertEqual(self.jobs["build-web"]["outputs"], self.jobs["build-image"]["outputs"])
+        for job in ("db-bootstrap", "deploy"):
+            self.assertEqual(needs_of(job)[1:3], ["build-image", "build-web"], job)
+            self.assertIn("(needs.build-image.result == 'success' || needs.build-web.result == 'success')", self.jobs[job]["if"], job)
+        for job in ("verify", "finish"):
+            self.assertTrue({"build-image", "build-web", "deploy"} <= set(needs_of(job)), job)
 
     def test_npm_read_token_is_ignored_and_optional(self):
         self.assertFalse(RELEASE[True]["workflow_call"]["secrets"]["NPM_READ_TOKEN"]["required"])
@@ -349,7 +370,7 @@ class PackageRead(unittest.TestCase):
 
 
 class Migrate(unittest.TestCase):
-    script = step("migrate", "Verify, render, register and run")
+    script = step("deploy", "Verify, render, register and run")
 
     def failed(self, code: str, logs: str = 'echo "the migration line"'):
         aws = f"""case "$*" in
@@ -391,7 +412,7 @@ class DeployBucketWrites(unittest.TestCase):
             self.assertFalse([line for line in code if "--sse" in line], name)
 
 
-FUNCTION = re.search(r"# --- render-taskdef begin[^\n]*\n(.*?)# --- render-taskdef end ---", step("migrate", "Verify, render, register and run"), re.S).group(1)
+FUNCTION = re.search(r"# --- render-taskdef begin[^\n]*\n(.*?)# --- render-taskdef end ---", step("deploy", "Verify, render, register and run"), re.S).group(1)
 REF = "r@" + DIGEST
 
 
@@ -449,11 +470,15 @@ class RenderFunction(unittest.TestCase):
         self.assertEqual(out.stdout, "")
 
     def test_release_steps_never_pass_a_version_tag_in_preprod(self):
-        for job in ("migrate", "rollout", "register-one-offs"):
-            for st in RELEASE["jobs"][job]["steps"]:
-                if "render-taskdef begin" in st.get("run", ""):
-                    self.assertEqual(st["env"]["VERSION"], "", job)
-                    self.assertEqual(st["env"]["COMMIT"], "${{ needs.record-digest.outputs.commit }}", job)
+        deploy = RELEASE["jobs"]["deploy"]
+        renders = [st for st in deploy["steps"] if "render-taskdef begin" in st.get("run", "")]
+        self.assertEqual(len(renders), 3)  # migrate, the rollout, ops
+        for st in renders:
+            self.assertEqual(st["env"]["VERSION"], "", st["name"])
+            self.assertNotIn("COMMIT", st["env"], st["name"])  # the job's, the one the build recorded
+            self.assertNotIn("IMAGE_REF", st["env"], st["name"])
+        self.assertEqual(deploy["env"]["COMMIT"], "${{ needs.build-image.outputs.commit || needs.build-web.outputs.commit }}")
+        self.assertEqual(deploy["env"]["IMAGE_REF"], "${{ needs.build-image.outputs.image-ref || needs.build-web.outputs.image-ref }}")
 
     def test_a_null_empty_or_missing_image_is_filled(self):
         for container in ({"name": "api", "image": None}, {"name": "api", "image": ""}, {"name": "api"}):
@@ -567,7 +592,7 @@ class DropProtection(unittest.TestCase):
 
     def test_an_aws_error_in_the_rollout_registers_nothing(self):
         aws = """case "$*" in *describe-services*) echo "ThrottlingException" >&2; exit 254;; *"s3 cp"*) echo '{"family": "f", "containerDefinitions": [{"name": "api"}]}';; *register-task-definition*) echo arn:td/api:8;; esac"""
-        out, calls, _ = run_step(step("rollout", "Verify, render, register and update each order"), aws,
+        out, calls, _ = run_step(step("deploy", "Verify, render, register and update each order"), aws,
                                  {"IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9", "ORDERS": '[["api"]]'})
         self.assertNotEqual(out.returncode, 0)
         self.assertNotIn("register-task-definition", calls)
@@ -580,7 +605,7 @@ class DropProtection(unittest.TestCase):
 *register-task-definition*) echo arn:td/api:8;;
 esac"""
         base = {"IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9", "ORDERS": '[["api"]]'}
-        script = step("rollout", "Verify, render, register and update each order")
+        script = step("deploy", "Verify, render, register and update each order")
         out, calls, _ = run_step(script, aws, base)
         self.assertNotEqual(out.returncode, 0)
         self.assertNotIn("register-task-definition", calls)
@@ -590,7 +615,7 @@ esac"""
 
     def test_the_inputs_reach_the_render(self):
         self.assertEqual(RELEASE[True]["workflow_call"]["inputs"]["allow-drop"]["default"], "")
-        roll = next(s for s in RELEASE["jobs"]["rollout"]["steps"] if s.get("id") == "roll")
+        roll = next(s for s in RELEASE["jobs"]["deploy"]["steps"] if s.get("id") == "roll")
         self.assertEqual(roll["env"]["ALLOW_DROP"], "${{ inputs.allow-drop }}")
         self.assertIn('render migrate one-off', TEXT)
         self.assertIn('render ops one-off', TEXT)
@@ -610,7 +635,7 @@ INDEX = {
 
 def families(index: dict, image: str = "backend"):
     aws = f"""case "$*" in *"taskdef/index.json"*) echo '{json.dumps(index)}' > index.json;; esac"""
-    out, _, output = run_step(step("rollout", "The families this image rolls"), aws, {"IMAGE": image})
+    out, _, output = run_step(step("deploy", "The families this image rolls"), aws, {"IMAGE": image})
     return out, dict(line.split("=", 1) for line in output.splitlines())
 
 
@@ -649,7 +674,7 @@ class RolloutOrder(unittest.TestCase):
 *register-task-definition*) echo arn:td/f:1;;
 *services-stable*) exit 255;;
 esac"""
-        out, calls, _ = run_step(step("rollout", "Verify, render, register and update each order"), aws, {
+        out, calls, _ = run_step(step("deploy", "Verify, render, register and update each order"), aws, {
             "IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9", "ORDERS": '[["pgbouncer", "valkey"], ["api", "worker"]]'})  # fmt: skip
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
         self.assertIn("did not become stable", out.stdout)
@@ -663,7 +688,7 @@ esac"""
 *"s3 cp"*) echo '{"family": "f", "containerDefinitions": [{"name": "c"}]}';;
 *register-task-definition*) echo arn:td/f:1;;
 esac"""
-        out, calls, _ = run_step(step("rollout", "Verify, render, register and update each order"), aws, {
+        out, calls, _ = run_step(step("deploy", "Verify, render, register and update each order"), aws, {
             "IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9", "ORDERS": '[["pgbouncer", "valkey"], ["api", "worker"]]'})  # fmt: skip
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         ecs = [line for line in calls.splitlines() if "update-service" in line or "services-stable" in line]
@@ -678,7 +703,7 @@ esac"""
 
     def test_a_dry_run_renders_every_family_and_changes_nothing(self):
         aws = """case "$*" in *"s3 cp"*) echo '{"family": "f", "containerDefinitions": [{"name": "c"}]}';; esac"""
-        out, calls, _ = run_step(step("rollout", "Verify, render, register and update each order"), aws, {
+        out, calls, _ = run_step(step("deploy", "Verify, render, register and update each order"), aws, {
             "IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "true", "GITHUB_RUN_ID": "9", "ORDERS": '[["pgbouncer"], ["api"]]'})  # fmt: skip
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("rendered 2 task definitions", out.stdout)
@@ -688,7 +713,7 @@ esac"""
 
 class BaselineReadiness(unittest.TestCase):
     """UC-DEL-001 row 7: the shared readiness check always runs, whatever the caller's smoke script does."""
-    script = step("smoke", "Baseline readiness")
+    script = step("verify", "Baseline readiness")
 
     def test_each_image_checks_its_path_and_a_failure_fails_the_job(self):
         for image, path in (("backend", "/api/status"), ("web", "/sign-in")):
@@ -699,7 +724,7 @@ class BaselineReadiness(unittest.TestCase):
             self.assertEqual(out.returncode, 22)
 
     def test_it_is_not_conditional(self):
-        st = next(s for s in RELEASE["jobs"]["smoke"]["steps"] if s.get("name", "").startswith("Baseline readiness"))
+        st = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("name", "").startswith("Baseline readiness"))
         self.assertNotIn("if", st)
 
 
@@ -709,7 +734,7 @@ class Smoke(unittest.TestCase):
 *describe-services*) echo {svc_td};;
 *describe-task-definition*) echo '{json.dumps(images)}';;
 esac"""
-        return run_step(step("smoke", "Every service's task definition"), aws, {"DOMAIN": "d", "IMAGE": "backend", "DIGEST": DIGEST, "SERVICES": services})[0]
+        return run_step(step("verify", "Every service's task definition"), aws, {"DOMAIN": "d", "IMAGE": "backend", "DIGEST": DIGEST, "SERVICES": services})[0]
 
     def test_a_daemon_passes_when_its_sidecar_runs_the_digest_whatever_the_order(self):
         sidecar, main = f"x/backend@{DIGEST}", "x/pgbouncer@sha256:" + "e" * 64
@@ -726,14 +751,14 @@ esac"""
 
 class SmokeScript(unittest.TestCase):
     """UC-DEL-001 row 7: the caller's smoke-script checks the domain without AWS credentials; absent = a warning."""
-    script = step("smoke", "The repo's own smoke checks")
+    script = step("verify", "The repo's own smoke checks")
 
     def run_smoke(self, path: str, files: dict[str, str] | None = None):
         out, _, _, summary, _ = run_step(self.script, "", {"SCRIPT": path, "DOMAIN": "preprod.example", "AWS_SESSION_TOKEN": "secret-token"}, files, with_summary=True)
         return out, summary
 
     def test_it_runs_after_the_shared_checks_in_the_same_job(self):
-        names = [s.get("name", "") for s in RELEASE["jobs"]["smoke"]["steps"]]
+        names = [s.get("name", "") for s in RELEASE["jobs"]["verify"]["steps"]]
         self.assertTrue(any(n.startswith("Every service's task definition") for n in names))
         self.assertTrue(any(n.startswith("The repo's own") for n in names))
         self.assertLess(names.index(next(n for n in names if n.startswith("Baseline readiness"))), names.index(next(n for n in names if n.startswith("The repo's own"))))
@@ -747,7 +772,10 @@ class SmokeScript(unittest.TestCase):
 
     def test_a_failing_script_fails_the_smoke_and_so_rolls_back(self):
         self.assertEqual(self.run_smoke("smoke.sh", {"smoke.sh": "exit 3\n"})[0].returncode, 3)
-        self.assertIn("needs.smoke.result == 'failure'", RELEASE["jobs"]["rollback"]["if"])
+        steps = RELEASE["jobs"]["verify"]["steps"]
+        ids = [s.get("id") or s.get("name", "") for s in steps]
+        self.assertLess(ids.index(next(i for i in ids if i.startswith("The repo's own"))), ids.index("watch"))
+        self.assertIn("steps.watch.outcome != 'success'", steps[ids.index("rollback")]["if"])
 
     def test_a_passing_script_gets_the_domain_and_no_aws_credentials(self):
         out, _ = self.run_smoke("smoke.sh", {"smoke.sh": 'echo "domain=${DOMAIN} token=${AWS_SESSION_TOKEN:-none}"\n'})
@@ -768,7 +796,7 @@ BASH4 = subprocess.run(["bash", "-c", "mapfile -t x < /dev/null"], capture_outpu
                      "needs bash 4+ (mapfile); this bash is older")
 class Watch(unittest.TestCase):
     def watch(self, known: str, firing: str, seconds: str, services: str = '["api", "worker"]'):
-        script = step("watch", "10 minutes after stable").replace("SECONDS + 600", "SECONDS + " + seconds)
+        script = step("verify", "10 minutes after stable").replace("SECONDS + 600", "SECONDS + " + seconds)
         # The stub answers like AWS: only the alarms among the requested --alarm-names that exist (or are firing).
         aws = f"""want=" $* "
 pick() {{ for a in $1; do case "$want" in *" $a "*) printf '%s\\t' "$a";; esac; done; echo; }}
@@ -821,7 +849,7 @@ esac"""
 class Assets(unittest.TestCase):
     def test_the_folder_is_sha_12(self):
         aws = """case "$*" in *list-objects-v2*--prefix*) echo None;; esac"""
-        out, calls, _ = run_step(step("assets", "Copy /app/dist/assets"), aws, {"IMAGE_REF": REF, "REGISTRY": "r", "DRY_RUN": "false"})
+        out, calls, _ = run_step(step("deploy", "Copy /app/dist/assets"), aws, {"IMAGE_REF": REF, "REGISTRY": "r", "DRY_RUN": "false"})
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn(f"--prefix {COMMIT}/", calls)
         self.assertIn(f"s3 sync ./assets-out s3://onepeek-preprod-web-assets/{COMMIT}/", calls)
@@ -829,11 +857,11 @@ class Assets(unittest.TestCase):
 
 class RollbackIssue(unittest.TestCase):
     def test_the_issue_title_names_the_commit(self):
-        self.assertIn('--title "Release ${COMMIT} to ${ENVIRONMENT} rolled back"', step("rollback", "Open an issue"))
+        self.assertIn('--title "Release ${COMMIT} to ${ENVIRONMENT} rolled back"', step("verify", "Open an issue"))
 
 
 class Notify(unittest.TestCase):
-    script = step("notify", "Deployment record")
+    script = step("finish", "Deployment record")
 
     def notify(self, watch: str, rollback: str, stable_at: str = "1700000300"):
         gh = 'case "$*" in *"/statuses"*) ;; *deployments*) echo 42;; esac'
@@ -870,16 +898,22 @@ class Notify(unittest.TestCase):
         self.assertIn("not running", summary)
 
     def test_it_runs_after_any_result_but_never_in_a_dry_run(self):
-        job = RELEASE["jobs"]["notify"]
+        job = RELEASE["jobs"]["finish"]
+        st = next(s for s in job["steps"] if s.get("name", "").startswith("Deployment record"))
         self.assertIn("always()", job["if"])
-        self.assertIn("!inputs.dry-run", job["if"])
-        self.assertIn("rollback", job["needs"])
-        self.assertEqual(job["permissions"], {"contents": "read", "deployments": "write"})
+        self.assertIn("always()", st["if"])
+        self.assertIn("!inputs.dry-run", st["if"])
+        self.assertIn("needs.prepare.outputs.commit != ''", st["if"])  # after every run that got past the version
+        self.assertIn("verify", job["needs"])
+        self.assertEqual(st["env"]["WATCH"], "${{ needs.verify.outputs.watch }}")
+        self.assertEqual(st["env"]["ROLLBACK"], "${{ needs.verify.outputs.rollback }}")
+        self.assertEqual(RELEASE["jobs"]["verify"]["outputs"], {"watch": "${{ steps.watch.outcome }}", "rollback": "${{ steps.rollback.outcome }}"})
+        self.assertEqual(job["permissions"], {"contents": "read", "id-token": "write", "deployments": "write", "packages": "write"})
 
 
 class ApiClient(unittest.TestCase):
     def test_preprod_publishes_the_dev_prerelease_under_next(self):
-        script = step("api-client", "Publish the prerelease under next")
+        script = step("finish", "Publish the prerelease under next")
         npm = 'case "$*" in *"pkg get name"*) echo \'"@onepeek/api-client"\';; *view*) exit 1;; esac'
         out, calls, _ = run_step(script, "", {"VERSION": "1.2.3", "GITHUB_SHA": "abcdef1234567890"}, extra_stubs={"npm": npm, "pnpm": ""})
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
@@ -888,15 +922,28 @@ class ApiClient(unittest.TestCase):
         self.assertNotIn("latest", calls)
 
     def test_a_rerun_of_a_published_commit_is_a_no_op(self):
-        script = step("api-client", "Publish the prerelease under next")
+        script = step("finish", "Publish the prerelease under next")
         npm = 'case "$*" in *"pkg get name"*) echo \'"@onepeek/api-client"\';; *view*) echo 1.2.3-dev.abcdef1;; esac'
         out, calls, _ = run_step(script, "", {"VERSION": "1.2.3", "GITHUB_SHA": "abcdef1234567890"}, extra_stubs={"npm": npm, "pnpm": ""})
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("npm view @onepeek/api-client@1.2.3-dev.abcdef1 version", calls)
         self.assertNotIn("pnpm publish", calls)
 
-    def test_it_waits_for_a_clean_watch(self):
-        self.assertIn("needs.watch.result == 'success'", RELEASE["jobs"]["api-client"]["if"])
+    def test_it_waits_for_a_clean_watch_and_each_step_for_the_one_before(self):
+        steps = RELEASE["jobs"]["finish"]["steps"]
+        first = next(i for i, s in enumerate(steps) if s.get("id") == "api-checkout")
+        self.assertIn("needs.verify.outputs.watch == 'success'", steps[first]["if"])
+        self.assertIn("inputs.image == 'backend'", steps[first]["if"])
+        self.assertIn("!inputs.dry-run", steps[first]["if"])
+        chain = steps[first:]
+        self.assertEqual(len(chain), 5)
+        for before, st in zip(chain, chain[1:]):
+            self.assertEqual(st["if"], "${{ !cancelled() && steps.%s.outcome == 'success' }}" % before["id"])
+        for st in chain[3:]:
+            self.assertEqual(st["working-directory"], "clients/typescript")
+        # After the unlock: the next release does not wait for the npm publish.
+        unlock = next(i for i, s in enumerate(steps) if s.get("name") == "Release the release lock")
+        self.assertLess(unlock, first)
 
 
 PREVIOUS = re.search(r"(previous_deployment\(\) \{.*?\n          \})", OPERATE, re.S).group(1)
@@ -949,7 +996,7 @@ esac"""
 
 class DbBootstrapRoleGuard(unittest.TestCase):
     def guard(self, role: str, migrate: str = "true", dry: str = "false"):
-        return run_step(step("version", "Refuse at once"), "", {"MIGRATE": migrate, "DRY_RUN": dry, "ROLE": role, "ENVIRONMENT_NAME": "preprod"})[0]
+        return run_step(step("prepare", "Refuse at once"), "", {"MIGRATE": migrate, "DRY_RUN": dry, "ROLE": role, "ENVIRONMENT_NAME": "preprod"})[0]
 
     def test_an_empty_role_on_a_migrating_release_fails_naming_the_variable(self):
         out = self.guard("")
@@ -977,7 +1024,7 @@ class OneServicesFile(unittest.TestCase):
 
     def services(self, image: str):
         aws = f"""case "$*" in *"s3 cp s3://onepeek-preprod-deploy/services.preprod.yaml services.yaml"*) printf '%s' '{SERVICES_FILE}' > services.yaml;; esac"""
-        out, calls, output = run_step(step("rollout", "The services file's services for this image"), aws, {"IMAGE": image})
+        out, calls, output = run_step(step("deploy", "The services file's services for this image"), aws, {"IMAGE": image})
         return out, calls, dict(line.split("=", 1) for line in output.splitlines())
 
     def test_e7_reads_the_published_copy_in_the_deploy_bucket(self):
@@ -988,11 +1035,11 @@ class OneServicesFile(unittest.TestCase):
         self.assertEqual(json.loads(self.services("web")[2]["services"]), ["web"])
 
     def test_the_gateway_routes_read_the_same_file(self):
-        self.assertIn("app api routes --env \"${ENVIRONMENT}\" --services-file services.yaml", step("rollout", "The gateway routes"))
+        self.assertIn("app api routes --env \"${ENVIRONMENT}\" --services-file services.yaml", step("deploy", "The gateway routes"))
 
     def test_no_infra_pin_and_no_infra_checkout_in_the_rollout(self):
         self.assertNotIn("infra-version.txt", TEXT)
-        steps = RELEASE["jobs"]["rollout"]["steps"]
+        steps = RELEASE["jobs"]["deploy"]["steps"]
         self.assertFalse([s for s in steps if "onepeek-infra" in str(s.get("with", {}).get("repository", ""))])
         self.assertNotIn("_infra", json.dumps(steps))
 
@@ -1047,10 +1094,111 @@ class SkippedBuildBranch(unittest.TestCase):
             return found
 
         below = [j for j in jobs if ancestors(j) & {"build-image", "build-web"}]
-        self.assertIn("scan", below)
+        self.assertEqual(below, ["db-bootstrap", "deploy", "verify", "finish"])
         for job_id in below:
             self.assertRegex(str(jobs[job_id].get("if", "")), self.STATUS,
                              f"release-ecs.yml:{job_id}: below a skipped build job, so it needs !cancelled() or always()")
+
+
+class JobGraph(unittest.TestCase):
+    """Foundation-reset W2.1: five stages, because each job waits about a minute for a runner (2026-11-05: 11.9 of 19.1
+    minutes were waiting). db-bootstrap stays a job (a reusable-workflow call under its own role) and the build is two
+    exclusive jobs (only the web build's token reads packages), so 7 jobs are defined and at most 6 run."""
+
+    JOBS = ["prepare", "build-image", "build-web", "db-bootstrap", "deploy", "verify", "finish"]
+
+    def test_the_job_count_is_pinned(self):
+        self.assertEqual(list(RELEASE["jobs"]), self.JOBS)
+
+    def test_at_most_six_jobs_run_and_five_without_migrate(self):
+        # build-image and build-web exclude each other by their conditions, so one is always skipped (no runner).
+        self.assertIn("inputs.image != 'web'", RELEASE["jobs"]["build-image"]["if"])
+        self.assertIn("inputs.image == 'web'", RELEASE["jobs"]["build-web"]["if"])
+        self.assertIn("inputs.migrate", RELEASE["jobs"]["db-bootstrap"]["if"])
+        self.assertEqual(len(self.JOBS) - 1, 6)
+        self.assertEqual(len(self.JOBS) - 2, 5)
+
+    def test_the_stages_run_in_order(self):
+        self.assertEqual(needs_of("deploy"), ["prepare", "build-image", "build-web", "db-bootstrap"])
+        self.assertEqual(needs_of("verify"), ["prepare", "build-image", "build-web", "deploy"])
+        self.assertEqual(needs_of("finish"), ["prepare", "build-image", "build-web", "db-bootstrap", "deploy", "verify"])
+
+    def test_no_job_is_a_matrix(self):
+        # Matrix outputs are last-writer-wins; the build records every image's digest in one step instead.
+        for name, job in RELEASE["jobs"].items():
+            self.assertNotIn("strategy", job, name)
+        self.assertNotIn("matrix.", TEXT)
+
+    def test_each_stage_keeps_the_steps_time_limits(self):
+        # delivery-pipelines §5: build 20, migrate 15, rollout 20, watch 12, now on the steps of the merged jobs.
+        def limit(job, match):
+            return next(s for s in RELEASE["jobs"][job]["steps"] if match(s))["timeout-minutes"]
+        self.assertEqual(limit("build-image", lambda s: s.get("id") == "push"), 20)
+        self.assertEqual(limit("deploy", lambda s: s.get("name", "").startswith("Verify, render, register and run the migrate")), 15)
+        self.assertEqual(limit("deploy", lambda s: s.get("id") == "roll"), 20)
+        self.assertEqual(limit("verify", lambda s: s.get("id") == "watch"), 12)
+        for name, job in RELEASE["jobs"].items():
+            if "steps" in job:
+                total = sum(s.get("timeout-minutes", 0) for s in job["steps"])
+                self.assertGreaterEqual(job["timeout-minutes"], total, name)
+
+    def test_the_build_steps_are_in_stage_order_and_all_but_the_record_skip_a_dry_run(self):
+        steps = RELEASE["jobs"]["build-image"]["steps"]
+        names = [s.get("id") or s.get("name") or s.get("uses", "") for s in steps]
+        order = ["push", "login", "waiver", "Trivy", "Syft", "record"]
+        found = [next(i for i, n in enumerate(names) if n.startswith(o)) for o in order]
+        self.assertEqual(found, sorted(found))
+        record = steps[found[-1]]
+        self.assertNotIn("if", record)
+        for i in found[:-1]:
+            self.assertIn("!inputs.dry-run", steps[i]["if"], names[i])
+
+    def test_the_deploy_steps_are_in_stage_order(self):
+        names = [s.get("name", "") for s in RELEASE["jobs"]["deploy"]["steps"]]
+        order = ["This run attempt holds", "Verify, render, register and run the migrate", "Copy /app/dist/assets",
+                 "E7.", "The gateway routes", "Record every service's current task definition",
+                 "Verify, render, register and update each order", "Lambda sandbox", "Verify, render, check the launch settings, register ops"]
+        found = [next(i for i, n in enumerate(names) if n.startswith(o)) for o in order]
+        self.assertEqual(found, sorted(found))
+
+
+class VerifyRollsBack(unittest.TestCase):
+    """UC-DEL-001 row 9, E2, E3: a failed rollout, ops registration, smoke or watch puts every service back."""
+    job = RELEASE["jobs"]["verify"]
+
+    def test_it_runs_after_a_deploy_that_failed_once_the_rollout_had_started(self):
+        self.assertEqual(self.job["if"], "${{ !cancelled() && !inputs.dry-run && (needs.deploy.result == 'success' || "
+                                         "(needs.deploy.result == 'failure' && needs.deploy.outputs.previous != '')) }}")
+        # previous is recorded right before the rollout: a failed migrate, assets or E7 never rolls back.
+        names = [s.get("id") or s.get("name", "") for s in RELEASE["jobs"]["deploy"]["steps"]]
+        self.assertEqual(names.index("previous") + 1, names.index("roll"))
+        for before in ("Verify, render, register and run the migrate", "Copy /app/dist/assets", "E7."):
+            self.assertLess(names.index(next(n for n in names if n.startswith(before))), names.index("previous"))
+        self.assertEqual(RELEASE["jobs"]["deploy"]["outputs"]["previous"], "${{ steps.previous.outputs.previous }}")
+
+    def test_a_failed_deploy_skips_smoke_and_watch(self):
+        st = next(s for s in self.job["steps"] if s.get("name", "").startswith("The deploy job finished its rollout"))
+        for result, code in (("success", 0), ("failure", 1)):
+            out, _, _ = run_step(st["run"], "", {"DEPLOY_RESULT": result})
+            self.assertEqual(out.returncode, code, result)
+        names = [s.get("id") or s.get("name", "") for s in self.job["steps"]]
+        check = names.index(st["name"])
+        for later in ("Baseline readiness", "Every service's task definition", "The repo's own", "watch"):
+            i = names.index(next(n for n in names if n.startswith(later)))
+            self.assertGreater(i, check, later)
+            self.assertNotIn("always()", str(self.job["steps"][i].get("if", "")), later)
+            self.assertNotIn("cancelled()", str(self.job["steps"][i].get("if", "")), later)
+
+    def test_the_rollback_runs_unless_the_watch_passed_and_never_after_a_failed_lock_check(self):
+        steps = {s.get("id"): s for s in self.job["steps"] if s.get("id")}
+        self.assertEqual(steps["rollback"]["if"], "${{ !cancelled() && steps.guard.outcome == 'success' && "
+                                                  "steps.creds.outcome == 'success' && steps.watch.outcome != 'success' }}")
+        self.assertEqual(steps["rollback"]["env"]["PREVIOUS"], "${{ needs.deploy.outputs.previous }}")
+        names = [s.get("id") or s.get("name", "") for s in self.job["steps"]]
+        self.assertEqual(names[-2:], ["rollback", "Open an issue naming the failure"])
+        self.assertEqual(names[:2], ["guard", "creds"])
+        issue = self.job["steps"][-1]
+        self.assertEqual(issue["if"], "${{ !cancelled() && steps.rollback.outcome == 'success' }}")
 
 
 if __name__ == "__main__":

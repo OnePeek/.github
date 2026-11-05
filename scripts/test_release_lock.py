@@ -89,8 +89,12 @@ def job_step(doc: dict, job: str, name: str) -> str:
     return next(s["run"] for s in doc["jobs"][job]["steps"] if s.get("name", "").startswith(name))
 
 
-TAKE = job_step(RELEASE, "lock", "Take the release lock")
-RELEASE_STEP = job_step(RELEASE, "unlock", "Release the release lock")
+# release-ecs.yml takes the lock in its first job, prepare, and releases it in its last, finish (foundation-reset W2.1);
+# operate.yml and release-lock.yml keep their lock and unlock jobs.
+LOCK_JOB = {"release-ecs": "prepare", "operate": "lock", "release-lock": "lock"}
+UNLOCK_JOB = {"release-ecs": "finish", "operate": "unlock"}
+TAKE = job_step(RELEASE, "prepare", "Take the release lock")
+RELEASE_STEP = job_step(RELEASE, "finish", "Release the release lock")
 LOCKWF = yaml.safe_load((WORKFLOWS / "release-lock.yml").read_text(encoding="utf-8"))
 ACTION = job_step(LOCKWF, "lock", "Take, release, freeze or thaw")
 
@@ -352,30 +356,50 @@ def needs(doc: dict, job: str) -> list[str]:
     return [n] if isinstance(n, str) else n
 
 
-GUARDED = ["sbom-sign", "migrate", "assets", "rollout", "register-one-offs", "rollback", "notify"]
+# The jobs that change something: build (signs and records the digest), deploy (migrate, assets, rollout, ops),
+# verify (rollback) and finish (the deployment record). build-web shares build-image's steps.
+GUARDED = ["build-image", "build-web", "deploy", "verify", "finish"]
 
 
 class Wiring(unittest.TestCase):
     """The lock is taken by the first job, before any build, and released by an always() job (playbook §5.4)."""
 
     def test_release_ecs_takes_the_lock_before_anything_else(self):
-        self.assertEqual(needs(RELEASE, "lock"), [])
-        self.assertEqual(needs(RELEASE, "version"), ["lock"])
-        self.assertEqual(RELEASE["jobs"]["version"]["if"], "${{ needs.lock.outputs.skip != 'true' }}")
+        self.assertEqual(needs(RELEASE, "prepare"), [])
+        names = [s.get("name", "") for s in RELEASE["jobs"]["prepare"]["steps"]]
+        take = names.index("Take the release lock")
+        # Before the lock only the refusals and the credentials to take it; the version and everything else after it.
+        for later in ("Order.", "Refuse at once", "Record the commit"):
+            self.assertGreater(names.index(next(n for n in names if n.startswith(later))), take, later)
+        version = next(s for s in RELEASE["jobs"]["prepare"]["steps"] if s.get("id") == "v")
+        self.assertEqual(version["if"], "${{ steps.order.outputs.skip != 'true' }}")
+        for job in ("build-image", "build-web"):
+            self.assertEqual(needs(RELEASE, job), ["prepare"], job)
+            self.assertIn("needs.prepare.outputs.skip != 'true'", RELEASE["jobs"][job]["if"], job)
         for job in RELEASE["jobs"]:
-            if job not in ("lock", "version"):
-                self.assertTrue(needs(RELEASE, job), job)
+            if job != "prepare":
+                self.assertIn("prepare", needs(RELEASE, job), job)
 
     def test_unlock_always_runs_after_every_deploy_job(self):
-        unlock = RELEASE["jobs"]["unlock"]
-        # Only when the lock job ran, and never for prod (which the lock job refuses).
-        self.assertEqual(unlock["if"], "${{ always() && needs.lock.result != 'skipped' && inputs.environment != 'prod' }}")
-        self.assertEqual(set(needs(RELEASE, "unlock")), set(RELEASE["jobs"]) - {"unlock", "api-client"})
-        self.assertIn("lock_release", job_step(RELEASE, "unlock", "Release the release lock"))
-        for doc in (RELEASE, OPERATE):
-            rel = next(s for s in doc["jobs"]["unlock"]["steps"] if s.get("name") == "Release the release lock")
-            self.assertEqual(rel["env"]["LOCK_TOKEN"], "${{ needs.lock.outputs.token }}")
-            self.assertEqual(doc["jobs"]["lock"]["outputs"]["token"], "${{ steps.take.outputs.token }}")
+        finish = RELEASE["jobs"]["finish"]
+        # Only when the prepare job ran, and never for prod (which the prepare job refuses).
+        self.assertEqual(finish["if"], "${{ always() && needs.prepare.result != 'skipped' && inputs.environment != 'prod' }}")
+        self.assertEqual(set(needs(RELEASE, "finish")), set(RELEASE["jobs"]) - {"finish"})
+        self.assertIn("lock_release", job_step(RELEASE, "finish", "Release the release lock"))
+        # Within finish the unlock and its credentials run whatever the steps before them did.
+        steps = finish["steps"]
+        unlock = next(i for i, s in enumerate(steps) if s.get("name") == "Release the release lock")
+        self.assertEqual(steps[unlock]["if"], "${{ always() }}")
+        self.assertTrue(steps[unlock - 1]["uses"].startswith("aws-actions/configure-aws-credentials@"))
+        self.assertEqual(steps[unlock - 1]["if"], "${{ always() }}")
+        for doc, name in ((RELEASE, "release-ecs"), (OPERATE, "operate")):
+            rel = next(s for s in doc["jobs"][UNLOCK_JOB[name]]["steps"] if s.get("name") == "Release the release lock")
+            self.assertEqual(rel["env"]["LOCK_TOKEN"], "${{ needs.%s.outputs.token }}" % LOCK_JOB[name])
+            self.assertEqual(doc["jobs"][LOCK_JOB[name]]["outputs"]["token"], "${{ steps.take.outputs.token }}")
+
+    def test_the_lock_token_reaches_only_the_unlock_step(self):
+        self.assertEqual(RELEASE_TEXT.count("needs.prepare.outputs.token"), 1)
+        self.assertEqual(RELEASE_TEXT.count("LOCK_TOKEN: "), 1)
 
     def test_operate_takes_and_releases_the_lock_around_its_one_job(self):
         self.assertEqual(needs(OPERATE, "operate"), ["lock"])
@@ -392,9 +416,9 @@ class Wiring(unittest.TestCase):
                 self.assertNotIn("concurrency", job, name)
 
     def test_a_release_waits_30_minutes_polling_every_30_seconds(self):
-        for doc in (RELEASE, OPERATE, LOCKWF):
+        for doc, name in ((RELEASE, "release-ecs"), (OPERATE, "operate"), (LOCKWF, "release-lock")):
             self.assertEqual((doc["env"]["LOCK_WAIT_SECONDS"], doc["env"]["LOCK_POLL_SECONDS"]), ("1800", "30"))
-            self.assertGreater(doc["jobs"]["lock"]["timeout-minutes"] * 60, 1800)
+            self.assertGreater(doc["jobs"][LOCK_JOB[name]]["timeout-minutes"] * 60, 1800)
 
     def test_the_lock_is_per_environment_in_its_deploy_bucket(self):
         self.assertIn('LOCK_BUCKET="${NAME}-deploy"', TAKE)
@@ -402,10 +426,10 @@ class Wiring(unittest.TestCase):
 
     def test_the_app_secrets_are_required_and_their_token_reads_the_holders_state(self):
         # No quiet fallback to GITHUB_TOKEN: without the App a lock left by another repo could never be taken over.
-        for doc in (RELEASE, OPERATE, LOCKWF):
+        for doc, wf in ((RELEASE, "release-ecs"), (OPERATE, "operate"), (LOCKWF, "release-lock")):
             for name in ("AGENTS_APP_CLIENT_ID", "AGENTS_APP_PRIVATE_KEY"):
                 self.assertTrue(doc[True]["workflow_call"]["secrets"][name]["required"], name)
-            lock = doc["jobs"]["lock"]
+            lock = doc["jobs"][LOCK_JOB[wf]]
             app = next(s for s in lock["steps"] if s.get("id") == "app")
             self.assertNotIn("if", app)
             self.assertTrue(app["uses"].startswith("actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510"))
@@ -414,17 +438,17 @@ class Wiring(unittest.TestCase):
             self.assertEqual(take["env"]["LOCK_GH_TOKEN"], "${{ steps.app.outputs.token }}")
             self.assertEqual(lock["permissions"]["actions"], "read")
             self.assertNotIn("github.token", json.dumps(lock))
-        check = job_step(RELEASE, "lock", "The agents' GitHub App secrets are set")
+        check = job_step(RELEASE, "prepare", "The agents' GitHub App secrets are set")
         for has, code in (("false", 1), ("", 1), ("true", 0)):
             r = subprocess.run(["bash", "-eo", "pipefail", "-c", check], capture_output=True, text=True, env={**os.environ, "HAS_APP": has})
             self.assertEqual(r.returncode, code, has)
             if code:
                 self.assertIn("AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY must be passed", r.stdout)
-        names = [s.get("name", "") for s in RELEASE["jobs"]["lock"]["steps"]]
+        names = [s.get("name", "") for s in RELEASE["jobs"]["prepare"]["steps"]]
         self.assertLess(names.index("The agents' GitHub App secrets are set (required, playbook §5.4)"), names.index("Take the release lock"))
 
     def test_deploy_from_dev_is_off_unless_the_input_turns_it_on(self):
-        script = job_step(RELEASE, "lock", "Deploy from dev is off")
+        script = job_step(RELEASE, "prepare", "Deploy from dev is off")
         self.assertIs(RELEASE[True]["workflow_call"]["inputs"]["deploy-from-dev"]["default"], False)
         for ref, flag, code in (("refs/heads/dev", "false", 1), ("refs/heads/dev", "true", 0), ("refs/heads/release", "false", 0)):
             r = subprocess.run(["bash", "-eo", "pipefail", "-c", script], capture_output=True, text=True,
@@ -432,11 +456,11 @@ class Wiring(unittest.TestCase):
             self.assertEqual(r.returncode, code, (ref, flag))
             if code:
                 self.assertIn("deploy from dev is disabled until the launch switch-over (foundation-playbook §5.4)", r.stdout)
-        names = [s.get("name", "") for s in RELEASE["jobs"]["lock"]["steps"]]
+        names = [s.get("name", "") for s in RELEASE["jobs"]["prepare"]["steps"]]
         self.assertLess(names.index(next(n for n in names if n.startswith("Deploy from dev"))), names.index("Take the release lock"))
 
     def test_prod_is_promote_only(self):
-        script = job_step(RELEASE, "lock", "Prod is promote-only")
+        script = job_step(RELEASE, "prepare", "Prod is promote-only")
         refused = subprocess.run(["bash", "-eo", "pipefail", "-c", script], capture_output=True, text=True, env={**os.environ, "ENVIRONMENT_NAME": "prod"})
         self.assertEqual(refused.returncode, 1)
         self.assertIn("promote.yml", refused.stdout)
@@ -459,19 +483,27 @@ class PartialReRun(unittest.TestCase):
         return doc["jobs"][job]["steps"][0]
 
     def test_every_changing_job_checks_the_lock_first(self):
-        for doc, jobs in ((RELEASE, GUARDED), (OPERATE, ["operate"])):
+        for doc, jobs, lock in ((RELEASE, GUARDED, "prepare"), (OPERATE, ["operate"], "lock")):
             for job in jobs:
-                self.assertIn("lock", needs(doc, job), job)
+                self.assertIn(lock, needs(doc, job), job)
                 g = self.guard(doc, job)
                 self.assertTrue(g["name"].startswith("This run attempt holds the release lock"), job)
-                self.assertEqual(g["env"]["LOCKED_ATTEMPT"], "${{ needs.lock.outputs.attempt }}")
+                self.assertEqual(g["env"]["LOCKED_ATTEMPT"], "${{ needs.%s.outputs.attempt }}" % lock)
+
+    def test_the_deployment_record_and_the_rollback_run_only_after_the_lock_check(self):
+        notify = next(s for s in RELEASE["jobs"]["finish"]["steps"] if s.get("name", "").startswith("Deployment record"))
+        self.assertIn("steps.guard.outcome == 'success'", notify["if"])
+        rollback = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("id") == "rollback")
+        self.assertIn("steps.guard.outcome == 'success'", rollback["if"])
+        for job in ("verify", "finish"):
+            self.assertEqual(self.guard(RELEASE, job).get("id"), "guard", job)
 
     def test_the_reusable_db_bootstrap_call_is_skipped_outside_the_locking_attempt(self):
-        self.assertIn("needs.lock.outputs.attempt == format('{0}', github.run_attempt)", RELEASE["jobs"]["db-bootstrap"]["if"])
-        self.assertIn("lock", needs(RELEASE, "db-bootstrap"))
+        self.assertIn("needs.prepare.outputs.attempt == format('{0}', github.run_attempt)", RELEASE["jobs"]["db-bootstrap"]["if"])
+        self.assertIn("prepare", needs(RELEASE, "db-bootstrap"))
 
     def test_the_check_fails_on_another_attempt_and_passes_on_the_locking_one(self):
-        script = self.guard(RELEASE, "rollout")["run"]
+        script = self.guard(RELEASE, "deploy")["run"]
         for locked, attempt, code in (("1", "1", 0), ("1", "2", 1), ("", "1", 1)):
             out = subprocess.run(["bash", "-eo", "pipefail", "-c", script], capture_output=True, text=True,
                                  env={**os.environ, "LOCKED_ATTEMPT": locked, "GITHUB_RUN_ATTEMPT": attempt})  # fmt: skip
@@ -495,7 +527,7 @@ class SameLockEverywhere(unittest.TestCase):
 INDEX = json.dumps({"onepeek-preprod-api": {"kind": "service", "order": 1, "service": "api", "image": "backend"},
                     "onepeek-preprod-migrate": {"kind": "one-off", "order": 0, "service": "migrate", "image": "backend"},
                     "onepeek-preprod-web": {"kind": "service", "order": 1, "service": "web", "image": "web"}})  # fmt: skip
-ORDER = job_step(RELEASE, "lock", "Order.")
+ORDER = job_step(RELEASE, "prepare", "Order.")
 
 
 def order(running: str, git: str, **extra: str):
@@ -537,7 +569,7 @@ class Order(unittest.TestCase):
             self.assertNotIn("skip=", output)
 
     def test_the_checkout_has_the_history(self):
-        checkout = next(s for s in RELEASE["jobs"]["lock"]["steps"] if str(s.get("uses", "")).startswith("actions/checkout@"))
+        checkout = next(s for s in RELEASE["jobs"]["prepare"]["steps"] if str(s.get("uses", "")).startswith("actions/checkout@"))
         self.assertEqual(checkout["with"]["fetch-depth"], 0)
 
 
