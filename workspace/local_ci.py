@@ -290,7 +290,9 @@ def shared_checks(repo: pathlib.Path, kind: str, name: str) -> list[tuple[str, l
     checks = []
     if shutil.which("actionlint"):
         checks.append(("actionlint (with shellcheck)", ["actionlint"]))
-    lint = WORKSPACE / ".github/scripts/check_runner_labels.py"
+    # OnePeek/.github lints itself with its own (changed) lint, as its workflow-lint job does; every other repo with the
+    # shared checkout's.
+    lint = (repo if name == ".github" else WORKSPACE / ".github") / "scripts/check_runner_labels.py"
     if lint.exists():
         checks.append(("runner-label lint", [sys.executable, str(lint), "--kind", kind,
                                              "--repo", f"OnePeek/{name}", str(repo / ".github/workflows")]))

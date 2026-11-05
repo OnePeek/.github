@@ -90,7 +90,8 @@ jobs:
 
   service-list:
     needs: depends-on
-    # operate.yml's service choices must equal the services file; the render function must match release-ecs.yml.
+    # operate.yml's service choices must equal the services file; the render function must match release-ecs.yml; the
+    # release-lock waits fit the runners' lifetimes (scripts/check_lock_limits.py).
     # local_ci.py runs the last step too (playbook §8a P5), with onepeek-infra at origin/dev as _infra.
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -130,3 +131,5 @@ jobs:
           pip install --quiet pyyaml==6.0.3
           python -m unittest discover -s scripts -p 'test_*.py'
           python scripts/check_service_list.py --services-file _infra/config/services.preprod.yaml
+          # The release-lock waits against the reaper lifetimes in onepeek-infra's config/ci.yaml (playbook §5.4a limits test).
+          python scripts/check_lock_limits.py --infra-config _infra/config/ci.yaml

@@ -369,38 +369,112 @@ class PackageRead(unittest.TestCase):
         self.assertNotIn("secrets.NPM_READ_TOKEN", TEXT)
 
 
+import test_release_lock as L  # noqa: E402  (the fake S3 and ECS of the release-lock tests)
+
+
 class Migrate(unittest.TestCase):
+    """Row 5 with the phases of playbook §5.4a "Rollback on cancel": migrating (no ARN) before run-task, the ARN after
+    it, locked once the task has stopped; a failed phase write means the key is lost and the run stops."""
+
     script = step("deploy", "Verify, render, register and run")
 
-    def failed(self, code: str, logs: str = 'echo "the migration line"'):
-        aws = f"""case "$*" in
-*"s3 cp"*) echo '{{"family": "f", "containerDefinitions": [{{"name": "migrate"}}]}}';;
-*register-task-definition*) echo arn:td/migrate:1;;
-*run-task*) echo arn:task/abc123;;
-*"containers[0].exitCode"*) echo {code};;
-*get-log-events*) {logs};;
-esac"""
-        return run_step(self.script, aws, {"IMAGE_REF": "r@" + DIGEST, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9"})
+    def migrate(self, code: str = "0", held: str | None = None, **extra: str):
+        held = held or L.mine()
+        return L.run(self.script, keys={L.LEGACY: held, L.BACKEND: held}, stubs={"cosign": "if [ -p /dev/stdin ]; then cat >/dev/null; fi"}, **{
+            "LOCK_TOKEN": L.TOKEN, "IMAGE_REF": "r@" + DIGEST, "SIGNING_KEY": "k", "DRY_RUN": "false", "COMMIT": COMMIT, "VERSION": "",
+            "AWS_CP": '{"family": "f", "containerDefinitions": [{"name": "migrate"}]}', "AWS_REGISTER_TASK_DEFINITION": "arn:td/migrate:1",
+            "AWS_RUN_TASK": L.TASK, "AWS_DESCRIBE_TASKS": code, "AWS_GET_LOG_EVENTS": "the migration line", **extra})  # fmt: skip
 
-    def test_a_failure_prints_the_tasks_awslogs_output(self):
-        out, calls, _ = self.failed("1")
+    def test_migrating_is_written_before_run_task_which_carries_started_by_run_id_and_attempt(self):
+        out = self.migrate()
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        lines = out.calls.splitlines()
+        run_task = next(i for i, l in enumerate(lines) if "ecs run-task" in l)
+        self.assertIn("--started-by 5000-1", lines[run_task])
+        first_puts = [i for i, l in enumerate(lines) if "put-object" in l][:2]
+        self.assertTrue(first_puts and all(i < run_task for i in first_puts))
+        phases = [(json.loads(p.split(" ", 1)[1])["phase"], json.loads(p.split(" ", 1)[1]).get("migrate_task")) for p in out.puts.splitlines()]
+        self.assertEqual(phases, [("migrating", None)] * 2 + [("migrating", L.TASK)] * 2 + [("locked", None)] * 2)
+        wait = next(i for i, l in enumerate(lines) if "tasks-stopped" in l)
+        self.assertLess(wait, [i for i, l in enumerate(lines) if "put-object" in l][4])
+
+    def test_a_lost_key_starts_no_migrate_task(self):
+        out = self.migrate(held=L.record(L.REPO, L.RUN, token="e" * 32, scope="backend"))
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("lost the release lock", out.stdout)
+        self.assertNotIn("run-task", out.calls)
+
+    def test_a_failure_prints_the_tasks_awslogs_output_after_the_task_stopped(self):
+        out = self.migrate("1")
         self.assertEqual(out.returncode, 1)
         self.assertIn("the migration line", out.stdout)
-        self.assertIn("--log-group-name /onepeek/preprod/one-off --log-stream-name migrate/migrate/abc123", calls)
+        self.assertIn("--log-group-name /onepeek/preprod/one-off --log-stream-name migrate/migrate/abc123", out.calls)
+        self.assertEqual(json.loads(out.keys[L.BACKEND])["phase"], "locked")   # the task has stopped: nothing to wait for
 
     def test_unreadable_logs_still_report_the_failure(self):
-        out, _, _ = self.failed("1", logs='echo "ResourceNotFoundException" >&2; exit 254')
+        out = self.migrate("1", FAIL_GET_LOG_EVENTS="ResourceNotFoundException")
         self.assertEqual(out.returncode, 1)
         self.assertIn("No output could be read", out.stdout)
 
     def test_the_login_missing_exit_is_a_plain_failure(self):
-        out, _, _ = self.failed("3")
+        out = self.migrate("3")
         self.assertEqual(out.returncode, 1)
         self.assertIn("db-bootstrap did not create the login", out.stdout)
         self.assertNotIn("bootstrap.yml", out.stdout)
 
     def test_the_text_no_longer_says_json_file(self):
         self.assertNotIn("json-file", self.script)
+
+
+class Rolling(unittest.TestCase):
+    """deploy writes rolling with previous and previous_lambda before the first update-service; verify writes done or
+    locked (playbook §5.4a "Rollback on cancel")."""
+
+    script = step("deploy", "Record every service's current task definition")
+
+    def previous(self, held: str | None = None, **extra: str):
+        held = held or L.mine()
+        return L.run(self.script, keys={L.LEGACY: held, L.BACKEND: held}, **{
+            "LOCK_TOKEN": L.TOKEN, "SERVICES": '["api", "worker"]', "HAS_SANDBOX": "yes", "DRY_RUN": "false",
+            "AWS_DESCRIBE_SERVICES": L.PREV["api"], "AWS_LIST_VERSIONS_BY_FUNCTION": "$LATEST 1 2 3", **extra})  # fmt: skip
+
+    def test_rolling_is_written_with_previous_and_previous_lambda_and_then_the_output(self):
+        out = self.previous()
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        rec = json.loads(out.keys[L.BACKEND])
+        self.assertEqual(rec["phase"], "rolling")
+        self.assertEqual(rec["previous"], {"api": L.PREV["api"], "worker": L.PREV["api"]})
+        self.assertEqual(rec["previous_lambda"], {"onepeek-preprod-sandbox-parse": "3", "onepeek-preprod-sandbox-fetch": "3"})
+        self.assertIn('previous={"api": ', out.output)
+
+    def test_a_lost_key_writes_no_previous_so_verify_never_rolls_back(self):
+        out = self.previous(held=L.record(L.REPO, L.RUN, token="e" * 32, scope="backend"))
+        self.assertEqual(out.returncode, 1)
+        self.assertNotIn("previous=", out.output)
+
+    def test_a_dry_run_writes_no_phase(self):
+        out = self.previous(DRY_RUN="true")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(out.puts, "")
+
+    def test_it_comes_before_the_first_update_service(self):
+        names = [s.get("name", "") for s in RELEASE["jobs"]["deploy"]["steps"]]
+        rec = names.index(next(n for n in names if n.startswith("Record every service's current task definition")))
+        roll = names.index(next(n for n in names if n.startswith("Verify, render, register and update each order")))
+        self.assertLess(rec, roll)
+
+    def test_verify_writes_done_after_a_clean_watch_and_locked_after_a_stable_rollback(self):
+        end = step("verify", "Record the end in the release lock")
+        for watch, phase in (("success", "done"), ("failure", "locked")):
+            held = L.mine("rolling", previous=L.PREV)
+            out = L.run(end, keys={L.LEGACY: held, L.BACKEND: held}, LOCK_TOKEN=L.TOKEN, WATCH=watch)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            rec = json.loads(out.keys[L.BACKEND])
+            self.assertEqual(rec["phase"], phase)
+            self.assertNotIn("previous", rec)
+        st = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("name", "").startswith("Record the end"))
+        self.assertEqual(st["if"], "${{ !cancelled() && steps.guard.outcome == 'success' && steps.creds.outcome == 'success' && "
+                                   "(steps.watch.outcome == 'success' || steps.rollback.outcome == 'success') }}")
 
 
 class DeployBucketWrites(unittest.TestCase):
@@ -908,7 +982,8 @@ class Notify(unittest.TestCase):
         self.assertEqual(st["env"]["WATCH"], "${{ needs.verify.outputs.watch }}")
         self.assertEqual(st["env"]["ROLLBACK"], "${{ needs.verify.outputs.rollback }}")
         self.assertEqual(RELEASE["jobs"]["verify"]["outputs"], {"watch": "${{ steps.watch.outcome }}", "rollback": "${{ steps.rollback.outcome }}"})
-        self.assertEqual(job["permissions"], {"contents": "read", "id-token": "write", "deployments": "write"})
+        # issues: write for the put-back's issue (playbook §5.4a "Rollback on cancel").
+        self.assertEqual(job["permissions"], {"contents": "read", "id-token": "write", "deployments": "write", "issues": "write"})
 
 
 class ApiClient(unittest.TestCase):
@@ -1167,7 +1242,9 @@ class JobGraph(unittest.TestCase):
     def test_no_registry_password_is_handled_for_the_scan(self):
         # Trivy authenticates to ECR from the AWS credentials the credentials step exported.
         for word in ("TRIVY_PASSWORD", "TRIVY_USERNAME", "scanner-secret", "add-mask"):
-            self.assertNotIn(word, TEXT.replace("# No registry password: Trivy reads", ""), word)
+            # The release-lock functions mask the App token and role session they mint again inside a wait (playbook §5.4a).
+            text = re.sub(r"# --- release-lock begin.*?# --- release-lock end ---", "", TEXT, flags=re.S)
+            self.assertNotIn(word, text.replace("# No registry password: Trivy reads", ""), word)
         self.assertNotRegex(TEXT, r"(?m)^[^#\n]*>>\s*\"?\$GITHUB_ENV")
 
     def test_every_verify_step_before_the_rollback_has_a_limit_and_the_job_limit_exceeds_them_all(self):
@@ -1278,9 +1355,10 @@ class VerifyRollsBack(unittest.TestCase):
                                                   "steps.creds.outcome == 'success' && steps.watch.outcome != 'success' }}")
         self.assertEqual(steps["rollback"]["env"]["PREVIOUS"], "${{ needs.deploy.outputs.previous }}")
         names = [s.get("id") or s.get("name", "") for s in self.job["steps"]]
-        self.assertEqual(names[-2:], ["rollback", "Open an issue naming the failure"])
+        self.assertEqual(names[-3:], ["rollback", "Open an issue naming the failure",
+                                      "Record the end in the release lock (done after a clean watch, locked after a stable rollback)"])
         self.assertEqual(names[:2], ["guard", "creds"])
-        issue = self.job["steps"][-1]
+        issue = self.job["steps"][-2]
         self.assertEqual(issue["if"], "${{ !cancelled() && steps.rollback.outcome == 'success' }}")
 
 

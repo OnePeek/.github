@@ -8,7 +8,8 @@
      .github/workflow-lint/github-only-jobs.yaml use the `github-only` form (plain `ubuntu-latest`). Exempt by name:
      onepeek-infra's ci-runner-canary.yml and ci-runner-image.yml, which name `onepeek-arm64` and
      `onepeek-arm64-canary` directly.
-  3. Every job that can run on `onepeek-*` sets `timeout-minutes`: at most 60 (fast, arm-build), 150 (stateful).
+  3. Every job that can run on `onepeek-*` sets `timeout-minutes`: at most 60 (fast, arm-build), 150 (stateful), or its
+     named TIMEOUT_EXCEPTIONS entry. An expression (for example one that depends on an input) is read as its larger value.
   4. No `pull_request_target`; no `workflow_run` job on `onepeek-*`.
   5. Private repos: a workflow triggered by `push` to `dev` that calls release-ecs.yml with `environment: preprod` sets
      `deploy-from-dev: true`; deploying preprod from dev stays off until the launch switch-over (foundation-playbook §5.4).
@@ -38,7 +39,28 @@ PROD_GUARD = "inputs.environment == 'prod' && 'ubuntu-latest' || "
 LIMITS = {"light": 30, "fast": 60, "arm-build": 60, "stateful": 150}
 # Named exceptions to rule 3 (ci-runners.md section 5.4), by (repo, workflow, job): the sandbox run lock waits up to
 # 80 minutes on the small class (sandbox.md section 7c item 4), under the spot reaper's 90-minute lifetime.
-TIMEOUT_EXCEPTIONS = {("OnePeek/onepeek-infra", "sandbox.yml", "lock"): 85}
+TIMEOUT_EXCEPTIONS = {
+    ("OnePeek/onepeek-infra", "sandbox.yml", "lock"): 85,
+    # The release-lock waits (foundation-playbook §5.4a "Waits that fit the runners"; ci-runners.md §5.4 rule 3), all
+    # stateful, each under the on-demand lifetime of 180 less 20. Listed even where the class cap allows more, so the
+    # limits test (scripts/check_lock_limits.py) reads the same entries.
+    ("OnePeek/.github", "release-ecs.yml", "prepare"): 135,
+    ("OnePeek/.github", "release-ecs.yml", "finish"): 60,
+    ("OnePeek/.github", "operate.yml", "lock"): 135,
+    ("OnePeek/.github", "operate.yml", "unlock"): 60,
+    ("OnePeek/.github", "release-lock.yml", "lock"): 135,
+}
+EXPRESSION_NUMBER = re.compile(r"(?<![\w.'])\d+(?![\w.'])")
+
+
+def timeout_minutes(value: object) -> int | None:
+    """A job's timeout-minutes as a number: an int as it is, an expression `${{ ... }}` as the largest number in it."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().startswith("${{") and value.strip().endswith("}}"):
+        numbers = [int(n) for n in EXPRESSION_NUMBER.findall(value)]
+        return max(numbers) if numbers else None
+    return None
 
 
 def _forms(var: str) -> dict[str, str]:
@@ -172,9 +194,9 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
             errors.append(f"{label}: rule 2: listed in github-only-jobs.yaml, so runs-on must be ubuntu-latest.")
         if cls is not None and cls != "github-only" and _names_runner(ro):
             limit = TIMEOUT_EXCEPTIONS.get((repo, name, job_id), LIMITS[cls])
-            tm = job.get("timeout-minutes")
-            if not isinstance(tm, int) or isinstance(tm, bool) or tm > limit:
-                errors.append(f"{label}: rule 3: timeout-minutes must be a number of at most {limit}, got {tm!r}.")
+            tm = timeout_minutes(job.get("timeout-minutes"))
+            if tm is None or tm > limit:
+                errors.append(f"{label}: rule 3: timeout-minutes must be a number of at most {limit}, got {job.get('timeout-minutes')!r}.")
             if "workflow_run" in triggers:
                 errors.append(f"{label}: rule 4: a workflow_run workflow must not run jobs on onepeek-*.")
     return errors
