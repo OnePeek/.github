@@ -384,7 +384,7 @@ class Wiring(unittest.TestCase):
         finish = RELEASE["jobs"]["finish"]
         # Only when the prepare job ran, and never for prod (which the prepare job refuses).
         self.assertEqual(finish["if"], "${{ always() && needs.prepare.result != 'skipped' && inputs.environment != 'prod' }}")
-        self.assertEqual(set(needs(RELEASE, "finish")), set(RELEASE["jobs"]) - {"finish"})
+        self.assertEqual(set(needs(RELEASE, "finish")), set(RELEASE["jobs"]) - {"finish", "api-client"})  # api-client runs after it
         self.assertIn("lock_release", job_step(RELEASE, "finish", "Release the release lock"))
         # Within finish the unlock and its credentials run whatever the steps before them did.
         steps = finish["steps"]

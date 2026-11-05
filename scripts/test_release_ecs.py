@@ -908,12 +908,12 @@ class Notify(unittest.TestCase):
         self.assertEqual(st["env"]["WATCH"], "${{ needs.verify.outputs.watch }}")
         self.assertEqual(st["env"]["ROLLBACK"], "${{ needs.verify.outputs.rollback }}")
         self.assertEqual(RELEASE["jobs"]["verify"]["outputs"], {"watch": "${{ steps.watch.outcome }}", "rollback": "${{ steps.rollback.outcome }}"})
-        self.assertEqual(job["permissions"], {"contents": "read", "id-token": "write", "deployments": "write", "packages": "write"})
+        self.assertEqual(job["permissions"], {"contents": "read", "id-token": "write", "deployments": "write"})
 
 
 class ApiClient(unittest.TestCase):
     def test_preprod_publishes_the_dev_prerelease_under_next(self):
-        script = step("finish", "Publish the prerelease under next")
+        script = step("api-client", "Publish the prerelease under next")
         npm = 'case "$*" in *"pkg get name"*) echo \'"@onepeek/api-client"\';; *view*) exit 1;; esac'
         out, calls, _ = run_step(script, "", {"VERSION": "1.2.3", "GITHUB_SHA": "abcdef1234567890"}, extra_stubs={"npm": npm, "pnpm": ""})
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
@@ -922,28 +922,22 @@ class ApiClient(unittest.TestCase):
         self.assertNotIn("latest", calls)
 
     def test_a_rerun_of_a_published_commit_is_a_no_op(self):
-        script = step("finish", "Publish the prerelease under next")
+        script = step("api-client", "Publish the prerelease under next")
         npm = 'case "$*" in *"pkg get name"*) echo \'"@onepeek/api-client"\';; *view*) echo 1.2.3-dev.abcdef1;; esac'
         out, calls, _ = run_step(script, "", {"VERSION": "1.2.3", "GITHUB_SHA": "abcdef1234567890"}, extra_stubs={"npm": npm, "pnpm": ""})
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("npm view @onepeek/api-client@1.2.3-dev.abcdef1 version", calls)
         self.assertNotIn("pnpm publish", calls)
 
-    def test_it_waits_for_a_clean_watch_and_each_step_for_the_one_before(self):
-        steps = RELEASE["jobs"]["finish"]["steps"]
-        first = next(i for i, s in enumerate(steps) if s.get("id") == "api-checkout")
-        self.assertIn("needs.verify.outputs.watch == 'success'", steps[first]["if"])
-        self.assertIn("inputs.image == 'backend'", steps[first]["if"])
-        self.assertIn("!inputs.dry-run", steps[first]["if"])
-        chain = steps[first:]
-        self.assertEqual(len(chain), 5)
-        for before, st in zip(chain, chain[1:]):
-            self.assertEqual(st["if"], "${{ !cancelled() && steps.%s.outcome == 'success' }}" % before["id"])
-        for st in chain[3:]:
-            self.assertEqual(st["working-directory"], "clients/typescript")
-        # After the unlock: the next release does not wait for the npm publish.
-        unlock = next(i for i, s in enumerate(steps) if s.get("name") == "Release the release lock")
-        self.assertLess(unlock, first)
+    def test_it_is_its_own_job_after_finish_for_a_clean_backend_watch_only(self):
+        job = RELEASE["jobs"]["api-client"]
+        self.assertEqual(needs_of("api-client"), ["prepare", "verify", "finish"])
+        for part in ("!cancelled()", "!inputs.dry-run", "inputs.image == 'backend'", "needs.verify.outputs.watch == 'success'"):
+            self.assertIn(part, job["if"])
+        self.assertEqual(job["permissions"], {"contents": "read", "packages": "write"})
+        self.assertEqual(job["defaults"]["run"]["working-directory"], "clients/typescript")
+        # Nothing of the publish is left in finish, which has no packages scope.
+        self.assertFalse([s for s in RELEASE["jobs"]["finish"]["steps"] if "pnpm" in str(s)])
 
 
 PREVIOUS = re.search(r"(previous_deployment\(\) \{.*?\n          \})", OPERATE, re.S).group(1)
@@ -1094,7 +1088,7 @@ class SkippedBuildBranch(unittest.TestCase):
             return found
 
         below = [j for j in jobs if ancestors(j) & {"build-image", "build-web"}]
-        self.assertEqual(below, ["db-bootstrap", "deploy", "verify", "finish"])
+        self.assertEqual(below, ["db-bootstrap", "deploy", "verify", "finish", "api-client"])
         for job_id in below:
             self.assertRegex(str(jobs[job_id].get("if", "")), self.STATUS,
                              f"release-ecs.yml:{job_id}: below a skipped build job, so it needs !cancelled() or always()")
@@ -1102,26 +1096,64 @@ class SkippedBuildBranch(unittest.TestCase):
 
 class JobGraph(unittest.TestCase):
     """Foundation-reset W2.1: five stages, because each job waits about a minute for a runner (2026-11-05: 11.9 of 19.1
-    minutes were waiting). db-bootstrap stays a job (a reusable-workflow call under its own role) and the build is two
-    exclusive jobs (only the web build's token reads packages), so 7 jobs are defined and at most 6 run."""
+    minutes were waiting). db-bootstrap stays a job (a reusable-workflow call under its own role), the build is two
+    exclusive jobs (only the web build's token reads packages) and the API client publish is its own job (only it holds
+    packages: write), so 8 jobs are defined; the backend runs at most 7 and the web image at most 5."""
 
-    JOBS = ["prepare", "build-image", "build-web", "db-bootstrap", "deploy", "verify", "finish"]
+    JOBS = ["prepare", "build-image", "build-web", "db-bootstrap", "deploy", "verify", "finish", "api-client"]
 
     def test_the_job_count_is_pinned(self):
         self.assertEqual(list(RELEASE["jobs"]), self.JOBS)
 
-    def test_at_most_six_jobs_run_and_five_without_migrate(self):
-        # build-image and build-web exclude each other by their conditions, so one is always skipped (no runner).
-        self.assertIn("inputs.image != 'web'", RELEASE["jobs"]["build-image"]["if"])
-        self.assertIn("inputs.image == 'web'", RELEASE["jobs"]["build-web"]["if"])
-        self.assertIn("inputs.migrate", RELEASE["jobs"]["db-bootstrap"]["if"])
-        self.assertEqual(len(self.JOBS) - 1, 6)
-        self.assertEqual(len(self.JOBS) - 2, 5)
+    def test_the_most_jobs_that_run_per_image(self):
+        # build-image and build-web exclude each other by their conditions, so one is always skipped (no runner);
+        # api-client runs for the backend only; db-bootstrap only with migrate.
+        jobs = RELEASE["jobs"]
+        self.assertIn("inputs.image != 'web'", jobs["build-image"]["if"])
+        self.assertIn("inputs.image == 'web'", jobs["build-web"]["if"])
+        self.assertIn("inputs.image == 'backend'", jobs["api-client"]["if"])
+        self.assertIn("inputs.migrate", jobs["db-bootstrap"]["if"])
+
+        def runs(image: str, migrate: bool) -> int:
+            n = 0
+            for name, job in jobs.items():
+                cond = job.get("if", "")
+                if "inputs.image == '%s'" % image not in cond and "inputs.image == " in cond:
+                    continue
+                if "inputs.image != '%s'" % image in cond:
+                    continue
+                if name == "db-bootstrap" and not migrate:
+                    continue
+                n += 1
+            return n
+        self.assertEqual(runs("backend", True), 7)
+        self.assertEqual(runs("web", True), 6)
+        self.assertEqual(runs("web", False), 5)
+        self.assertEqual(runs("backend", False), 6)
 
     def test_the_stages_run_in_order(self):
         self.assertEqual(needs_of("deploy"), ["prepare", "build-image", "build-web", "db-bootstrap"])
         self.assertEqual(needs_of("verify"), ["prepare", "build-image", "build-web", "deploy"])
         self.assertEqual(needs_of("finish"), ["prepare", "build-image", "build-web", "db-bootstrap", "deploy", "verify"])
+        self.assertEqual(needs_of("api-client"), ["prepare", "verify", "finish"])
+
+    def test_only_api_client_has_packages_write_and_build_web_keeps_packages_read(self):
+        for name, job in RELEASE["jobs"].items():
+            perms = job.get("permissions") or {}
+            self.assertEqual(perms.get("packages") == "write", name == "api-client", name)
+        self.assertEqual(RELEASE["jobs"]["build-web"]["permissions"].get("packages"), "read")
+        self.assertNotIn("packages: write", str(RELEASE.get("permissions", "")))
+
+    def test_the_scanner_password_is_only_in_the_scan_step(self):
+        self.assertNotIn("TRIVY_PASSWORD", str(RELEASE.get("env", "")))
+        for name, job in RELEASE["jobs"].items():
+            self.assertNotIn("TRIVY_PASSWORD", str(job.get("env", "")), name)
+            for st in job.get("steps", []):
+                has = "TRIVY_PASSWORD" in str(st)
+                self.assertEqual(has, st.get("uses", "").startswith("aquasecurity/trivy-action") and name in ("build-image", "build-web"),
+                                 f"{name}: {st.get('name') or st.get('uses')}")
+        self.assertNotIn("TRIVY_PASSWORD", TEXT.replace("TRIVY_PASSWORD: ${{ steps.login.outputs.scanner-secret }}", ""))
+        self.assertNotRegex(TEXT, r"(?m)^[^#\n]*>>\s*\"?\$GITHUB_ENV")
 
     def test_no_job_is_a_matrix(self):
         # Matrix outputs are last-writer-wins; the build records every image's digest in one step instead.

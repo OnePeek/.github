@@ -548,7 +548,7 @@ jobs:
           echo "ref=${registry}/${NAME}/${IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
           password=$(aws ecr get-login-password)
           echo "::add-mask::${password}"
-          { echo "TRIVY_USERNAME=AWS"; echo "TRIVY_PASSWORD=${password}"; } >> "$GITHUB_ENV"
+          echo "scanner-secret=${password}" >> "$GITHUB_OUTPUT"   # read only by the scan step's own env
       - name: The waiver file, only if the repository has one
         id: waiver
         if: ${{ !inputs.dry-run }}
@@ -567,6 +567,8 @@ jobs:
           version: v0.76.1
         env:
           TRIVY_PLATFORM: linux/arm64
+          TRIVY_USERNAME: AWS
+          TRIVY_PASSWORD: ${{ steps.login.outputs.scanner-secret }}   # this step only, never the job or GITHUB_ENV
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v2.6.5
@@ -1299,10 +1301,8 @@ jobs:
   finish:
     # Rows 10 and 11 and the unlock, after every run that took the lock, whatever happened. In order: the deployment
     # record and notice; the unlock (always, only with the token the prepare job took the lock with; if this job itself
-    # is lost, the next release that waits sees this run has finished and takes the lock over); then, backend only and
-    # after a clean watch, the API client: @onepeek/api-client, generated from the committed OpenAPI file, published to
-    # GitHub Packages as the prerelease <next>-dev.<sha7> under the next dist-tag (promote.yml publishes <version> under
-    # latest). Never for prod, which the prepare job refuses.
+    # is lost, the next release that waits sees this run has finished and takes the lock over). No packages scope: the
+    # API client publish is the api-client job after it.
     needs: [prepare, build-image, build-web, db-bootstrap, deploy, verify]
     if: ${{ always() && needs.prepare.result != 'skipped' && inputs.environment != 'prod' }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
@@ -1311,7 +1311,6 @@ jobs:
       contents: read
       id-token: write
       deployments: write
-      packages: write
     steps:
       - name: This run attempt holds the release lock (a re-run of only some jobs does not)
         id: guard
@@ -1587,27 +1586,35 @@ jobs:
           }
           # --- release-lock end ---
           lock_release
-      - id: api-checkout
-        if: ${{ !cancelled() && !inputs.dry-run && inputs.image == 'backend' && needs.verify.outputs.watch == 'success' }}
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+  api-client:
+    # Backend only, after a clean watch: @onepeek/api-client, generated from the committed OpenAPI file, published to
+    # GitHub Packages as the prerelease <next>-dev.<sha7> under the next dist-tag (UC-DEL-001 row 11); promote.yml
+    # publishes <version> under latest. Its own job so that only this one holds packages: write (least privilege), and
+    # after finish so the unlock never waits for the npm publish. Never for prod, which the prepare job refuses.
+    needs: [prepare, verify, finish]
+    if: ${{ !cancelled() && !inputs.dry-run && inputs.image == 'backend' && needs.verify.outputs.watch == 'success' }}
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - id: api-pnpm
-        if: ${{ !cancelled() && steps.api-checkout.outcome == 'success' }}
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           package_json_file: clients/typescript/package.json
-      - id: api-node
-        if: ${{ !cancelled() && steps.api-pnpm.outcome == 'success' }}
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: clients/typescript/.node-version
           cache: pnpm
           cache-dependency-path: clients/typescript/pnpm-lock.yaml
       - name: Install, generate and build
-        id: api-build
-        if: ${{ !cancelled() && steps.api-node.outcome == 'success' }}
-        working-directory: clients/typescript
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -1615,8 +1622,6 @@ jobs:
           pnpm generate
           pnpm build
       - name: Publish the prerelease under next
-        if: ${{ !cancelled() && steps.api-build.outcome == 'success' }}
-        working-directory: clients/typescript
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.prepare.outputs.version }}
