@@ -522,9 +522,25 @@ class DropProtection(unittest.TestCase):
         out = render({"family": "f", "containerDefinitions": [{"name": "api", "environment": env("A")}]}, mode="first-deploy")
         self.assertEqual(out.returncode, 0, out.stderr)
 
-    def test_a_vanished_container_counts_as_dropping_its_names(self):
-        out = render({"family": "f", "containerDefinitions": [{"name": "other", "environment": env("A", "B"), "secrets": secrets("S")}]}, current=RUNNING)
+    def test_a_vanished_container_counts_as_dropping_its_names_that_no_container_keeps(self):
+        out = render({"family": "f", "containerDefinitions": [{"name": "other", "environment": env("A", "B")}]}, current=RUNNING)
         self.assertNotEqual(out.returncode, 0)
+        self.assertIn("api/S", out.stderr)
+        self.assertNotIn("api/A", out.stderr)
+
+    def test_names_moved_between_containers_of_the_service_are_not_a_drop(self):
+        """First real backend release (run 42011154980): the registered pgbouncer was the placeholder, one container with the
+        start-up variables; the real template carries them in the pgbouncer-config sidecar and none in pgbouncer."""
+        names = ("AWS_REGION", "CLOUD", "HTTPS_PROXY", "NODE_LOCAL_ADDRESS", "NO_PROXY", "ONEPEEK_CONFIG_PATH", "ONEPEEK_ENV", "ONEPEEK_SERVICE", "ONEPEEK_SERVICES_FILE")
+        placeholder = {"family": "f", "containerDefinitions": [{"name": "pgbouncer", "image": "old", "environment": env(*names)}]}
+        real = {"family": "f", "containerDefinitions": [{"name": "pgbouncer-config", "environment": env(*names)}, {"name": "pgbouncer", "image": "main"}]}
+        out = render(real, current=placeholder)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        gone = {"family": "f", "containerDefinitions": [{"name": "pgbouncer-config", "environment": env(*names[1:])}, {"name": "pgbouncer", "image": "main"}]}
+        out = render(gone, current=placeholder)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("pgbouncer/AWS_REGION", out.stderr)
+        self.assertEqual(render(gone, current=placeholder, allow_drop="AWS_REGION").returncode, 0)
 
     def test_one_offs_are_not_checked_and_an_unknown_mode_refuses(self):
         both = {"family": "f", "containerDefinitions": [{"name": "migrate", "environment": env("S"), "secrets": secrets("S")}]}

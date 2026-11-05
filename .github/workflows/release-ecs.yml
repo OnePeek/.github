@@ -850,9 +850,11 @@ jobs:
           if mode not in ("one-off", "first-deploy"):
               current = json.load(open(mode))
               allowed = set(os.environ["ALLOW_DROP"].replace(",", " ").split())
-              new = {c.get("name"): names(c, "environment") | names(c, "secrets") for c in containers}
+              # Per service, not per container: a name may move between containers (the placeholder revision holds a
+              # sidecar'"'"'s variables in the one container the real template splits in two). The container is context only.
+              new = set().union(*(names(c, "environment") | names(c, "secrets") for c in containers))
               gone = sorted("%s/%s" % (c.get("name", "?"), n) for c in current.get("containerDefinitions", [])
-                            for n in (names(c, "environment") | names(c, "secrets")) - new.get(c.get("name"), set()) - allowed)
+                            for n in (names(c, "environment") | names(c, "secrets")) - new - allowed)
               if gone:
                   sys.exit("drop protection: names in the registered revision that this render would drop (list them in allow-drop "
                            "only for the contract step of an expand/contract change): " + ", ".join(gone))
@@ -1142,9 +1144,11 @@ jobs:
           if mode not in ("one-off", "first-deploy"):
               current = json.load(open(mode))
               allowed = set(os.environ["ALLOW_DROP"].replace(",", " ").split())
-              new = {c.get("name"): names(c, "environment") | names(c, "secrets") for c in containers}
+              # Per service, not per container: a name may move between containers (the placeholder revision holds a
+              # sidecar'"'"'s variables in the one container the real template splits in two). The container is context only.
+              new = set().union(*(names(c, "environment") | names(c, "secrets") for c in containers))
               gone = sorted("%s/%s" % (c.get("name", "?"), n) for c in current.get("containerDefinitions", [])
-                            for n in (names(c, "environment") | names(c, "secrets")) - new.get(c.get("name"), set()) - allowed)
+                            for n in (names(c, "environment") | names(c, "secrets")) - new - allowed)
               if gone:
                   sys.exit("drop protection: names in the registered revision that this render would drop (list them in allow-drop "
                            "only for the contract step of an expand/contract change): " + ", ".join(gone))
@@ -1277,9 +1281,11 @@ jobs:
           if mode not in ("one-off", "first-deploy"):
               current = json.load(open(mode))
               allowed = set(os.environ["ALLOW_DROP"].replace(",", " ").split())
-              new = {c.get("name"): names(c, "environment") | names(c, "secrets") for c in containers}
+              # Per service, not per container: a name may move between containers (the placeholder revision holds a
+              # sidecar'"'"'s variables in the one container the real template splits in two). The container is context only.
+              new = set().union(*(names(c, "environment") | names(c, "secrets") for c in containers))
               gone = sorted("%s/%s" % (c.get("name", "?"), n) for c in current.get("containerDefinitions", [])
-                            for n in (names(c, "environment") | names(c, "secrets")) - new.get(c.get("name"), set()) - allowed)
+                            for n in (names(c, "environment") | names(c, "secrets")) - new - allowed)
               if gone:
                   sys.exit("drop protection: names in the registered revision that this render would drop (list them in allow-drop "
                            "only for the contract step of an expand/contract change): " + ", ".join(gone))
