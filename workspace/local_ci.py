@@ -81,6 +81,31 @@ def packages_token() -> str:
     return tok.stdout.strip() if tok.returncode == 0 else ""
 
 
+# Tracked files that deliberately hold conflict markers (none today); repo-relative paths.
+CONFLICT_MARKER_ALLOW: tuple[str, ...] = ()
+_MARKER = re.compile(r"^(<{7} |>{7} )", re.M)
+
+
+def conflict_markers(repo: pathlib.Path) -> list[str]:
+    """`path:line` of each unresolved merge conflict marker (`<<<<<<< ` or `>>>>>>> ` at a line start) in tracked text files.
+
+    A bare `=======` is a Markdown heading underline, so it counts only as the middle of a conflict, never alone."""
+    r = subprocess.run(["git", "-C", str(repo), "ls-files", "-z"], capture_output=True)
+    found = []
+    for rel in filter(None, r.stdout.decode("utf-8", "replace").split("\0")):
+        f = repo / rel
+        if rel in CONFLICT_MARKER_ALLOW or not f.is_file() or f.is_symlink():
+            continue
+        data = f.read_bytes()
+        if b"\0" in data:  # binary
+            continue
+        text = data.decode("utf-8", "replace")
+        m = _MARKER.search(text)
+        if m:
+            found.append(f"{rel}:{text.count(chr(10), 0, m.start()) + 1}")
+    return found
+
+
 def docker_ready() -> bool:
     """True when the docker CLI is installed and its daemon answers."""
     if not shutil.which("docker"):
@@ -313,6 +338,10 @@ def main(argv: list[str] | None = None) -> int:
     a.ctx, a.own = ctx, name
     if not a.list and (problem := uv_problem()):
         print(f"FAIL  {problem}")
+        return 1
+
+    if not a.list and (marks := conflict_markers(repo)):
+        print("FAIL  unresolved merge conflict markers (resolve them first): " + ", ".join(marks[:20]))
         return 1
 
     for check, cmd in shared_checks(repo, kind, name):

@@ -314,6 +314,24 @@ class Versions(unittest.TestCase):
             self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
         self.assertEqual(pkg.read_bytes(), before)
 
+    def test_conflict_markers_fail_before_any_step_and_clean_or_underlines_pass(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+        doc = d / "AGENTS.md"
+        doc.write_text("Title\n" + "=" * 7 + "\ntext\n")  # a Markdown heading underline is not a marker
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True)
+        with mock.patch.object(lc, "uv_problem", return_value=""):
+            self.assertEqual(lc.conflict_markers(d), [])
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+            doc.write_text("a\n" + "<" * 7 + " HEAD\nx\n" + "=" * 7 + "\ny\n" + ">" * 7 + " dev\n")
+            subprocess.run(["git", "-C", str(d), "add", "-A"], check=True)
+            self.assertEqual(lc.conflict_markers(d), ["AGENTS.md:2"])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
+            self.assertIn("AGENTS.md:2", out.getvalue())
+            with mock.patch.object(lc, "CONFLICT_MARKER_ALLOW", ("AGENTS.md",)):
+                self.assertEqual(lc.conflict_markers(d), [])
+
     def test_steps_use_one_shared_provider_cache_unless_the_laptop_sets_one(self):
         home = pathlib.Path(tempfile.mkdtemp())
         d = self.repo("on: [pull_request]\nenv:\n  TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache\njobs:\n  a:\n"
