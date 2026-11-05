@@ -265,24 +265,48 @@ class Versions(unittest.TestCase):
                 (b / t).symlink_to(shutil.which(t))
         return b
 
-    def test_without_tflint_the_whole_step_runs_in_one_container_of_ci_image(self):
+    def test_without_tflint_each_command_runs_in_its_own_container_with_the_images_entrypoint(self):
         d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n        working-directory: sub\n"
                       "    steps:\n      - env:\n          TFLINT_LOG: debug\n        run: |\n          tflint --init\n          cd . && tflint --recursive\n")
         (d / "sub").mkdir()
-        (d / "sub/.tflint.hcl").write_text('plugin "aws" {\n  enabled = true\n  version = "0.30.0"\n  source = "github.com/terraform-linters/tflint-ruleset-aws"\n}\n')
+        cache = pathlib.Path(tempfile.mkdtemp()) / "tflint.d"
         log = pathlib.Path(tempfile.mkdtemp()) / "docker.log"
         b = self._bin(docker=f'[ "$1" = info ] && exit 0\necho "$@" >> {log}\n')
-        with mock.patch.dict(os.environ, {"PATH": str(b)}), mock.patch.object(lc, "uv_problem", return_value=""):
+        with mock.patch.dict(os.environ, {"PATH": str(b)}), mock.patch.object(lc, "uv_problem", return_value=""), \
+                mock.patch.object(lc, "TFLINT_CACHE", cache):
             self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
-        text = log.read_text()
-        self.assertEqual(text.count("run --rm"), 1)  # one container: the plugins --init installs are there for --recursive
-        line = text
-        self.assertTrue(line.startswith(f"run --rm -v {d.resolve()}:/data -w /data/sub "), line)
-        self.assertIn("-e TFLINT_LOG", line)
-        self.assertNotIn("debug", line)  # passed by name, never by value
-        self.assertIn(f"ghcr.io/terraform-linters/tflint:v{lc.TFLINT_VERSION} sh -ec", line)
-        self.assertIn("tflint --init", line)
-        self.assertIn("cd . && tflint --recursive", line)
+        lines = log.read_text().splitlines()
+        image = f"ghcr.io/terraform-linters/tflint:v{lc.TFLINT_VERSION}"
+        self.assertEqual(len(lines), 2)
+        for line, want in zip(lines, ("--init", "--recursive")):
+            self.assertTrue(line.startswith(f"run --rm -v {d.resolve()}:/data -w /data/sub -v {cache}:/root/.tflint.d -e TFLINT_LOG {image} {want}"), line)
+            self.assertNotIn("debug", line)  # passed by name, never by value
+            self.assertNotIn(" sh ", line)  # the image's entrypoint is tflint; there is no shell to start
+        self.assertTrue(cache.is_dir())
+
+    def test_a_tflint_step_with_other_commands_needs_native_tflint(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          echo hi\n          tflint --init\n")
+        with mock.patch.dict(os.environ, {"PATH": str(self._bin(docker="exit 0\n"))}), mock.patch.object(lc, "uv_problem", return_value=""):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
+        self.assertIn("needs tflint", out.getvalue())
+
+    def test_the_pinned_image_really_runs_on_a_plugin_fixture_and_a_clean_one(self):
+        if not lc.docker_ready():
+            self.skipTest("docker is not available")
+        aws = ('plugin "aws" {\n  enabled = true\n  version = "0.40.0"\n  source = "github.com/terraform-linters/tflint-ruleset-aws"\n}\n')
+        for hcl in (aws, ""):  # a declared plugin needs --init's download to reach --recursive (needs the network)
+            d = self._tf_repo()
+            (d / "main.tf").write_text('terraform {\n  required_version = ">= 1.0"\n}\n\nvariable "x" {\n  description = "x"\n  type        = string\n}\n\noutput "x" {\n  description = "x"\n  value       = var.x\n}\n')
+            (d / ".tflint.hcl").write_text(hcl)
+            cache = pathlib.Path(tempfile.mkdtemp()) / "tflint.d"
+            out = io.StringIO()
+            with mock.patch.object(lc, "tflint_mode", return_value="docker"), mock.patch.object(lc, "TFLINT_CACHE", cache), \
+                    mock.patch.object(lc, "uv_problem", return_value=""), contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0, out.getvalue())
+            self.assertIn("PASS", out.getvalue())
+            self.assertEqual(bool(hcl), any(cache.rglob("tflint-ruleset-aws*")), out.getvalue())
 
     def test_tflint_calls_are_found_anywhere_in_a_step_but_not_other_tools(self):
         for yes in ("tflint --init", "  tflint", "cd x && tflint -f json", "if tflint; then :; fi", "a; tflint", "(tflint)", "a | tflint"):

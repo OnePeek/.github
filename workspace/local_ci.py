@@ -133,15 +133,43 @@ def tflint_problem(allow_docker: bool = True) -> str:
     return f"{have} on this laptop and Docker is {'not used (--skip-docker)' if not allow_docker else 'not available'} (CI runs {TFLINT_IMAGE}:v{TFLINT_VERSION})"
 
 
-def tflint_via_docker(cmd: str, repo: pathlib.Path, cwd: pathlib.Path, env: dict[str, str]) -> str:
-    """The whole step in one container of CI's pinned tflint image (so `--init`'s plugins reach `--recursive`), the repo mounted
-    at /data; GITHUB_TOKEN, TFLINT_* and the step's own variables are passed by name, never by value."""
-    rel = cwd.resolve().relative_to(repo.resolve())  # ValueError when outside: the caller fails the step first
-    workdir = "/data" if str(rel) == "." else f"/data/{rel}"
-    names = sorted(k for k in env if k == "GITHUB_TOKEN" or k.startswith("TFLINT_"))
-    flags = " ".join(f"-e {shlex.quote(k)}" for k in names)
-    return (f"docker run --rm -v {shlex.quote(str(repo.resolve()))}:/data -w {shlex.quote(workdir)} {flags} "
-            f"{TFLINT_IMAGE}:v{TFLINT_VERSION} sh -ec {shlex.quote(cmd)}")
+TFLINT_CACHE = pathlib.Path.home() / ".cache" / "onepeek" / "tflint.d"  # the plugins `tflint --init` installs, kept between runs
+
+
+def tflint_commands(cmd: str, repo: pathlib.Path, cwd: pathlib.Path) -> list[tuple[pathlib.Path, list[str]]] | None:
+    """The (directory, tflint arguments) of each command when the step is only tflint commands (each optionally after
+    `cd <dir> &&` or a `cd <dir>` line), else None. ValueError when a directory is outside the repository."""
+    out, here = [], cwd.resolve()
+    here.relative_to(repo.resolve())
+    for line in cmd.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for seg in re.split(r"\s*&&\s*", line):
+            words = shlex.split(seg)
+            if len(words) == 2 and words[0] == "cd":
+                here = (here / words[1]).resolve()
+                here.relative_to(repo.resolve())
+            elif words and words[0] == "tflint":
+                out.append((here, words[1:]))
+            else:
+                return None
+    return out
+
+
+def tflint_via_docker(commands: list[tuple[pathlib.Path, list[str]]], repo: pathlib.Path, env: dict[str, str]) -> str:
+    """Each tflint command as its own `docker run` of CI's pinned image (its entrypoint is tflint; no shell), the repo at /data
+    and one plugin cache at /root/.tflint.d so `--init` holds for `--recursive`. Only GITHUB_TOKEN and TFLINT_* are passed,
+    by name, never by value."""
+    TFLINT_CACHE.mkdir(parents=True, exist_ok=True)
+    flags = " ".join(f"-e {shlex.quote(k)}" for k in sorted(env) if k == "GITHUB_TOKEN" or k.startswith("TFLINT_"))
+    lines = []
+    for here, args in commands:
+        rel = here.resolve().relative_to(repo.resolve())
+        workdir = "/data" if str(rel) == "." else f"/data/{rel}"
+        lines.append(f"docker run --rm -v {shlex.quote(str(repo.resolve()))}:/data -w {shlex.quote(workdir)} "
+                     f"-v {shlex.quote(str(TFLINT_CACHE))}:/root/.tflint.d {flags} {TFLINT_IMAGE}:v{TFLINT_VERSION} {shlex.join(args)}")
+    return "\n".join(lines)
 
 
 def plugin_cache() -> pathlib.Path:
@@ -485,9 +513,9 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                 tflint_docker = False
                 if TFLINT_CALL.search(cmd):
                     try:
-                        (repo / step.get("working-directory", workdir)).resolve().relative_to(repo.resolve())
+                        pure = tflint_commands(cmd, repo, repo / step.get("working-directory", workdir))
                     except ValueError:
-                        print(f"FAIL  {label}: working-directory is outside the repository")
+                        print(f"FAIL  {label}: a directory is outside the repository")
                         return 1
                     if why := tflint_problem(not a.skip_docker):
                         if a.release and not a.list:
@@ -497,6 +525,9 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                         skipped.append(f"{label} (SKIP: {why})")
                         continue
                     tflint_docker = tflint_mode(not a.skip_docker) == "docker"
+                    if tflint_docker and pure is None:
+                        print(f"FAIL  {label}: this step runs other commands besides tflint, so it needs tflint {TFLINT_VERSION} on PATH (Docker runs only plain tflint commands)")
+                        return 1
                 if any(re.search(rf"\bmv\s+{re.escape(c)}\b", cmd) for c in checkout_paths if not c.startswith("${{")):
                     skipped.append(f"{label} (CI-only: places a checkout the laptop does not make)")
                     continue
@@ -523,11 +554,11 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                     continue
                 cwd = repo / step.get("working-directory", workdir)
                 cmd = EXPR.sub("", cmd)
-                if tflint_docker:
-                    cmd = tflint_via_docker(cmd, repo, cwd, env)
                 # A tool a skipped install step would have put in the working directory: use the laptop's.
                 cmd = re.sub(r"(?m)(^|\s)\./([A-Za-z0-9_-]+)\b",
                              lambda m: m.group(0) if (cwd / m.group(2)).exists() or not shutil.which(m.group(2)) else m.group(1) + m.group(2), cmd)
+                if tflint_docker:
+                    cmd = tflint_via_docker(tflint_commands(cmd, repo, cwd) or [], repo, env)
                 # `npm pkg set` (the api-client's "Version as next snapshot") rewrites package.json in the working tree: put it back.
                 pkg = cwd / "package.json"
                 keep = pkg.read_bytes() if re.search(r"\bnpm pkg (set|delete|fix)\b", cmd) and pkg.is_file() else None
