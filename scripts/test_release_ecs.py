@@ -981,23 +981,31 @@ class OneServicesFile(unittest.TestCase):
         self.assertNotIn("_infra", json.dumps(steps))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class CosignRegistryLogin(unittest.TestCase):
-    def test_every_cosign_verify_comes_after_an_ecr_login_in_its_job(self):
-        # First live backend release (2026-11-05): cosign verify got 401 from ECR in a job that never logged in.
+    """Every cosign verify runs after an ECR login that is unconditional within its job (first live release: 401)."""
+
+    @staticmethod
+    def _code_lines(run: str) -> list[str]:
+        return [ln.strip() for ln in run.splitlines() if ln.strip() and not ln.strip().startswith(("#", ": "))]
+
+    def test_every_cosign_verify_comes_after_an_unconditional_ecr_login_in_its_job(self):
         import yaml  # noqa: PLC0415
         root = pathlib.Path(__file__).resolve().parent.parent / ".github" / "workflows"
-        for name in ("release-ecs.yml",):
+        for name in ("release-ecs.yml", "operate.yml"):
             wf = yaml.safe_load((root / name).read_text(encoding="utf-8"))
             for job_id, job in wf["jobs"].items():
-                seen_login = False
+                login_ok = False  # set only by a login in a step with no `if:` (or the same `if:` as the verify step)
                 for st in job.get("steps", []):
-                    run = str(st.get("run", ""))
-                    for line in run.splitlines():
-                        if "ecr get-login-password" in line and ("docker login" in line or "cosign login" in line):
-                            seen_login = True
-                        if line.strip().startswith("cosign verify"):
-                            self.assertTrue(seen_login, f"{name}:{job_id}: cosign verify before any ECR login")
+                    cond = st.get("if")
+                    for line in self._code_lines(str(st.get("run", ""))):
+                        login = line.startswith("aws ecr get-login-password |") and ("cosign login" in line or "docker login" in line)
+                        if login and cond is None:
+                            login_ok = True
+                        if line.startswith("cosign verify"):
+                            ok = login_ok or any(
+                                l.startswith("aws ecr get-login-password |") for l in self._code_lines(str(st.get("run", ""))))
+                            self.assertTrue(ok, f"{name}:{job_id}: cosign verify without an unconditional ECR login before it")
+
+if __name__ == "__main__":
+    unittest.main()
