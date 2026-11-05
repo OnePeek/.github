@@ -856,6 +856,7 @@ jobs:
           print(json.dumps(doc))'
           }
           # --- render-taskdef end ---
+          aws ecr get-login-password | cosign login "${IMAGE_REF%%/*}" --username AWS --password-stdin >/dev/null  # cosign reads the signature from ECR (first live release: 401)
           cosign verify --experimental-oci11 --insecure-ignore-tlog=true --key "${SIGNING_KEY}" "${IMAGE_REF}" >/dev/null
           render migrate one-off > migrate.json
           if [ "${DRY_RUN}" = "true" ]; then echo "Dry run: migrate renders and its signature verifies."; exit 0; fi
@@ -1281,6 +1282,7 @@ jobs:
           print(json.dumps(doc))'
           }
           # --- render-taskdef end ---
+          aws ecr get-login-password | cosign login "${IMAGE_REF%%/*}" --username AWS --password-stdin >/dev/null  # cosign reads the signature from ECR (first live release: 401)
           cosign verify --experimental-oci11 --insecure-ignore-tlog=true --key "${SIGNING_KEY}" "${IMAGE_REF}" >/dev/null
           # ops exists only when the services file names it (aws-stack §16 first preprod run: ops is out until built).
           aws s3 cp "s3://${NAME}-deploy/services.${ENVIRONMENT}.yaml" services.yaml --only-show-errors

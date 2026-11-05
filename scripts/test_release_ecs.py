@@ -3,6 +3,7 @@ Run: python -m unittest discover -s scripts -p 'test_*.py'"""
 
 import json
 import os
+import pathlib
 import re
 import stat
 import subprocess
@@ -982,3 +983,21 @@ class OneServicesFile(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CosignRegistryLogin(unittest.TestCase):
+    def test_every_cosign_verify_comes_after_an_ecr_login_in_its_job(self):
+        # First live backend release (2026-11-05): cosign verify got 401 from ECR in a job that never logged in.
+        import yaml  # noqa: PLC0415
+        root = pathlib.Path(__file__).resolve().parent.parent / ".github" / "workflows"
+        for name in ("release-ecs.yml",):
+            wf = yaml.safe_load((root / name).read_text(encoding="utf-8"))
+            for job_id, job in wf["jobs"].items():
+                seen_login = False
+                for st in job.get("steps", []):
+                    run = str(st.get("run", ""))
+                    for line in run.splitlines():
+                        if "ecr get-login-password" in line and ("docker login" in line or "cosign login" in line):
+                            seen_login = True
+                        if line.strip().startswith("cosign verify"):
+                            self.assertTrue(seen_login, f"{name}:{job_id}: cosign verify before any ECR login")
