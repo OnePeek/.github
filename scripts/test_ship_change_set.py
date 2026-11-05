@@ -1099,8 +1099,14 @@ class ReleaseGates(unittest.TestCase):
             self.assertEqual(why is None, ok, (repo, run, why))
 
     def test_the_previous_release_in_the_same_set_must_go_first(self) -> None:
-        why = ship.chain_problem("onepeek-web", ["backend-service", "onepeek-web"], lambda prev: (self.OK, HEAD))
+        why = ship.chain_problem("onepeek-web", ["backend-service", "onepeek-web"], lambda prev: (self.OK, HEAD), body="release-after: backend-service")
         self.assertIn("backend-service releases in this set", why)
+        why = ship.chain_problem("backend-service", ["onepeek-infra", "backend-service"], lambda prev: (self.OK, HEAD))
+        self.assertIn("onepeek-infra releases in this set", why)
+
+    def test_web_and_backend_have_no_edge_without_release_after(self) -> None:
+        # foundation-playbook §5.4a: backend and web release in parallel unless web declares release-after: backend-service.
+        self.assertIsNone(ship.chain_problem("onepeek-web", ["backend-service", "onepeek-web"], lambda prev: (self.OK, HEAD)))
 
     def test_run_list_and_release_head_are_read_with_gh(self) -> None:
         seen = []
@@ -1122,9 +1128,11 @@ class ReleaseGates(unittest.TestCase):
         return pr_info
 
     def main_with(self, argv, lock=None, run=None):
+        read = lambda prev: (run, HEAD)  # noqa: E731
+        real = ship.scope_facts
         with mock.patch.object(ship, "pr_info", side_effect=self.pr_info()), mock.patch.object(ship, "docs_pin_problems", return_value=[]), \
                 mock.patch.object(ship, "release_lock", return_value=lock), \
-                mock.patch.object(ship, "release_run", return_value=(run, HEAD)):
+                mock.patch.object(ship, "scope_facts", side_effect=lambda s, r=None: real(s, read)):
             return ship.main(argv)
 
     def test_a_release_pull_request_is_refused_while_the_lock_is_held_or_the_chain_is_unmet(self) -> None:
@@ -1167,7 +1175,8 @@ class ReleaseMergeMethod(unittest.TestCase):
         gates = ReleaseGates()
         state = {"s": "OPEN"}
         base = gates.pr_info()
-        calls, say = [], []
+        calls, say, watched = [], [], []
+        self.watched = watched
 
         def pr_info(r, n):
             return {**base(r, n), "state": state["s"]}
@@ -1180,7 +1189,8 @@ class ReleaseMergeMethod(unittest.TestCase):
         removed = []
         with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "gh", side_effect=gh), \
                 mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "release_lock", side_effect=locks), \
-                mock.patch.object(ship, "release_run", return_value=(ReleaseGates.OK, HEAD)), \
+                mock.patch.object(ship, "scope_facts", side_effect=lambda s, r=None: ship.release_order.Facts(False, [ship.release_order.Run(HEAD, "completed", "success")], HEAD)), \
+                mock.patch.object(ship, "watch_release", side_effect=lambda r, sha: watched.append((r, sha))), \
                 mock.patch.object(ship, "green_head", return_value="c" * 40), mock.patch.object(ship, "no_conflicts"), \
                 mock.patch.object(ship, "remove_worktrees", side_effect=lambda r, b: removed.append(b)), \
                 mock.patch.object(ship, "say", side_effect=say.append):
