@@ -572,7 +572,9 @@ jobs:
 
   scan:
     needs: [version, build]
-    if: ${{ !inputs.dry-run }}
+    # One of build-image and build-web is always skipped, and GitHub skips every job below a skipped one unless its
+    # condition calls a status function, so this job (and sbom-sign) checks the joined build result itself.
+    if: ${{ !cancelled() && !inputs.dry-run && needs.build.result == 'success' }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 15
     permissions:
@@ -622,7 +624,7 @@ jobs:
 
   sbom-sign:
     needs: [lock, version, build, scan]
-    if: ${{ !inputs.dry-run }}
+    if: ${{ !cancelled() && !inputs.dry-run && needs.build.result == 'success' && needs.scan.result == 'success' }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
     timeout-minutes: 15
     permissions:
@@ -695,7 +697,8 @@ jobs:
     # Reads back the signed digest that step 4 recorded in SSM and checks its signature. Every later job uses these
     # digests; in a dry run they are simply the digests of the latest release. Nothing is registered here.
     needs: [version, build, scan, sbom-sign]
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    # Outside a dry run the image must have been signed in this run, or there is no recorded digest to read back.
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (inputs.dry-run || needs.sbom-sign.result == 'success') }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:

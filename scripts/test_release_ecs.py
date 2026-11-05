@@ -1008,5 +1008,34 @@ class CosignRegistryLogin(unittest.TestCase):
                     if step_login and st.get("if") is None:
                         job_login = True
 
+
+class SkippedBuildBranch(unittest.TestCase):
+    """One of build-image and build-web is always skipped; every job below them must still run (v1.12.5 web release:
+    scan and sbom-sign were skipped, so no digest was recorded)."""
+
+    STATUS = re.compile(r"always\(\)|cancelled\(\)|failure\(\)|success\(\)")
+
+    def test_every_job_below_the_split_build_calls_a_status_function(self):
+        root = pathlib.Path(__file__).resolve().parent.parent / ".github" / "workflows"
+        jobs = yaml.safe_load((root / "release-ecs.yml").read_text(encoding="utf-8"))["jobs"]
+
+        def ancestors(job_id: str) -> set[str]:
+            found: set[str] = set()
+            todo = [job_id]
+            while todo:
+                needs = jobs[todo.pop()].get("needs", [])
+                for need in [needs] if isinstance(needs, str) else needs:
+                    if need not in found:
+                        found.add(need)
+                        todo.append(need)
+            return found
+
+        below = [j for j in jobs if ancestors(j) & {"build-image", "build-web"}]
+        self.assertIn("scan", below)
+        for job_id in below:
+            self.assertRegex(str(jobs[job_id].get("if", "")), self.STATUS,
+                             f"release-ecs.yml:{job_id}: below a skipped build job, so it needs !cancelled() or always()")
+
+
 if __name__ == "__main__":
     unittest.main()
