@@ -619,7 +619,6 @@ class SharedLockWorkflow(unittest.TestCase):
         expr = LOCKWF["jobs"]["lock"]["timeout-minutes"]
         self.assertEqual({a: evaluate(expr, action=a) for a in ("take", "release", "freeze", "thaw")},
                          {"take": 135, "release": 10, "freeze": 10, "thaw": 10})
-        self.assertIn("TODO(.github #56)", (WORKFLOWS / "release-lock.yml").read_text(encoding="utf-8"))
 
 
 def evaluate(expr: str, **inputs: str):
@@ -1110,8 +1109,26 @@ class OperateRolling(unittest.TestCase):
         self.assertNotIn("previous", out.keys[BACKEND])
         self.assertEqual(out.puts, "")
         self.assertIn("::error::The rollback of api in preprod failed, and nothing is put back", out.stdout)
-        self.assertIn("lock_status.py preprod", out.stdout)
-        self.assertIn("Rollback of api failed", out.summary)
+        self.assertIn("The unlock job frees the key (phase locked, nothing put back)", out.stdout)
+        self.assertIn("cancel-release.yml", out.stdout)
+        self.assertNotIn("delete", out.stdout.lower())   # never tells anyone to delete the key by hand
+        self.assertNotIn("succeeded but", out.stdout)
+        self.assertIn("The rollback of api in preprod failed", out.summary)
+
+    def test_a_rollback_whose_final_phase_write_fails_is_not_reported_as_a_failed_rollback(self):
+        quick = OPERATE_STEP.replace("SECONDS + 300", "SECONDS + 0")   # no alarm: the watch ends at once
+        self.assertNotEqual(quick, OPERATE_STEP)
+        out = run(quick, keys={LEGACY: mine(), BACKEND: mine()}, files={"services.yaml": SERVICES_FILE},
+                  stubs={name: "exit 0" for name in ("docker", "cosign", "curl")}, FAIL_PUT_OBJECT="AccessDenied",
+                  ACTION="rollback", SERVICE="api", TARGET="sha-" + "2" * 12, REASON="test", LOCK_TOKEN=TOKEN,
+                  AWS_REGION="ap-south-1", DOMAIN_PREPROD="preprod.example", AWS_GET_CALLER_IDENTITY="111111111111",
+                  AWS_DESCRIBE_SERVICES=API_TD, AWS_CP=TEMPLATE, AWS_DESCRIBE_IMAGES="sha256:" + "a" * 64,
+                  SEQ_DESCRIBE_TASK_DEFINITION=json.dumps(["sha-" + "1" * 12, json.dumps({"containerDefinitions": [{"name": "api"}]})]),
+                  AWS_REGISTER_TASK_DEFINITION=API_TD.replace(":6", ":9"), AWS_DESCRIBE_ALARMS="")  # fmt: skip
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("The rollback of api in preprod succeeded but its phase write failed", out.stdout)
+        self.assertNotIn("preprod failed", out.stdout)
+        self.assertIn("succeeded but its phase write failed", out.summary)
 
 
 if __name__ == "__main__":

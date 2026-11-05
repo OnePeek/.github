@@ -1452,7 +1452,8 @@ jobs:
             # A rollback never puts back (playbook §5.4a "Rollback on cancel", operate.yml): it is itself the restoring action,
             # and its watch can still see alarms from the bad version it replaced, so putting previous back would reinstate
             # that version. The record stays locked, never rolling, and a failed rollback fails the run with an alert.
-            trap 'rc=$?; if [ "${rc}" -ne 0 ]; then echo "::error::The rollback of ${SERVICE} in ${ENVIRONMENT} failed, and nothing is put back: the lock record stays locked, never rolling. A person decides the next step: cancel-release.yml or a new release. Until cancel-release.yml exists (.github #55), the manual path: read the key with python3 .github/workspace/lock_status.py ${ENVIRONMENT}, then the founder only deletes it with the conditional delete (aws s3api delete-object --if-match <its ETag>)."; echo "Rollback of ${SERVICE} failed; nothing put back: ${REASON}" >> "$GITHUB_STEP_SUMMARY"; fi' EXIT
+            ROLLBACK_OK=""   # set once the rollback itself (stable, smoke, watch) succeeded, so a failed final phase write is told apart
+            trap 'rc=$?; if [ "${rc}" -ne 0 ]; then if [ -n "${ROLLBACK_OK}" ]; then what="The rollback of ${SERVICE} in ${ENVIRONMENT} succeeded but its phase write failed"; else what="The rollback of ${SERVICE} in ${ENVIRONMENT} failed"; fi; echo "::error::${what}, and nothing is put back: the lock record stays locked, never rolling. The unlock job frees the key (phase locked, nothing put back), and a person decides the next step: cancel-release.yml once it exists (.github #55), or a new release."; echo "${what}; nothing put back: ${REASON}" >> "$GITHUB_STEP_SUMMARY"; fi' EXIT
           else
             lock_write_phase rolling "$(cat previous.json)" || exit 1
           fi
@@ -1579,6 +1580,7 @@ jobs:
             if [ -n "${alarms}" ]; then echo "::error::Deploy alarms firing: ${alarms}"; exit 1; fi
             sleep 30
           done
+          ROLLBACK_OK=yes
           lock_write_phase "done" || exit 1   # stable, smoke and watch passed: nothing to undo
           echo "${ACTION} ${SERVICE} ${VERSION_NOW}: ${REASON}" >> "$GITHUB_STEP_SUMMARY"
       - name: Deployment record with the reason
