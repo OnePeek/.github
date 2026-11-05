@@ -131,6 +131,15 @@ class Tokens(unittest.TestCase):
         self.assertIn(("UNVERIFIED", "secrets: AGENTS_APP_CLIENT_ID, NPM_READ_TOKEN cannot be read from a laptop; "
                                      "check they are set in backend-service"), rep.lines)
 
+    def test_the_app_holding_actions_write_fails(self) -> None:  # option A, foundation-playbook §5.4a
+        for level, fails in (("write", 1), ("read", 0)):
+            rep = pf.Report()
+            inst = {"installations": [{"id": 7, "app_slug": pf.APP_SLUG, "repository_selection": "all",
+                                       "permissions": {"actions": level, "metadata": "read", "contents": "read", "pull_requests": "read"}}]}
+            pf.token_checks(self.TEXTS[:1], "backend-service", rep, api=api({"orgs/": (True, inst)}))
+            found = [t for s, t in rep.lines if s == "FAIL" and "actions: write" in t]
+            self.assertEqual(len(found), fails, rep.lines)
+
     def test_granted_and_installed_passes(self) -> None:
         rep = pf.Report()
         inst = {"installations": [{"id": 7, "app_slug": pf.APP_SLUG, "repository_selection": "selected",

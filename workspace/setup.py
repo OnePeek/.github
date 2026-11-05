@@ -13,7 +13,8 @@ matter; `--check` also fails when a repo's copy differs from the shared one (edi
 It links (or, where symlinks are not allowed, copies) into <root>/.claude/:
   skills/<name>    from <repo>/.claude/skills/<name>
   agents/<name>.md from <repo>/.claude/agents/<name>.md
-and <root>/AGENTS.md and <root>/CLAUDE.md from .github/workspace/ (CLAUDE.md loads AGENTS.md, as in every repo). It then runs `lefthook install` in every sibling folder that is a git clone with a lefthook.yml (or says how to install lefthook). Your own files there (for example settings.local.json)
+and <root>/AGENTS.md and <root>/CLAUDE.md from .github/workspace/ (CLAUDE.md loads AGENTS.md, as in every repo), and
+<root>/.claude/settings.json (the P19 hook, workspace/hooks/p19_guard.py). It then runs `lefthook install` in every sibling folder that is a git clone with a lefthook.yml (or says how to install lefthook). Your own files there (for example settings.local.json)
 are never touched; a name used by two repos is refused, not overwritten. It ends by printing the local hygiene hints: the weekly
 Docker build-cache prune and the shared Terraform provider cache (TF_PLUGIN_CACHE_DIR).
 """
@@ -109,7 +110,9 @@ def sources() -> tuple[dict[str, pathlib.Path], dict[str, pathlib.Path], list[st
 
 def wanted() -> dict[pathlib.Path, pathlib.Path]:
     skills, agents, _ = sources()
-    links = {ROOT / "AGENTS.md": HERE / "AGENTS.md", ROOT / "CLAUDE.md": HERE / "CLAUDE.md"}
+    links = {ROOT / "AGENTS.md": HERE / "AGENTS.md", ROOT / "CLAUDE.md": HERE / "CLAUDE.md",
+             # The P19 hook (hooks/p19_guard.py): the cancel and dispatch rules of foundation-playbook §5.4a.
+             ROOT / ".claude" / "settings.json": HERE / "settings.json"}
     links.update({ROOT / ".claude" / "skills" / n: p for n, p in skills.items()})
     links.update({ROOT / ".claude" / "agents" / f"{n}.md": p for n, p in agents.items()})
     return links

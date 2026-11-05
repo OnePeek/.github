@@ -312,6 +312,10 @@ def token_checks(texts: list[tuple[str, str]], own: str, rep: Report, api=gh_jso
             rep.add("UNVERIFIED", f"tokens: cannot read {APP_SLUG}'s permissions: {app}")
     if why:
         rep.add("UNVERIFIED", f"tokens: {why}")
+    # Option A (foundation-playbook §5.4a "cancel-release.yml"): the agents' App never holds Actions write, so it can
+    # neither cancel runs nor dispatch cancel-release.yml; agents cancel only through cancel_release.py.
+    if granted is not None and granted.get("actions") == "write":
+        rep.add("FAIL", f"tokens: {APP_SLUG} is granted actions: write; it must hold at most actions: read (playbook §5.4a option A)")
     for r in reqs:
         if granted is not None:
             short = [f"{p}: {lvl} (has {granted.get(p, 'none')})" for p, lvl in sorted(r["permissions"].items())

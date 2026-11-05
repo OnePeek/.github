@@ -7,7 +7,7 @@ long-running services, in file order. `--write` regenerates the list. It also fa
 render function differs between release-ecs.yml and operate.yml (one function, delivery-pipelines §5), or if the
 release-lock functions differ between release-ecs.yml (the take in prepare, the phase writes in deploy's migrate and
 previous steps and in verify, and finish), operate.yml (lock, the phase writes in operate, and unlock) and release-lock.yml
-(one lock code, foundation-playbook §5.4, §5.4a).
+and cancel-release.yml (one lock code, foundation-playbook §5.4, §5.4a).
 """
 
 from __future__ import annotations
@@ -60,10 +60,12 @@ def main(argv: list[str] | None = None) -> int:
     lock_file = args.workflows / "release-lock.yml"
     locks = {"release-ecs.yml": blocks(release_text, LOCK), "operate.yml": blocks(text, LOCK),
              "release-lock.yml": blocks(lock_file.read_text(encoding="utf-8"), LOCK) if lock_file.exists() else []}
-    wanted_copies = {"release-ecs.yml": 5, "operate.yml": 3, "release-lock.yml": 1}
+    cancel_file = args.workflows / "cancel-release.yml"
+    locks["cancel-release.yml"] = blocks(cancel_file.read_text(encoding="utf-8"), LOCK) if cancel_file.exists() else []
+    wanted_copies = {"release-ecs.yml": 5, "operate.yml": 3, "release-lock.yml": 1, "cancel-release.yml": 1}
     if any(len(locks[f]) != n for f, n in wanted_copies.items()):
         problems.append("release-lock blocks: release-ecs.yml needs five (take, migrate, previous, verify's end, finish), "
-                        "operate.yml three (lock, operate, unlock), release-lock.yml one")
+                        "operate.yml three (lock, operate, unlock), release-lock.yml one, cancel-release.yml one")
     elif len({b for found in locks.values() for b in found}) != 1:
         problems.append("the release-lock functions differ between release-ecs.yml, operate.yml and release-lock.yml")
     for p in problems:

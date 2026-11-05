@@ -10,7 +10,7 @@ import check_lock_limits as c
 
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github/workflows"
 LIFE = {"spot": 90, "on-demand": 180}
-SHARED = ("release-ecs.yml", "operate.yml", "release-lock.yml")
+SHARED = ("release-ecs.yml", "operate.yml", "release-lock.yml", "cancel-release.yml")
 
 
 class Limits(unittest.TestCase):

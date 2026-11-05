@@ -12,7 +12,7 @@ Fails when, for any waiting job of the shared workflows:
     mapping, as the lint reads it);
   - the wait cap the workflow sets is not the one in the table, or its re-mint interval is not below the shortest
     credential lifetime it holds (1 hour: the OIDC role session and the App installation token);
-  - a job that waits (runs lock_take or lock_finish) is missing from the table below, which this test holds as data.
+  - a job that waits (runs lock_take, lock_finish or lock_cancel) is missing from the table below, which this test holds as data.
 Run by this repo's pull requests (workflow-lint service-list, with onepeek-infra at dev as _infra) and by
 ship_change_set.py before it merges a pin move of these workflows.
 """
@@ -30,7 +30,7 @@ from check_runner_labels import LIMITS, MAPPING_REPO, TIMEOUT_EXCEPTIONS, classi
 
 CREDENTIAL_MINUTES = 60  # a deploy role's OIDC session and an App installation token (playbook §5.4a)
 BOOT_AND_IDLE = 20  # the reaper lifetime less 20 minutes for boot and an idle machine
-WAITING = ("lock_take", "lock_finish")
+WAITING = ("lock_take", "lock_finish", "lock_cancel")
 # Every waiting job (playbook §5.4a "Every wait and its limit"): its wait cap, the workflow env that sets it, and the
 # sum of its other steps' limits, in minutes.
 TABLE: dict[tuple[str, str], dict] = {
@@ -39,6 +39,7 @@ TABLE: dict[tuple[str, str], dict] = {
     ("operate.yml", "lock"): {"cap": 120, "cap_env": "LOCK_WAIT_CAP_SECONDS", "other": 15},
     ("operate.yml", "unlock"): {"cap": 15, "cap_env": "LOCK_MIGRATE_WAIT_SECONDS", "other": 20},  # put-back 20
     ("release-lock.yml", "lock"): {"cap": 120, "cap_env": "LOCK_WAIT_CAP_SECONDS", "other": 15},
+    ("cancel-release.yml", "cancel"): {"cap": 95, "cap_env": "LOCK_WAIT_CAP_SECONDS", "other": 15},  # 75 for the run, 20 put-back
 }
 
 

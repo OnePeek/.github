@@ -49,6 +49,7 @@ TIMEOUT_EXCEPTIONS = {
     ("OnePeek/.github", "operate.yml", "lock"): 135,
     ("OnePeek/.github", "operate.yml", "unlock"): 60,
     ("OnePeek/.github", "release-lock.yml", "lock"): 135,
+    ("OnePeek/.github", "cancel-release.yml", "cancel"): 110,
 }
 EXPRESSION_NUMBER = re.compile(r"(?<![\w.'])\d+(?![\w.'])")
 

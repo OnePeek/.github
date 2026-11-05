@@ -125,7 +125,7 @@ jobs:
           LOCK_ROLE_ARN: ${{ inputs.role-to-assume }}
           LOCK_ROLE_SESSION: ${{ github.event.repository.name }}-${{ github.run_id }}
         run: |
-          # --- release-lock begin (identical in release-ecs.yml, operate.yml and release-lock.yml; checked by scripts/check_service_list.py) ---
+          # --- release-lock begin (identical in release-ecs.yml, operate.yml, release-lock.yml and cancel-release.yml; checked by scripts/check_service_list.py) ---
           # Release locks per scope (foundation-playbook §5.4, §5.4a): one key per scope in s3://onepeek-<env>-deploy/locks/
           # (infra.json, backend.json, web.json, mcp.json), taken with a conditional write (If-None-Match: *) and removed with a
           # conditional delete on its ETag (If-Match). Expand step of the move off locks/release.json: every take set starts with
@@ -637,6 +637,204 @@ jobs:
                 *) return 1 ;;
               esac
             done
+          }
+          lock_status_fields() {  # lock_status_fields <key> <file>: the lock-status fields of one record (a fixed list; never the token)
+            python3 -c '
+          import datetime, json, sys
+          key, r = sys.argv[1], json.load(open(sys.argv[2]))
+          def age(started):
+              try:
+                  then = datetime.datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+                  return str(datetime.datetime.now(datetime.timezone.utc) - then).split(".")[0]
+              except Exception:
+                  return "?"
+          if key.endswith("frozen.json"):
+              fields = [("frozen by", r.get("who", "?")), ("branch", "%s %s" % (r.get("repo", "?"), r.get("ref", "?"))),
+                        ("infra_head", r.get("infra_head", "-")), ("infra_settled", r.get("infra_settled", "-")), ("age", age(r.get("started")))]
+          else:
+              fields = [("holder", r.get("repo", "?")), ("run", r.get("run", "?")), ("commit", r.get("commit", "?")),
+                        ("phase", r.get("phase", "locked")), ("age", age(r.get("started"))), ("repair_run", r.get("repair_run", "-"))]
+              if r.get("phase") == "rolling":
+                  fields.append(("previous", ", ".join(sorted((r.get("previous") or {}).keys())) or "-"))
+          print("%s: %s" % (key, "; ".join("%s %s" % f for f in fields)))' "$1" "$2"
+          }
+          lock_status_all() {  # prints every key's lock-status fields (log and run summary); an unreadable key is an error, never free
+            local key etag line rc=0
+            for key in locks/infra.json locks/backend.json locks/web.json locks/mcp.json "${FROZEN_KEY}" "${LOCK_LEGACY_KEY}"; do
+              if ! etag=$(lock_read "${key}" lock-status.json); then echo "::error::s3://${LOCK_BUCKET}/${key} is unreadable."; rc=1; continue; fi
+              if [ "${etag}" = "absent" ]; then line="${key}: free"; elif ! line=$(lock_status_fields "${key}" lock-status.json); then line="${key}: unreadable record"; rc=1; fi
+              echo "${line}" | tee -a "${GITHUB_STEP_SUMMARY}"
+            done
+            rm -f lock-status.json
+            return "${rc}"
+          }
+          lock_cancel_keys() {  # the keys this caller may touch, its scope's key first: an app its own scope's key, infra every key; release.json during the move
+            case "${LOCK_SCOPE}" in
+              infra) echo "locks/infra.json locks/backend.json locks/web.json locks/mcp.json ${LOCK_LEGACY_KEY}" ;;
+              *) echo "locks/${LOCK_SCOPE}.json ${LOCK_LEGACY_KEY}" ;;
+            esac
+          }
+          LOCK_CANCEL_HELD=()
+          lock_cancel_read() {  # reads the caller's keys -> 0 a record of the caller's repo is held (LOCK_CANCEL_* set), 3 none, 1 refused or unreadable
+            local key keys etag holder repo run attempt token scope phase task repair
+            LOCK_CANCEL_HELD=(); LOCK_CANCEL_RUN=""; LOCK_CANCEL_ATTEMPT=""; LOCK_CANCEL_PHASE=""; LOCK_CANCEL_TASK=""; LOCK_CANCEL_REPAIR=""; LOCK_CANCEL_FILE=""
+            read -r -a keys <<< "$(lock_cancel_keys)"
+            for key in "${keys[@]}"; do
+              if ! etag=$(lock_read "${key}" "lock-cancel-${key##*/}"); then echo "::error::s3://${LOCK_BUCKET}/${key} is unreadable; nothing is changed."; return 1; fi
+              if [ "${etag}" = "absent" ]; then continue; fi
+              if ! holder=$(lock_holder "lock-cancel-${key##*/}"); then echo "::error::s3://${LOCK_BUCKET}/${key} holds no readable record; nothing is changed."; return 1; fi
+              read -r repo run attempt token scope phase task repair <<< "${holder}"
+              if [ "${repo}" != "${GITHUB_REPOSITORY}" ]; then
+                if [ "${key}" = "locks/${LOCK_SCOPE}.json" ]; then   # the caller's own scope's key held by another repo: never touched
+                  if [ "${repo}" = "$(lock_scope_repo infra)" ]; then
+                    echo "::error::locks/${LOCK_SCOPE}.json is held by an infra release ($(lock_url "${repo}" "${run}")): cancel from onepeek-infra."
+                  else
+                    echo "::error::locks/${LOCK_SCOPE}.json is held by ${repo} ($(lock_url "${repo}" "${run}")), not this repository: cancel from there."
+                  fi
+                  return 1
+                fi
+                echo "s3://${LOCK_BUCKET}/${key} is held by ${repo}, not this repository; it is left alone."
+                continue
+              fi
+              if [ -n "${LOCK_CANCEL_RUN}" ] && [ "${run}-${attempt}" != "${LOCK_CANCEL_RUN}-${LOCK_CANCEL_ATTEMPT}" ]; then
+                echo "s3://${LOCK_BUCKET}/${key} names another run of this repository (${run}); it is left for its own cancel."
+                continue
+              fi
+              LOCK_CANCEL_HELD+=("${key}=${etag}")
+              if [ -z "${LOCK_CANCEL_RUN}" ]; then
+                LOCK_CANCEL_RUN="${run}"; LOCK_CANCEL_ATTEMPT="${attempt}"; LOCK_CANCEL_PHASE="${phase}"; LOCK_CANCEL_TASK="${task}"; LOCK_CANCEL_REPAIR="${repair}"
+                LOCK_CANCEL_FILE="lock-cancel-${key##*/}"
+              fi
+            done
+            if [ "${#LOCK_CANCEL_HELD[@]}" -eq 0 ]; then return 3; fi
+            return 0
+          }
+          lock_cancel_delete_all() {  # lock_cancel_delete_all <key=etag...>: the conditional delete of each key on the ETag given
+            local key rc
+            for key in "$@"; do
+              rc=0
+              lock_delete "${key%%=*}" "${key#*=}" || rc=$?
+              case "${rc}" in
+                0) echo "Removed s3://${LOCK_BUCKET}/${key%%=*}." ;;
+                2) echo "::error::s3://${LOCK_BUCKET}/${key%%=*} changed meanwhile; it is left in place."; return 1 ;;
+                *) return 1 ;;
+              esac
+            done
+          }
+          lock_cancel_claim() {  # the exclusive repair claim on every held key -> 0 claimed (LOCK_CLAIMED key=etag list), 1 lost or failed
+            local key rc tries etag holder
+            LOCK_CLAIMED=()
+            LOCK_REPAIR_TOKEN=$(python3 -c "import secrets;print(secrets.token_hex(16))")
+            for key in "${LOCK_CANCEL_HELD[@]}"; do
+              etag="${key#*=}"; key="${key%%=*}"; tries=0
+              while :; do
+                REPAIR_RUN="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" REPAIR_TOKEN="${LOCK_REPAIR_TOKEN}" python3 -c '
+          import json, os, sys
+          r = json.load(open(sys.argv[1]))
+          r.update(repair_run=os.environ["REPAIR_RUN"], repair_token=os.environ["REPAIR_TOKEN"], phase="rolling")
+          json.dump(r, open("lock-claim.json", "w"))' "lock-cancel-${key##*/}"
+                rc=0
+                lock_put "${key}" lock-claim.json "${etag}" || rc=$?
+                if [ "${rc}" -eq 0 ]; then LOCK_CLAIMED+=("${key}=${LOCK_PUT_ETAG}"); break; fi
+                if [ "${rc}" -eq 3 ] && [ "${tries}" -lt 3 ]; then   # 409: re-read; retry only while the ETag is the one this run read
+                  tries=$((tries + 1)); sleep 1
+                  if etag2=$(lock_read "${key}" "lock-cancel-${key##*/}") && [ "${etag2}" = "${etag}" ]; then continue; fi
+                fi
+                if [ "${rc}" -eq 1 ]; then return 1; fi
+                holder=$(lock_read "${key}" lock-claim-now.json >/dev/null && lock_holder lock-claim-now.json | cut -d' ' -f8 || echo "?")
+                echo "::error::The repair claim on s3://${LOCK_BUCKET}/${key} was lost to another repairer (run ${holder}); this run stops and changes nothing."
+                return 1
+              done
+            done
+          }
+          lock_cancel() {  # cancel-release.yml (delivery-pipelines UC-DEL-009): cancel the caller's live release, or repair its finished one
+            local rc live deadline status other conclusion
+            rc=0
+            lock_cancel_read || rc=$?
+            case "${rc}" in
+              3) echo "Lock free, nothing held." | tee -a "${GITHUB_STEP_SUMMARY}"; return 0 ;;
+              0) ;;
+              *) return 1 ;;
+            esac
+            echo "Held by $(lock_url "${GITHUB_REPOSITORY}" "${LOCK_CANCEL_RUN}") (attempt ${LOCK_CANCEL_ATTEMPT}), phase ${LOCK_CANCEL_PHASE} at the cancel." | tee -a "${GITHUB_STEP_SUMMARY}"
+            if ! lock_run_finished "${GITHUB_REPOSITORY}" "${LOCK_CANCEL_RUN}"; then
+              if [ "${LOCK_SCOPE}" = "infra" ]; then   # an apply is never cancelled (playbook F27)
+                if ! live=$(GH_TOKEN="${LOCK_GH_TOKEN}" gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${LOCK_CANCEL_RUN}/jobs?per_page=100" \
+                    --jq '[.jobs[] | select((.name == "apply" or (.name | startswith("apply "))) and .status != "completed")] | length' 2>"${LOCK_ERR}"); then
+                  echo "::error::The jobs of run ${LOCK_CANCEL_RUN} cannot be read, so nothing is cancelled: $(cat "${LOCK_ERR}")"; return 1
+                fi
+                if [ "${live}" != "0" ]; then
+                  echo "::error::The infra release's apply is running: an apply is never cancelled (playbook F27). Run cancel-release.yml again after the apply." | tee -a "${GITHUB_STEP_SUMMARY}"
+                  return 1
+                fi
+              fi
+              # The run is live: cancel it (never force-cancel), then wait for its finish to free the key.
+              if ! GH_TOKEN="${LOCK_CANCEL_TOKEN}" gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${LOCK_CANCEL_RUN}/cancel" >/dev/null 2>"${LOCK_ERR}"; then
+                echo "::error::Run ${LOCK_CANCEL_RUN} could not be cancelled: $(cat "${LOCK_ERR}")"; return 1
+              fi
+              echo "Cancelled $(lock_url "${GITHUB_REPOSITORY}" "${LOCK_CANCEL_RUN}"); waiting for its finish to free the key."
+              deadline=$((SECONDS + LOCK_CANCEL_WAIT_SECONDS))
+              while :; do
+                sleep "${LOCK_CANCEL_POLL_SECONDS}"
+                if ! lock_remint_if_due; then return 1; fi
+                other="${LOCK_CANCEL_RUN}"
+                rc=0
+                lock_cancel_read || rc=$?
+                if [ "${rc}" -eq 3 ]; then echo "Lock free: the cancelled run's finish freed the key." | tee -a "${GITHUB_STEP_SUMMARY}"; return 0; fi
+                if [ "${rc}" -ne 0 ]; then return 1; fi
+                if [ "${LOCK_CANCEL_RUN}" != "${other}" ]; then
+                  echo "Freed by run ${other}, now held by $(lock_url "${GITHUB_REPOSITORY}" "${LOCK_CANCEL_RUN}"); it is left alone." | tee -a "${GITHUB_STEP_SUMMARY}"; return 0
+                fi
+                if lock_run_finished "${GITHUB_REPOSITORY}" "${LOCK_CANCEL_RUN}"; then break; fi
+                if [ "${SECONDS}" -ge "${deadline}" ]; then
+                  lock_fail_waiting "${GITHUB_REPOSITORY}" "${LOCK_SCOPE}" "${LOCK_CANCEL_RUN}"
+                  echo "The key is still held in phase ${LOCK_CANCEL_PHASE}; nothing was removed." | tee -a "${GITHUB_STEP_SUMMARY}"
+                  return 1
+                fi
+              done
+            fi
+            conclusion=$(GH_TOKEN="${LOCK_GH_TOKEN}" gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${LOCK_CANCEL_RUN}" --jq '.conclusion // "?"' 2>/dev/null || echo "?")
+            echo "The holder's run has finished (${conclusion}) with the key in phase ${LOCK_CANCEL_PHASE}." | tee -a "${GITHUB_STEP_SUMMARY}"
+            case "${LOCK_CANCEL_PHASE}" in
+              locked|done) lock_cancel_delete_all "${LOCK_CANCEL_HELD[@]}" || return 1 ;;
+              migrating)
+                # Never stopped: wait for the task (the migrate step's limit), and keep the key while it runs.
+                deadline=$((SECONDS + LOCK_MIGRATE_WAIT_SECONDS))
+                while :; do
+                  rc=0
+                  live=$(lock_migrate_live "${LOCK_CANCEL_TASK}" "${LOCK_CANCEL_RUN}" "${LOCK_CANCEL_ATTEMPT}") || rc=$?
+                  if [ "${rc}" -eq 2 ]; then return 1; fi
+                  if [ "${rc}" -eq 1 ]; then break; fi
+                  if [ "${SECONDS}" -ge "${deadline}" ]; then
+                    echo "::error::The migrate task ${live} is still running after ${LOCK_MIGRATE_WAIT_SECONDS} s; the key is kept (a migrate task is never stopped)." | tee -a "${GITHUB_STEP_SUMMARY}"; return 1
+                  fi
+                  sleep "${LOCK_POLL_SECONDS}"
+                done
+                echo "The migrate task stopped; exit code $(lock_migrate_exit "${LOCK_CANCEL_TASK}")." | tee -a "${GITHUB_STEP_SUMMARY}"
+                lock_cancel_delete_all "${LOCK_CANCEL_HELD[@]}" || return 1 ;;
+              rolling)
+                if [ "${LOCK_CANCEL_REPAIR}" != "-" ] && ! lock_run_finished "${GITHUB_REPOSITORY}" "${LOCK_CANCEL_REPAIR%-*}"; then
+                  echo "::error::Being repaired by $(lock_url "${GITHUB_REPOSITORY}" "${LOCK_CANCEL_REPAIR%-*}"); this run writes nothing." | tee -a "${GITHUB_STEP_SUMMARY}"; return 1
+                fi
+                lock_cancel_claim || return 1
+                if ! lock_put_back "${LOCK_CANCEL_FILE}"; then
+                  echo "::error::The put-back failed: the key stays rolling with this claim; run cancel-release.yml again to claim and repair it." | tee -a "${GITHUB_STEP_SUMMARY}"; return 1
+                fi
+                lock_cancel_report_services "${LOCK_CANCEL_FILE}"
+                lock_cancel_delete_all "${LOCK_CLAIMED[@]}" || return 1
+                echo "Lock free: every service is back on its recorded revision." | tee -a "${GITHUB_STEP_SUMMARY}" ;;
+            esac
+          }
+          lock_cancel_report_services() {  # each service with its revision before (the record) and after (describe-services), and the aliases
+            local kind svc td now
+            while read -r kind svc td; do
+              if [ "${kind}" = "service" ]; then
+                now=$(aws ecs describe-services --cluster "${NAME}" --services "${svc}" --query 'services[0].taskDefinition' --output text 2>/dev/null || echo "?")
+                echo "- ${svc}: recorded ${td##*/}, now ${now##*/}" >> "${GITHUB_STEP_SUMMARY}"
+              else
+                echo "- ${svc} live alias: version ${td}" >> "${GITHUB_STEP_SUMMARY}"
+              fi
+            done < lock-put-back.txt
           }
           lock_freeze() {  # preprod-frozen (§5.4, §5.6): only a hotfix/* run writes it, naming its branch (repo and ref)
             local msg etag branch repo ref

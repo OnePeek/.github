@@ -12,11 +12,13 @@ SERVICES = "services:\n  api: {triggers: [request]}\n  migrate: {triggers: [migr
 
 
 class T(unittest.TestCase):
-    def run_check(self, operate, release=BLOCK, services=SERVICES, *extra, lock=LOCK):
+    def run_check(self, operate, release=BLOCK, services=SERVICES, *extra, lock=LOCK, cancel=LOCK):
         with tempfile.TemporaryDirectory() as d:
             w = Path(d)
             if lock is not None:
                 (w / "release-lock.yml").write_text(lock)
+            if cancel is not None:
+                (w / "cancel-release.yml").write_text(cancel)
             (w / "operate.yml").write_text(operate)
             (w / "release-ecs.yml").write_text(release)
             (w / "s.yaml").write_text(services)
@@ -42,6 +44,10 @@ class T(unittest.TestCase):
 
     def test_the_shared_lock_workflow_must_match(self):
         self.assertEqual(self.run_check(OPERATE, lock=LOCK.replace(":;", "echo;")), 1)
+
+    def test_the_cancel_workflow_must_carry_the_same_lock_code(self):
+        self.assertEqual(self.run_check(OPERATE, cancel=LOCK.replace(":;", "echo;")), 1)
+        self.assertEqual(self.run_check(OPERATE, cancel=None), 1)
 
 
 if __name__ == "__main__":
