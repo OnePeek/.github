@@ -243,12 +243,218 @@ class Versions(unittest.TestCase):
         (fake / "tflint").write_text("#!/bin/sh\necho 'TFLint version 0.50.0'\nexit 1\n")
         (fake / "tflint").chmod(0o755)
         with mock.patch.dict(os.environ, {"PATH": f"{fake}:{os.environ['PATH']}"}), \
-                mock.patch.object(lc, "uv_problem", return_value=""):
+                mock.patch.object(lc, "uv_problem", return_value=""), mock.patch.object(lc, "docker_ready", return_value=False):
             self.assertIn("CI pins 0.65.0", lc.tflint_problem())
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)  # skipped, not run (the fake would fail)
         self.assertIn("tflint 0.50.0 is installed; CI pins 0.65.0", buf.getvalue())
+
+    def _tf_repo(self) -> pathlib.Path:
+        return self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+                         "      - run: |\n          tflint --init\n          tflint --recursive\n")
+
+    def _bin(self, **scripts: str) -> pathlib.Path:
+        """A PATH folder of stub tools (name -> shell body) plus the system tools the steps need; no real tflint or docker."""
+        b = pathlib.Path(tempfile.mkdtemp())
+        for name, body in scripts.items():
+            (b / name).write_text("#!/bin/sh\n" + body)
+            (b / name).chmod(0o755)
+        for t in ("bash", "sh", "env", "git", "python3", "cat", "echo"):
+            if shutil.which(t) and not (b / t).exists():
+                (b / t).symlink_to(shutil.which(t))
+        return b
+
+    def test_without_tflint_each_command_runs_in_its_own_container_with_the_images_entrypoint(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n        working-directory: sub\n"
+                      "    steps:\n      - env:\n          TFLINT_LOG: debug\n        run: |\n          tflint --init\n          cd . && tflint --recursive\n")
+        (d / "sub").mkdir()
+        cache = pathlib.Path(tempfile.mkdtemp()) / "tflint.d"
+        log = pathlib.Path(tempfile.mkdtemp()) / "docker.log"
+        b = self._bin(docker=f'[ "$1" = info ] && exit 0\necho "$@" >> {log}\n')
+        with mock.patch.dict(os.environ, {"PATH": str(b)}), mock.patch.object(lc, "uv_problem", return_value=""), \
+                mock.patch.object(lc, "TFLINT_CACHE", cache):
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+        lines = log.read_text().splitlines()
+        image = f"ghcr.io/terraform-linters/tflint:v{lc.TFLINT_VERSION}"
+        self.assertEqual(len(lines), 2)
+        for line, want in zip(lines, ("--init", "--recursive")):
+            self.assertTrue(line.startswith(f"run --rm -v {d.resolve()}:/data -w /data/sub -v {cache}:/root/.tflint.d -e TFLINT_LOG {image} {want}"), line)
+            self.assertNotIn("debug", line)  # passed by name, never by value
+            self.assertNotIn(" sh ", line)  # the image's entrypoint is tflint; there is no shell to start
+        self.assertTrue(cache.is_dir())
+
+    def test_a_tflint_step_with_other_commands_needs_native_tflint(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          echo hi\n          tflint --init\n")
+        with mock.patch.dict(os.environ, {"PATH": str(self._bin(docker="exit 0\n"))}), mock.patch.object(lc, "uv_problem", return_value=""):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
+        self.assertIn("needs tflint", out.getvalue())
+
+    def test_the_pinned_image_really_runs_on_a_plugin_fixture_and_a_clean_one(self):
+        if not lc.docker_ready():
+            self.skipTest("docker is not available")
+        aws = ('plugin "aws" {\n  enabled = true\n  version = "0.40.0"\n  source = "github.com/terraform-linters/tflint-ruleset-aws"\n}\n')
+        bundled = 'plugin "terraform" {\n  enabled = true\n  preset  = "all"\n}\nrule "terraform_standard_module_structure" {\n  enabled = false\n}\n'  # ships inside tflint: no download
+        # The aws plugin needs --init's download to reach --recursive; GitHub's API may rate-limit that download (then it is skipped).
+        for hcl in (bundled, "", aws):
+            d = self._tf_repo()
+            (d / "main.tf").write_text('terraform {\n  required_version = ">= 1.0"\n}\n\nvariable "x" {\n  description = "x"\n  type        = string\n}\n\noutput "x" {\n  description = "x"\n  value       = var.x\n}\n')
+            (d / ".tflint.hcl").write_text(hcl)
+            cache = pathlib.Path(tempfile.mkdtemp()) / "tflint.d"
+            out = io.StringIO()
+            with mock.patch.object(lc, "tflint_mode", return_value="docker"), mock.patch.object(lc, "TFLINT_CACHE", cache), \
+                    mock.patch.object(lc, "uv_problem", return_value=""), contextlib.redirect_stdout(out):
+                rc = lc.main([str(d), "--jobs", "a"])
+            if hcl is aws and "rate limit" in out.getvalue():
+                self.skipTest("GitHub rate-limited the plugin download")
+            self.assertEqual(rc, 0, out.getvalue())
+            self.assertIn("PASS", out.getvalue())
+            self.assertEqual(hcl is aws, any(cache.rglob("tflint-ruleset-aws*")), out.getvalue())
+
+    def test_tflint_calls_are_found_anywhere_in_a_step_but_not_other_tools(self):
+        for yes in ("tflint --init", "  tflint", "cd x && tflint -f json", "if tflint; then :; fi", "a; tflint", "(tflint)", "a | tflint"):
+            self.assertTrue(lc.TFLINT_CALL.search(yes), yes)
+        for no in ("tflint-foo --x", "echo tflint", "mytflint", "tflint.sh"):
+            self.assertFalse(lc.TFLINT_CALL.search(no), no)
+
+    def test_a_working_directory_outside_the_repo_fails_the_tflint_step(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - working-directory: ../elsewhere\n        run: tflint\n")
+        with mock.patch.dict(os.environ, {"PATH": str(self._bin(docker="exit 0\n"))}), mock.patch.object(lc, "uv_problem", return_value=""):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
+        self.assertIn("outside the repository", out.getvalue())
+
+    def test_native_tflint_at_ci_version_runs_without_docker(self):
+        d = self._tf_repo()
+        log = pathlib.Path(tempfile.mkdtemp()) / "t.log"
+        b = self._bin(tflint=f'[ "$1" = --version ] && echo "TFLint version {lc.TFLINT_VERSION}" && exit 0\necho "$@" >> {log}\n',
+                      docker="exit 9\n")
+        with mock.patch.dict(os.environ, {"PATH": str(b)}), mock.patch.object(lc, "uv_problem", return_value=""):
+            self.assertEqual(lc.tflint_mode(), "native")
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+        self.assertEqual(log.read_text().splitlines(), ["--init", "--recursive"])
+
+    def test_skip_docker_leaves_tflint_to_ci_but_release_still_fails(self):
+        d = self._tf_repo()
+        b = self._bin(docker=f"exit 0\n")  # a working docker that --skip-docker must not use
+        with mock.patch.dict(os.environ, {"PATH": str(b)}), mock.patch.object(lc, "uv_problem", return_value=""):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(lc.main([str(d), "--jobs", "a", "--skip-docker"]), 0)
+            self.assertIn("WARN", err.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a", "--skip-docker", "--release"]), 1)
+            self.assertIn("FAIL", out.getvalue())
+
+    def test_release_fails_on_a_missing_trivy_too(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: trivy config .\n")
+        with mock.patch.dict(os.environ, {"PATH": str(self._bin())}), mock.patch.object(lc, "uv_problem", return_value=""):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a", "--release"]), 1)
+            self.assertIn("trivy", out.getvalue())
+
+    def test_conflict_marker_forms_and_exclusions(self):
+        d = self.repo("on: [pull_request]\njobs: {}\n")
+        L, R = "<" * 7, ">" * 7
+        cases = {"open.md": f"a\n{L} HEAD\n", "close.md": f"a\n{R} dev\n", "bare_open.md": f"a\n{L}\n", "bare_close.md": f"a\r\n{R}\r\n"}
+        for n, body in cases.items():
+            (d / n).write_text(body)
+        (d / "midline.md").write_text(f"see {L} here\n")
+        (d / "eight.md").write_text("<" * 8 + "x\n")
+        (d / "bin.dat").write_bytes(b"\0" + f"\n{L} HEAD\n".encode())
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True)
+        got = lc.conflict_markers(d)
+        self.assertEqual(sorted(g.split(":")[0] for g in got), ["bare_close.md", "bare_open.md", "close.md", "open.md"])
+
+    def test_an_unmerged_file_is_reported_once(self):
+        d = self.repo("on: [pull_request]\njobs: {}\n")
+        home = tempfile.mkdtemp()  # no git settings of the machine (identity, default branch, conflict style) reach the fixture
+        env = {**os.environ, "HOME": home, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+        flags = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main", "-c", "merge.conflictStyle=merge",
+                 "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
+        g = lambda *a, check=True: subprocess.run(["git", "-C", str(d), *flags, *a], check=check, capture_output=True, text=True, env=env)
+        (d / "f.txt").write_text("base\n"); g("add", "-A"); g("commit", "-qm", "base"); g("branch", "-M", "main")
+        g("checkout", "-qb", "other"); (d / "f.txt").write_text("other\n"); g("commit", "-qam", "o")
+        g("checkout", "-q", "main"); (d / "f.txt").write_text("main\n"); g("commit", "-qam", "m")
+        self.assertNotEqual(g("merge", "other", check=False).returncode, 0)
+        self.assertEqual(len(g("ls-files", "-u").stdout.splitlines()), 3)  # really mid-merge: three index stages
+        self.assertIn("<" * 7, (d / "f.txt").read_text())
+        self.assertEqual(lc.conflict_markers(d), ["f.txt:1"])
+
+    def test_conflict_scan_falls_back_when_git_lacks_deduplicate(self):
+        d = self.repo("on: [pull_request]\njobs: {}\n")
+        (d / "f.txt").write_text("<" * 7 + " HEAD\n")
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True)
+        real = subprocess.run
+
+        def fake(argv, *a, **k):
+            if "--deduplicate" in argv:
+                return subprocess.CompletedProcess(argv, 129, b"", b"unknown option")
+            return real(argv, *a, **k)
+        with mock.patch.object(lc.subprocess, "run", side_effect=fake):
+            self.assertEqual(lc.conflict_markers(d), ["f.txt:1"])
+
+    def test_without_tflint_or_docker_it_warns_and_under_release_fails(self):
+        d = self._tf_repo()
+        with mock.patch.dict(os.environ, {"PATH": str(self._bin())}), mock.patch.object(lc, "uv_problem", return_value=""):
+            err, out = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+            self.assertIn("WARN", err.getvalue())
+            self.assertIn("Docker is not available", out.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a", "--release"]), 1)
+            self.assertIn("FAIL", out.getvalue())
+
+    def test_a_step_that_runs_npm_pkg_set_leaves_package_json_unchanged(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n"
+                      "        working-directory: clients/typescript\n    steps:\n      - name: Version as next snapshot\n"
+                      "        run: |\n          npm pkg set version=9.9.9-next.1\n          grep -q 9.9.9 package.json\n")
+        pkg = d / "clients/typescript/package.json"
+        pkg.parent.mkdir(parents=True)
+        pkg.write_text('{"name": "x", "version": "1.0.0"}\n')
+        before = pkg.read_bytes()
+        if not shutil.which("npm"):
+            self.skipTest("npm is not installed")
+        with mock.patch.object(lc, "uv_problem", return_value=""):
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+        self.assertEqual(pkg.read_bytes(), before)
+
+    def test_package_json_is_restored_even_when_the_step_fails(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+                      "      - run: |\n          printf '{}' > package.json\n          npm pkg set version=2.0.0 || true\n          false\n")
+        pkg = d / "package.json"
+        pkg.write_text('{"version": "1.0.0"}\n')
+        before = pkg.read_bytes()
+        with mock.patch.object(lc, "uv_problem", return_value=""), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
+        self.assertEqual(pkg.read_bytes(), before)
+
+    def test_conflict_markers_fail_before_any_step_and_clean_or_underlines_pass(self):
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+        doc = d / "AGENTS.md"
+        doc.write_text("Title\n" + "=" * 7 + "\ntext\n")  # a Markdown heading underline is not a marker
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True)
+        with mock.patch.object(lc, "uv_problem", return_value=""):
+            self.assertEqual(lc.conflict_markers(d), [])
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+            doc.write_text("a\n" + "<" * 7 + " HEAD\nx\n" + "=" * 7 + "\ny\n" + ">" * 7 + " dev\n")
+            subprocess.run(["git", "-C", str(d), "add", "-A"], check=True)
+            self.assertEqual(lc.conflict_markers(d), ["AGENTS.md:2"])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
+            self.assertIn("AGENTS.md:2", out.getvalue())
+            with mock.patch.object(lc, "CONFLICT_MARKER_ALLOW", ("AGENTS.md",)):
+                self.assertEqual(lc.conflict_markers(d), [])
 
     def test_steps_use_one_shared_provider_cache_unless_the_laptop_sets_one(self):
         home = pathlib.Path(tempfile.mkdtemp())

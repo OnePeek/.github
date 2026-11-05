@@ -269,6 +269,14 @@ class DependsOn(Repo):
         self.assertEqual(self.check([], {("backend-service", 73): self.OPEN}, ["OnePeek/backend-service#73"]), (False, ["FAIL"]))
         self.assertEqual(self.check([], {}), (True, ["PASS"]))
 
+    def test_release_reaches_local_ci_and_a_plain_run_does_not_ask_for_it(self) -> None:
+        d = self.repo({".github/workflows/w.yml": "jobs: {}\n"})
+        for release in (True, False):
+            with mock.patch.object(pf.subprocess, "run") as run:
+                run.return_value.returncode, run.return_value.stdout, run.return_value.stderr = 0, "LOCAL CI OK (1s)\n", ""
+                self.assertEqual(pf.run_local_ci(d, release)[0], True)
+            self.assertEqual("--release" in run.call_args[0][0], release)
+
     def test_main_refuses_before_local_ci(self) -> None:
         d = self.repo({".github/workflows/w.yml": "jobs: {}\n"})
         with mock.patch.object(pf, "dependency_check", return_value=False), \
@@ -319,13 +327,14 @@ class DocsWait(Repo):
         d = self.repo({".github/workflows/w.yml": "jobs: {}\n"})
         for flags, strict in (([], False), (["--release"], True)):
             with mock.patch.object(pf, "dependency_check", return_value=True), \
-                    mock.patch.object(pf, "run_local_ci", return_value=(True, "LOCAL CI OK")), \
+                    mock.patch.object(pf, "run_local_ci", return_value=(True, "LOCAL CI OK")) as lci, \
                     mock.patch.object(pf, "pin_checks"), mock.patch.object(pf, "tool_checks"), \
                     mock.patch.object(pf, "docs_check"), mock.patch.object(pf, "token_checks"), \
                     mock.patch.object(pf, "release_repos", return_value=[]), \
                     mock.patch.object(pf, "docs_wait_check") as dw:
                 pf.main([str(d), *flags])
             self.assertEqual(dw.call_args.kwargs["strict"], strict, flags)
+            self.assertEqual(lci.call_args[0][1], strict, flags)  # --release reaches local CI
 
     def test_a_pin_on_main_prints_nothing(self) -> None:
         self.assertEqual(self.check(True, "ahead", []), [])
