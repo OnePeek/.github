@@ -991,21 +991,22 @@ class CosignRegistryLogin(unittest.TestCase):
 
     def test_every_cosign_verify_comes_after_an_unconditional_ecr_login_in_its_job(self):
         import yaml  # noqa: PLC0415
+        login_re = re.compile(r"^aws ecr get-login-password \| (cosign|docker) login\b")
         root = pathlib.Path(__file__).resolve().parent.parent / ".github" / "workflows"
         for name in ("release-ecs.yml", "operate.yml"):
             wf = yaml.safe_load((root / name).read_text(encoding="utf-8"))
             for job_id, job in wf["jobs"].items():
-                login_ok = False  # set only by a login in a step with no `if:` (or the same `if:` as the verify step)
+                job_login = False  # an earlier, unconditional step logged in
                 for st in job.get("steps", []):
-                    cond = st.get("if")
+                    step_login = False  # a login earlier in this same step
                     for line in self._code_lines(str(st.get("run", ""))):
-                        login = line.startswith("aws ecr get-login-password |") and ("cosign login" in line or "docker login" in line)
-                        if login and cond is None:
-                            login_ok = True
+                        if login_re.match(line):
+                            step_login = True
                         if line.startswith("cosign verify"):
-                            ok = login_ok or any(
-                                l.startswith("aws ecr get-login-password |") for l in self._code_lines(str(st.get("run", ""))))
-                            self.assertTrue(ok, f"{name}:{job_id}: cosign verify without an unconditional ECR login before it")
+                            self.assertTrue(job_login or step_login,
+                                            f"{name}:{job_id}: cosign verify without an ECR login before it")
+                    if step_login and st.get("if") is None:
+                        job_login = True
 
 if __name__ == "__main__":
     unittest.main()
