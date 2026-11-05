@@ -546,9 +546,6 @@ jobs:
           registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
           digest=$(cut -d= -f2 "digest-${IMAGE}.txt")
           echo "ref=${registry}/${NAME}/${IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
-          password=$(aws ecr get-login-password)
-          echo "::add-mask::${password}"
-          echo "scanner-secret=${password}" >> "$GITHUB_OUTPUT"   # read only by the scan step's own env
       - name: The waiver file, only if the repository has one
         id: waiver
         if: ${{ !inputs.dry-run }}
@@ -567,8 +564,7 @@ jobs:
           version: v0.76.1
         env:
           TRIVY_PLATFORM: linux/arm64
-          TRIVY_USERNAME: AWS
-          TRIVY_PASSWORD: ${{ steps.login.outputs.scanner-secret }}   # this step only, never the job or GITHUB_ENV
+          # No registry password: Trivy reads the AWS credentials configure-aws-credentials exported (ecr:GetAuthorizationToken).
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v2.6.5
@@ -1153,7 +1149,7 @@ jobs:
     needs: [prepare, build-image, build-web, deploy]
     if: ${{ !cancelled() && !inputs.dry-run && (needs.deploy.result == 'success' || (needs.deploy.result == 'failure' && needs.deploy.outputs.previous != '')) }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 45
+    timeout-minutes: 60   # above the sum of its step limits (10 + 5 + 10 + 12 + 20), so a hang ends as a failed step and the rollback still runs
     permissions:
       contents: read
       id-token: write
@@ -1197,6 +1193,7 @@ jobs:
           if [ "${IMAGE}" = "backend" ]; then path="/api/status"; else path="/sign-in"; fi
           curl --fail --silent --show-error --max-time 10 --retry 6 --retry-delay 10 --retry-all-errors "https://${DOMAIN}${path}" >/dev/null
       - name: Every service's task definition carries this release's image digest (describe-services; no ecs:ListTasks)
+        timeout-minutes: 5
         env:
           DIGEST: ${{ needs.build-image.outputs.digest || needs.build-web.outputs.digest }}
           SERVICES: ${{ needs.deploy.outputs.services }}
@@ -1210,6 +1207,7 @@ jobs:
             fi
           done
       - name: The repo's own smoke checks against the domain, in addition (UC-DEL-001 row 7; @smoke journeys)
+        timeout-minutes: 10
         env:
           SCRIPT: ${{ inputs.smoke-script }}
           DOMAIN: ${{ inputs.domain }}
@@ -1379,6 +1377,8 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - name: Release the release lock
+        # Runs even when the guard failed (a re-run of only some jobs): safe, because the release only removes a lock
+        # whose record carries exactly this token, and a run that did not take the lock has none.
         if: ${{ always() }}
         env:
           LOCK_TOKEN: ${{ needs.prepare.outputs.token }}

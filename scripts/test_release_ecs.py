@@ -1105,31 +1105,51 @@ class JobGraph(unittest.TestCase):
     def test_the_job_count_is_pinned(self):
         self.assertEqual(list(RELEASE["jobs"]), self.JOBS)
 
-    def test_the_most_jobs_that_run_per_image(self):
-        # build-image and build-web exclude each other by their conditions, so one is always skipped (no runner);
-        # api-client runs for the backend only; db-bootstrap only with migrate.
-        jobs = RELEASE["jobs"]
-        self.assertIn("inputs.image != 'web'", jobs["build-image"]["if"])
-        self.assertIn("inputs.image == 'web'", jobs["build-web"]["if"])
-        self.assertIn("inputs.image == 'backend'", jobs["api-client"]["if"])
-        self.assertIn("inputs.migrate", jobs["db-bootstrap"]["if"])
+    @staticmethod
+    def _simulate(image: str, migrate: bool, dry_run: bool) -> list[str]:
+        """Evaluates every job's needs and `if` the way Actions does, with every job that runs succeeding."""
+        attempt = 1
+        inputs = {"image": image, "migrate": migrate, "dry-run": dry_run, "environment": "preprod"}
+        result: dict[str, str] = {}
+        outputs = {"prepare": {"skip": "false", "attempt": str(attempt)}, "deploy": {"previous": ""},
+                   "verify": {"watch": "success"}}
 
-        def runs(image: str, migrate: bool) -> int:
-            n = 0
-            for name, job in jobs.items():
-                cond = job.get("if", "")
-                if "inputs.image == '%s'" % image not in cond and "inputs.image == " in cond:
-                    continue
-                if "inputs.image != '%s'" % image in cond:
-                    continue
-                if name == "db-bootstrap" and not migrate:
-                    continue
-                n += 1
-            return n
-        self.assertEqual(runs("backend", True), 7)
-        self.assertEqual(runs("web", True), 6)
-        self.assertEqual(runs("web", False), 5)
-        self.assertEqual(runs("backend", False), 6)
+        def evaluate(expr: str) -> bool:
+            e = expr.strip()
+            e = e[3:-2] if e.startswith("${{") else e
+            e = re.sub(r"contains\(needs\.\*\.result, '(\w+)'\)", lambda m: repr(m.group(1) in result.values()), e)
+            e = re.sub(r"format\('\{0\}', github\.run_attempt\)", repr(str(attempt)), e)
+            e = re.sub(r"needs\.([\w-]+)\.outputs\.(\w+)", lambda m: repr(outputs.get(m.group(1), {}).get(m.group(2), "")), e)
+            e = re.sub(r"needs\.([\w-]+)\.result", lambda m: repr(result[m.group(1)]), e)
+            e = re.sub(r"inputs\.([\w-]+)", lambda m: repr(inputs[m.group(1)]), e)
+            e = e.replace("!cancelled()", "True").replace("always()", "True")
+            e = e.replace("&&", " and ").replace("||", " or ")
+            e = re.sub(r"!(?!=)", " not ", e)
+            return bool(eval(e, {"__builtins__": {}}))  # noqa: S307  (the workflow's own expressions, in a test)
+
+        ran = []
+        for name, job in RELEASE["jobs"].items():
+            if "if" in job:
+                go = evaluate(job["if"])
+            else:  # the implicit success(): every needed job succeeded
+                go = all(result[n] == "success" for n in needs_of(name))
+            result[name] = "success" if go else "skipped"
+            if go:
+                ran.append(name)
+        return ran
+
+    def test_the_jobs_that_run_per_image_come_from_evaluating_the_conditions(self):
+        every = ["prepare", "build-image", "db-bootstrap", "deploy", "verify", "finish", "api-client"]
+        self.assertEqual(self._simulate("backend", True, False), every)
+        self.assertEqual(self._simulate("backend", False, False), [j for j in every if j != "db-bootstrap"])
+        web = ["prepare", "build-web", "db-bootstrap", "deploy", "verify", "finish"]
+        self.assertEqual(self._simulate("web", True, False), web)
+        self.assertEqual(self._simulate("web", False, False), [j for j in web if j != "db-bootstrap"])
+        # A dry run reads the digests back and deploys nothing live: no migrate, watch or client publish.
+        self.assertEqual(self._simulate("backend", True, True), ["prepare", "build-image", "deploy", "finish"])
+        self.assertEqual(self._simulate("web", True, True), ["prepare", "build-web", "deploy", "finish"])
+        self.assertEqual(len(self._simulate("backend", True, False)), 7)
+        self.assertEqual(len(self._simulate("web", False, False)), 5)
 
     def test_the_stages_run_in_order(self):
         self.assertEqual(needs_of("deploy"), ["prepare", "build-image", "build-web", "db-bootstrap"])
@@ -1144,16 +1164,39 @@ class JobGraph(unittest.TestCase):
         self.assertEqual(RELEASE["jobs"]["build-web"]["permissions"].get("packages"), "read")
         self.assertNotIn("packages: write", str(RELEASE.get("permissions", "")))
 
-    def test_the_scanner_password_is_only_in_the_scan_step(self):
-        self.assertNotIn("TRIVY_PASSWORD", str(RELEASE.get("env", "")))
-        for name, job in RELEASE["jobs"].items():
-            self.assertNotIn("TRIVY_PASSWORD", str(job.get("env", "")), name)
-            for st in job.get("steps", []):
-                has = "TRIVY_PASSWORD" in str(st)
-                self.assertEqual(has, st.get("uses", "").startswith("aquasecurity/trivy-action") and name in ("build-image", "build-web"),
-                                 f"{name}: {st.get('name') or st.get('uses')}")
-        self.assertNotIn("TRIVY_PASSWORD", TEXT.replace("TRIVY_PASSWORD: ${{ steps.login.outputs.scanner-secret }}", ""))
+    def test_no_registry_password_is_handled_for_the_scan(self):
+        # Trivy authenticates to ECR from the AWS credentials the credentials step exported.
+        for word in ("TRIVY_PASSWORD", "TRIVY_USERNAME", "scanner-secret", "add-mask"):
+            self.assertNotIn(word, TEXT.replace("# No registry password: Trivy reads", ""), word)
         self.assertNotRegex(TEXT, r"(?m)^[^#\n]*>>\s*\"?\$GITHUB_ENV")
+
+    def test_every_verify_step_before_the_rollback_has_a_limit_and_the_job_limit_exceeds_them_all(self):
+        # A job timeout cancels the job, so the rollback would never run: a hang must end as a failed step.
+        job = RELEASE["jobs"]["verify"]
+        steps = job["steps"]
+        rollback = next(i for i, s in enumerate(steps) if s.get("id") == "rollback")
+        trivial = ("This run attempt holds", "The deploy job finished its rollout")
+        for s in steps[:rollback]:
+            if "run" in s and not s.get("name", "").startswith(trivial):
+                self.assertIn("timeout-minutes", s, s.get("name"))
+        smoke = next(s for s in steps if s.get("name", "").startswith("The repo's own smoke checks"))
+        self.assertEqual(smoke["timeout-minutes"], 10)
+        self.assertGreater(job["timeout-minutes"], sum(s.get("timeout-minutes", 0) for s in steps))
+        self.assertGreaterEqual(job["timeout-minutes"], 55)
+
+    def test_no_step_gating_a_change_runs_after_a_failure(self):
+        # No always() or cancelled() in the build, deploy or verify steps before the rollback, so the lock-attempt
+        # check (and every earlier step) gates every change.
+        for name in ("build-image", "build-web", "deploy", "verify"):
+            steps = RELEASE["jobs"][name]["steps"]
+            if name == "verify":
+                steps = steps[:next(i for i, s in enumerate(steps) if s.get("id") == "rollback")]
+            for s in steps:
+                self.assertNotRegex(str(s.get("if", "")), r"always\(\)|cancelled\(\)", f"{name}: {s.get('name') or s.get('uses')}")
+
+    def test_e7_runs_for_the_backend_only(self):
+        e7 = next(s for s in RELEASE["jobs"]["deploy"]["steps"] if s.get("name", "").startswith("E7."))
+        self.assertEqual(e7["if"], "${{ inputs.image == 'backend' }}")
 
     def test_no_job_is_a_matrix(self):
         # Matrix outputs are last-writer-wins; the build records every image's digest in one step instead.
