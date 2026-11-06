@@ -21,6 +21,7 @@ Then wait for its report and act on every blocking and should-fix finding: a des
 4. **Tests.** Every test the LLD names exists and tests the behaviour, not internals. Every testing-plan level is covered.
 5. **Bypasses.** The reviewer tries to break each rule the change relies on, using throwaway fixtures only.
 6. **Gates.** The reviewer runs every gate listed in this repo's `AGENTS.md` on a throwaway worktree.
+7. **Done check, mutations and pitfalls.** The reviewer runs `done_check.py` against the pull request, breaks at least one behaviour per area, and checks the change against every line of `.github/workspace/pitfalls.md`.
 
 ## The result
 Findings ranked **blocking**, **should-fix** and **nit**. Each has its `file:line`, the evidence, and the packet section it breaks. The report ends with a verdict: **ready** or **not ready**. A pull request needs "ready".

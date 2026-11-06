@@ -6,7 +6,9 @@ Run from inside a repo (the backend has the same thing as `uv run app context`):
     python3 ../.github/workspace/packet.py infra/aws-stack --out .context/aws-stack.md
     python3 ../.github/workspace/packet.py mcp-gateway --refine
 
-It makes a temporary detached worktree of ../onepeek-docs at the pinned commit, runs that commit's tools/context.py, and
+The docs clone is `--docs <path>`, else `$ONEPEEK_WORKSPACE/onepeek-docs`, else `../onepeek-docs` next to the repo, so a
+repo worktree under a session scratchpad works too. It makes a temporary detached worktree of that clone at the commit
+pinned in the repo's (or worktree's) own docs-version.txt, runs that commit's tools/context.py, and
 always removes the worktree. The packet therefore matches the docs the repo says it implements, never whatever happens
 to be checked out. Standard library only; argument lists only (no shell).
 """
@@ -14,6 +16,7 @@ to be checked out. Standard library only; argument lists only (no shell).
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import re
 import shutil
@@ -47,7 +50,17 @@ def lane_of(text: str | None) -> str:
     return found[0]
 
 
-def main() -> int:
+def docs_dir(repo: pathlib.Path, docs: pathlib.Path | None, env: dict | None = None) -> pathlib.Path:
+    """The onepeek-docs clone: `--docs`, else `$ONEPEEK_WORKSPACE/onepeek-docs`, else the sibling of the repo."""
+    workspace = (os.environ if env is None else env).get("ONEPEEK_WORKSPACE")
+    if docs is not None:
+        return docs.resolve()
+    if workspace:
+        return (pathlib.Path(workspace) / "onepeek-docs").resolve()
+    return (repo / ".." / "onepeek-docs").resolve()
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("unit", help="module ID, platform/<part>, clients/<client> or infra/<part>")
     ap.add_argument("--refine", action="store_true", help="packet for refining a minimum module LLD")
@@ -55,7 +68,9 @@ def main() -> int:
     ap.add_argument("--task", type=pathlib.Path, help="the task text; a `Lane: feature|hotfix` line in it sets the lane")
     ap.add_argument("--pr", metavar="REPO#N", help="read the `Lane:` line from this OnePeek pull request's body (gh)")
     ap.add_argument("--repo", type=pathlib.Path, default=pathlib.Path.cwd(), help="the repo (default: current folder)")
-    a = ap.parse_args()
+    ap.add_argument("--docs", type=pathlib.Path, help="the onepeek-docs clone (default: $ONEPEEK_WORKSPACE/onepeek-docs, "
+                    "else ../onepeek-docs next to the repo)")
+    a = ap.parse_args(argv)
 
     text = a.task.read_text() if a.task else ""
     if a.pr:
@@ -76,7 +91,7 @@ def main() -> int:
     if not pin:
         print(f"{pin_file}: no full onepeek-docs commit SHA (write onepeek-docs@<40-char sha>)", file=sys.stderr)
         return 1
-    docs = (a.repo / ".." / "onepeek-docs").resolve()
+    docs = docs_dir(a.repo, a.docs)
     if not (docs / ".git").exists():
         print(f"{docs} is missing: git clone https://github.com/OnePeek/onepeek-docs.git {docs}", file=sys.stderr)
         return 1
