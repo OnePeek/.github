@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import pathlib
 import shutil
 import subprocess
@@ -65,6 +66,24 @@ class Refusal(Repo):
                     mock.patch.object(pf, "pin_checks") as pins:
                 self.assertEqual(pf.main([str(d)]), 1, out)
             pins.assert_not_called()
+
+    def test_release_refuses_the_shared_workflows_override(self) -> None:
+        # foundation-playbook §8c L4: a release is checked against the pins, never an unmerged .github worktree.
+        d = self.repo({".github/workflows/w.yml": "on: [pull_request]\njobs: {}\n"})
+        for env in ({}, {"ONEPEEK_SHARED_GITHUB": "/x"}):
+            args = [str(d), "--release"] + (["--shared", "/x"] if not env else [])
+            with mock.patch.dict(os.environ, {"ONEPEEK_SHARED_GITHUB": "", **env}), \
+                    mock.patch.object(pf, "run_local_ci") as ci, mock.patch.object(pf, "dependency_check") as dep:
+                self.assertEqual(pf.main(args), 1)
+            ci.assert_not_called()
+            dep.assert_not_called()
+
+    def test_shared_without_release_goes_to_local_ci(self) -> None:
+        d = self.repo({".github/workflows/w.yml": "on: [pull_request]\njobs: {}\n"})
+        with mock.patch.dict(os.environ, {"ONEPEEK_SHARED_GITHUB": ""}), \
+                mock.patch.object(pf, "run_local_ci", return_value=(False, "x")) as ci, mock.patch.object(pf, "dependency_check", return_value=True):
+            pf.main([str(d), "--shared", "/x"])
+        self.assertEqual(ci.call_args.args[2], "/x")
 
     def test_goes_on_after_local_ci_ok(self) -> None:
         d = self.repo({".github/workflows/w.yml": "on: [pull_request]\njobs: {}\n"})
