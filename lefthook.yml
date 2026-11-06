@@ -1,4 +1,4 @@
-# Pre-commit hooks (branching-and-delivery standard §4). Install once per clone: `python3 .github/workspace/setup.py`.
+# Pre-commit hooks (branching-and-delivery standard §4). Install once per clone: `uvx lefthook install`.
 pre-commit:
   commands:
     gitleaks:
