@@ -32,7 +32,8 @@ MIGRATE_TD = "arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-prepro
 
 # A fake S3 (one file per key) with the conditional-write semantics the lock relies on: If-None-Match: * refuses an
 # existing key, If-Match refuses another ETag (and a missing key), a missing key is NoSuchKey. FAIL_<OP> injects any other
-# error; CONFLICT_PUTS answers that many conditional puts with 409; RACE_ON_DELETE has another run take a key just
+# error; CONFLICT_PUTS answers that many conditional puts with 409 (CHANGE_ON_CONFLICT: and gives the key a new ETag, its
+# body unchanged, as another writer's write would); RACE_ON_DELETE has another run take a key just
 # before its delete; CHANGE_BEFORE_PUT changes a key just before a put with If-Match. Every put's body is logged in
 # `puts`. Other calls print SEQ_<OP> (a JSON list, one per call) or AWS_<OP>.
 FAKE_AWS = r"""#!/usr/bin/env python3
@@ -64,6 +65,8 @@ if op == "put-object":
         fail("PutObject", "PreconditionFailed")
     if opt("--if-match"):
         if counter("conflict") < int(os.environ.get("CONFLICT_PUTS", "0")):
+            if os.environ.get("CHANGE_ON_CONFLICT") and os.path.exists(tag):
+                open(tag, "w").write('"conflicted"')
             fail("PutObject", "ConditionalRequestConflict")
         change = os.environ.get("CHANGE_BEFORE_PUT")
         if change and os.path.exists(obj):
@@ -172,6 +175,7 @@ def run(script: str, keys: dict | None = None, gh: str = "echo in_progress", fro
         out.output = read("output") or ""  # type: ignore[attr-defined]
         out.summary = read("summary") or ""  # type: ignore[attr-defined]
         out.token_request = read("token-request") or ""  # type: ignore[attr-defined]
+        out.headers = read("headers") or ""  # type: ignore[attr-defined]
         return out
 
 
@@ -381,6 +385,8 @@ class Take(unittest.TestCase):
 OPENSSL = '#!/bin/bash\necho "openssl $*" >> "$FAKE_S3/calls"\ncat >/dev/null\nprintf sig\n'
 CURL = """#!/bin/bash
 echo "curl $*" >> "$FAKE_S3/calls"
+prev=""
+for a in "$@"; do if [ "$prev" = "-H" ] && [ "${a#@}" != "$a" ]; then cat "${a#@}" >> "$FAKE_S3/headers"; fi; prev="$a"; done
 case "$*" in
 *access_tokens*) cat >> "$FAKE_S3/token-request"; echo >> "$FAKE_S3/token-request"; echo '{"token": "new-app-token"}';;
 *installation*) echo '{"id": 42}';;
@@ -402,7 +408,7 @@ class Remint(unittest.TestCase):
 
     def test_a_wait_longer_than_the_interval_uses_a_fresh_app_token_and_role_session(self):
         out = self.held_run()
-        self.assertIn("curl -sSf -H Authorization: Bearer", out.calls)
+        self.assertIn("Authorization: Bearer ", out.headers)
         self.assertIn("/repos/OnePeek/backend-service/installation", out.calls)
         self.assertIn("/app/installations/42/access_tokens", out.calls)
         self.assertIn("aws sts assume-role-with-web-identity --role-arn arn:aws:iam::111111111111:role/onepeek-preprod-deploy-backend-service "
@@ -414,6 +420,11 @@ class Remint(unittest.TestCase):
     def test_the_new_token_has_the_same_repositories_and_permissions_and_the_key_is_never_printed(self):
         out = self.held_run()
         self.assertNotIn("PRIVATE KEY", out.stdout + out.stderr + out.calls)
+        # Every bearer token reaches curl as a header file, never on its command line.
+        self.assertIn("Authorization: Bearer eyJ", out.headers)
+        self.assertIn("Authorization: bearer req", out.headers)
+        self.assertNotIn("Authorization", out.calls)
+        self.assertNotIn("eyJ", out.calls)
         self.assertIn("::add-mask::new-app-token", out.stdout)
         self.assertIn("::add-mask::st", out.stdout)
         self.assertEqual(json.loads(out.token_request.splitlines()[0]), {"repositories": ["backend-service", "onepeek-web", "onepeek-infra", "mcp-athena"],
@@ -602,9 +613,19 @@ class SharedLockWorkflow(unittest.TestCase):
         self.assertNotIn("concurrency", LOCKWF)
         self.assertEqual(LOCKWF["jobs"]["lock"]["permissions"]["actions"], "read")
 
-    def test_its_limit_waits_only_for_take_and_freeze(self):
-        self.assertEqual(LOCKWF["jobs"]["lock"]["timeout-minutes"],
-                         "${{ (inputs.action == 'take' || inputs.action == 'freeze') && 135 || 10 }}")
+    def test_its_limit_waits_only_for_take_and_freeze_keeps_10_minutes_until_the_release_order(self):
+        # freeze's wait for a live infra.json holder is built with the release order (.github #56, playbook §5.4a "Freeze
+        # and thaw"); until then freeze, like release and thaw, has the 10-minute limit.
+        expr = LOCKWF["jobs"]["lock"]["timeout-minutes"]
+        self.assertEqual({a: evaluate(expr, action=a) for a in ("take", "release", "freeze", "thaw")},
+                         {"take": 135, "release": 10, "freeze": 10, "thaw": 10})
+
+
+def evaluate(expr: str, **inputs: str):
+    """A timeout-minutes expression of inputs.* comparisons, &&, || and integers, evaluated for the given inputs."""
+    body = re.fullmatch(r"\$\{\{(.*)\}\}", expr.strip(), re.S).group(1)
+    body = re.sub(r"inputs\.([\w-]+)", lambda m: repr(inputs[m.group(1)]), body).replace("&&", " and ").replace("||", " or ")
+    return eval(body, {"__builtins__": {}})  # noqa: S307 - only the shipped expression, already held to that form by the lint
 
 
 def needs(doc: dict, job: str) -> list[str]:
@@ -813,8 +834,11 @@ class OperateScope(unittest.TestCase):
         for job in ("operate", "unlock"):
             env = [s.get("env", {}) for s in OPERATE["jobs"][job]["steps"] if "lock_" in str(s.get("run", ""))]
             self.assertTrue(env and all(e["LOCK_SCOPE"] == "${{ needs.lock.outputs.scope }}" for e in env), job)
-        # prepare's infra edge is the order check's settled() (W2.3 slice 3), not this queued-or-running part.
-        self.assertFalse([s for j in RELEASE["jobs"].values() for s in j.get("steps", []) if "LOCK_INFRA_EDGE" in (s.get("env") or {})])
+        # prepare runs the infra edge's queued-or-running part too (§5.4a "Taking keys and waiting" item 4; E5), until the
+        # order check's settled() is built (.github #56); no other step sets it.
+        edge = [(j, s.get("id")) for j, job in RELEASE["jobs"].items() for s in job.get("steps", []) if "LOCK_INFRA_EDGE" in (s.get("env") or {})]
+        self.assertEqual(edge, [("prepare", "take")])
+        self.assertEqual(step_of(RELEASE, "prepare", "Take the release lock")["env"]["LOCK_INFRA_EDGE"], "1")
 
 
 INFRA_RUNS = 'case "$*" in *workflows/release.yml/runs*) %s;; *) echo in_progress;; esac'
@@ -917,6 +941,200 @@ class Order(unittest.TestCase):
             out = order(running, git)
             self.assertEqual(out.returncode, 1, running)
             self.assertNotIn("skip=", out.output)
+
+
+
+class FreshCredentials(unittest.TestCase):
+    """A take may wait up to the cap and renews its session only in its own shell, so no later step of its job runs on the
+    job-start session or App token (playbook §5.4a "Waits that fit the runners" rule 4)."""
+
+    def test_every_step_after_a_waiting_take_has_fresh_credentials(self):
+        import check_lock_limits
+        checked = 0
+        for doc, wf in ((RELEASE, "release-ecs"), (OPERATE, "operate"), (LOCKWF, "release-lock")):
+            steps = doc["jobs"][LOCK_JOB[wf]]["steps"]
+            take = next(i for i, s in enumerate(steps) if check_lock_limits.waits(s))
+            role = next(s for s in steps[:take] if str(s.get("uses", "")).startswith("aws-actions/configure-aws-credentials@"))["with"]
+            fresh = False
+            for step in steps[take + 1:]:
+                if str(step.get("uses", "")).startswith("aws-actions/configure-aws-credentials@"):
+                    self.assertEqual(step["with"], role, wf)   # the same role, region and session name
+                    fresh = True
+                    continue
+                self.assertNotIn("steps.app.outputs.token", json.dumps(step), (wf, step.get("name")))   # minted before the wait
+                if re.search(r"(^|[\s;|&(])aws ", str(step.get("run", ""))):
+                    self.assertTrue(fresh, (wf, step.get("name")))
+                    checked += 1
+        self.assertGreater(checked, 0)   # prepare's order check reads S3 and ECS after the take
+
+
+class EdgeLimits(unittest.TestCase):
+    """§5.4a "Every wait and its limit": a live infra run holding infra.json gets the job's cap; only a run that is
+    queued, or live but holding no key, gets the 60 minutes."""
+
+    def waits(self, keys):
+        out = run(TAKE, keys=keys, gh=INFRA_RUNS % "echo 77", LOCK_INFRA_EDGE="1", LOCK_QUEUED_WAIT_SECONDS="1", LOCK_WAIT_CAP_SECONDS="6")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("::error::waiting for OnePeek/onepeek-infra (infra, run 77); re-run", out.stdout)
+        self.assertNotIn("put-object", out.calls)
+        return out.stdout.count("Waiting for the preprod release lock")
+
+    def test_a_live_infra_run_that_holds_infra_json_is_waited_for_up_to_the_cap(self):
+        self.assertGreaterEqual(self.waits({INFRA_KEY: record(INFRA, "77", scope="infra")}), 4)
+
+    def test_a_queued_infra_run_or_one_that_holds_no_key_gets_the_60_minutes(self):
+        self.assertLessEqual(self.waits({}), 2)
+
+
+class InfraOwnScope(unittest.TestCase):
+    def test_infra_waits_for_another_infra_run_under_the_cap_not_the_30_minute_app_limit(self):
+        held = record(INFRA, "77", scope="infra")
+        out = run(ACTION, keys={INFRA_KEY: held}, ACTION="take", LOCK_SCOPE="infra", GITHUB_REPOSITORY=INFRA,
+                  LOCK_WAIT_SECONDS="1", LOCK_WAIT_CAP_SECONDS="6")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("::error::waiting for OnePeek/onepeek-infra (infra, run 77); re-run", out.stdout)
+        self.assertGreaterEqual(out.stdout.count("Waiting for the preprod release lock"), 4)
+        self.assertEqual(out.keys, {INFRA_KEY: held})
+
+
+class ConflictETag(unittest.TestCase):
+    def test_a_409_after_which_the_etag_changed_means_the_key_is_lost(self):
+        # §5.4a "Answers to a conditional write": retry only while the ETag is still the one read and the record its own.
+        out = run(call("lock_write_phase rolling", "echo changed-something"), keys={LEGACY: mine(), BACKEND: mine()}, LOCK_TOKEN=TOKEN,
+                  CONFLICT_PUTS="1", CHANGE_ON_CONFLICT="1")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("changed during a conflicting write", out.stdout)
+        self.assertNotIn("changed-something", out.stdout)
+        self.assertEqual(json.loads(out.keys[LEGACY])["phase"], "locked")
+        self.assertEqual(out.puts, "")
+
+
+API_TD = PREV["api"]
+RECORD_PREVIOUS = step_of(RELEASE, "deploy", "Record every service's current task definition")
+ROLLBACK = step_of(RELEASE, "verify", "Put every service back on the revision recorded")
+
+
+class FirstDeploy(unittest.TestCase):
+    """A service first deployed by this release has no previous revision: it is recorded first-deploy and the put-back
+    scales it to 0 rather than refusing the whole put-back (playbook §5.4a, provisional 2026-11-06)."""
+
+    def test_previous_records_first_deploy_for_a_service_with_no_revision(self):
+        for missing in ("None", ""):
+            out = run(RECORD_PREVIOUS["run"], keys={LEGACY: mine(), BACKEND: mine()}, LOCK_TOKEN=TOKEN, DRY_RUN="false",
+                      SERVICES='["api", "worker"]', SEQ_DESCRIBE_SERVICES=json.dumps([API_TD, missing]))
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertEqual(json.loads(out.keys[BACKEND])["previous"], {"api": API_TD, "worker": "first-deploy"}, missing)
+
+    def test_operate_records_first_deploy_the_same_way(self):
+        self.assertIn('prev[svc] = td if td and td != "None" else "first-deploy"', job_step(OPERATE, "operate", "Redeploy or roll back"))
+
+    def test_the_put_back_scales_a_first_deployed_service_to_0_and_unlocks(self):
+        held = mine("rolling", previous={"api": API_TD, "worker": "first-deploy"})
+        out = run(FINISH, keys={LEGACY: held, BACKEND: held}, LOCK_TOKEN=TOKEN, GH_TOKEN="gh")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(f"aws ecs update-service --cluster onepeek-preprod --service api --task-definition {API_TD}", out.calls)
+        self.assertIn("aws ecs update-service --cluster onepeek-preprod --service worker --desired-count 0", out.calls)
+        self.assertIn("aws ecs wait services-stable --cluster onepeek-preprod --services api worker", out.calls)
+        self.assertEqual(out.keys, {})
+
+    def test_a_previous_entry_that_is_neither_a_revision_nor_first_deploy_still_refuses_the_put_back(self):
+        held = mine("rolling", previous={"api": "None"})
+        out = run(FINISH, keys={LEGACY: held, BACKEND: held}, LOCK_TOKEN=TOKEN)
+        self.assertEqual(out.returncode, 1)
+        self.assertNotIn("update-service", out.calls)
+        self.assertEqual(out.keys, {LEGACY: held, BACKEND: held})
+
+    def test_verifys_rollback_scales_a_first_deployed_service_to_0(self):
+        out = run(ROLLBACK["run"], PREVIOUS=json.dumps({"api": API_TD, "worker": "first-deploy"}), HAS_SANDBOX="")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(f"--service api --task-definition {API_TD}", out.calls)
+        self.assertIn("--service worker --desired-count 0", out.calls)
+        self.assertNotIn("--task-definition first-deploy", out.calls)
+
+
+class ManualPath(unittest.TestCase):
+    """Until cancel-release.yml exists (.github #55), every message naming it also gives the manual path."""
+
+    def says_the_manual_path(self, text):
+        self.assertIn("cancel-release.yml", text)
+        self.assertIn("python3 .github/workspace/lock_status.py preprod", text)
+        self.assertIn("the founder only deletes it with the conditional delete (aws s3api delete-object --if-match <its ETag>)", text)
+
+    def test_a_rolling_key_names_cancel_release_and_the_manual_path(self):
+        out = run(TAKE, keys={BACKEND: record(REPO, "88", scope="backend", phase="rolling")}, gh="echo completed")
+        self.assertEqual(out.returncode, 1)
+        self.says_the_manual_path(out.stdout)
+
+    def test_a_failed_put_back_names_cancel_release_and_the_manual_path(self):
+        held = mine("rolling", previous=PREV)
+        out = run(FINISH, keys={LEGACY: held, BACKEND: held}, LOCK_TOKEN=TOKEN, FAIL_UPDATE_SERVICE="ServiceNotFound")
+        self.assertEqual(out.returncode, 1)
+        self.says_the_manual_path(out.stdout)
+
+
+OPERATE_STEP = job_step(OPERATE, "operate", "Redeploy or roll back")
+SERVICES_FILE = "services:\n  api:\n    image: backend\n    triggers: [http]\n"
+TEMPLATE = json.dumps({"family": "onepeek-preprod-api", "containerDefinitions": [{"name": "api", "image": ""}]})
+
+
+# docker and cosign read the password from stdin as the real tools do: a stub that exits without reading it breaks the pipe
+# under `aws ecr get-login-password | docker login --password-stdin`, and the fake aws then exits 120 (Linux runners race this).
+READS_PASSWORD = 'case " $* " in *" --password-stdin "*) cat >/dev/null ;; esac\nexit 0'
+TOOL_STUBS = {"docker": READS_PASSWORD, "cosign": READS_PASSWORD, "curl": "exit 0"}
+
+
+class OperateRolling(unittest.TestCase):
+    """operate.yml's phases (playbook §5.4a "Rollback on cancel", operate.yml): a redeploy writes rolling before its first
+    update-service, so a failure puts it back; a rollback never puts back, and a failed one stays locked with an alert."""
+
+    def operate(self, action):
+        stubs = TOOL_STUBS
+        return run(OPERATE_STEP, keys={LEGACY: mine(), BACKEND: mine()}, files={"services.yaml": SERVICES_FILE}, stubs=stubs,
+                   ACTION=action, SERVICE="api", TARGET="sha-" + "2" * 12 if action == "rollback" else "", REASON="test", LOCK_TOKEN=TOKEN,
+                   AWS_REGION="ap-south-1", DOMAIN_PREPROD="preprod.example", AWS_GET_CALLER_IDENTITY="111111111111",
+                   AWS_DESCRIBE_SERVICES=API_TD, AWS_CP=TEMPLATE, AWS_DESCRIBE_IMAGES="sha256:" + "a" * 64,
+                   SEQ_DESCRIBE_TASK_DEFINITION=json.dumps(["sha-" + "1" * 12, json.dumps({"containerDefinitions": [{"name": "api"}]})]),
+                   AWS_REGISTER_TASK_DEFINITION=API_TD.replace(":6", ":9"), AWS_DESCRIBE_ALARMS="onepeek-preprod-deploy-api-errors")  # fmt: skip
+
+    def test_a_redeploy_writes_rolling_with_previous_before_its_first_update_service(self):
+        out = self.operate("redeploy")
+        self.assertEqual(out.returncode, 1)   # the watch saw an alarm
+        self.assertIn("Deploy alarms firing", out.stdout)
+        rec = json.loads(out.keys[BACKEND])
+        self.assertEqual((rec["phase"], rec["previous"]), ("rolling", {"api": API_TD}))   # so the unlock job puts it back
+        lines = out.calls.splitlines()
+        rolling = next(i for i, l in enumerate(lines) if "put-object" in l and BACKEND in l)
+        update = next(i for i, l in enumerate(lines) if "update-service" in l)
+        self.assertLess(rolling, update)
+
+    def test_a_failed_rollback_stays_locked_never_rolling_and_fails_with_an_alert(self):
+        out = self.operate("rollback")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("update-service --cluster onepeek-preprod --service api --task-definition", out.calls)
+        self.assertEqual({k: json.loads(v)["phase"] for k, v in out.keys.items()}, {LEGACY: "locked", BACKEND: "locked"})
+        self.assertNotIn("previous", out.keys[BACKEND])
+        self.assertEqual(out.puts, "")
+        self.assertIn("::error::The rollback of api in preprod failed, and nothing is put back", out.stdout)
+        self.assertIn("The unlock job frees the key (phase locked, nothing put back)", out.stdout)
+        self.assertIn("cancel-release.yml", out.stdout)
+        self.assertNotIn("delete", out.stdout.lower())   # never tells anyone to delete the key by hand
+        self.assertNotIn("succeeded but", out.stdout)
+        self.assertIn("The rollback of api in preprod failed", out.summary)
+
+    def test_a_rollback_whose_final_phase_write_fails_is_not_reported_as_a_failed_rollback(self):
+        quick = OPERATE_STEP.replace("SECONDS + 300", "SECONDS + 0")   # no alarm: the watch ends at once
+        self.assertNotEqual(quick, OPERATE_STEP)
+        out = run(quick, keys={LEGACY: mine(), BACKEND: mine()}, files={"services.yaml": SERVICES_FILE},
+                  stubs=TOOL_STUBS, FAIL_PUT_OBJECT="AccessDenied",
+                  ACTION="rollback", SERVICE="api", TARGET="sha-" + "2" * 12, REASON="test", LOCK_TOKEN=TOKEN,
+                  AWS_REGION="ap-south-1", DOMAIN_PREPROD="preprod.example", AWS_GET_CALLER_IDENTITY="111111111111",
+                  AWS_DESCRIBE_SERVICES=API_TD, AWS_CP=TEMPLATE, AWS_DESCRIBE_IMAGES="sha256:" + "a" * 64,
+                  SEQ_DESCRIBE_TASK_DEFINITION=json.dumps(["sha-" + "1" * 12, json.dumps({"containerDefinitions": [{"name": "api"}]})]),
+                  AWS_REGISTER_TASK_DEFINITION=API_TD.replace(":6", ":9"), AWS_DESCRIBE_ALARMS="")  # fmt: skip
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("The rollback of api in preprod succeeded but its phase write failed", out.stdout)
+        self.assertNotIn("preprod failed", out.stdout)
+        self.assertIn("succeeded but its phase write failed", out.summary)
 
 
 if __name__ == "__main__":

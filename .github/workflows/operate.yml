@@ -190,7 +190,7 @@ jobs:
           # write) and the run waits holding nothing, so no run ever waits while it holds a key.
           # The record names the repo, run ID, run attempt, commit, start time, a random token, the scope and the phase (locked,
           # migrating, rolling or done). Only the holder (or the one repairer that claimed it) writes it, with If-Match on the
-          # ETag it read; a 412 means the key is lost, a 409 is re-read and retried up to 3 times. A key whose holder's run has
+          # ETag it read; a 412 means the key is lost, a 409 is re-read and retried up to 3 times while the ETag is unchanged. A key whose holder's run has
           # finished is taken over by its phase: locked or done, removed; migrating, removed only once the migrate task has
           # stopped; rolling, never (cancel-release.yml repairs it). Anything unreadable fails closed: no lock, no deploy.
           # preprod-frozen: while s3://onepeek-<env>-deploy/locks/frozen.json exists (written from a hotfix/* branch, §5.6), it
@@ -360,10 +360,11 @@ jobs:
                 echo "::error::The App token could not be minted again (JWT)."; return 1
               fi
               repo="${LOCK_APP_REPOS%%,*}"
-              if ! installation=$(curl -sSf -H "Authorization: Bearer ${jwt}" -H "Accept: application/vnd.github+json" \
+              # Every bearer token goes to curl as a header file (-H @file, written by the printf builtin), never on its command line.
+              if ! installation=$(curl -sSf -H @<(printf 'Authorization: Bearer %s\n' "${jwt}") -H "Accept: application/vnd.github+json" \
                   "${GITHUB_API_URL:-https://api.github.com}/repos/${LOCK_OWNER}/${repo}/installation" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])') \
                 || ! LOCK_GH_TOKEN=$(LOCK_APP_REPOS="${LOCK_APP_REPOS}" python3 -c 'import json,os;print(json.dumps({"repositories": os.environ["LOCK_APP_REPOS"].split(","), "permissions": json.loads(os.environ["LOCK_APP_PERMISSIONS"])}))' \
-                  | curl -sSf -X POST -H "Authorization: Bearer ${jwt}" -H "Accept: application/vnd.github+json" --data @- \
+                  | curl -sSf -X POST -H @<(printf 'Authorization: Bearer %s\n' "${jwt}") -H "Accept: application/vnd.github+json" --data @- \
                     "${GITHUB_API_URL:-https://api.github.com}/app/installations/${installation}/access_tokens" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])'); then
                 echo "::error::The App token could not be minted again."; return 1
               fi
@@ -371,7 +372,7 @@ jobs:
               echo "Minted a new App token."
             fi
             if [ -n "${LOCK_ROLE_ARN:-}" ]; then
-              if ! jwt=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
+              if ! jwt=$(curl -sSf -H @<(printf 'Authorization: bearer %s\n' "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}") "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
                   | python3 -c 'import json,sys;print(json.load(sys.stdin)["value"])') \
                 || ! creds=$(aws sts assume-role-with-web-identity --role-arn "${LOCK_ROLE_ARN}" --role-session-name "${LOCK_ROLE_SESSION}" \
                   --web-identity-token "${jwt}" --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>"${LOCK_ERR}"); then
@@ -455,7 +456,7 @@ jobs:
                 # An earlier attempt of this run (one attempt runs at a time), or a finished run: taken over by its phase.
                 case "${phase}" in
                   rolling)
-                    echo "::error::s3://${LOCK_BUCKET}/$1 is held rolling by $(lock_url "${repo}" "${run}"), whose run has ended with its services part-way between two versions: nothing deploys until cancel-release.yml in ${repo} puts them back and frees it (delivery-pipelines UC-DEL-009)."
+                    echo "::error::s3://${LOCK_BUCKET}/$1 is held rolling by $(lock_url "${repo}" "${run}"), whose run has ended with its services part-way between two versions: nothing deploys until cancel-release.yml in ${repo} puts them back and frees it (delivery-pipelines UC-DEL-009). Until cancel-release.yml exists (.github #55), the manual path: read the key with python3 .github/workspace/lock_status.py ${ENVIRONMENT}, then the founder only deletes it with the conditional delete (aws s3api delete-object --if-match <its ETag>)."
                     return 1 ;;
                   migrating)
                     rc=0
@@ -473,25 +474,29 @@ jobs:
                 if [ "${rc}" -eq 1 ]; then return 1; fi
                 continue
               fi
-              if [ "${scope}" = "${LOCK_SCOPE}" ]; then LOCK_BLOCKER="${repo} ${scope} ${run} own"; else LOCK_BLOCKER="${repo} ${scope} ${run} other"; fi
+              # The 30-minute own-scope limit is an app's (§5.4a "Every wait and its limit"). Infra waits for any holder, another
+              # infra run included, under the release-lock row's cap only.
+              if [ "${scope}" = "${LOCK_SCOPE}" ] && [ "${LOCK_SCOPE}" != "infra" ]; then LOCK_BLOCKER="${repo} ${scope} ${run} own"; else LOCK_BLOCKER="${repo} ${scope} ${run} other"; fi
               return 4
             done
           }
-          lock_edge_busy() {  # 0 while an infra release run is queued or running or infra.json is held by a live run (LOCK_BLOCKER set), 1 not, 2 unreadable
+          lock_edge_busy() {  # 0 while infra.json is held by a live run or an infra release run is queued or running (LOCK_BLOCKER set), 1 not, 2 unreadable
             local live etag holder repo run rest infra
             infra=$(lock_scope_repo infra)
+            # A live run that holds infra.json counts towards the job's cap; only a run that is queued, or live but holding no
+            # key yet, counts towards the 60-minute limit (§5.4a "Every wait and its limit"). So infra.json is read first.
+            if ! etag=$(lock_read locks/infra.json lock-infra.json); then return 2; fi
+            if [ "${etag}" != "absent" ]; then
+              if ! holder=$(lock_holder lock-infra.json); then return 2; fi
+              read -r repo run rest <<< "${holder}"
+              if ! lock_run_finished "${repo}" "${run}"; then LOCK_BLOCKER="${repo} infra ${run} other"; return 0; fi
+            fi
             if ! live=$(GH_TOKEN="${LOCK_GH_TOKEN}" gh api "repos/${infra}/actions/workflows/release.yml/runs?per_page=20" \
                 --jq '[.workflow_runs[] | select(.status != "completed") | .id] | first // ""' 2>"${LOCK_ERR}"); then
               echo "::error::The infra release runs cannot be read: $(cat "${LOCK_ERR}")" >&2; return 2
             fi
             if [ -n "${live}" ]; then LOCK_BLOCKER="${infra} infra ${live} queued"; return 0; fi
-            if ! etag=$(lock_read locks/infra.json lock-infra.json); then return 2; fi
-            if [ "${etag}" = "absent" ]; then return 1; fi
-            if ! holder=$(lock_holder lock-infra.json); then return 2; fi
-            read -r repo run rest <<< "${holder}"
-            if lock_run_finished "${repo}" "${run}"; then return 1; fi
-            LOCK_BLOCKER="${repo} infra ${run} other"
-            return 0
+            return 1
           }
           lock_take() {  # takes every key of LOCK_SCOPE try-or-release; waits holding nothing within the limits, then fails with the re-run message
             local key keys rc state reason start own=0 queued=0 taken holder scope run kind where
@@ -554,15 +559,19 @@ jobs:
             done
           }
           lock_write_phase() {  # lock_write_phase <phase> [JSON of fields to set; null removes one]: the holder's conditional write to every key it holds
-            local key keys etag holder rc tries fields="${2:-}"
+            local key keys etag holder rc tries conflicted fields="${2:-}"
             if [ -z "${fields}" ]; then fields='{}'; fi
             if ! keys=$(lock_keys); then return 1; fi
             read -r -a keys <<< "${keys}"
             for key in "${keys[@]}"; do
               tries=0
+              conflicted=""
               while :; do
                 if ! etag=$(lock_read "${key}" lock-phase-held.json); then
                   echo "::error::s3://${LOCK_BUCKET}/${key} is unreadable, so this run has lost the release lock and changes nothing more."; return 1
+                fi
+                if [ -n "${conflicted}" ] && [ "${etag}" != "${conflicted}" ]; then   # after a 409, a changed ETag means the key is lost
+                  echo "::error::s3://${LOCK_BUCKET}/${key} changed during a conflicting write, so this run has lost the release lock and changes nothing more."; return 1
                 fi
                 if [ "${etag}" = "absent" ] || ! holder=$(lock_holder lock-phase-held.json) || ! lock_is_mine "${holder}" || [ "$(echo "${holder}" | cut -d' ' -f8)" != "-" ]; then
                   echo "::error::s3://${LOCK_BUCKET}/${key} is no longer this run's record, so this run has lost the release lock and changes nothing more."; return 1
@@ -583,8 +592,8 @@ jobs:
                 rc=0
                 lock_put "${key}" lock-phase-mine.json "${etag}" || rc=$?
                 if [ "${rc}" -eq 0 ]; then break; fi
-                if [ "${rc}" -eq 3 ] && [ "${tries}" -lt 3 ]; then   # 409: another conditional write was in flight; re-read, retry if still ours
-                  tries=$((tries + 1)); sleep 1; continue
+                if [ "${rc}" -eq 3 ] && [ "${tries}" -lt 3 ]; then   # 409: another conditional write was in flight; re-read, retry only on the same ETag and still ours
+                  tries=$((tries + 1)); conflicted="${etag}"; sleep 1; continue
                 fi
                 if [ "${rc}" -eq 1 ]; then echo "::error::This run has lost the release lock and changes nothing more."; return 1; fi
                 echo "::error::s3://${LOCK_BUCKET}/${key} changed under this run (a repairer claimed it, or it was taken again), so this run has lost the release lock and changes nothing more."
@@ -593,16 +602,21 @@ jobs:
               echo "s3://${LOCK_BUCKET}/${key}: phase $1."
             done
           }
-          lock_put_back() {  # lock_put_back <record file>: every service in previous back to its revision, services-stable, the sandbox aliases, an issue
+          lock_put_back() {  # lock_put_back <record file>: every service in previous back to its revision (first-deploy: to 0), services-stable, the sandbox aliases, an issue
             local kind svc td fn ver stable=""
             if ! python3 -c '
           import json, re, sys
           r = json.load(open(sys.argv[1]))
           prev, lam = r.get("previous") or {}, r.get("previous_lambda") or {}
           for s, td in prev.items():
-              if not (re.fullmatch(r"[a-z0-9][a-z0-9-]*", s) and re.fullmatch(r"arn:aws:ecs:[a-z0-9-]+:[0-9]{12}:task-definition/[A-Za-z0-9_-]+:[0-9]+", td)):
+              if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", s):
                   sys.exit("bad previous entry: %r" % s)
-              print("service", s, td)
+              if td == "first-deploy":   # first deployed by this release: no revision to go back to, so it is scaled to 0
+                  print("first", s, "-")
+              elif re.fullmatch(r"arn:aws:ecs:[a-z0-9-]+:[0-9]{12}:task-definition/[A-Za-z0-9_-]+:[0-9]+", td):
+                  print("service", s, td)
+              else:
+                  sys.exit("bad previous entry: %r" % s)
           for f, v in lam.items():
               if not (re.fullmatch(r"[A-Za-z0-9_-]+", f) and str(v).isdigit()):
                   sys.exit("bad previous_lambda entry: %r" % f)
@@ -610,11 +624,19 @@ jobs:
               echo "::error::The record's previous revisions are unreadable: nothing can be put back."; return 1
             fi
             while read -r kind svc td; do
-              if [ "${kind}" != "service" ]; then continue; fi
-              if ! aws ecs update-service --cluster "${NAME}" --service "${svc}" --task-definition "${td}" >/dev/null; then
-                echo "::error::${svc} could not be put back on ${td##*/}."; return 1
-              fi
-              echo "Put ${svc} back on ${td##*/}."
+              case "${kind}" in
+                service)
+                  if ! aws ecs update-service --cluster "${NAME}" --service "${svc}" --task-definition "${td}" >/dev/null; then
+                    echo "::error::${svc} could not be put back on ${td##*/}."; return 1
+                  fi
+                  echo "Put ${svc} back on ${td##*/}." ;;
+                first)
+                  if ! aws ecs update-service --cluster "${NAME}" --service "${svc}" --desired-count 0 >/dev/null; then
+                    echo "::error::${svc}, first deployed by this release, could not be scaled to 0."; return 1
+                  fi
+                  echo "Scaled ${svc} to 0: this release deployed it first, so it has no revision to go back to." ;;
+                *) continue ;;
+              esac
               stable="${stable} ${svc}"
             done < lock-put-back.txt
             if [ -n "${stable}" ]; then
@@ -680,7 +702,7 @@ jobs:
               rolling)
                 echo "The rollout began and nothing confirmed an end: every service goes back to its recorded revision."
                 if ! lock_put_back "${first}"; then
-                  echo "::error::The put-back failed, so the key stays rolling: run cancel-release.yml in ${GITHUB_REPOSITORY} to put the services back and free it."; return 1
+                  echo "::error::The put-back failed, so the key stays rolling: run cancel-release.yml in ${GITHUB_REPOSITORY} to put the services back and free it. Until cancel-release.yml exists (.github #55), the manual path: read the key with python3 .github/workspace/lock_status.py ${ENVIRONMENT}, then the founder only deletes it with the conditional delete (aws s3api delete-object --if-match <its ETag>)."; return 1
                 fi ;;
             esac
             for key in "${mine[@]}"; do
@@ -810,7 +832,7 @@ jobs:
           # write) and the run waits holding nothing, so no run ever waits while it holds a key.
           # The record names the repo, run ID, run attempt, commit, start time, a random token, the scope and the phase (locked,
           # migrating, rolling or done). Only the holder (or the one repairer that claimed it) writes it, with If-Match on the
-          # ETag it read; a 412 means the key is lost, a 409 is re-read and retried up to 3 times. A key whose holder's run has
+          # ETag it read; a 412 means the key is lost, a 409 is re-read and retried up to 3 times while the ETag is unchanged. A key whose holder's run has
           # finished is taken over by its phase: locked or done, removed; migrating, removed only once the migrate task has
           # stopped; rolling, never (cancel-release.yml repairs it). Anything unreadable fails closed: no lock, no deploy.
           # preprod-frozen: while s3://onepeek-<env>-deploy/locks/frozen.json exists (written from a hotfix/* branch, §5.6), it
@@ -980,10 +1002,11 @@ jobs:
                 echo "::error::The App token could not be minted again (JWT)."; return 1
               fi
               repo="${LOCK_APP_REPOS%%,*}"
-              if ! installation=$(curl -sSf -H "Authorization: Bearer ${jwt}" -H "Accept: application/vnd.github+json" \
+              # Every bearer token goes to curl as a header file (-H @file, written by the printf builtin), never on its command line.
+              if ! installation=$(curl -sSf -H @<(printf 'Authorization: Bearer %s\n' "${jwt}") -H "Accept: application/vnd.github+json" \
                   "${GITHUB_API_URL:-https://api.github.com}/repos/${LOCK_OWNER}/${repo}/installation" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])') \
                 || ! LOCK_GH_TOKEN=$(LOCK_APP_REPOS="${LOCK_APP_REPOS}" python3 -c 'import json,os;print(json.dumps({"repositories": os.environ["LOCK_APP_REPOS"].split(","), "permissions": json.loads(os.environ["LOCK_APP_PERMISSIONS"])}))' \
-                  | curl -sSf -X POST -H "Authorization: Bearer ${jwt}" -H "Accept: application/vnd.github+json" --data @- \
+                  | curl -sSf -X POST -H @<(printf 'Authorization: Bearer %s\n' "${jwt}") -H "Accept: application/vnd.github+json" --data @- \
                     "${GITHUB_API_URL:-https://api.github.com}/app/installations/${installation}/access_tokens" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])'); then
                 echo "::error::The App token could not be minted again."; return 1
               fi
@@ -991,7 +1014,7 @@ jobs:
               echo "Minted a new App token."
             fi
             if [ -n "${LOCK_ROLE_ARN:-}" ]; then
-              if ! jwt=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
+              if ! jwt=$(curl -sSf -H @<(printf 'Authorization: bearer %s\n' "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}") "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
                   | python3 -c 'import json,sys;print(json.load(sys.stdin)["value"])') \
                 || ! creds=$(aws sts assume-role-with-web-identity --role-arn "${LOCK_ROLE_ARN}" --role-session-name "${LOCK_ROLE_SESSION}" \
                   --web-identity-token "${jwt}" --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>"${LOCK_ERR}"); then
@@ -1075,7 +1098,7 @@ jobs:
                 # An earlier attempt of this run (one attempt runs at a time), or a finished run: taken over by its phase.
                 case "${phase}" in
                   rolling)
-                    echo "::error::s3://${LOCK_BUCKET}/$1 is held rolling by $(lock_url "${repo}" "${run}"), whose run has ended with its services part-way between two versions: nothing deploys until cancel-release.yml in ${repo} puts them back and frees it (delivery-pipelines UC-DEL-009)."
+                    echo "::error::s3://${LOCK_BUCKET}/$1 is held rolling by $(lock_url "${repo}" "${run}"), whose run has ended with its services part-way between two versions: nothing deploys until cancel-release.yml in ${repo} puts them back and frees it (delivery-pipelines UC-DEL-009). Until cancel-release.yml exists (.github #55), the manual path: read the key with python3 .github/workspace/lock_status.py ${ENVIRONMENT}, then the founder only deletes it with the conditional delete (aws s3api delete-object --if-match <its ETag>)."
                     return 1 ;;
                   migrating)
                     rc=0
@@ -1093,25 +1116,29 @@ jobs:
                 if [ "${rc}" -eq 1 ]; then return 1; fi
                 continue
               fi
-              if [ "${scope}" = "${LOCK_SCOPE}" ]; then LOCK_BLOCKER="${repo} ${scope} ${run} own"; else LOCK_BLOCKER="${repo} ${scope} ${run} other"; fi
+              # The 30-minute own-scope limit is an app's (§5.4a "Every wait and its limit"). Infra waits for any holder, another
+              # infra run included, under the release-lock row's cap only.
+              if [ "${scope}" = "${LOCK_SCOPE}" ] && [ "${LOCK_SCOPE}" != "infra" ]; then LOCK_BLOCKER="${repo} ${scope} ${run} own"; else LOCK_BLOCKER="${repo} ${scope} ${run} other"; fi
               return 4
             done
           }
-          lock_edge_busy() {  # 0 while an infra release run is queued or running or infra.json is held by a live run (LOCK_BLOCKER set), 1 not, 2 unreadable
+          lock_edge_busy() {  # 0 while infra.json is held by a live run or an infra release run is queued or running (LOCK_BLOCKER set), 1 not, 2 unreadable
             local live etag holder repo run rest infra
             infra=$(lock_scope_repo infra)
+            # A live run that holds infra.json counts towards the job's cap; only a run that is queued, or live but holding no
+            # key yet, counts towards the 60-minute limit (§5.4a "Every wait and its limit"). So infra.json is read first.
+            if ! etag=$(lock_read locks/infra.json lock-infra.json); then return 2; fi
+            if [ "${etag}" != "absent" ]; then
+              if ! holder=$(lock_holder lock-infra.json); then return 2; fi
+              read -r repo run rest <<< "${holder}"
+              if ! lock_run_finished "${repo}" "${run}"; then LOCK_BLOCKER="${repo} infra ${run} other"; return 0; fi
+            fi
             if ! live=$(GH_TOKEN="${LOCK_GH_TOKEN}" gh api "repos/${infra}/actions/workflows/release.yml/runs?per_page=20" \
                 --jq '[.workflow_runs[] | select(.status != "completed") | .id] | first // ""' 2>"${LOCK_ERR}"); then
               echo "::error::The infra release runs cannot be read: $(cat "${LOCK_ERR}")" >&2; return 2
             fi
             if [ -n "${live}" ]; then LOCK_BLOCKER="${infra} infra ${live} queued"; return 0; fi
-            if ! etag=$(lock_read locks/infra.json lock-infra.json); then return 2; fi
-            if [ "${etag}" = "absent" ]; then return 1; fi
-            if ! holder=$(lock_holder lock-infra.json); then return 2; fi
-            read -r repo run rest <<< "${holder}"
-            if lock_run_finished "${repo}" "${run}"; then return 1; fi
-            LOCK_BLOCKER="${repo} infra ${run} other"
-            return 0
+            return 1
           }
           lock_take() {  # takes every key of LOCK_SCOPE try-or-release; waits holding nothing within the limits, then fails with the re-run message
             local key keys rc state reason start own=0 queued=0 taken holder scope run kind where
@@ -1174,15 +1201,19 @@ jobs:
             done
           }
           lock_write_phase() {  # lock_write_phase <phase> [JSON of fields to set; null removes one]: the holder's conditional write to every key it holds
-            local key keys etag holder rc tries fields="${2:-}"
+            local key keys etag holder rc tries conflicted fields="${2:-}"
             if [ -z "${fields}" ]; then fields='{}'; fi
             if ! keys=$(lock_keys); then return 1; fi
             read -r -a keys <<< "${keys}"
             for key in "${keys[@]}"; do
               tries=0
+              conflicted=""
               while :; do
                 if ! etag=$(lock_read "${key}" lock-phase-held.json); then
                   echo "::error::s3://${LOCK_BUCKET}/${key} is unreadable, so this run has lost the release lock and changes nothing more."; return 1
+                fi
+                if [ -n "${conflicted}" ] && [ "${etag}" != "${conflicted}" ]; then   # after a 409, a changed ETag means the key is lost
+                  echo "::error::s3://${LOCK_BUCKET}/${key} changed during a conflicting write, so this run has lost the release lock and changes nothing more."; return 1
                 fi
                 if [ "${etag}" = "absent" ] || ! holder=$(lock_holder lock-phase-held.json) || ! lock_is_mine "${holder}" || [ "$(echo "${holder}" | cut -d' ' -f8)" != "-" ]; then
                   echo "::error::s3://${LOCK_BUCKET}/${key} is no longer this run's record, so this run has lost the release lock and changes nothing more."; return 1
@@ -1203,8 +1234,8 @@ jobs:
                 rc=0
                 lock_put "${key}" lock-phase-mine.json "${etag}" || rc=$?
                 if [ "${rc}" -eq 0 ]; then break; fi
-                if [ "${rc}" -eq 3 ] && [ "${tries}" -lt 3 ]; then   # 409: another conditional write was in flight; re-read, retry if still ours
-                  tries=$((tries + 1)); sleep 1; continue
+                if [ "${rc}" -eq 3 ] && [ "${tries}" -lt 3 ]; then   # 409: another conditional write was in flight; re-read, retry only on the same ETag and still ours
+                  tries=$((tries + 1)); conflicted="${etag}"; sleep 1; continue
                 fi
                 if [ "${rc}" -eq 1 ]; then echo "::error::This run has lost the release lock and changes nothing more."; return 1; fi
                 echo "::error::s3://${LOCK_BUCKET}/${key} changed under this run (a repairer claimed it, or it was taken again), so this run has lost the release lock and changes nothing more."
@@ -1213,16 +1244,21 @@ jobs:
               echo "s3://${LOCK_BUCKET}/${key}: phase $1."
             done
           }
-          lock_put_back() {  # lock_put_back <record file>: every service in previous back to its revision, services-stable, the sandbox aliases, an issue
+          lock_put_back() {  # lock_put_back <record file>: every service in previous back to its revision (first-deploy: to 0), services-stable, the sandbox aliases, an issue
             local kind svc td fn ver stable=""
             if ! python3 -c '
           import json, re, sys
           r = json.load(open(sys.argv[1]))
           prev, lam = r.get("previous") or {}, r.get("previous_lambda") or {}
           for s, td in prev.items():
-              if not (re.fullmatch(r"[a-z0-9][a-z0-9-]*", s) and re.fullmatch(r"arn:aws:ecs:[a-z0-9-]+:[0-9]{12}:task-definition/[A-Za-z0-9_-]+:[0-9]+", td)):
+              if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", s):
                   sys.exit("bad previous entry: %r" % s)
-              print("service", s, td)
+              if td == "first-deploy":   # first deployed by this release: no revision to go back to, so it is scaled to 0
+                  print("first", s, "-")
+              elif re.fullmatch(r"arn:aws:ecs:[a-z0-9-]+:[0-9]{12}:task-definition/[A-Za-z0-9_-]+:[0-9]+", td):
+                  print("service", s, td)
+              else:
+                  sys.exit("bad previous entry: %r" % s)
           for f, v in lam.items():
               if not (re.fullmatch(r"[A-Za-z0-9_-]+", f) and str(v).isdigit()):
                   sys.exit("bad previous_lambda entry: %r" % f)
@@ -1230,11 +1266,19 @@ jobs:
               echo "::error::The record's previous revisions are unreadable: nothing can be put back."; return 1
             fi
             while read -r kind svc td; do
-              if [ "${kind}" != "service" ]; then continue; fi
-              if ! aws ecs update-service --cluster "${NAME}" --service "${svc}" --task-definition "${td}" >/dev/null; then
-                echo "::error::${svc} could not be put back on ${td##*/}."; return 1
-              fi
-              echo "Put ${svc} back on ${td##*/}."
+              case "${kind}" in
+                service)
+                  if ! aws ecs update-service --cluster "${NAME}" --service "${svc}" --task-definition "${td}" >/dev/null; then
+                    echo "::error::${svc} could not be put back on ${td##*/}."; return 1
+                  fi
+                  echo "Put ${svc} back on ${td##*/}." ;;
+                first)
+                  if ! aws ecs update-service --cluster "${NAME}" --service "${svc}" --desired-count 0 >/dev/null; then
+                    echo "::error::${svc}, first deployed by this release, could not be scaled to 0."; return 1
+                  fi
+                  echo "Scaled ${svc} to 0: this release deployed it first, so it has no revision to go back to." ;;
+                *) continue ;;
+              esac
               stable="${stable} ${svc}"
             done < lock-put-back.txt
             if [ -n "${stable}" ]; then
@@ -1300,7 +1344,7 @@ jobs:
               rolling)
                 echo "The rollout began and nothing confirmed an end: every service goes back to its recorded revision."
                 if ! lock_put_back "${first}"; then
-                  echo "::error::The put-back failed, so the key stays rolling: run cancel-release.yml in ${GITHUB_REPOSITORY} to put the services back and free it."; return 1
+                  echo "::error::The put-back failed, so the key stays rolling: run cancel-release.yml in ${GITHUB_REPOSITORY} to put the services back and free it. Until cancel-release.yml exists (.github #55), the manual path: read the key with python3 .github/workspace/lock_status.py ${ENVIRONMENT}, then the founder only deletes it with the conditional delete (aws s3api delete-object --if-match <its ETag>)."; return 1
                 fi ;;
             esac
             for key in "${mine[@]}"; do
@@ -1399,11 +1443,20 @@ jobs:
           import json, os, subprocess
           prev = {}
           for svc in open("selected.txt").read().split():
-              prev[svc] = subprocess.run(["aws", "ecs", "describe-services", "--cluster", os.environ["NAME"], "--services", svc, "--query",
-                                          "services[0].taskDefinition", "--output", "text"], check=True, capture_output=True, text=True).stdout.strip()
+              td = subprocess.run(["aws", "ecs", "describe-services", "--cluster", os.environ["NAME"], "--services", svc, "--query",
+                                   "services[0].taskDefinition", "--output", "text"], check=True, capture_output=True, text=True).stdout.strip()
+              prev[svc] = td if td and td != "None" else "first-deploy"   # no revision yet: the put-back scales it to 0
           json.dump({"previous": prev, "previous_lambda": {}}, open("previous.json", "w"))
           PY
-          lock_write_phase rolling "$(cat previous.json)" || exit 1
+          if [ "${ACTION}" = "rollback" ]; then
+            # A rollback never puts back (playbook §5.4a "Rollback on cancel", operate.yml): it is itself the restoring action,
+            # and its watch can still see alarms from the bad version it replaced, so putting previous back would reinstate
+            # that version. The record stays locked, never rolling, and a failed rollback fails the run with an alert.
+            ROLLBACK_OK=""   # set once the rollback itself (stable, smoke, watch) succeeded, so a failed final phase write is told apart
+            trap 'rc=$?; if [ "${rc}" -ne 0 ]; then if [ -n "${ROLLBACK_OK}" ]; then what="The rollback of ${SERVICE} in ${ENVIRONMENT} succeeded but its phase write failed"; else what="The rollback of ${SERVICE} in ${ENVIRONMENT} failed"; fi; echo "::error::${what}, and nothing is put back: the lock record stays locked, never rolling. The unlock job frees the key (phase locked, nothing put back), and a person decides the next step: cancel-release.yml once it exists (.github #55), or a new release."; echo "${what}; nothing put back: ${REASON}" >> "$GITHUB_STEP_SUMMARY"; fi' EXIT
+          else
+            lock_write_phase rolling "$(cat previous.json)" || exit 1
+          fi
           VERSION_NOW=""
           while read -r svc; do
             image=$(awk -F'\t' -v s="${svc}" '$1==s{print $2}' targets.tsv)
@@ -1527,6 +1580,7 @@ jobs:
             if [ -n "${alarms}" ]; then echo "::error::Deploy alarms firing: ${alarms}"; exit 1; fi
             sleep 30
           done
+          ROLLBACK_OK=yes
           lock_write_phase "done" || exit 1   # stable, smoke and watch passed: nothing to undo
           echo "${ACTION} ${SERVICE} ${VERSION_NOW}: ${REASON}" >> "$GITHUB_STEP_SUMMARY"
       - name: Deployment record with the reason
@@ -1571,6 +1625,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - name: Release the release lock
+        timeout-minutes: 40   # its migrate wait 15 and put-back 20, plus 5 for the reads and deletes (playbook §5.4a)
         env:
           LOCK_TOKEN: ${{ needs.lock.outputs.token }}
           LOCK_SCOPE: ${{ needs.lock.outputs.scope }}
@@ -1586,7 +1641,7 @@ jobs:
           # write) and the run waits holding nothing, so no run ever waits while it holds a key.
           # The record names the repo, run ID, run attempt, commit, start time, a random token, the scope and the phase (locked,
           # migrating, rolling or done). Only the holder (or the one repairer that claimed it) writes it, with If-Match on the
-          # ETag it read; a 412 means the key is lost, a 409 is re-read and retried up to 3 times. A key whose holder's run has
+          # ETag it read; a 412 means the key is lost, a 409 is re-read and retried up to 3 times while the ETag is unchanged. A key whose holder's run has
           # finished is taken over by its phase: locked or done, removed; migrating, removed only once the migrate task has
           # stopped; rolling, never (cancel-release.yml repairs it). Anything unreadable fails closed: no lock, no deploy.
           # preprod-frozen: while s3://onepeek-<env>-deploy/locks/frozen.json exists (written from a hotfix/* branch, §5.6), it
@@ -1756,10 +1811,11 @@ jobs:
                 echo "::error::The App token could not be minted again (JWT)."; return 1
               fi
               repo="${LOCK_APP_REPOS%%,*}"
-              if ! installation=$(curl -sSf -H "Authorization: Bearer ${jwt}" -H "Accept: application/vnd.github+json" \
+              # Every bearer token goes to curl as a header file (-H @file, written by the printf builtin), never on its command line.
+              if ! installation=$(curl -sSf -H @<(printf 'Authorization: Bearer %s\n' "${jwt}") -H "Accept: application/vnd.github+json" \
                   "${GITHUB_API_URL:-https://api.github.com}/repos/${LOCK_OWNER}/${repo}/installation" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])') \
                 || ! LOCK_GH_TOKEN=$(LOCK_APP_REPOS="${LOCK_APP_REPOS}" python3 -c 'import json,os;print(json.dumps({"repositories": os.environ["LOCK_APP_REPOS"].split(","), "permissions": json.loads(os.environ["LOCK_APP_PERMISSIONS"])}))' \
-                  | curl -sSf -X POST -H "Authorization: Bearer ${jwt}" -H "Accept: application/vnd.github+json" --data @- \
+                  | curl -sSf -X POST -H @<(printf 'Authorization: Bearer %s\n' "${jwt}") -H "Accept: application/vnd.github+json" --data @- \
                     "${GITHUB_API_URL:-https://api.github.com}/app/installations/${installation}/access_tokens" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])'); then
                 echo "::error::The App token could not be minted again."; return 1
               fi
@@ -1767,7 +1823,7 @@ jobs:
               echo "Minted a new App token."
             fi
             if [ -n "${LOCK_ROLE_ARN:-}" ]; then
-              if ! jwt=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
+              if ! jwt=$(curl -sSf -H @<(printf 'Authorization: bearer %s\n' "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}") "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
                   | python3 -c 'import json,sys;print(json.load(sys.stdin)["value"])') \
                 || ! creds=$(aws sts assume-role-with-web-identity --role-arn "${LOCK_ROLE_ARN}" --role-session-name "${LOCK_ROLE_SESSION}" \
                   --web-identity-token "${jwt}" --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>"${LOCK_ERR}"); then
@@ -1851,7 +1907,7 @@ jobs:
                 # An earlier attempt of this run (one attempt runs at a time), or a finished run: taken over by its phase.
                 case "${phase}" in
                   rolling)
-                    echo "::error::s3://${LOCK_BUCKET}/$1 is held rolling by $(lock_url "${repo}" "${run}"), whose run has ended with its services part-way between two versions: nothing deploys until cancel-release.yml in ${repo} puts them back and frees it (delivery-pipelines UC-DEL-009)."
+                    echo "::error::s3://${LOCK_BUCKET}/$1 is held rolling by $(lock_url "${repo}" "${run}"), whose run has ended with its services part-way between two versions: nothing deploys until cancel-release.yml in ${repo} puts them back and frees it (delivery-pipelines UC-DEL-009). Until cancel-release.yml exists (.github #55), the manual path: read the key with python3 .github/workspace/lock_status.py ${ENVIRONMENT}, then the founder only deletes it with the conditional delete (aws s3api delete-object --if-match <its ETag>)."
                     return 1 ;;
                   migrating)
                     rc=0
@@ -1869,25 +1925,29 @@ jobs:
                 if [ "${rc}" -eq 1 ]; then return 1; fi
                 continue
               fi
-              if [ "${scope}" = "${LOCK_SCOPE}" ]; then LOCK_BLOCKER="${repo} ${scope} ${run} own"; else LOCK_BLOCKER="${repo} ${scope} ${run} other"; fi
+              # The 30-minute own-scope limit is an app's (§5.4a "Every wait and its limit"). Infra waits for any holder, another
+              # infra run included, under the release-lock row's cap only.
+              if [ "${scope}" = "${LOCK_SCOPE}" ] && [ "${LOCK_SCOPE}" != "infra" ]; then LOCK_BLOCKER="${repo} ${scope} ${run} own"; else LOCK_BLOCKER="${repo} ${scope} ${run} other"; fi
               return 4
             done
           }
-          lock_edge_busy() {  # 0 while an infra release run is queued or running or infra.json is held by a live run (LOCK_BLOCKER set), 1 not, 2 unreadable
+          lock_edge_busy() {  # 0 while infra.json is held by a live run or an infra release run is queued or running (LOCK_BLOCKER set), 1 not, 2 unreadable
             local live etag holder repo run rest infra
             infra=$(lock_scope_repo infra)
+            # A live run that holds infra.json counts towards the job's cap; only a run that is queued, or live but holding no
+            # key yet, counts towards the 60-minute limit (§5.4a "Every wait and its limit"). So infra.json is read first.
+            if ! etag=$(lock_read locks/infra.json lock-infra.json); then return 2; fi
+            if [ "${etag}" != "absent" ]; then
+              if ! holder=$(lock_holder lock-infra.json); then return 2; fi
+              read -r repo run rest <<< "${holder}"
+              if ! lock_run_finished "${repo}" "${run}"; then LOCK_BLOCKER="${repo} infra ${run} other"; return 0; fi
+            fi
             if ! live=$(GH_TOKEN="${LOCK_GH_TOKEN}" gh api "repos/${infra}/actions/workflows/release.yml/runs?per_page=20" \
                 --jq '[.workflow_runs[] | select(.status != "completed") | .id] | first // ""' 2>"${LOCK_ERR}"); then
               echo "::error::The infra release runs cannot be read: $(cat "${LOCK_ERR}")" >&2; return 2
             fi
             if [ -n "${live}" ]; then LOCK_BLOCKER="${infra} infra ${live} queued"; return 0; fi
-            if ! etag=$(lock_read locks/infra.json lock-infra.json); then return 2; fi
-            if [ "${etag}" = "absent" ]; then return 1; fi
-            if ! holder=$(lock_holder lock-infra.json); then return 2; fi
-            read -r repo run rest <<< "${holder}"
-            if lock_run_finished "${repo}" "${run}"; then return 1; fi
-            LOCK_BLOCKER="${repo} infra ${run} other"
-            return 0
+            return 1
           }
           lock_take() {  # takes every key of LOCK_SCOPE try-or-release; waits holding nothing within the limits, then fails with the re-run message
             local key keys rc state reason start own=0 queued=0 taken holder scope run kind where
@@ -1950,15 +2010,19 @@ jobs:
             done
           }
           lock_write_phase() {  # lock_write_phase <phase> [JSON of fields to set; null removes one]: the holder's conditional write to every key it holds
-            local key keys etag holder rc tries fields="${2:-}"
+            local key keys etag holder rc tries conflicted fields="${2:-}"
             if [ -z "${fields}" ]; then fields='{}'; fi
             if ! keys=$(lock_keys); then return 1; fi
             read -r -a keys <<< "${keys}"
             for key in "${keys[@]}"; do
               tries=0
+              conflicted=""
               while :; do
                 if ! etag=$(lock_read "${key}" lock-phase-held.json); then
                   echo "::error::s3://${LOCK_BUCKET}/${key} is unreadable, so this run has lost the release lock and changes nothing more."; return 1
+                fi
+                if [ -n "${conflicted}" ] && [ "${etag}" != "${conflicted}" ]; then   # after a 409, a changed ETag means the key is lost
+                  echo "::error::s3://${LOCK_BUCKET}/${key} changed during a conflicting write, so this run has lost the release lock and changes nothing more."; return 1
                 fi
                 if [ "${etag}" = "absent" ] || ! holder=$(lock_holder lock-phase-held.json) || ! lock_is_mine "${holder}" || [ "$(echo "${holder}" | cut -d' ' -f8)" != "-" ]; then
                   echo "::error::s3://${LOCK_BUCKET}/${key} is no longer this run's record, so this run has lost the release lock and changes nothing more."; return 1
@@ -1979,8 +2043,8 @@ jobs:
                 rc=0
                 lock_put "${key}" lock-phase-mine.json "${etag}" || rc=$?
                 if [ "${rc}" -eq 0 ]; then break; fi
-                if [ "${rc}" -eq 3 ] && [ "${tries}" -lt 3 ]; then   # 409: another conditional write was in flight; re-read, retry if still ours
-                  tries=$((tries + 1)); sleep 1; continue
+                if [ "${rc}" -eq 3 ] && [ "${tries}" -lt 3 ]; then   # 409: another conditional write was in flight; re-read, retry only on the same ETag and still ours
+                  tries=$((tries + 1)); conflicted="${etag}"; sleep 1; continue
                 fi
                 if [ "${rc}" -eq 1 ]; then echo "::error::This run has lost the release lock and changes nothing more."; return 1; fi
                 echo "::error::s3://${LOCK_BUCKET}/${key} changed under this run (a repairer claimed it, or it was taken again), so this run has lost the release lock and changes nothing more."
@@ -1989,16 +2053,21 @@ jobs:
               echo "s3://${LOCK_BUCKET}/${key}: phase $1."
             done
           }
-          lock_put_back() {  # lock_put_back <record file>: every service in previous back to its revision, services-stable, the sandbox aliases, an issue
+          lock_put_back() {  # lock_put_back <record file>: every service in previous back to its revision (first-deploy: to 0), services-stable, the sandbox aliases, an issue
             local kind svc td fn ver stable=""
             if ! python3 -c '
           import json, re, sys
           r = json.load(open(sys.argv[1]))
           prev, lam = r.get("previous") or {}, r.get("previous_lambda") or {}
           for s, td in prev.items():
-              if not (re.fullmatch(r"[a-z0-9][a-z0-9-]*", s) and re.fullmatch(r"arn:aws:ecs:[a-z0-9-]+:[0-9]{12}:task-definition/[A-Za-z0-9_-]+:[0-9]+", td)):
+              if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", s):
                   sys.exit("bad previous entry: %r" % s)
-              print("service", s, td)
+              if td == "first-deploy":   # first deployed by this release: no revision to go back to, so it is scaled to 0
+                  print("first", s, "-")
+              elif re.fullmatch(r"arn:aws:ecs:[a-z0-9-]+:[0-9]{12}:task-definition/[A-Za-z0-9_-]+:[0-9]+", td):
+                  print("service", s, td)
+              else:
+                  sys.exit("bad previous entry: %r" % s)
           for f, v in lam.items():
               if not (re.fullmatch(r"[A-Za-z0-9_-]+", f) and str(v).isdigit()):
                   sys.exit("bad previous_lambda entry: %r" % f)
@@ -2006,11 +2075,19 @@ jobs:
               echo "::error::The record's previous revisions are unreadable: nothing can be put back."; return 1
             fi
             while read -r kind svc td; do
-              if [ "${kind}" != "service" ]; then continue; fi
-              if ! aws ecs update-service --cluster "${NAME}" --service "${svc}" --task-definition "${td}" >/dev/null; then
-                echo "::error::${svc} could not be put back on ${td##*/}."; return 1
-              fi
-              echo "Put ${svc} back on ${td##*/}."
+              case "${kind}" in
+                service)
+                  if ! aws ecs update-service --cluster "${NAME}" --service "${svc}" --task-definition "${td}" >/dev/null; then
+                    echo "::error::${svc} could not be put back on ${td##*/}."; return 1
+                  fi
+                  echo "Put ${svc} back on ${td##*/}." ;;
+                first)
+                  if ! aws ecs update-service --cluster "${NAME}" --service "${svc}" --desired-count 0 >/dev/null; then
+                    echo "::error::${svc}, first deployed by this release, could not be scaled to 0."; return 1
+                  fi
+                  echo "Scaled ${svc} to 0: this release deployed it first, so it has no revision to go back to." ;;
+                *) continue ;;
+              esac
               stable="${stable} ${svc}"
             done < lock-put-back.txt
             if [ -n "${stable}" ]; then
@@ -2076,7 +2153,7 @@ jobs:
               rolling)
                 echo "The rollout began and nothing confirmed an end: every service goes back to its recorded revision."
                 if ! lock_put_back "${first}"; then
-                  echo "::error::The put-back failed, so the key stays rolling: run cancel-release.yml in ${GITHUB_REPOSITORY} to put the services back and free it."; return 1
+                  echo "::error::The put-back failed, so the key stays rolling: run cancel-release.yml in ${GITHUB_REPOSITORY} to put the services back and free it. Until cancel-release.yml exists (.github #55), the manual path: read the key with python3 .github/workspace/lock_status.py ${ENVIRONMENT}, then the founder only deletes it with the conditional delete (aws s3api delete-object --if-match <its ETag>)."; return 1
                 fi ;;
             esac
             for key in "${mine[@]}"; do
