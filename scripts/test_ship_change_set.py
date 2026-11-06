@@ -1677,7 +1677,8 @@ class HeadKeepsMoving(unittest.TestCase):
     def test_wait_green_stops_at_the_given_deadline(self) -> None:
         pending = [{"name": "a", "bucket": "pending", "workflow": "w"}]
         with mock.patch.object(ship, "checks", return_value=pending) as cs, mock.patch.object(ship, "say"), \
-                mock.patch.object(ship, "warn_checks", return_value=([], "")), self.assertRaises(SystemExit):
+                mock.patch.object(ship, "warn_checks", return_value=([], "")), mock.patch.object(ship, "POLL_S", 0.01), \
+                mock.patch.object(ship, "CHECK_TIMEOUT_S", 0.2), self.assertRaises(SystemExit):
             ship.wait_green("onepeek-web", 3, False, ship.time.time() - 1)
         cs.assert_not_called()
 
