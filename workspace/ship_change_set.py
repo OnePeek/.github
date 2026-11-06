@@ -36,7 +36,9 @@ without waiting for a new CI run, because only that one line changed since the g
 waits for CI as before). Neither
 `--order` nor `Depends on:` ever moves onepeek-docs off first place. After each merge, the local worktrees of that branch are removed
 when clean (§8a P6). A required check that failed before an earlier repo in the set merged is re-run once
-(it may have needed that repo); a second failure stops the run. Nothing is merged past a red required check.
+(it may have needed that repo); a second failure stops the run. Nothing is merged past a red required check, except
+the warn-only checks ship_watch.yaml lists in `warn_checks` (decision 173: the sandbox workflow's, until `warn_until`),
+which are not waited on; deleting the list makes them block again.
 
 Run it from the workspace root (the folder holding the repos side by side). Needs `gh` signed in.
 """
@@ -213,13 +215,14 @@ def parse(item: str) -> tuple[str, int]:
 
 def pr_info(repo: str, n: int) -> dict:
     return json.loads(gh("pr", "view", str(n), "-R", f"{ORG}/{repo}", "--json",
-                         "state,baseRefName,headRefName,headRefOid,mergeCommit,isDraft,mergeable,body,isCrossRepository,headRepositoryOwner"))
+                         "state,baseRefName,headRefName,headRefOid,mergeCommit,isDraft,mergeable,body,isCrossRepository,headRepositoryOwner,"
+                         "author"))
 
 
 def read_checks(repo: str, n: int, required: bool) -> list[dict]:
     """`gh pr checks` exits non-zero while checks are pending or failed but still prints them; an empty result is
     only taken from its own "no ... checks reported" message, and any other failure stops the run."""
-    cmd = ["gh", "pr", "checks", str(n), "-R", f"{ORG}/{repo}", "--json", "name,bucket,link"]
+    cmd = ["gh", "pr", "checks", str(n), "-R", f"{ORG}/{repo}", "--json", "name,bucket,link,workflow"]
     r = subprocess.run([*cmd, *(["--required"] if required else [])], capture_output=True, text=True, check=False)
     if r.stdout.strip().startswith("["):
         return json.loads(r.stdout)
@@ -319,12 +322,53 @@ def refresh_docs_pin(repo: str, branch: str, base: str, docs_label: str, docs_he
             git(src, "worktree", "remove", "--force", str(wt))
 
 
+CONFIG = [pathlib.Path(__file__).resolve().parent / "ship_watch.yaml"]  # --config (the watcher passes its own)
+
+
+def read_config(path: pathlib.Path | None = None) -> dict:
+    """ship_watch.yaml (or --config): {} when it is missing, unreadable or not a mapping, so nothing is exempted."""
+    try:
+        import yaml  # only here: the rest of this tool needs no third-party package
+        cfg = yaml.safe_load((path or CONFIG[0]).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - any failure reads as no settings (fail closed)
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def warn_checks(path: pathlib.Path | None = None) -> tuple[list[tuple[str, str, str]], str]:
+    """Decision 173 (§6.6 build rulings): the checks that warn but never block a merge, as (repo, workflow, exact check
+    name) from `warn_checks`, and the end condition `warn_until`. No `warn_until`, an empty list, or any malformed
+    entry gives no warn checks, so every check blocks (fail closed). Deleting the list ends it."""
+    cfg = read_config(path)
+    rows, until = cfg.get("warn_checks"), cfg.get("warn_until")
+    if not isinstance(until, str) or not until.strip() or not isinstance(rows, list) or not rows:
+        return [], ""
+    keys = ("repo", "workflow", "name")
+    if not all(isinstance(r, dict) and all(isinstance(r.get(k), str) and r[k] for k in keys) for r in rows):
+        return [], ""
+    return [(r["repo"], r["workflow"], r["name"]) for r in rows], until
+
+
+def is_warn(c: dict, warn: list[tuple[str, str, str]], repo: str) -> bool:
+    return (repo, c.get("workflow"), c.get("name")) in warn
+
+
+GREEN = ("pass", "skipping")  # any other bucket, or none, is red or pending (§6.6 fail closed on every shape)
+
+
 def wait_green(repo: str, n: int, may_rerun: bool) -> None:
     deadline, reran = time.time() + CHECK_TIMEOUT_S, False
+    warn, until = warn_checks()
+    told = False
     while time.time() < deadline:
         cs = checks(repo, n)
-        pending = [c["name"] for c in cs if c["bucket"] == "pending"]
-        failed = [c for c in cs if c["bucket"] == "fail" or c["bucket"] == "cancel"]
+        skipped = sorted({c["name"] for c in cs if is_warn(c, warn, repo)})
+        if skipped and not told:  # decision 173: they still run and report; the watcher alerts when one is red
+            say(f"{repo}#{n}: not waiting on warn-only check(s) {skipped} (until {until})")
+            told = True
+        cs = [c for c in cs if not is_warn(c, warn, repo)]
+        pending = [c["name"] for c in cs if c.get("bucket") == "pending"]
+        failed = [c for c in cs if c.get("bucket") not in (*GREEN, "pending")]
         if cs and not pending and not failed:
             say(f"{repo}#{n}: required checks green ({len(cs)})")
             return
@@ -712,7 +756,10 @@ def resolve_pin(repo: str, n: int, push: bool = True) -> str | None:
     if pin not in pr_commits(DOCS, DOCS_PR[0]):
         say(f"{repo}#{n}: docs pin {(pin or 'none')[:7]} is not a commit of {DOCS}#{DOCS_PR[0]}; not re-pinning it")
         return None
-    return refresh_docs_pin(repo, i["headRefName"], i["baseRefName"], f"{DOCS}#{DOCS_PR[0]}", docs_head(DOCS_PR[0]), push)
+    sha = refresh_docs_pin(repo, i["headRefName"], i["baseRefName"], f"{DOCS}#{DOCS_PR[0]}", docs_head(DOCS_PR[0]), push)
+    if sha:
+        TOOL_PUSHED.add(sha)
+    return sha
 
 
 def conflict_after(repo: str, n: int, sha: str) -> str:
@@ -721,6 +768,20 @@ def conflict_after(repo: str, n: int, sha: str) -> str:
 
 
 DOCS_PR: list[int] = []
+TOOL_PUSHED: set[str] = set()  # commits this run pushed itself (pin moves, docs-pin refreshes): no new review needed
+
+
+def review_gate(repo: str, n: int, i: dict) -> str | None:
+    """agent-operations.md §6.6 "Review gates for merging" (F36) for the pull request's head `i["headRefOid"]`, read
+    live; the bot allow-list is the `authors` of ship_watch.yaml (--config). An unreadable record is a problem."""
+    try:
+        reviews = read_reviews()
+    except (OSError, ValueError) as e:
+        return f"{repo}#{n}: cannot read the review record: {e}"
+    authors = read_config().get("authors")
+    why = review_problem(f"{repo}#{n}", i["headRefOid"], i.get("author"), read_checks(repo, n, False), reviews,
+                         authors if isinstance(authors, list) else [])
+    return f"{repo}#{n}: {why}" if why else None
 
 
 def refresh_one(repo: str, n: int) -> int:
@@ -830,7 +891,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--order", default="", help="repoA,repoB,...: merge in this order instead of the fixed one (§8a P1)")
     ap.add_argument("--aws-profile", default="", help="AWS profile that can read s3://onepeek-<env>-deploy (release pull requests)")
     ap.add_argument("--no-chain", metavar="REASON", default="", help="release pull requests: skip the chain check (never the lock), with the reason")
+    ap.add_argument("--config", default=str(CONFIG[0]), help="ship_watch.yaml to read: warn-only checks, bot authors")
     a = ap.parse_args(argv)
+    CONFIG[:] = [pathlib.Path(a.config)]
     if a.refresh:
         return refresh_one(*parse(a.refresh))
     if not a.prs:
@@ -880,6 +943,9 @@ def main(argv: list[str]) -> int:
         why = own_branch_problem(repo, n, i)
         if why:
             problems.append(why)
+        gate = review_gate(repo, n, i) if i["state"] == "OPEN" else None
+        if gate:
+            problems.append(gate)
         state = mergeable(repo, n) if i["mergeable"] == "UNKNOWN" else i["mergeable"]
         if state == "CONFLICTING" and docs and repo not in (DOCS, ".github") and not why:
             conflicting.append((repo, n))  # maybe only docs-version.txt: refreshed below, once nothing else is wrong
@@ -946,6 +1012,7 @@ def main(argv: list[str]) -> int:
         no_conflicts(prs[k:], resolve_pin)
         if tag and repo not in (DOCS, ".github"):
             pushed = bump_pins(repo, info[(repo, n)]["headRefName"], *tag)
+            TOOL_PUSHED.add(pushed or "")
             moved.add(repo)  # its pins are at the tag inside the set (moved now, or already there)
             if pushed:
                 wait_head(repo, n, pushed)
@@ -954,6 +1021,7 @@ def main(argv: list[str]) -> int:
         tested = tested_bases(repo, n) if docs_merge and (repo, n) in pinned else set()
         if docs_merge and (repo, n) in pinned:
             pushed, only_pin = move_docs_pin(repo, info[(repo, n)]["headRefName"], head, docs_merge)
+            TOOL_PUSHED.add(pushed or "")
             if pushed:
                 wait_head(repo, n, pushed)
                 head = pushed
@@ -971,6 +1039,12 @@ def main(argv: list[str]) -> int:
                 raise SystemExit(f"STOP {repo}#{n}: {why}")
         keep = [] if base_ref == RELEASE_BASE else ["--delete-branch"]  # a release pull request's head is `dev`: never deleted
         refuse_unresolved(repo, n)  # every review thread read and resolved before the merge (§6.4)
+        reviewed = info[(repo, n)]["headRefOid"]  # the review gates, again, right before the merge (F36)
+        why = review_gate(repo, n, info[(repo, n)]) if head == reviewed else (
+            None if head in TOOL_PUSHED - {""} else f"{repo}#{n}: head {head[:7]} is neither the reviewed head "
+                                                     f"{reviewed[:7]} nor a commit this run pushed")
+        if why:
+            raise SystemExit(f"STOP {why}; nothing after it is merged")
         gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, *keep, "--match-head-commit", head)
         merged = pr_info(repo, n)
         if merged["state"] != "MERGED":
