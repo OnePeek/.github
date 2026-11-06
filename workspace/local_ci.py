@@ -9,7 +9,8 @@ skipped: the laptop already has the tools; reusable-workflow jobs are listed as 
 stand for run here directly (actionlint with shellcheck, the runner-label lint). A step that rewrites package.json (`npm pkg set`) has it restored afterwards. Steps that need GitHub's API or
 AWS (they read GH_TOKEN, assume a role, or call `gh api`) are skipped and listed, never run.
 
-Exit 0 when every step ran and passed; 1 at the first failure (its output is shown); 2 bad input.
+Exit 0 when every step ran and passed; 1 at the first failure (its output is shown), or at the end when a `terraform test`
+step was not run (no step is reported OK that did not run, T-58); 2 bad input.
 """
 from __future__ import annotations
 
@@ -141,6 +142,23 @@ def tool_version(tool: str) -> str | None:
     r = subprocess.run([tool, "--version"], capture_output=True, text=True)
     m = re.search(r"(\d+\.\d+\.\d+)", r.stdout + r.stderr)
     return m.group(1) if m else "unknown"
+
+
+def terraform_problem(repo: pathlib.Path) -> str:
+    """Why a `terraform test` step cannot run here as CI runs it, or "": the laptop's terraform must equal the repository's
+    `.terraform-version` (T-58). A missing or unreadable pin is a reason too: the check fails closed."""
+    try:
+        want = (repo / ".terraform-version").read_text(encoding="utf-8").strip()
+    except OSError:
+        return "the repository has no readable .terraform-version to check the laptop's terraform against"
+    if not want:
+        return ".terraform-version is empty"
+    have = tool_version("terraform")
+    if have is None:
+        return f"terraform is not on PATH (the repository pins {want})"
+    if have != want:
+        return f"the laptop's terraform is {have}, the repository pins {want} (.terraform-version)"
+    return ""
 
 
 def uv_problem() -> str:
@@ -607,8 +625,15 @@ def main(argv: list[str] | None = None) -> int:
         print("\nSkipped (CI runs these):")
         for s in skipped:
             print(f"  - {s}")
-    if not a.list:
-        print(f"\nLOCAL CI OK ({time.time() - started:.0f}s)")
+    if a.list:
+        return 0
+    # A skipped `terraform test` never ends OK (T-58): the run says which suites the laptop did not test.
+    if untested := [s for s in skipped if s.startswith("terraform test skipped: ")]:
+        print(f"\nLOCAL CI NOT OK: {len(untested)} terraform test step(s) did not run here; run them, or let CI:")
+        for s in untested:
+            print(f"  - {s.removeprefix('terraform test skipped: ')}")
+        return 1
+    print(f"\nLOCAL CI OK ({time.time() - started:.0f}s)")
     return 0
 
 
@@ -665,8 +690,7 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                 def skip(reason: str) -> bool:
                     """Records the skip; True when the run must fail (a skipped `terraform test` under --release)."""
                     if tf_test:
-                        print(f"{'FAIL' if a.release and not a.list else 'WARN'}  {label}: terraform test skipped: {reason}",
-                              file=sys.stderr if not a.release else sys.stdout)
+                        print(f"{'WARN' if a.list else 'FAIL'}  {label}: terraform test skipped: {reason}")
                         if a.release and not a.list:
                             return True
                         skipped.insert(0, f"terraform test skipped: {label} ({reason})")
@@ -762,6 +786,10 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                     continue
                 if docker_skipped and re.search(r"(127\.0\.0\.1|localhost):\d+", code + " " + " ".join(map(str, env.values()))):
                     if skip(f"SKIP: needs a service an earlier skipped docker step starts"):
+                        return 1
+                    continue
+                if tf_test and (why := terraform_problem(repo)):
+                    if skip(f"SKIP: {why}"):
                         return 1
                     continue
                 if a.list:
