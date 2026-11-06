@@ -974,7 +974,7 @@ class JobServices(unittest.TestCase):
 
     def run_job(self, step: str, health: str = "healthy", docker: bool = True, timeout: int = 120):
         d = make_repo_with("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    services:\n      pg:\n"
-                           f"        image: {self.SPEC['image']}\n        ports: ['127.0.0.1:55432:5432']\n"
+                           f"        image: {self.SPEC['image']} # 17\n        ports: ['127.0.0.1:55432:5432']\n"
                            f"        env:\n          POSTGRES_DB: onepeek\n    steps:\n      - run: {step}\n")
         calls, real = [], subprocess.run
 
