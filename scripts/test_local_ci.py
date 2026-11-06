@@ -650,7 +650,7 @@ class LinuxContainerL2(unittest.TestCase):
         for code in ("npx eslint .", "terraform fmt -check", "python3 scripts/tool.py", "echo hello # bash x"):
             self.assertFalse(lc.wants_linux(lc.strip_comments(code)), code)
 
-    NETWORK_TOOLS = ("uv", "uvx", "pip", "pip3", "pipx", "npm", "npx", "pnpm", "pnpx", "yarn", "apt-get", "curl", "wget")
+    NETWORK_TOOLS = ("uv", "uvx", "pip", "pip3", "pipx", "npm", "npx", "pnpm", "pnpx", "yarn", "apt-get", "curl", "wget", "terraform")
 
     def test_every_container_step_of_the_shared_workflows_gets_network_exactly_when_it_calls_a_network_tool(self):
         # The contract step (`uvx ...`) ran with `--network none`, so uv could not reach PyPI (T-64). The expectation here
@@ -675,6 +675,14 @@ class LinuxContainerL2(unittest.TestCase):
             self.assertTrue(lc.NEEDS_NETWORK.search(f"{tool} install x"), tool)
         for code in ("python3 -m unittest discover -s scripts -p 'test_*.py'", "python -m pytest scripts/", "bash scripts/t.sh",
                      "uvicorn app:main", "python scripts/pipeline.py", "curly --x"):
+            self.assertIsNone(lc.NEEDS_NETWORK.search(code), code)
+
+    def test_terraform_gets_network_by_its_full_name(self):
+        # What infra's render_taskdefs.py and check_iam_boundary.py run in the container: init fetches the Linux providers (T-68).
+        for code in ("terraform init -backend=false -input=false", "terraform init -lockfile=readonly -input=false", "terraform test",
+                     "terraform -chdir=modules/aws/startup-env init -backend=false"):
+            self.assertTrue(lc.NEEDS_NETWORK.search(code), code)
+        for code in ("python3 scripts/terraform_render.py", "terraformer import aws", "python3 -m unittest scripts/test_render_taskdefs.py"):
             self.assertIsNone(lc.NEEDS_NETWORK.search(code), code)
 
     def test_the_image_tag_is_the_hash_of_the_dockerfile(self):
@@ -702,6 +710,32 @@ class LinuxContainerL2(unittest.TestCase):
         # infra #177's local CI failed in the container with `uvx: command not found` (2026-11-06).
         text = (ROOT / "workspace/local-ci/Dockerfile").read_text(encoding="utf-8")
         self.assertIn(f"uv=={lc.UV_VERSION}", text)
+
+    def test_the_dockerfile_has_terraform_at_the_ci_pin_checksummed_for_both_architectures(self):
+        # infra's deploy-filters, rendered and ci-boundary steps failed in the container: terraform is not on PATH (T-68).
+        default = yaml.safe_load((ROOT / ".github/workflows/terraform-checks.yml").read_text(encoding="utf-8"))
+        self.assertEqual(default[True]["workflow_call"]["inputs"]["terraform-version"]["default"], lc.TERRAFORM_VERSION)
+        text = (ROOT / "workspace/local-ci/Dockerfile").read_text(encoding="utf-8")
+        self.assertRegex(text, rf"(?m)^ARG TERRAFORM_VERSION={re.escape(lc.TERRAFORM_VERSION)}$")
+        for arch in ("amd64", "arm64"):
+            self.assertRegex(text, rf"(?m)^\s+{arch}\) sum=[0-9a-f]{{64}} ;;", arch)
+        self.assertIn('sha256sum -c -', text)
+
+    def test_the_container_gets_the_provider_cache_at_its_own_path(self):
+        cache = pathlib.Path(tempfile.mkdtemp())
+        repo = pathlib.Path(tempfile.mkdtemp())
+        seen = []
+
+        def fake_run(argv, **kw):
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with mock.patch.object(lc, "plugin_cache", return_value=cache), mock.patch.object(lc.subprocess, "run", fake_run):
+            lc.container_step("true", repo, {"TF_PLUGIN_CACHE_DIR": "/elsewhere"}, repo, {}, False, "img:1")
+        argv = seen[-1]
+        pairs = list(zip(argv, argv[1:]))
+        self.assertIn(("-v", f"{cache}:{cache}"), pairs)
+        self.assertIn(("-e", f"TF_PLUGIN_CACHE_DIR={cache}"), pairs)
+        self.assertNotIn(("-e", "TF_PLUGIN_CACHE_DIR"), pairs)
 
     def run_darwin(self, *args, docker=True):
         d = make_repo_with(job_yaml("python3 -m unittest discover -s scripts", "npx eslint ."))
@@ -773,6 +807,13 @@ class LinuxContainerL2(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("bash=5", out)
         self.assertIn("x=bar", out)
+
+    @unittest.skipUnless(shutil.which("docker") and subprocess.run(["docker", "info"], capture_output=True).returncode == 0, "Docker is needed")
+    def test_the_container_has_terraform_at_the_ci_pin(self):
+        repo = pathlib.Path(tempfile.mkdtemp())
+        rc, out, _ = lc.container_step("terraform version", repo, {}, repo, {}, False, lc.ensure_image())
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"Terraform v{lc.TERRAFORM_VERSION}\n", out)
 
 
 class BuildImageL3(unittest.TestCase):

@@ -47,6 +47,7 @@ OPTIONAL_TOOLS = ("trivy",)
 UV_VERSION = "0.12.0"
 CI_PYTHON = "3.14"  # the runner image's Python minor version; workspace/local-ci/Dockerfile's base must be python:<this>
 TFLINT_VERSION = "0.65.0"
+TERRAFORM_VERSION = "1.16.6"  # terraform-checks.yml's default; workspace/local-ci/Dockerfile installs this one (T-68)
 TFLINT_IMAGE = "ghcr.io/terraform-linters/tflint"
 # One provider cache for every local run and worktree (§8a P6), unless the laptop sets TF_PLUGIN_CACHE_DIR itself.
 SHARED_PLUGIN_CACHE = pathlib.Path.home() / ".cache" / "onepeek" / "terraform-plugins"
@@ -90,7 +91,8 @@ TERRAFORM_TEST = re.compile(r"\bterraform\b[^\n;&|]*\btest\b")
 LOCAL_CI_DIR = pathlib.Path(__file__).resolve().parent / "local-ci"
 SCRIPT_TESTS = re.compile(r"(?:\bpython3?\s+-m\s+(?:unittest|pytest)\b|\bpytest\b)[^\n]*\bscripts\b|(?:^|[\s;&|(])(?:bash\s+\S+|\S+\.sh)(?![\w.-])", re.M)
 # Each tool by its full name: `\buv\b` never matched `uvx`, so the contract step ran with no network (T-64).
-NEEDS_NETWORK = re.compile(r"\b(uv|uvx|pip|pip3|pipx|npm|npx|pnpm|pnpx|yarn|apt-get|curl|wget)\b|\bgit (clone|fetch|pull)\b|\bdocker pull\b")
+# terraform: `terraform init` fetches the Linux providers the laptop's cache lacks (T-68).
+NEEDS_NETWORK = re.compile(r"\b(uv|uvx|pip|pip3|pipx|npm|npx|pnpm|pnpx|yarn|apt-get|curl|wget|terraform)\b|\bgit (clone|fetch|pull)\b|\bdocker pull\b")
 
 
 def image_tag(dockerfile: pathlib.Path | None = None) -> str:
@@ -119,14 +121,17 @@ def container_step(cmd: str, cwd: pathlib.Path, env: dict[str, str], repo: pathl
                    tag: str) -> tuple[int, str, float]:
     """The step in the Linux container: the repo (and its git directory, for a worktree) and the run's temp folder at the
     same paths, the step's environment passed by name, `--network none` unless it reaches a registry, never
-    Docker-in-Docker. Runs as the laptop user so files it writes stay yours."""
+    Docker-in-Docker. Runs as the laptop user so files it writes stay yours. The provider cache (plugin_cache()) is
+    mounted at its own path and named in TF_PLUGIN_CACHE_DIR, so `terraform init` in a step reuses it (T-68)."""
     t = time.time()
     names = sorted(k for k in {**env, **files} if k not in ("PATH", "HOME", "VIRTUAL_ENV", "TF_PLUGIN_CACHE_DIR") and not k.startswith("AWS_"))
-    mounts = {str(repo.resolve()), str(run_root())}
+    cache = str(plugin_cache())
+    mounts = {str(repo.resolve()), str(run_root()), cache}
     common = subprocess.run(["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True)
     if common.returncode == 0 and common.stdout.strip():
         mounts.add(common.stdout.strip())
     argv = ["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp", "-e", "CI=true",
+            "-e", f"TF_PLUGIN_CACHE_DIR={cache}",
             *([] if network else ["--network", "none"])]
     for m in sorted(mounts):
         argv += ["-v", f"{m}:{m}"]
