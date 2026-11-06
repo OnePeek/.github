@@ -10,7 +10,8 @@ same pull request as the fix.
    `git fetch` first. Never edit, stash or commit in a shared checkout.
 2. **Never `commit -a`, `--no-verify` or a force push.** Push a detached worktree with `git push origin HEAD:<branch>`.
 3. **Commit every file you changed.** On 2026-11-06 a builder pushed a commit holding 2 of its 6 changed files, and CI went
-   green on the wrong code. Run `python3 $ONEPEEK_WORKSPACE/.github/workspace/done_check.py <worktree> --pr <repo>#<n>` before you report.
+   green on the wrong code. Run `python3 "$ONEPEEK_WORKSPACE/.github/workspace/done_check.py" <worktree> --pr <repo>#<n> --expect <files>` before you report
+   (add `--since <sha>` when your commits join a longer pull request).
    It must end `DONE CHECK OK`.
 4. **Run local CI on your worktree path**, not on the repo name. `local_ci.py <repo>` reads the shared checkout. For a
    `.github` change, set `ONEPEEK_WORKSPACE` to a folder whose `.github` links to your worktree, so the shared lint is yours.
@@ -68,7 +69,7 @@ same pull request as the fix.
 21. **Do not wait on CI, a review or a dependency.** On 2026-11-06 an agent sat about 70 minutes waiting on its own
     background work. Write the status file, push if you have push authority and local CI is green (otherwise keep the worktree path), and
     hand back `BLOCKED` within about 5 minutes; the coordinator
-    watches and resumes you (`agent-operations.md` §5.6).
+    watches and resumes you (`agent-operations.md` §5.5).
 
 ## Added 2026-11-06 (watch until holding, agent-operations.md §8a)
 22. **`.context/` is never committed.** A builder committed its status file. It is in `.gitignore` now, and `done_check.py` fails on it.
@@ -78,3 +79,6 @@ same pull request as the fix.
 26. **GitHub's API can show the old head for a few seconds after a push.** `done_check.py` re-reads briefly; do not "fix" a failure by pushing again.
 27. **Tests that run `git` clear Git's repository-local variables first** (`git rev-parse --local-env-vars`: `GIT_DIR`, `GIT_INDEX_FILE` and the rest). A hook passes them on, and an inherited `GIT_DIR` made a fixture rewrite another repo's config (.github #60).
 28. **The local CI container must hold every tool CI's steps call.** The Python 3.14 container (#57) lacked `uv`, so `uvx` steps failed locally but not on CI (infra #177). `uv` is baked in at `local_ci.UV_VERSION`, and a test pins it. A new tool in a workflow step is added to the Dockerfile in the same pull request.
+29. **Workspace paths in the kit start from `"$ONEPEEK_WORKSPACE"`, quoted.** The shared agents and skills said `../.github/workspace/packet.py` and `.github/workspace/done_check.py`, which lead nowhere from a worktree under the scratchpad (CodeRabbit on 7 rollout pull requests, 2026-11-06). Never write a relative path to another repo.
+32. **A push is proven by the remote, never by its output.** After every push, compare `git ls-remote origin refs/heads/<branch>` with `git rev-parse HEAD`, or run `done_check.py`. The coordinator filtered push output for "error|rejected", and a detached HEAD's `fatal:` slipped through, so a review ran on the old head (.github #64, 2026-11-06).
+34. **Undo a mutation with the reverse edit, never `git checkout <file>`.** `git checkout` throws away every uncommitted change in the file, the real fix included. The coordinator lost its own fix this way twice in one day (.github #64 `done_check.py`, infra #177 `stuck-deploys.tf`). Commit the fix first, or mutate a copy.
