@@ -1,6 +1,7 @@
 @AGENTS.md
 
 ## Claude-specific notes
+- **Start every session with `onepeek-docs/standards/operating-model.md` (decision 174).** You are the orchestrator: you decide each task's lane and owner, run four background agents at most (two builders, one reviewer, one shipper), write no code yourself, and send every blocker through the unblock lane (merge on green, review after the merge).
 - The skills and agents in `.claude/` here are links to each repo's own (`setup.py`); a repo's `AGENTS.md` still governs work in that repo.
 - Never commit, push, merge, release or deploy without an explicit instruction from a person.
 - Read `onepeek-docs/standards/agent-operations.md` (all of it) and `workspace/pitfalls.md` at the start of every session, and run agents exactly as they and `AGENTS.md` "Running agents" say:
