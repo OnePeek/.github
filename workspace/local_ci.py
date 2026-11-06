@@ -133,8 +133,9 @@ def container_step(cmd: str, cwd: pathlib.Path, env: dict[str, str], repo: pathl
     for k in names:
         argv += ["-e", k]
     argv += ["-w", str(cwd), tag, "bash", "-eo", "pipefail", "-c", cmd]
-    r = subprocess.run(argv, env={**os.environ, **env, **files}, capture_output=True, text=True)
-    return r.returncode, r.stdout + r.stderr, time.time() - t
+    # One stream in the order written, so the last line shown is the step's real last line (T-69).
+    r = subprocess.run(argv, env={**os.environ, **env, **files}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return r.returncode, r.stdout, time.time() - t
 
 
 def tool_version(tool: str) -> str | None:
@@ -390,8 +391,8 @@ def run_step(cmd: str, cwd: pathlib.Path, env: dict[str, str], shell: str, linux
     env = {**env, "TF_PLUGIN_CACHE_DIR": str(plugin_cache())}
     if linux:
         return container_step(cmd, cwd, env, linux[0], files, linux[2], linux[1])
-    r = subprocess.run(argv, cwd=cwd, env={**base, "CI": "true", **files, **env}, capture_output=True, text=True)
-    return r.returncode, (r.stdout + r.stderr), time.time() - t
+    r = subprocess.run(argv, cwd=cwd, env={**base, "CI": "true", **files, **env}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return r.returncode, r.stdout, time.time() - t
 
 
 SHARED_PIN = re.compile(r"OnePeek/\.github/\.github/workflows/[^@\s]+@([0-9A-Za-z._/-]+)")

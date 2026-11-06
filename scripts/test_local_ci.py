@@ -136,7 +136,7 @@ class LocalCi(unittest.TestCase):
     def test_keep_going_runs_every_step_and_lists_every_failure(self):
         # T-69: the default stops at the first failure, so faults surfaced one per run; --keep-going shows them all at once.
         d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
-                      "      - name: first\n        run: 'echo noise; echo boom-a; exit 3'\n      - run: touch after-a\n"
+                      "      - name: first\n        run: 'echo noise >&2; echo boom-a; exit 3'\n      - run: touch after-a\n"
                       "  b:\n    runs-on: ubuntu-latest\n    steps:\n      - name: second\n        run: 'echo boom-b >&2; exit 4'\n"
                       "  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: touch ran-c\n")
         out = io.StringIO()
