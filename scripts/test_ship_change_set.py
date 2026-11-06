@@ -18,13 +18,16 @@ _SPEC.loader.exec_module(ship)
 
 
 REAL_GATE = ship.review_gate
+REAL_RETARGET = ship.retarget_stacked
 
 
 def setUpModule() -> None:
-    """The review gates (F36) pass for every test except ReviewGate's, which calls the real one (REAL_GATE)."""
-    p = mock.patch.object(ship, "review_gate", return_value=None)
-    p.start()
-    unittest.addModuleCleanup(p.stop)
+    """The review gates (F36) pass, and nothing is stacked (F39), for every test except ReviewGate's and Retarget's,
+    which call the real ones (REAL_GATE, REAL_RETARGET)."""
+    for name in ("review_gate", "retarget_stacked"):
+        p = mock.patch.object(ship, name, return_value=None)
+        p.start()
+        unittest.addModuleCleanup(p.stop)
 
 
 class Order(unittest.TestCase):
@@ -232,6 +235,52 @@ class ReviewGate(unittest.TestCase):
                 mock.patch.object(ship, "gh") as gh, self.assertRaisesRegex(SystemExit, "neither the reviewed head"):
             ship.main(["onepeek-web#3", "--go"])
         gh.assert_not_called()
+
+
+class Retarget(unittest.TestCase):  # F39: a pull request stacked on the merged branch is moved before the branch is deleted
+    INFO = {"state": "OPEN", "baseRefName": "dev", "headRefName": "fix/404-page", "headRefOid": "h3", "isDraft": False,
+            "mergeable": "MERGEABLE", "body": "", "isCrossRepository": False, "headRepositoryOwner": {"login": "OnePeek"},
+            "author": {"login": "Karan-98-Mehta"}}
+
+    def merge(self, listed: str, edit_fails: bool = False) -> list[tuple]:
+        calls: list[tuple] = []
+
+        def gh(*args):
+            calls.append(args)
+            if args[:2] == ("pr", "edit") and edit_fails:
+                raise SystemExit("STOP: `gh pr edit 7 ...` failed: HTTP 422")
+            return listed if args[:2] == ("pr", "list") else ""
+
+        def info(repo, n):
+            merged = any(c[:2] == ("pr", "merge") for c in calls)
+            return dict(self.INFO, state="MERGED", mergeCommit={"oid": "m1"}) if merged else self.INFO
+        with mock.patch.object(ship, "pr_info", side_effect=info), mock.patch.object(ship, "say"), \
+                mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "no_conflicts"), \
+                mock.patch.object(ship, "green_head", return_value="h3"), mock.patch.object(ship, "refuse_unresolved"), \
+                mock.patch.object(ship, "remove_worktrees"), mock.patch.object(ship, "gh", side_effect=gh), \
+                mock.patch.object(ship, "retarget_stacked", REAL_RETARGET):
+            ship.main(["onepeek-web#3", "--go"])
+        return calls
+
+    def test_a_stacked_pull_request_is_retargeted_before_the_merge(self):
+        calls = self.merge('[{"number": 9}, {"number": 7}]')
+        verbs = [c[:2] for c in calls]
+        self.assertEqual(calls[0], ("pr", "list", "-R", "OnePeek/onepeek-web", "--base", "fix/404-page", "--state", "open",
+                                    "--json", "number", "--limit", "200"))
+        self.assertEqual(calls[1:3], [("pr", "edit", "7", "-R", "OnePeek/onepeek-web", "--base", "dev"),
+                                      ("pr", "edit", "9", "-R", "OnePeek/onepeek-web", "--base", "dev")])
+        self.assertEqual(verbs[3:], [("pr", "merge")])
+
+    def test_a_failed_retarget_stops_before_the_merge(self):
+        with self.assertRaisesRegex(SystemExit, "could not retarget .* not merged") as stop:
+            self.merge('[{"number": 7}]', edit_fails=True)
+        self.assertIn("HTTP 422", str(stop.exception))
+        for bad in ("not json", '[{"no": 1}]'):  # an unreadable list fails closed too
+            with self.assertRaisesRegex(SystemExit, "could not retarget"):
+                self.merge(bad)
+
+    def test_none_stacked_means_no_edit(self):
+        self.assertEqual([c[:2] for c in self.merge("[]")], [("pr", "list"), ("pr", "merge")])
 
 
 class Conflicts(unittest.TestCase):

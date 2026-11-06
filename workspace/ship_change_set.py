@@ -909,6 +909,22 @@ def review_problem(label: str, head: str, author: dict | None, all_checks: list[
     return f"no review at {head}"
 
 
+def retarget_stacked(repo: str, n: int, branch: str) -> None:
+    """Before a merge deletes `branch`, move each open pull request based on it to the repo's merge base: GitHub closes a
+    pull request whose base branch is deleted (F39: .github#76, infra#192). Bodies are left alone. A failure stops the
+    merge."""
+    target = BASE.get(repo, "dev")
+    try:
+        stacked = json.loads(gh("pr", "list", "-R", f"{ORG}/{repo}", "--base", branch, "--state", "open",
+                                "--json", "number", "--limit", "200"))
+        for m in sorted(p["number"] for p in stacked):
+            gh("pr", "edit", str(m), "-R", f"{ORG}/{repo}", "--base", target)
+            say(f"{repo}#{m}: retargeted from {branch} to {target} before {repo}#{n} merges")
+    except (SystemExit, ValueError, KeyError, TypeError) as e:
+        raise SystemExit(f"STOP {repo}#{n}: could not retarget the pull requests based on {branch} ({e}); "
+                         "not merged, nothing after it is merged") from None
+
+
 def refuse_unresolved(repo: str, n: int) -> None:
     """Right before a merge: stop while the pull request has any unresolved review thread, naming each one."""
     threads = unresolved_threads(repo, n)
@@ -1094,6 +1110,8 @@ def main(argv: list[str]) -> int:
             why = f"{repo}#{n}: head {head[:7]} is neither the reviewed head {reviewed[:7]} nor a commit this run pushed"
         if why:
             raise SystemExit(f"STOP {why}; nothing after it is merged")
+        if keep:  # its branch is deleted on merge (F39)
+            retarget_stacked(repo, n, info[(repo, n)]["headRefName"])
         gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, *keep, "--match-head-commit", head)
         merged = pr_info(repo, n)
         if merged["state"] != "MERGED":
