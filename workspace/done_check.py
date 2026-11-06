@@ -17,6 +17,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import time
 
 IGNORED_PREFIXES = (".context/",)
 
@@ -56,6 +57,20 @@ def parse_pr(ref: str) -> tuple[str, str]:
     return (repo if "/" in repo else f"OnePeek/{repo}"), number
 
 
+PR_READ_TRIES, PR_READ_WAIT = 4, 5  # GitHub's API can show the old head for a few seconds after a push
+
+
+def read_pr(repo: str, number: str, head: str, worktree: pathlib.Path, sleep=time.sleep) -> dict:
+    """The pull request as GitHub reports it, re-read briefly while its head still lags a fresh push."""
+    for attempt in range(PR_READ_TRIES):
+        info = json.loads(run(["gh", "pr", "view", number, "-R", repo, "--json", "headRefName,headRefOid,baseRefName,files"],
+                              worktree))
+        if info.get("headRefOid") == head or attempt == PR_READ_TRIES - 1:
+            return info
+        sleep(PR_READ_WAIT)
+    return info
+
+
 def check(worktree: pathlib.Path, pr: str | None, branch: str | None) -> list[str]:
     problems: list[str] = []
     dirty = dirty_files(run(["git", "status", "--porcelain=v1", "-uall"], worktree))
@@ -65,8 +80,7 @@ def check(worktree: pathlib.Path, pr: str | None, branch: str | None) -> list[st
     base_ref = None
     if pr:
         repo, number = parse_pr(pr)
-        info = json.loads(run(["gh", "pr", "view", number, "-R", repo, "--json", "headRefName,headRefOid,baseRefName,files"],
-                              worktree))
+        info = read_pr(repo, number, head, worktree)
         branch = branch or info["headRefName"]
         base_ref = info["baseRefName"]
         if info["headRefOid"] != head:

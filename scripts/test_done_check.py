@@ -100,5 +100,28 @@ class Check(unittest.TestCase):
         self.assertEqual(dc.main([str(self.r.work), "--pr", "not-a-pr"]), 1)
 
 
+class ReadPrWaitsForAFreshPush(unittest.TestCase):
+    def test_a_lagging_head_is_re_read_then_accepted(self):
+        answers = iter(['{"headRefOid": "old"}', '{"headRefOid": "new"}'])
+        waits = []
+        orig = dc.run
+        dc.run = lambda cmd, cwd: next(answers)
+        try:
+            info = dc.read_pr("OnePeek/x", "1", "new", pathlib.Path("."), sleep=waits.append)
+        finally:
+            dc.run = orig
+        self.assertEqual(info["headRefOid"], "new")
+        self.assertEqual(waits, [dc.PR_READ_WAIT])
+
+    def test_a_head_that_never_arrives_is_returned_for_the_check_to_fail(self):
+        orig = dc.run
+        dc.run = lambda cmd, cwd: '{"headRefOid": "old"}'
+        try:
+            info = dc.read_pr("OnePeek/x", "1", "new", pathlib.Path("."), sleep=lambda s: None)
+        finally:
+            dc.run = orig
+        self.assertEqual(info["headRefOid"], "old")
+
+
 if __name__ == "__main__":
     unittest.main()
