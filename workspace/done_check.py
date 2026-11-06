@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The done-gate a builder runs before it reports (workspace pitfalls.md 3; agent-operations.md §5.4 step 5).
 
-    python3 .github/workspace/done_check.py <worktree> [--pr <repo>#<n>] [--branch <name>] [--expect <file> ...]
+    python3 "$ONEPEEK_WORKSPACE/.github/workspace/done_check.py" <worktree> [--pr <repo>#<n>] [--branch <name>]
+        [--expect <file> ...] [--since <sha>]
 
 It fails when the work that was reported is not the work that was pushed:
   1. the worktree is not a linked worktree (`git worktree add`, agent-operations.md §4.3);
@@ -13,7 +14,11 @@ It fails when the work that was reported is not the work that was pushed:
   4. with `--pr`: the pull request's head commit is not HEAD, `--branch` is not its head branch, the base cannot be
      fetched, HEAD does not contain the current base, or the pull request's files are not exactly the files HEAD changes
      against the base;
-  5. with `--expect`: the pull request's files are not exactly the files the builder reports.
+  5. with `--expect`: the pull request's files are not exactly the files the builder reports;
+  6. with `--since <sha>` (needs `--pr` and `--expect`; for a builder that adds commits to a longer pull request): the
+     `--expect` files are compared with the files changed by the commits after <sha> instead of with the whole pull
+     request's. <sha> is 7 to 40 hex characters, must name a commit that HEAD contains, and merge commits and commits
+     already on the base do not count (merging the base in adds none of its files).
 With `--pr` it always prints the pull request's files, and a WARN when the change is over the slice cap of
 agent-operations.md §4.5 (generated files aside). It prints one line per problem and ends `DONE CHECK OK` or
 `DONE CHECK FAILED`. Exit 0 only when OK.
@@ -23,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -91,6 +97,45 @@ def compare_expected(pr_files: list[str], expected: list[str]) -> list[str]:
     return problems
 
 
+SHA = re.compile(r"[0-9a-f]{7,40}")
+
+
+def files_since(since: str, base_ref: str, worktree: pathlib.Path) -> tuple[list[str], list[str]]:
+    """(files, problems): every path the non-merge commits after `since` change, leaving out commits already on
+    origin/<base_ref>, so merging the base in adds none of its files. A rename lists both paths, as `pr_files` does."""
+    if not SHA.fullmatch(since):
+        return [], [f"--since must be a commit SHA (7 to 40 hex characters), got {since!r}"]
+    try:
+        full = run(["git", "rev-parse", "--verify", "-q", f"{since}^{{commit}}"], worktree).strip()
+    except subprocess.CalledProcessError:
+        return [], [f"--since {since} is not a commit in this worktree"]
+    try:
+        run(["git", "merge-base", "--is-ancestor", full, "HEAD"], worktree)
+    except subprocess.CalledProcessError as e:
+        return [], [f"--since {since} is not an ancestor of HEAD" if e.returncode == 1
+                    else f"could not compare --since {since} with HEAD: {(e.stderr or '').strip()}"]
+    commits = run(["git", "rev-list", f"{full}..HEAD", "--not", f"origin/{base_ref}"], worktree).split()
+    files: set[str] = set()
+    for c in commits:
+        # --cc: a plain commit lists its files; a merge lists only what it changed against every parent (a conflict
+        # fix or a file added during the merge), never the base's files it brings in (review of .github #64).
+        files.update(nul_fields(run(["git", "diff-tree", "-r", "-z", "--cc", "--no-commit-id", "--name-only",
+                                     "--no-renames", c], worktree)))
+    return sorted(files), []
+
+
+def compare_since(since_files: list[str], expected: list[str], since: str) -> list[str]:
+    """Problems when the files the commits after `since` change differ from the files the builder reports."""
+    problems = []
+    missing = sorted(set(expected) - set(since_files))
+    extra = sorted(set(since_files) - set(expected))
+    if missing:
+        problems.append(f"reported but not changed after {since}: " + ", ".join(missing))
+    if extra:
+        problems.append(f"changed after {since} but not reported: " + ", ".join(extra))
+    return problems
+
+
 def parse_pr(ref: str) -> tuple[str, str]:
     repo, sep, number = ref.partition("#")
     if not sep or not repo or not number.isdigit():
@@ -146,7 +191,8 @@ def linked_worktree_problem(worktree: pathlib.Path) -> str | None:
     return None
 
 
-def check(worktree: pathlib.Path, pr: str | None, branch: str | None, expect: list[str] | None = None) -> list[str]:
+def check(worktree: pathlib.Path, pr: str | None, branch: str | None, expect: list[str] | None = None,
+          since: str | None = None) -> list[str]:
     problems: list[str] = []
     why = linked_worktree_problem(worktree)
     if why:
@@ -159,6 +205,9 @@ def check(worktree: pathlib.Path, pr: str | None, branch: str | None, expect: li
     remote_repo = "origin"
     if expect is not None and not pr:
         problems.append("--expect needs --pr: the expected files are compared with the pull request's")
+    if since is not None and (not pr or expect is None):
+        problems.append("--since needs --pr and --expect: it compares the reported files with the commits after it")
+        since = None
     if pr:
         repo, number = parse_pr(pr)
         info = read_pr(repo, number, head, worktree)
@@ -174,7 +223,7 @@ def check(worktree: pathlib.Path, pr: str | None, branch: str | None, expect: li
         print(f"pull request files ({len(files)}):")
         for f in files:
             print(f"  {f}")
-        if expect is not None:
+        if expect is not None and since is None:
             problems += compare_expected(files, expect)
         try:
             run(["git", "fetch", "-q", "origin", base_ref], worktree)
@@ -186,6 +235,13 @@ def check(worktree: pathlib.Path, pr: str | None, branch: str | None, expect: li
         except subprocess.CalledProcessError as e:
             problems.append(f"HEAD does not contain the current origin/{base_ref}: merge it in" if e.returncode == 1
                             else f"could not compare HEAD with origin/{base_ref}: {(e.stderr or '').strip()}")
+        if since is not None and expect is not None:
+            since_files, why = files_since(since, base_ref, worktree)
+            problems += why or compare_since(since_files, expect, since)
+            if not why:
+                print(f"files changed after {since} ({len(since_files)}):")
+                for f in since_files:
+                    print(f"  {f}")
         diff = ["git", "diff", "-z", "--no-renames", f"origin/{base_ref}...HEAD"]
         changed = nul_fields(run([*diff[:2], "--name-only", *diff[2:]], worktree))
         problems += compare_files(files, changed)
@@ -217,9 +273,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pr", help="<repo>#<n>, for example onepeek-infra#177")
     ap.add_argument("--branch", help="the remote branch HEAD was pushed to")
     ap.add_argument("--expect", nargs="+", metavar="FILE", help="the files the builder reports as changed")
+    ap.add_argument("--since", metavar="SHA", help="compare --expect with the files of the commits after SHA only")
     args = ap.parse_args(argv)
     try:
-        problems = check(args.worktree.resolve(), args.pr, args.branch, args.expect)
+        problems = check(args.worktree.resolve(), args.pr, args.branch, args.expect, args.since)
     except (subprocess.CalledProcessError, ValueError, KeyError, TypeError, OSError, json.JSONDecodeError) as e:
         problems = [f"could not check: {e}"]  # fail closed (pitfalls.md 14)
     for p in problems:
