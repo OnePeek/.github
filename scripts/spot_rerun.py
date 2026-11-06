@@ -8,6 +8,10 @@ annotation with no log), and the run is on its first attempt, it re-runs
 the failed jobs once (`gh run rerun <id> --failed`) and writes the reason (the job names) to the step summary.
 Otherwise it does nothing: a second reclaim, or an ordinary failure, stays failed and visible.
 
+It also never re-runs a superseded run (ci-runners.md section 4.1, W2.6): a re-run joins its concurrency group again and
+would cancel the newer, current run. superseded() is checked before any log is read and again just before the re-run;
+a read that fails re-runs nothing (exit 1).
+
     RUN_ID=<github.event.workflow_run.id> REPO=<github.repository> python3 spot_rerun.py
 
 RUN_ID and REPO are checked strictly (digits only; owner/name). The token is GH_TOKEN (actions: read, checks: read, and
@@ -21,6 +25,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 
 # A reclaimed runner's log can reach the API minutes after the job ends: the log is read up to LOG_TRIES times.
 LOG_TRIES = 4
@@ -110,6 +115,45 @@ def reclaimed_jobs(repo: str, jobs: list[dict]) -> list[str]:
     return [ids[j] for j in ids if j in found]
 
 
+def superseded(repo: str, run_id: str, info: dict) -> str:
+    """Why the run is superseded, or "" when it is not (ci-runners.md section 4.1). Raises GhError when a read fails
+    (fail closed: the caller re-runs nothing). A newer-or-equal run (same workflow_id, event and head_branch, any
+    status, an equal created_at counts as newer) supersedes it; for push and pull_request events so does a branch head
+    that is no longer the run's head_sha, or a branch that no longer exists."""
+    wf, event, branch = str(info.get("workflow_id") or ""), str(info.get("event") or ""), str(info.get("head_branch") or "")
+    sha, created = str(info.get("head_sha") or ""), str(info.get("created_at") or "")
+    if not (RUN_ID.fullmatch(wf) and event and branch and sha and created):
+        err = GhError(f"run {run_id} has no workflow_id, event, head_branch, head_sha or created_at to compare")
+        print(f"::warning::{err}", file=sys.stderr)
+        raise err
+    name = clean(str(info.get("name") or wf))
+    query = "&".join(f"{k}={urllib.parse.quote(v, safe='')}" for k, v in
+                     (("branch", branch), ("event", event), ("created", ">=" + created)))
+    try:
+        out = gh("api", "--paginate", f"repos/{repo}/actions/workflows/{wf}/runs?{query}&per_page=100",
+                 "--jq", ".workflow_runs[] | {id, created_at, html_url}")
+        runs = [json.loads(line) for line in out.splitlines() if line.strip()]
+    except (GhError, json.JSONDecodeError) as e:
+        print(f"::warning::the runs of workflow {wf} on {clean(branch)} could not be read: {e}", file=sys.stderr)
+        raise GhError(f"runs of workflow {wf} could not be read: {e}") from e
+    for other in runs:
+        if str(other.get("id")) != str(run_id) and str(other.get("created_at", "")) >= created:
+            oid = str(other.get("id", ""))
+            link = f"https://github.com/{repo}/actions/runs/{oid}" if RUN_ID.fullmatch(oid) else "a newer run"
+            return (f"run {run_id} is superseded by {link} (newer run of {name} on {clean(branch)})")
+    if event in ("push", "pull_request"):
+        try:
+            head = gh("api", f"repos/{repo}/branches/{urllib.parse.quote(branch, safe='/')}", "--jq", ".commit.sha").strip()
+        except GhError as e:
+            if "404" in str(e):
+                return f"run {run_id} is superseded: the branch {clean(branch)} no longer exists"
+            print(f"::warning::the head of branch {clean(branch)} could not be read: {e}", file=sys.stderr)
+            raise
+        if head != sha:
+            return (f"run {run_id} is superseded: the head of {clean(branch)} is now {head[:7]}, not {sha[:7]}")
+    return ""
+
+
 def summary(text: str) -> None:
     print(text)
     path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -128,16 +172,24 @@ WORKFLOW_NAME = re.compile(r"[A-Za-z0-9 ._-]{1,100}", re.ASCII)
 def run(run_id: str, repo: str, workflow: str = "", rerun_all: str = "") -> int:
     """0 when nothing was needed or the re-run was requested; 1 only for an input or API error."""
     validate(run_id, repo)
-    info = json.loads(gh("api", f"repos/{repo}/actions/runs/{run_id}", "--jq", "{run_attempt, conclusion}"))
+    info = json.loads(gh("api", f"repos/{repo}/actions/runs/{run_id}", "--jq", "{run_attempt, conclusion, workflow_id, event, head_branch, head_sha, created_at, name}"))
     if info.get("conclusion") != "failure":
         summary(f"No re-run: run {run_id} did not fail (conclusion {info.get('conclusion')!r}).")
         return 0
     if info.get("run_attempt") != 1:
         summary(f"No re-run: run {run_id} is on attempt {info.get('run_attempt')}; a second failure stays failed.")
         return 0
+    why = superseded(repo, run_id, info)  # before any log read: a superseded run costs no log reads
+    if why:
+        summary(f"No re-run: {why}.")
+        return 0
     names = reclaimed_jobs(repo, failed_jobs(repo, run_id))
     if not names:
         summary(f"No re-run: no failed job in run {run_id} shows a spot reclaim.")
+        return 0
+    why = superseded(repo, run_id, info)  # the log reads took up to 90 seconds: a push may have landed meanwhile
+    if why:
+        summary(f"No re-run: {why}.")
         return 0
     whole = bool(workflow) and WORKFLOW_NAME.fullmatch(workflow) is not None and workflow in rerun_all.split()
     if whole:  # its jobs share a lock or state per attempt: re-run every job (sandbox.md section 7c item 10)
