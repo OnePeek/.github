@@ -14,7 +14,8 @@ _SPEC = importlib.util.spec_from_file_location(
 sw = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(sw)
 CFG = {"repos": ["onepeek-docs", ".github", "onepeek-infra", "onepeek-web"], "authors": ["Karan-98-Mehta"],
-       "known_flakes": ["flaky / job"], "depends_on_check": "depends-on / depends-on"}
+       "known_flakes": ["flaky / job"], "depends_on_check": "depends-on / depends-on",
+       "warn": [("sandbox", "apply-")]}
 NOW = 1_800_000_000.0
 GREEN = [{"name": "depends-on / depends-on", "bucket": "pass", "link": "https://x/runs/11/job/1"}]
 
@@ -89,12 +90,12 @@ class Base(unittest.TestCase):
         self.addCleanup(p.stop)
         self.addCleanup(self.tmp.cleanup)
 
-    def run_pass(self, fake, dry=False, now=NOW, state=None):
+    def run_pass(self, fake, dry=False, now=NOW, state=None, cfg=CFG):
         if state is not None:
             self.out.mkdir(parents=True, exist_ok=True)
             (self.out / "state.json").write_text(json.dumps(state))
         with mock.patch.object(sw, "GH_RUN", fake):
-            return sw.one_pass(CFG, self.out, dry, now, pathlib.Path(self.tmp.name))
+            return sw.one_pass(cfg, self.out, dry, now, pathlib.Path(self.tmp.name))
 
     def reruns(self, fake):
         return [c[2] for c in fake.calls if c[:2] == ["run", "rerun"]]
@@ -171,6 +172,41 @@ class Queue(Base):
         rows = [json.loads(x) for x in (self.out / "measures.jsonl").read_text().splitlines()]
         self.assertEqual(rows, [{"pr": "onepeek-web#1", "merged_at": "2026-11-06T03:30:00Z", "hours_open_to_merge": 3.5,
                                  "review_rounds": 2, "bot_threads": 2, "reruns": 1}])
+
+
+class WarnOnly(Base):
+    """Decision 173: the sandbox checks warn but never block, while ship_watch.yaml lists them."""
+
+    def infra(self, sandbox, other="pass", cfg=CFG):
+        cs = [{"name": "tests", "bucket": other, "workflow": "checks", "link": "https://x/runs/1/job/1"},
+              {"name": "apply-test", "bucket": sandbox, "workflow": "sandbox", "link": "https://x/runs/77/job/9"}]
+        fake = FakeGh(world(("onepeek-infra", pr("onepeek-infra", 5))), checks={"onepeek-infra#5": cs})
+        return self.run_pass(fake, cfg=cfg)
+
+    def test_a_pending_warn_check_merges(self):
+        self.infra("pending")
+        self.assertEqual(self.merged, ["onepeek-infra#5"])
+
+    def test_a_red_warn_check_merges_and_alerts(self):
+        s = self.infra("fail")
+        self.assertEqual(self.merged, ["onepeek-infra#5"])
+        self.assertIn("sandbox red on onepeek-infra#5: https://x/runs/77", s["alerts"])
+        self.assertEqual(s["warned"], [{"pr": "onepeek-infra#5", "check": "apply-test", "link": "https://x/runs/77/job/9"}])
+
+    def test_any_other_red_check_blocks(self):
+        s = self.infra("pass", other="fail")
+        self.assertEqual(self.merged, [])
+        self.assertEqual(s["prs"][0]["reason"], "red: tests")
+
+    def test_without_the_list_the_warn_check_blocks_again(self):
+        s = self.infra("pending", cfg=dict(CFG, warn=[]))
+        self.assertEqual((self.merged, s["prs"][0]["reason"]), ([], "pending: apply-test"))
+        self.assertFalse([a for a in s["alerts"] if "sandbox red" in a])
+
+    def test_the_list_is_read_from_ship_watch_yaml(self):
+        cfg = sw.load_config(sw.HERE / "ship_watch.yaml")
+        self.assertIn(("sandbox", "apply-test"), cfg["warn"])
+        self.assertNotIn("checks", {w for w, _ in cfg["warn"]})
 
 
 class Rerun(Base):

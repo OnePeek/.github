@@ -36,7 +36,9 @@ without waiting for a new CI run, because only that one line changed since the g
 waits for CI as before). Neither
 `--order` nor `Depends on:` ever moves onepeek-docs off first place. After each merge, the local worktrees of that branch are removed
 when clean (§8a P6). A required check that failed before an earlier repo in the set merged is re-run once
-(it may have needed that repo); a second failure stops the run. Nothing is merged past a red required check.
+(it may have needed that repo); a second failure stops the run. Nothing is merged past a red required check, except
+the warn-only checks ship_watch.yaml lists in `warn_checks` (decision 173: the sandbox workflow's, until `warn_until`),
+which are not waited on; deleting the list makes them block again.
 
 Run it from the workspace root (the folder holding the repos side by side). Needs `gh` signed in.
 """
@@ -218,7 +220,7 @@ def pr_info(repo: str, n: int) -> dict:
 def read_checks(repo: str, n: int, required: bool) -> list[dict]:
     """`gh pr checks` exits non-zero while checks are pending or failed but still prints them; an empty result is
     only taken from its own "no ... checks reported" message, and any other failure stops the run."""
-    cmd = ["gh", "pr", "checks", str(n), "-R", f"{ORG}/{repo}", "--json", "name,bucket,link"]
+    cmd = ["gh", "pr", "checks", str(n), "-R", f"{ORG}/{repo}", "--json", "name,bucket,link,workflow"]
     r = subprocess.run([*cmd, *(["--required"] if required else [])], capture_output=True, text=True, check=False)
     if r.stdout.strip().startswith("["):
         return json.loads(r.stdout)
@@ -318,10 +320,42 @@ def refresh_docs_pin(repo: str, branch: str, base: str, docs_label: str, docs_he
             git(src, "worktree", "remove", "--force", str(wt))
 
 
+WARN_FILE = pathlib.Path(__file__).resolve().parent / "ship_watch.yaml"
+
+
+def warn_checks(path: pathlib.Path = WARN_FILE) -> tuple[list[tuple[str, str]], str]:
+    """Decision 173: the checks that warn but never block a merge, as (workflow, check-name prefix) from
+    ship_watch.yaml's `warn_checks`, and its end condition `warn_until`. Deleting the list ends it. A file that is
+    missing, unreadable or malformed gives no warn checks, so every check blocks (fail closed)."""
+    try:
+        import yaml  # only here: the rest of this tool needs no third-party package
+    except ImportError:
+        return [], ""
+    try:
+        cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+        warn = [(r["workflow"], r["prefix"]) for r in cfg.get("warn_checks") or []]
+    except (OSError, yaml.YAMLError, AttributeError, KeyError, TypeError):
+        return [], ""
+    if not all(isinstance(w, str) and w and isinstance(p, str) and p for w, p in warn):
+        return [], ""
+    return warn, str(cfg.get("warn_until") or "")
+
+
+def is_warn(c: dict, warn: list[tuple[str, str]]) -> bool:
+    return any(c.get("workflow") == w and c["name"].startswith(p) for w, p in warn)
+
+
 def wait_green(repo: str, n: int, may_rerun: bool) -> None:
     deadline, reran = time.time() + CHECK_TIMEOUT_S, False
+    warn, until = warn_checks()
+    told = False
     while time.time() < deadline:
         cs = checks(repo, n)
+        skipped = sorted({c["name"] for c in cs if is_warn(c, warn)})
+        if skipped and not told:  # decision 173: they still run and report; the watcher alerts when one is red
+            say(f"{repo}#{n}: not waiting on warn-only check(s) {skipped} (until {until or 'the list is removed'})")
+            told = True
+        cs = [c for c in cs if not is_warn(c, warn)]
         pending = [c["name"] for c in cs if c["bucket"] == "pending"]
         failed = [c for c in cs if c["bucket"] == "fail" or c["bucket"] == "cancel"]
         if cs and not pending and not failed:

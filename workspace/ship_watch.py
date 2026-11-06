@@ -12,7 +12,8 @@ HOLD (a release, a draft, or an author not in the allow-list). READY ones merge 
 goes on (F32). A red check is re-run once only when it is the depends-on check and every pull request its `Depends on:`
 lines name has merged, or when it is a known flake. The only write this script makes itself is `gh run rerun`: it never
 merges a release, closes a pull request, pushes, or touches a review thread. Any read failure fails the pass closed:
-nothing is merged or re-run, and an alert says why. Without --go or --dry-run, the first run (no state.json yet) is a
+nothing is merged or re-run, and an alert says why. While ship_watch.yaml lists `warn_checks` (decision 173: the sandbox
+workflow's, until `warn_until`), those checks never block READY; a red one is an alert ("sandbox red on ..."). Without --go or --dry-run, the first run (no state.json yet) is a
 dry run and later runs merge.
 
 It writes ship-status.json, ship-status.md, state.json and measures.jsonl (one line per pull request it merged) to
@@ -102,6 +103,7 @@ def load_config(path: pathlib.Path) -> dict:
     keys = {"repos": list, "authors": list, "known_flakes": list, "depends_on_check": str}
     if not isinstance(cfg, dict) or any(not isinstance(cfg.get(k), t) for k, t in keys.items()):
         raise SystemExit(f"{path}: needs {', '.join(f'{k} ({t.__name__})' for k, t in keys.items())}")
+    cfg["warn"] = scs.warn_checks(path)[0]  # decision 173: one reader, shared with ship_change_set's wait
     return cfg
 
 
@@ -166,13 +168,14 @@ def classify(p: dict, cfg: dict) -> tuple[str, str]:
     waiting = [d for d, s in p["dep_states"].items() if s != "MERGED"]
     if waiting:
         return "BLOCKED", f"waiting for {', '.join(waiting)}"
-    red = [c["name"] for c in p["checks"] if c["bucket"] in ("fail", "cancel")]
+    hard = [c for c in p["checks"] if not scs.is_warn(c, cfg["warn"])]  # warn-only checks never block (decision 173)
+    red = [c["name"] for c in hard if c["bucket"] in ("fail", "cancel")]
     if red:
         return "BLOCKED", f"red: {', '.join(red)}"
-    pending = [c["name"] for c in p["checks"] if c["bucket"] == "pending"]
+    pending = [c["name"] for c in hard if c["bucket"] == "pending"]
     if pending:
         return "BLOCKED", f"pending: {', '.join(pending)}"
-    if not p["checks"]:
+    if not hard:
         return "BLOCKED", "no checks reported"
     if p["threads"]:
         return "BLOCKED", f"{len(p['threads'])} unresolved review thread(s): {', '.join(p['threads'])}"
@@ -250,6 +253,7 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
     errors: list[str] = []
     alerts: list[str] = []
     actions: list[str] = []
+    warned: list[dict] = []
     prs = read_prs(cfg, errors)
     ci = read_ci(cfg, errors)
     progress, todo = {}, []
@@ -260,6 +264,11 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
         progress[p["label"]] = {"fp": fp, "since": since}
         if now - since >= NO_PROGRESS_S:
             alerts.append(f"{p['label']}: no progress for {(now - since) / 3600:.1f} h ({p['class']} {p['reason']})".rstrip())
+        for c in p.get("checks") or []:
+            if c["bucket"] in ("fail", "cancel") and scs.is_warn(c, cfg["warn"]):
+                run = re.match(r".*/runs/\d+", c.get("link") or "")
+                alerts.append(f"sandbox red on {p['label']}: {run.group(0) if run else c.get('link')}")
+                warned.append({"pr": p["label"], "check": c["name"], "link": c.get("link")})
         more, red = reruns(p, cfg, done)
         todo += more
         alerts += red
@@ -315,7 +324,7 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
             except (ReadError, ValueError, KeyError, TypeError) as e:
                 alerts.append(f"{p['label']}: measures unreadable: {e}")
     open_labels = {p["label"] for p in prs}
-    status = {"at": iso(now), "mode": "dry-run" if dry else "go", "alerts": alerts, "actions": actions, "ci": ci,
+    status = {"at": iso(now), "mode": "dry-run" if dry else "go", "alerts": alerts, "actions": actions, "warned": warned, "ci": ci,
               "prs": [{k: p.get(k) for k in ("label", "title", "url", "class", "reason", "headRefOid", "baseRefName",
                                               "isDraft", "mergeable", "checks", "threads", "dep_states")} for p in prs]}
     new_state = {"prs": progress, "no_runner_since": no_runner,

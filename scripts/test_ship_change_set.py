@@ -80,6 +80,11 @@ class Checks(unittest.TestCase):
         with mock.patch.object(ship.subprocess, "run", return_value=done(8, '[{"name":"a","bucket":"pending"}]')):
             self.assertEqual(ship.read_checks("r", 1, True), [{"name": "a", "bucket": "pending"}])
 
+    def test_the_workflow_of_each_check_is_read(self) -> None:  # warn-only checks are matched by it (decision 173)
+        with mock.patch.object(ship.subprocess, "run", return_value=done(0, "[]")) as run:
+            ship.read_checks("r", 1, True)
+        self.assertIn("name,bucket,link,workflow", run.call_args[0][0])
+
     def test_none_required_is_empty_only_from_gh_own_message(self) -> None:
         msg = done(1, "", "no required checks reported on the 'x' branch")
         with mock.patch.object(ship.subprocess, "run", return_value=msg):
@@ -94,6 +99,49 @@ class Checks(unittest.TestCase):
         every = [{"name": "ci", "bucket": "pass"}, {"name": "CodeRabbit", "bucket": "pending"}]
         with mock.patch.object(ship, "read_checks", side_effect=lambda r, n, req: [] if req else every):
             self.assertEqual(ship.checks("r", 1), [{"name": "ci", "bucket": "pass"}])
+
+
+class WarnOnly(unittest.TestCase):
+    """Decision 173: wait_green does not wait on the warn-only checks ship_watch.yaml lists; every other check blocks."""
+
+    def wait(self, sandbox, other="pass", warn=(("sandbox", "apply-"),)):
+        cs = [{"name": "tests", "bucket": other, "workflow": "checks", "link": ""},
+              {"name": "apply-test", "bucket": sandbox, "workflow": "sandbox", "link": ""}]
+        with mock.patch.object(ship, "checks", return_value=cs), mock.patch.object(ship, "say"), \
+                mock.patch.object(ship, "warn_checks", return_value=(list(warn), "T-30")), \
+                mock.patch.object(ship, "CHECK_TIMEOUT_S", 0.05), mock.patch.object(ship, "POLL_S", 0.01):
+            ship.wait_green("onepeek-infra", 5, False)
+
+    def test_pending_or_red_warn_check_does_not_block(self):
+        self.wait("pending")
+        self.wait("fail")
+
+    def test_every_other_red_check_blocks(self):
+        with self.assertRaisesRegex(SystemExit, "failed \\['tests'\\]"):
+            self.wait("pass", other="fail")
+
+    def test_an_empty_list_blocks_on_the_warn_check_again(self):
+        with self.assertRaisesRegex(SystemExit, "still pending"):
+            self.wait("pending", warn=())
+        with self.assertRaisesRegex(SystemExit, "apply-test"):
+            self.wait("fail", warn=())
+
+    def test_same_workflow_and_prefix_only(self):
+        self.assertTrue(ship.is_warn({"name": "apply-test", "workflow": "sandbox"}, [("sandbox", "apply-")]))
+        self.assertFalse(ship.is_warn({"name": "apply-test", "workflow": "checks"}, [("sandbox", "apply-")]))
+        self.assertFalse(ship.is_warn({"name": "tests", "workflow": "sandbox"}, [("sandbox", "apply-")]))
+
+    def test_the_file_is_read_and_a_bad_one_gives_no_warn_checks(self):
+        warn, until = ship.warn_checks()
+        self.assertIn(("sandbox", "apply-test"), warn)
+        self.assertEqual(until, "T-30")
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "w.yaml"
+            for text in ("warn_checks: [{workflow: sandbox}]", "warn_checks: [{workflow: sandbox, prefix: ''}]",
+                         "warn_checks: x", "[1, 2]", "a: [", "warn_checks: [{workflow: 3, prefix: a}]"):
+                f.write_text(text)
+                self.assertEqual(ship.warn_checks(f), ([], ""), text)
+            self.assertEqual(ship.warn_checks(f.with_name("missing.yaml")), ([], ""))
 
 
 class Conflicts(unittest.TestCase):

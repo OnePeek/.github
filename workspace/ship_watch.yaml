@@ -9,3 +9,20 @@ authors: [Karan-98-Mehta, app/dependabot]
 known_flakes: []
 # The depends-on check's name as passing runs print it (every repo, 2026-11-06).
 depends_on_check: depends-on / depends-on
+# Decision 173: checks that warn but never block a merge (ship_change_set.py does not wait on them; the watcher ignores
+# them for READY and alerts when one is red), as the workflow and a check-name prefix. These are the jobs of
+# onepeek-infra's sandbox workflow, named as passing runs print them (`gh pr checks 180 -R OnePeek/onepeek-infra --json
+# workflow,name`, 2026-11-06). A job added there later blocks until it is listed. Delete the list when warn_until is met.
+warn_until: T-30
+warn_checks:
+  - {workflow: sandbox, prefix: gate}
+  - {workflow: sandbox, prefix: budget}
+  - {workflow: sandbox, prefix: lock}
+  - {workflow: sandbox, prefix: apply-phase-1}
+  - {workflow: sandbox, prefix: images}
+  - {workflow: sandbox, prefix: apply-phase-2}
+  - {workflow: sandbox, prefix: smoke}
+  - {workflow: sandbox, prefix: destroy}
+  - {workflow: sandbox, prefix: sweep}
+  - {workflow: sandbox, prefix: unlock}
+  - {workflow: sandbox, prefix: apply-test}
