@@ -23,14 +23,6 @@ spec.loader.exec_module(lc)
 
 
 
-def plugin_download_unreachable(text: str) -> bool:
-    """The tflint plugin download (`tflint --init` fetching a GitHub release) could not reach GitHub's API: rate limited, a
-    network timeout, DNS or connection failure. Environment trouble, not a defect in the image or the config, so the
-    test skips (the network is not under test); any other failure is still a failure."""
-    if "rate limit" in text:
-        return True
-    return bool(re.search(r"Failed to fetch GitHub releases.*?(timeout|timed out|deadline exceeded|no such host|connection (reset|refused)|\bEOF\b)", text, re.S | re.I))
-
 class LocalCi(unittest.TestCase):
     def repo(self, workflow: str) -> pathlib.Path:
         d = pathlib.Path(tempfile.mkdtemp())
@@ -305,36 +297,32 @@ class Versions(unittest.TestCase):
                 self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
         self.assertIn("needs tflint", out.getvalue())
 
-    def test_a_failed_plugin_download_is_a_skip_only_when_github_was_unreachable(self):
-        base = 'Failed to install a plugin; Failed to fetch GitHub releases: Get "https://api.github.com/x": '
-        for why in ("net/http: TLS handshake timeout", "dial tcp: lookup api.github.com: no such host", "context deadline exceeded (Client.Timeout exceeded)",
-                    "read: connection reset by peer", "unexpected EOF"):
-            self.assertTrue(plugin_download_unreachable(base + why), why)
-        self.assertTrue(plugin_download_unreachable("API rate limit exceeded for 1.2.3.4"))
-        # A real problem with the plugin or the config stays a failure.
-        for text in ("", "Failed to install a plugin; checksum mismatch", base + "404 Not Found", "rule violation: terraform_unused_declarations"):
-            self.assertFalse(plugin_download_unreachable(text), text)
-
     def test_the_pinned_image_really_runs_on_a_plugin_fixture_and_a_clean_one(self):
         if not lc.docker_ready():
             self.skipTest("docker is not available")
-        aws = ('plugin "aws" {\n  enabled = true\n  version = "0.40.0"\n  source = "github.com/terraform-linters/tflint-ruleset-aws"\n}\n')
+        # The plugin fixture needs no network: GitHub's API is not under test (a 504 from it failed CI, T-54). Its plugin is a
+        # local one, pre-seeded in the cache: a wrapper over the image's own bundled ruleset (tflint runs bundled plugins as
+        # `tflint --act-as-bundled-plugin`). `--init` has nothing to download for a plugin with no source, and `--recursive`,
+        # in its own container, finds the plugin only through the cache mounted at /root/.tflint.d.
+        probe = ('plugin "terraform" {\n  enabled = false\n}\nplugin "probe" {\n  enabled = true\n  preset  = "all"\n}\n'
+                 'rule "terraform_standard_module_structure" {\n  enabled = false\n}\n')
         bundled = 'plugin "terraform" {\n  enabled = true\n  preset  = "all"\n}\nrule "terraform_standard_module_structure" {\n  enabled = false\n}\n'  # ships inside tflint: no download
-        # The aws plugin needs --init's download to reach --recursive; GitHub's API may rate-limit that download (then it is skipped).
-        for hcl in (bundled, "", aws):
+        clean = 'terraform {\n  required_version = ">= 1.0"\n}\n\nvariable "x" {\n  description = "x"\n  type        = string\n}\n\noutput "x" {\n  description = "x"\n  value       = var.x\n}\n'
+        for hcl, tf, want in ((bundled, clean, 0), ("", clean, 0), (probe, clean, 0), (probe, clean + 'variable "unused" {\n  description = "u"\n  type        = string\n}\n', 1)):
             d = self._tf_repo()
-            (d / "main.tf").write_text('terraform {\n  required_version = ">= 1.0"\n}\n\nvariable "x" {\n  description = "x"\n  type        = string\n}\n\noutput "x" {\n  description = "x"\n  value       = var.x\n}\n')
+            (d / "main.tf").write_text(tf)
             (d / ".tflint.hcl").write_text(hcl)
             cache = pathlib.Path(tempfile.mkdtemp()) / "tflint.d"
+            (cache / "plugins").mkdir(parents=True)
+            (cache / "plugins/tflint-ruleset-probe").write_text("#!/bin/sh\nexec /usr/local/bin/tflint --act-as-bundled-plugin\n")
+            (cache / "plugins/tflint-ruleset-probe").chmod(0o755)
             out = io.StringIO()
             with mock.patch.object(lc, "tflint_mode", return_value="docker"), mock.patch.object(lc, "TFLINT_CACHE", cache), \
                     mock.patch.object(lc, "uv_problem", return_value=""), contextlib.redirect_stdout(out):
                 rc = lc.main([str(d), "--jobs", "a"])
-            if hcl is aws and plugin_download_unreachable(out.getvalue()):
-                self.skipTest("GitHub's API could not be reached for the plugin download (rate limit or network)")
-            self.assertEqual(rc, 0, out.getvalue())
-            self.assertIn("PASS", out.getvalue())
-            self.assertEqual(hcl is aws, any(cache.rglob("tflint-ruleset-aws*")), out.getvalue())
+            self.assertEqual(rc, want, out.getvalue())
+            # The last fixture fails only because the probe plugin really ran in --recursive's container: an unused variable.
+            self.assertIn("terraform_unused_declarations" if want else "PASS", out.getvalue())
 
     def test_tflint_calls_are_found_anywhere_in_a_step_but_not_other_tools(self):
         for yes in ("tflint --init", "  tflint", "cd x && tflint -f json", "if tflint; then :; fi", "a; tflint", "(tflint)", "a | tflint"):
