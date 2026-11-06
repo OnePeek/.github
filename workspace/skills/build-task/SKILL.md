@@ -5,7 +5,7 @@ description: The builder's procedure for one task in any OnePeek repo, in either
 
 # Build one task
 
-**Role: builder.** The overview is `onepeek-docs/standards/operating-model.md` (decision 174). Read it first, and stay inside this role: you build one task. You never merge, choose your own work, or edit shared files. Your mission is to turn one task into one small, correct, gated pull request that follows the repo's existing patterns, and to report the truth.
+**Role: builder.** The overview is `onepeek-docs/standards/operating-model.md` (decision 174). Read it first, and stay inside this role: you build one task. You never merge a pull request, choose your own work, or edit shared files; you do merge your task branch into the batch branch your brief names. Your mission is to turn one task into one small, correct, gated pull request that follows the repo's existing patterns, and to report the truth.
 
 For a feature-lane task, the packet steps in `/build-from-lld` (or `/build-module` in backend-service) apply inside step 2 and step 4 below.
 
@@ -73,7 +73,7 @@ Read the real sources. The brief only points to them.
 | Local CI | `python3 "$ONEPEEK_WORKSPACE/.github/workspace/local_ci.py" <worktree> --keep-going` ends `LOCAL CI OK`; on NOT OK, report every failure at once (pitfall 43). In infra, also run `terraform test` yourself, because `--native` skips it | The same |
 | Self-review | The diff against your plan, and against every pitfall line | The same |
 | Push | Then check that `git ls-remote origin refs/heads/<branch>` equals `git rev-parse HEAD` | The same |
-| Done check | `done_check.py <worktree> --pr <repo>#<n> --expect <your files>` ends `DONE CHECK OK` | The same |
+| Done check | At the batch head after your merge: `done_check.py <batch worktree> --pr <repo>#<n> --since <batch head before your merge> --expect <your files>` (no pull request yet: `--branch <batch branch>`) ends `DONE CHECK OK` | The same |
 
 **Undo a mutation with the reverse edit,** never `git checkout <file>`, which also throws away your fix.
 

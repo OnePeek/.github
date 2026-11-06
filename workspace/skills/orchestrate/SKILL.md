@@ -15,7 +15,7 @@ description: The orchestrator's procedure (the main session in the OnePeek works
    - the runner status;
    - the latest `ship-status.md`;
    - `git worktree list` in each repo, to find agent worktrees left behind.
-   - check that the shared `.github` and `onepeek-docs` checkouts are on `main`, then `git -C <repo> pull --ff-only origin main` and `python3 .github/workspace/setup.py --sync-repos --check` (re-sync if it drifts); after any merge to `workspace/ship_*.py` or `packet.py`, restart the watcher (F41), so the tools and docs agents read are current (F38: a 79-commit-stale docs checkout lacked `operating-model.md`).
+   - check that the shared `.github` and `onepeek-docs` checkouts are on `main`, then `git -C <repo> pull --ff-only origin main` and `python3 .github/workspace/setup.py --check` (it reports synced-copy drift; run `--sync-repos` only when it does); after any merge to `workspace/ship_*.py` or `packet.py`, restart the watcher (F41), so the tools and docs agents read are current (F38: a 79-commit-stale docs checkout lacked `operating-model.md`).
 4. Write the session plan into the task list: the 3 to 6 items you will finish, in order, each with its lane and its owner.
 5. Send the founder one line: what is done, what is next, and what you need from them, if anything.
 
@@ -61,13 +61,13 @@ Your own docs rulings are never "mechanical". The reviewer reviews the code buil
    - Builder A takes the `onepeek-infra` and `.github` work.
    - Builder B takes `backend-service`, `onepeek-web` and the other repos.
    - A builder stays on one repo lane per session.
-3. **File ownership.** Never give two builders tasks that touch the same file. Check the file list of every open pull request (`gh pr view <n> --json files`). Put the tasks one after the other, or stack the pull requests.
+3. **File ownership.** Never give two builders tasks that touch the same file. Check the file list of every open pull request (`gh pr view <n> --json files`). Put the tasks one after the other, or into the same batch (never a stacked pull request).
    - **Batch pull requests** (founder, 2026-11-07): name one batch branch per repo and lane per window (`batch/<repo>-<lane>-<yyyymmdd>-<n>`, about 60-90 minutes); every brief in that repo and lane says "merge your task branch into <batch>". Close the batch on its window, never on size. A blocker that stops merges ships alone. Merge-tool, IAM and security changes in a batch get the reviewer before the merge (F43).
    - A stacked pull request is based on the trunk with a `Depends on:` line, never on another pull request's branch (F39).
 4. **Work-in-progress limit:**
-   - Each builder has 1 task at a time.
+   - Each builder has one brief at a time; a brief may hold several tasks (a batch). "Two tasks" in the retire rule means two briefs.
    - The reviewer works a queue, in this order: post-merge reviews of the unblock lane, then the head of the dependency chain, then features.
-   - The shipper is always on.
+   - The shipper agent is not kept running: the watcher script merges. Read its "Post-merge reviews due" list at every check-in and queue those reviews.
    - **At most 4 background agents**, briefed through the agent types `builder`, `spec-reviewer` and `shipper`.
    - **More than 3 high-risk pull requests waiting for review:** run two reviewers and one builder (the watcher script keeps merging); back to one reviewer at three or fewer (founder, 2026-11-06).
    - **Brief a reviewer one pull request per run** (it has no `SendMessage`, and its hand-back ends the run): resume the same reviewer with the next pull request, so its context carries over, until it nears 150k tokens or has done two tasks, whichever comes first (agents slowed or stopped reporting after about two tasks on 2026-11-06). Never batch 5-6 pull requests into one run: the verdict for the head of the chain then waits for all the others (2026-11-06).
@@ -91,7 +91,7 @@ The brief gives **pointers to the real sources**, plus the decisions only you ca
   - every gap you have ruled on, with the commit;
   - the number of any shared-file line, which you assign.
 - **Boundaries:** the files to touch; the files not to touch, each with the pull request that owns it; what is out of scope.
-- **Authority:** commit and push to this branch (yes or no); open a pull request (yes or no); merge (never). Anything denied, such as cloud CLIs.
+- **Authority:** commit and push the task branch, and merge it into the named batch branch (yes or no); open the batch pull request if none exists (yes or no); merge a pull request (never). Anything denied, such as cloud CLIs.
 - **Done means:** the lane's done-gate (build-task §6), the report format, and a status update every 10 minutes.
 
 If you cannot fill a field, the task is not ready. Close the gap first.
@@ -114,7 +114,7 @@ Read each agent's status file, its branch head, its pull request's checks, and `
 | A pull request ready for 30 minutes and not merged | Ask the shipper for the cause, and remove it |
 | An agent acting outside its role (§11) | Stop it, revert anything it pushed out of role, brief it again, and add a pitfall line to the next process pull request |
 | An idle slot | Fill it under §5 |
-| An agent's context above about 150k tokens | Give the task to a fresh agent at its next phase change |
+| An agent above about 150k tokens, or done with two briefs | Retire it; give the next brief to a fresh agent |
 | Every hour | Update the handover note and the task list |
 
 ## 9. Talking to the founder

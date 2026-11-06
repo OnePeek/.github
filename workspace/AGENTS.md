@@ -27,7 +27,7 @@ How AI agents are run, so work is fast and token use stays low (founder, 2026-11
 3. **The right model for the job** (revised 2026-11-06, founder).
    - **Opus:** anything touching security, parsing, error handling, concurrency, CI workflows or infra; every design draft; every independent review.
    - **Sonnet:** only truly mechanical work, such as pin moves, renames, restyling to tokens and text syncs.
-4. **One agent per repo lane, resumed.** Follow-ups in the same repo (the next slice, review fixes, a closed gap) resume that lane's agent so it keeps its context. Start it fresh when its context passes about 150k tokens or the work moves to an unrelated area. Reviewers start fresh for round 1 and are resumed for round 2.
+4. **One agent per repo lane, resumed.** Follow-ups in the same repo (the next slice, review fixes, a closed gap) resume that lane's agent so it keeps its context. Start it fresh after two briefs or when its context passes about 150k tokens, whichever comes first or the work moves to an unrelated area. Reviewers start fresh for round 1 and are resumed for round 2.
 5. **Three agents at once: two builders and one independent reviewer** (founder, 2026-11-06), on non-overlapping files.
    - Every normal-code and high-risk pull request, every design and anything touching security gets an independent Opus review before it merges. Mechanical and wording-only changes follow `agent-operations.md` §5.4a, and the coordinator's own work is never classed below normal code.
    - The coordinator does docs and design decisions itself, checks every design against the code before a builder starts, reviews every report, and takes over an agent that stalls.

@@ -74,7 +74,7 @@ Remove your worktrees and fixtures before you report.
 
 ## 7. Never
 - Commit, push, merge, or create a branch on the remote.
-- Reply to or resolve a thread. List them, with the reply text, for the orchestrator.
+- Reply to or resolve a CodeRabbit thread, or draft reply texts (founder, 2026-11-07: nobody replies).
 - Review the orchestrator's rulings as code.
 - Turn a review into a redesign.
 - Write into `reviews.json`: the orchestrator copies your verdict.

@@ -1,6 +1,6 @@
 ---
 name: ship
-description: The shipper's procedure. Watch every open pull request, CI run, runner, dependency and bot thread; merge what is ready; name every blocker within 5 minutes. Use for the always-on shipper agent.
+description: The shipper's procedure. Watch every open pull request, CI run, runner, dependency and bot thread; merge what is ready; name every blocker within 5 minutes. Use when the orchestrator starts the shipper for a pass the watcher script (`ship_watch.py --go`) cannot do; the shipper is not kept running.
 ---
 
 # Ship
@@ -64,7 +64,7 @@ Send the orchestrator a summary once a day.
 - Release, or close a pull request.
 - Merge past a red fast check or an open real defect.
 - Merge an unreviewed feature head.
-- Write into `reviews.json`, or reply to or resolve a thread yourself. The orchestrator posts them until the founder allows thread replies for this role.
+- Write into `reviews.json`, or reply to or resolve a CodeRabbit thread (nobody does, founder 2026-11-07).
 
 ## Pin rounds (founder, 2026-11-06; operating-model §8 Shipping 9)
 - One pin round per `.github` merge train: merge only the newest tag's round, after the train's last `.github` merge. List older open pin pull requests in your report as superseded; the orchestrator closes them.

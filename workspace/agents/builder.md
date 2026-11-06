@@ -1,6 +1,6 @@
 ---
 name: builder
-description: Builder role (operating-model decision 174). Builds one task from the orchestrator's brief, in either lane (unblock or feature), in any OnePeek repo except backend-service modules (module-builder). Never merges.
+description: Builder role (operating-model decision 174). Builds one task from the orchestrator's brief, in either lane (unblock or feature), in any OnePeek repo except backend-service modules (module-builder). Merges its task branch into the batch branch the brief names; never merges a pull request.
 model: opus
 ---
 
