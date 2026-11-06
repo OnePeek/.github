@@ -26,6 +26,9 @@ Slice (about 400 changed lines at most, generated files and merges aside):
 
 Known traps for this slice: <pitfalls.md numbers, or new ones>
 
+Status: write <worktree>/.context/status.md at every phase change (at least every 10 min); never wait > 5 min on CI,
+  a review or a dependency, so push, set phase: blocked, and hand back a BLOCKED report (agent-operations.md §5.6).
+
 Authority (what the person allowed for this task): commit + push to the branch: yes | no;  open PR: yes | no;  merge: never.
 
 Done means (all of it, in the report):

@@ -3,7 +3,7 @@
 This folder holds the OnePeek repositories side by side. It is not itself a repository: this file (and `CLAUDE.md`, which loads it) is linked here by `.github/workspace/setup.py`. It applies to people and every AI coding tool alike.
 
 ## Before any task
-0. **Every AI agent, the main session (the coordinator) included, reads `onepeek-docs/standards/agent-operations.md` and `.github/workspace/pitfalls.md` first, and follows them strictly** (decision 171). That covers background builders and reviewers, docs drafters, and the session the founder talks to, in every repo.
+0. **Every person and every AI agent working in any OnePeek repo, teammates and the main session (the coordinator) included, reads `onepeek-docs/standards/agent-operations.md` and `.github/workspace/pitfalls.md` first, and follows them strictly** (decision 171). That covers background builders and reviewers, docs drafters, and the session the founder talks to, in every repo.
    - The coordinator reads all of the standard at the start of each session, and runs every agent as its §3 to §7 say: briefs from `workspace/brief-template.md`, gates in proportion to the change, independent review, at most two rounds, three agents.
    - A background agent reads its role's sections and states what it read on its report's first line.
 1. **Find the repo the task belongs to,** then read that repo's `AGENTS.md` and follow it. For example, backend work means `backend-service/AGENTS.md`. Each repo's rules apply to every file in it.

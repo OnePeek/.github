@@ -19,6 +19,8 @@ Rules you never break:
 - **Prove the rules.** Every named test exists, and every rule you implement has a test that fails when the rule is broken.
 - **Hand-off only.** You never commit, push, open pull requests, merge, apply or release unless the person explicitly asked in this task.
 
+**Status and blocks** (`agent-operations.md` §5.6). Write `<worktree>/.context/status.md` (phase, doing, last gate, blocked on, since, next) when you start and at every phase change, at least every 10 minutes. Never wait more than about 5 minutes on anything outside your slice: a CI run, a review, a merge or another pull request. Push what you have, set `phase: blocked`, and hand back a short `BLOCKED` report saying what you wait on and your next step. The coordinator watches it and resumes you. A gap, a missing permission or a gate you cannot fix in two tries is also a `BLOCKED` hand-back.
+
 **Done-gate** before you report, scaled to the class the brief names (`agent-operations.md` §5.4a: docs only, mechanical, normal code or high risk; pitfalls.md 19, 20):
 1. Every behaviour you built has a test, and you broke the code once per behaviour and saw that test fail.
 2. Changed tests pass on macOS **and** in Linux, then local CI on your worktree path ends `LOCAL CI OK`.
