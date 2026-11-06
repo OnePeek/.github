@@ -2188,6 +2188,16 @@ class DirectPinPush(unittest.TestCase):
                 mock.patch.object(ship.subprocess, "run", side_effect=run):
             self.assertEqual(ship.callers(), ([], ["onepeek-web: cannot search dev: fatal: bad object"]))
 
+    def test_a_failed_fetch_over_a_stale_trunk_is_a_skip_never_a_stale_read(self) -> None:
+        git_repo(self.root, "onepeek-web", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))  # origin/dev exists locally
+        real = subprocess.run
+
+        def run(cmd, **kw):
+            return done(1, "", "fatal: unable to access") if "fetch" in cmd else real(cmd, **kw)
+        with mock.patch.object(ship, "expected_repos", return_value=["onepeek-web"]), \
+                mock.patch.object(ship.subprocess, "run", side_effect=run):
+            self.assertEqual(ship.callers(), ([], ["onepeek-web: cannot fetch dev: fatal: unable to access"]))
+
     def test_main_fails_the_run_when_a_caller_was_skipped(self) -> None:
         with mock.patch.object(ship, "callers", return_value=([], ["mcp-athena: not checked out in /x"])):
             failures = ship.pin_moves(set(), "v1.8.2", NEW)
