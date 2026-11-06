@@ -5,8 +5,9 @@ from pathlib import Path
 import check_service_list as c
 
 LOCK = "          # --- release-lock begin (x) ---\n          lock_take() { :; }\n          # --- release-lock end ---\n"
-BLOCK = "          # --- render-taskdef begin (x) ---\n          render() { :; }\n          # --- render-taskdef end ---\n" + LOCK + LOCK
-OPERATE = "on:\n  options:\n    # service-list begin\n    options: [all, api]\n    # service-list end\n" + BLOCK
+RENDER = "          # --- render-taskdef begin (x) ---\n          render() { :; }\n          # --- render-taskdef end ---\n"
+BLOCK = RENDER + LOCK * 5  # release-ecs.yml: take, migrate, previous, verify's end, finish
+OPERATE = "on:\n  options:\n    # service-list begin\n    options: [all, api]\n    # service-list end\n" + RENDER + LOCK * 3
 SERVICES = "services:\n  api: {triggers: [request]}\n  migrate: {triggers: [migration]}\n"
 
 

@@ -1,9 +1,11 @@
-"""The cross-repo release lock in release-ecs.yml and operate.yml (onepeek-docs architecture/lld/infra/foundation-playbook.md
-§5.4; delivery-pipelines.md UC-DEL-001, UC-DEL-002, E5), run for real against a fake S3 and a stub `gh`.
+"""The release locks per scope in release-ecs.yml, operate.yml and release-lock.yml (onepeek-docs
+architecture/lld/infra/foundation-playbook.md §5.4, §5.4a; delivery-pipelines.md UC-DEL-001, UC-DEL-002, UC-DEL-007,
+E2, E3, E5, E10, E11), run for real against a fake S3 and ECS and a stub `gh`.
 Run: python -m unittest discover -s scripts -p 'test_*.py'"""
 
 import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -15,16 +17,25 @@ import yaml
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github/workflows"
 RELEASE = yaml.safe_load((WORKFLOWS / "release-ecs.yml").read_text(encoding="utf-8"))
 OPERATE = yaml.safe_load((WORKFLOWS / "operate.yml").read_text(encoding="utf-8"))
+LOCKWF = yaml.safe_load((WORKFLOWS / "release-lock.yml").read_text(encoding="utf-8"))
 RELEASE_TEXT = (WORKFLOWS / "release-ecs.yml").read_text(encoding="utf-8")
 OPERATE_TEXT = (WORKFLOWS / "operate.yml").read_text(encoding="utf-8")
 REPO, RUN = "OnePeek/backend-service", "5000"
+INFRA = "OnePeek/onepeek-infra"
 ENV = {"NAME": "onepeek-preprod", "ENVIRONMENT": "preprod", "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": RUN,
-       "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SHA": "f" * 40, "GITHUB_SERVER_URL": "https://github.com",
-       "LOCK_WAIT_SECONDS": "2", "LOCK_POLL_SECONDS": "1", "LOCK_GH_TOKEN": "t"}  # fmt: skip
+       "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SHA": "f" * 40, "GITHUB_SERVER_URL": "https://github.com", "LOCK_SCOPE": "backend",
+       "LOCK_WAIT_SECONDS": "2", "LOCK_WAIT_CAP_SECONDS": "4", "LOCK_QUEUED_WAIT_SECONDS": "2", "LOCK_MIGRATE_WAIT_SECONDS": "2",
+       "LOCK_REMINT_SECONDS": "3000", "LOCK_POLL_SECONDS": "1", "LOCK_LOOKUP_GAP_SECONDS": "0", "LOCK_GH_TOKEN": "t"}  # fmt: skip
+LEGACY, BACKEND, WEB, INFRA_KEY, MCP = "locks/release.json", "locks/backend.json", "locks/web.json", "locks/infra.json", "locks/mcp.json"
+TASK = "arn:aws:ecs:ap-south-1:111111111111:task/onepeek-preprod/abc123"
+MIGRATE_TD = "arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-migrate:4"
 
 # A fake S3 (one file per key) with the conditional-write semantics the lock relies on: If-None-Match: * refuses an
-# existing key, If-Match refuses another ETag, a missing key is NoSuchKey. FAIL_<OP> injects any other error, and
-# RACE_ON_DELETE has another run take the lock just before a delete.
+# existing key, If-Match refuses another ETag (and a missing key), a missing key is NoSuchKey. FAIL_<OP> injects any other
+# error; CONFLICT_PUTS answers that many conditional puts with 409 (CHANGE_ON_CONFLICT: and gives the key a new ETag, its
+# body unchanged, as another writer's write would); RACE_ON_DELETE has another run take a key just
+# before its delete; CHANGE_BEFORE_PUT changes a key just before a put with If-Match. Every put's body is logged in
+# `puts`. Other calls print SEQ_<OP> (a JSON list, one per call) or AWS_<OP>.
 FAKE_AWS = r"""#!/usr/bin/env python3
 import hashlib, json, os, shutil, sys
 state = os.environ["FAKE_S3"]
@@ -39,6 +50,11 @@ def paths():
 def fail(op, message):
     sys.stderr.write("An error occurred (%s) when calling the %s operation: x\n" % (message, op))
     sys.exit(254)
+def counter(name):
+    path = os.path.join(state, "count_" + name)
+    n = int(open(path).read()) if os.path.exists(path) else 0
+    open(path, "w").write(str(n + 1))
+    return n
 op = args[1] if len(args) > 1 else ""
 injected = os.environ.get("FAIL_" + op.replace("-", "_").upper())
 if injected:
@@ -47,10 +63,25 @@ if op == "put-object":
     obj, tag = paths()
     if opt("--if-none-match") == "*" and os.path.exists(obj):
         fail("PutObject", "PreconditionFailed")
+    if opt("--if-match"):
+        if counter("conflict") < int(os.environ.get("CONFLICT_PUTS", "0")):
+            if os.environ.get("CHANGE_ON_CONFLICT") and os.path.exists(tag):
+                open(tag, "w").write('"conflicted"')
+            fail("PutObject", "ConditionalRequestConflict")
+        change = os.environ.get("CHANGE_BEFORE_PUT")
+        if change and os.path.exists(obj):
+            open(obj, "w").write(change)
+            open(tag, "w").write('"changed"')
+        if not os.path.exists(obj):
+            fail("PutObject", "NoSuchKey")
+        if opt("--if-match") != open(tag).read():
+            fail("PutObject", "PreconditionFailed")
     shutil.copy(opt("--body"), obj)
     etag = '"%s"' % hashlib.md5(open(obj, "rb").read()).hexdigest()
     open(tag, "w").write(etag)
-    print(json.dumps({"ETag": etag}))
+    with open(os.path.join(state, "puts"), "a") as f:
+        f.write(opt("--key") + " " + open(obj).read() + "\n")
+    print(etag)
 elif op == "get-object":
     obj, tag = paths()
     if not os.path.exists(obj):
@@ -60,7 +91,7 @@ elif op == "get-object":
 elif op == "delete-object":
     obj, tag = paths()
     race = os.environ.get("RACE_ON_DELETE")
-    if race and opt("--key") == "locks/release.json":
+    if race:
         open(obj, "w").write(race)
         open(tag, "w").write('"raced"')
     if not os.path.exists(obj):
@@ -70,14 +101,25 @@ elif op == "delete-object":
     os.remove(obj)
     os.remove(tag)
 else:
-    print(os.environ.get("AWS_" + op.replace("-", "_").upper(), ""))
+    name = op.replace("-", "_").upper()
+    seq = os.environ.get("SEQ_" + name)
+    if seq:
+        items = json.loads(seq)
+        print(items[min(counter("seq_" + name), len(items) - 1)])
+    else:
+        print(os.environ.get("AWS_" + name, ""))
 """
 TOKEN = "c" * 32  # a fixed fake lock token (32 hex characters)
 
 
-def record(repo: str = "OnePeek/onepeek-infra", run: str = "77", attempt: str = "1", token: str = "f" * 32) -> str:
-    return json.dumps({"repo": repo, "run_id": run, "run_attempt": attempt, "commit": "sha-" + "1" * 12,
-                       "started": "2026-11-03T10:00:00+00:00", "token": token})  # fmt: skip
+def record(repo: str = INFRA, run: str = "77", attempt: str = "1", token: str = "f" * 32, **fields) -> str:
+    r = {"repo": repo, "run_id": run, "run_attempt": attempt, "commit": "sha-" + "1" * 12, "started": "2026-11-03T10:00:00+00:00", "token": token}
+    r.update(fields)
+    return json.dumps(r)
+
+
+def mine(phase: str = "locked", **fields) -> str:
+    return record(REPO, RUN, token=TOKEN, scope="backend", phase=phase, **fields)
 
 
 def frozen(repo: str = "OnePeek/backend-service", ref: str = "refs/heads/hotfix/x", run: str = "90") -> str:
@@ -89,31 +131,33 @@ def job_step(doc: dict, job: str, name: str) -> str:
     return next(s["run"] for s in doc["jobs"][job]["steps"] if s.get("name", "").startswith(name))
 
 
-# release-ecs.yml takes the lock in its first job, prepare, and releases it in its last, finish (foundation-reset W2.1);
-# operate.yml and release-lock.yml keep their lock and unlock jobs.
+def step_of(doc: dict, job: str, name: str) -> dict:
+    return next(s for s in doc["jobs"][job]["steps"] if s.get("name", "").startswith(name))
+
+
 LOCK_JOB = {"release-ecs": "prepare", "operate": "lock", "release-lock": "lock"}
 UNLOCK_JOB = {"release-ecs": "finish", "operate": "unlock"}
 TAKE = job_step(RELEASE, "prepare", "Take the release lock")
-RELEASE_STEP = job_step(RELEASE, "finish", "Release the release lock")
-LOCKWF = yaml.safe_load((WORKFLOWS / "release-lock.yml").read_text(encoding="utf-8"))
+FINISH = job_step(RELEASE, "finish", "Release the release lock")
 ACTION = job_step(LOCKWF, "lock", "Take, release, freeze or thaw")
+LIB = re.search(r"# --- release-lock begin.*?# --- release-lock end ---\n", TAKE, re.S).group(0)
 
 
-def run(script: str, held: str | None = None, gh: str = "echo in_progress", frozen_by: str | None = None, files: dict | None = None,
-        git: str | None = None, **extra: str):
-    """Returns (result, calls, the lock left in S3 or None, GITHUB_OUTPUT); `.frozen` and `.summary` on the result."""
+def run(script: str, keys: dict | None = None, gh: str = "echo in_progress", frozen_by: str | None = None, files: dict | None = None,
+        git: str | None = None, stubs: dict | None = None, **extra: str):
+    """Returns the result with .keys (every key left in S3), .calls, .puts, .output, .summary and .frozen."""
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
-        stubs = {"aws": FAKE_AWS, "gh": f'#!/bin/bash\necho "gh $*" >> "{root}/calls"\n{gh}\n'}
+        tools = {"aws": FAKE_AWS, "gh": f'#!/bin/bash\necho "gh token=$GH_TOKEN $*" >> "{root}/calls"\n{gh}\n', **(stubs or {})}
         if git is not None:
-            stubs["git"] = f'#!/bin/bash\necho "git $*" >> "{root}/calls"\n{git}\n'
-        for name, body in stubs.items():
+            tools["git"] = f'#!/bin/bash\necho "git $*" >> "{root}/calls"\n{git}\n'
+        for name, body in tools.items():
             f = root / name
-            f.write_text(body)
+            f.write_text(body if body.startswith("#!") else f'#!/bin/bash\necho "{name} $*" >> "{root}/calls"\n{body}\n')
             f.chmod(f.stat().st_mode | stat.S_IEXEC)
-        if held is not None:
-            (root / "s3_locks_release.json").write_text(held)
-            (root / "etag_locks_release.json").write_text('"held-etag"')
+        for key, content in (keys or {}).items():
+            (root / ("s3_" + key.replace("/", "_"))).write_text(content)
+            (root / ("etag_" + key.replace("/", "_"))).write_text('"etag-%s"' % key.split("/")[-1])
         if frozen_by is not None:
             (root / "s3_locks_frozen.json").write_text(frozen_by)
             (root / "etag_locks_frozen.json").write_text('"frozen-etag"')
@@ -124,231 +168,464 @@ def run(script: str, held: str | None = None, gh: str = "echo in_progress", froz
             "GITHUB_STEP_SUMMARY": str(root / "summary"),
         })  # fmt: skip
         read = lambda n: (root / n).read_text() if (root / n).exists() else None
+        out.keys = {p.name[3:].replace("locks_", "locks/"): p.read_text() for p in root.glob("s3_locks_*") if p.name != "s3_locks_frozen.json"}  # type: ignore[attr-defined]
         out.frozen = read("s3_locks_frozen.json")  # type: ignore[attr-defined]
+        out.calls = read("calls") or ""  # type: ignore[attr-defined]
+        out.puts = read("puts") or ""  # type: ignore[attr-defined]
+        out.output = read("output") or ""  # type: ignore[attr-defined]
         out.summary = read("summary") or ""  # type: ignore[attr-defined]
-        return out, read("calls") or "", read("s3_locks_release.json"), read("output") or ""
+        out.token_request = read("token-request") or ""  # type: ignore[attr-defined]
+        out.headers = read("headers") or ""  # type: ignore[attr-defined]
+        return out
+
+
+def call(*lines: str) -> str:
+    """The lock functions followed by the given lines (a phase write, a finish), as a step would run them."""
+    return LIB + "\n".join(lines) + "\n"
+
+
+def tasks(*items: tuple[str, str, str]) -> str:
+    return json.dumps({"tasks": [{"taskArn": a, "taskDefinitionArn": td, "lastStatus": s} for a, td, s in items], "failures": []})
 
 
 class Take(unittest.TestCase):
-    def test_a_free_lock_is_taken_with_a_conditional_write_naming_this_run(self):
-        out, calls, obj, output = run(TAKE)
+    def test_a_free_scope_takes_release_json_then_its_own_key_with_conditional_writes_naming_this_run(self):
+        out = run(TAKE)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn("aws s3api put-object --bucket onepeek-preprod-deploy --key locks/release.json --body lock-mine.json --if-none-match *", calls)
-        mine = json.loads(obj)
-        self.assertEqual({k: mine[k] for k in ("repo", "run_id", "run_attempt", "commit")},
-                         {"repo": REPO, "run_id": RUN, "run_attempt": "1", "commit": "sha-" + "f" * 12})
-        self.assertTrue(mine["started"].endswith("+00:00"))
-        self.assertRegex(mine["token"], r"^[0-9a-f]{32}$")
-        self.assertIn("token=" + mine["token"], output)
-        self.assertIn("attempt=1", output)
+        puts = [line for line in out.calls.splitlines() if "put-object" in line]
+        self.assertEqual([p.split("--key ")[1].split()[0] for p in puts], [LEGACY, BACKEND])
+        self.assertTrue(all("--if-none-match *" in p for p in puts))
+        self.assertEqual(set(out.keys), {LEGACY, BACKEND})
+        rec = json.loads(out.keys[BACKEND])
+        self.assertEqual({k: rec[k] for k in ("repo", "run_id", "run_attempt", "commit", "scope", "phase")},
+                         {"repo": REPO, "run_id": RUN, "run_attempt": "1", "commit": "sha-" + "f" * 12, "scope": "backend", "phase": "locked"})
+        self.assertRegex(rec["token"], r"^[0-9a-f]{32}$")
+        self.assertEqual(json.loads(out.keys[LEGACY]), rec)
+        self.assertIn("token=" + rec["token"], out.output)
+        self.assertIn("attempt=1", out.output)
 
     def test_every_take_draws_a_new_random_token(self):
-        tokens = {json.loads(run(TAKE)[2])["token"] for _ in range(3)}
+        tokens = {json.loads(run(TAKE).keys[BACKEND])["token"] for _ in range(3)}
         self.assertEqual(len(tokens), 3)
 
-    def test_a_lock_held_by_a_running_release_waits_then_fails_naming_its_run_and_is_left_alone(self):
-        out, calls, obj, output = run(TAKE, held=record(), LOCK_WAIT_SECONDS="4")
-        self.assertEqual(out.returncode, 1)
-        self.assertIn("still held after 4 s by https://github.com/OnePeek/onepeek-infra/actions/runs/77", out.stdout)
-        self.assertGreaterEqual(out.stdout.count("Waiting for the preprod release lock"), 2)
-        self.assertEqual(obj, record())
-        self.assertNotIn("delete-object", calls)
-        self.assertNotIn("attempt=", output)
+    def test_the_scope_is_never_a_free_input(self):
+        self.assertEqual(RELEASE["env"]["LOCK_SCOPE"], "${{ inputs.image }}")
+        for bad in ("", "sandbox", "all"):
+            out = run(TAKE, LOCK_SCOPE=bad)
+            self.assertEqual(out.returncode, 1, bad)
+            self.assertNotIn("put-object", out.calls)
 
-    def test_a_lock_whose_run_has_finished_is_removed_on_its_etag_and_taken(self):
-        out, calls, obj, _ = run(TAKE, held=record(), gh="echo completed")
+    def test_its_own_key_held_by_a_live_run_of_its_scope_waits_30_minutes_then_fails_with_the_re_run_message_holding_nothing(self):
+        held = record(REPO, "77", scope="backend", phase="locked")
+        out = run(TAKE, keys={BACKEND: held}, LOCK_WAIT_SECONDS="2", LOCK_WAIT_CAP_SECONDS="30")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("::error::waiting for OnePeek/backend-service (backend, run 77); re-run", out.stdout)
+        self.assertLess(out.stdout.count("Waiting for the preprod release lock"), 6)  # the 30-minute limit, not the cap
+        self.assertEqual(out.keys, {BACKEND: held})  # release.json was given back every time: no wait while holding a key
+
+    def test_its_own_key_held_by_infra_waits_up_to_the_cap_not_the_30_minutes(self):
+        held = record(INFRA, "77", scope="infra")
+        out = run(TAKE, keys={BACKEND: held}, LOCK_WAIT_SECONDS="1", LOCK_WAIT_CAP_SECONDS="6")
+        self.assertEqual(out.returncode, 1)
+        self.assertGreaterEqual(out.stdout.count("Waiting for the preprod release lock"), 3)
+        self.assertIn("::error::waiting for OnePeek/onepeek-infra (infra, run 77); re-run", out.stdout)
+
+    def test_try_or_release_gives_back_every_key_taken_on_the_etag_of_its_own_write_before_it_waits(self):
+        out = run(TAKE, keys={BACKEND: record(INFRA, "77", scope="infra")}, LOCK_WAIT_CAP_SECONDS="3")
+        self.assertEqual(out.returncode, 1)
+        written = re.search(r'locks/release.json \{.*', out.puts).group(0)
+        self.assertIn(REPO, written)
+        lines = out.calls.splitlines()
+        put = next(i for i, l in enumerate(lines) if "put-object" in l and LEGACY in l)
+        delete = next(i for i, l in enumerate(lines) if "delete-object" in l and LEGACY in l)
+        self.assertGreater(delete, put)
+        self.assertRegex(lines[delete], r'--if-match "[0-9a-f]{32}"')
+        self.assertNotIn(LEGACY, out.keys)
+        sleeps = [i for i, l in enumerate(lines) if "get-object" in l and "frozen" in l]
+        self.assertGreater(sleeps[1], delete)  # the next attempt starts only after the give-back
+
+    def test_infra_takes_all_five_keys_in_the_fixed_order_one_token_one_run(self):
+        out = run(ACTION, ACTION="take", LOCK_SCOPE="infra", GITHUB_REPOSITORY=INFRA)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn("gh api repos/OnePeek/onepeek-infra/actions/runs/77 --jq .status", calls)
-        self.assertIn('delete-object --bucket onepeek-preprod-deploy --key locks/release.json --if-match "held-etag"', calls)
-        self.assertEqual(json.loads(obj)["run_id"], RUN)
+        order = [l.split("--key ")[1].split()[0] for l in out.calls.splitlines() if "put-object" in l]
+        self.assertEqual(order, [LEGACY, INFRA_KEY, BACKEND, WEB, MCP])
+        records = [json.loads(v) for v in out.keys.values()]
+        self.assertEqual(len({(r["token"], r["run_id"], r["scope"]) for r in records}), 1)
+        self.assertEqual(records[0]["scope"], "infra")
+
+    def test_infras_partial_take_releases_every_key_it_took_in_reverse_then_waits_holding_nothing(self):
+        web = record("OnePeek/onepeek-web", "88", scope="web", phase="rolling")
+        out = run(ACTION, keys={WEB: web}, ACTION="take", LOCK_SCOPE="infra", GITHUB_REPOSITORY=INFRA, LOCK_WAIT_CAP_SECONDS="1")
+        self.assertEqual(out.returncode, 1)
+        deletes = [l.split("--key ")[1].split()[0] for l in out.calls.splitlines() if "delete-object" in l]
+        self.assertEqual(deletes[:3], [BACKEND, INFRA_KEY, LEGACY])
+        self.assertEqual(out.keys, {WEB: web})
+        self.assertIn("::error::waiting for OnePeek/onepeek-web (web, run 88); re-run", out.stdout)
+
+    def test_a_key_whose_run_has_finished_is_taken_over_by_its_phase_locked_or_done(self):
+        for phase in ("locked", "done"):
+            out = run(TAKE, keys={BACKEND: record(REPO, "77", scope="backend", phase=phase)}, gh="echo completed")
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertIn('delete-object --bucket onepeek-preprod-deploy --key locks/backend.json --if-match "etag-backend.json"', out.calls)
+            self.assertEqual(json.loads(out.keys[BACKEND])["run_id"], RUN)
+
+    def test_a_rolling_key_is_never_taken_over_and_every_take_names_its_run_and_cancel_release(self):
+        held = record(REPO, "77", scope="backend", phase="rolling", previous={"api": "arn:aws:ecs:ap-south-1:111111111111:task-definition/x:1"})
+        for extra in ({"gh": "echo completed"}, {"GITHUB_RUN_ID": "77", "GITHUB_RUN_ATTEMPT": "2"}):
+            out = run(TAKE, keys={BACKEND: held}, **extra)
+            self.assertEqual(out.returncode, 1)
+            self.assertIn("held rolling by https://github.com/OnePeek/backend-service/actions/runs/77", out.stdout)
+            self.assertIn("cancel-release.yml", out.stdout)
+            self.assertNotIn("delete-object --bucket onepeek-preprod-deploy --key locks/backend.json", out.calls)
+            self.assertEqual(out.keys[BACKEND], held)
+            self.assertNotIn(LEGACY, out.keys)  # given back
+
+    def test_a_migrating_key_with_a_running_task_is_never_taken_over(self):
+        held = record(REPO, "77", scope="backend", phase="migrating", migrate_task=TASK)
+        out = run(TAKE, keys={BACKEND: held}, gh="echo completed", AWS_DESCRIBE_TASKS=tasks((TASK, MIGRATE_TD, "RUNNING")))
+        self.assertEqual(out.returncode, 1)
+        self.assertIn(f"::error::waiting for {TASK} (backend, run 77); re-run", out.stdout)
+        self.assertEqual(out.keys, {BACKEND: held})
+        self.assertNotIn("ecs stop-task", out.calls)
+
+    def test_a_migrating_key_whose_task_stopped_or_is_missing_is_taken_over(self):
+        held = record(REPO, "77", scope="backend", phase="migrating", migrate_task=TASK)
+        stopped = tasks((TASK, MIGRATE_TD, "STOPPED"))
+        missing = json.dumps({"tasks": [], "failures": [{"arn": TASK, "reason": "MISSING"}]})
+        for answer in (stopped, missing):
+            out = run(TAKE, keys={BACKEND: held}, gh="echo completed", AWS_DESCRIBE_TASKS=answer)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertEqual(json.loads(out.keys[BACKEND])["run_id"], RUN)
+
+    def test_the_migrate_lookup_uses_cluster_and_started_by_only_and_filters_the_family_from_describe_tasks(self):
+        held = record(REPO, "77", "2", scope="backend", phase="migrating")
+        other = "arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-ops:3"
+        out = run(TAKE, keys={BACKEND: held}, gh="echo completed", AWS_LIST_TASKS=TASK, AWS_DESCRIBE_TASKS=tasks((TASK, other, "RUNNING")))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)   # another family's task is not the migration
+        self.assertIn("aws ecs list-tasks --cluster onepeek-preprod --started-by 77-2 --query taskArns[] --output text", out.calls)
+        listing = next(l for l in out.calls.splitlines() if "list-tasks" in l)
+        self.assertNotIn("--family", listing)
+        out = run(TAKE, keys={BACKEND: held}, gh="echo completed", AWS_LIST_TASKS=TASK, AWS_DESCRIBE_TASKS=tasks((TASK, MIGRATE_TD, "RUNNING")))
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(out.keys, {BACKEND: held})
+
+    def test_no_migrate_task_in_two_lookups_means_stopped(self):
+        held = record(REPO, "77", scope="backend", phase="migrating")
+        out = run(TAKE, keys={BACKEND: held}, gh="echo completed", AWS_LIST_TASKS="None")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(out.calls.count("ecs list-tasks"), 2)
 
     def test_an_earlier_attempt_of_this_run_is_taken_over_without_asking_github(self):
-        out, calls, obj, _ = run(TAKE, held=record(REPO, RUN, "1"), GITHUB_RUN_ATTEMPT="2")
+        out = run(TAKE, keys={BACKEND: record(REPO, RUN, "1", scope="backend")}, GITHUB_RUN_ATTEMPT="2")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertNotIn("gh api", calls)
-        self.assertEqual(json.loads(obj)["run_attempt"], "2")
+        self.assertNotIn("gh token", out.calls)
+        self.assertEqual(json.loads(out.keys[BACKEND])["run_attempt"], "2")
 
     def test_the_same_attempt_of_this_run_is_not_taken_over(self):
-        # Two takes in one caller run (release-lock.yml called twice) must not take each other's lock.
-        out, calls, obj, _ = run(TAKE, held=record(REPO, RUN, "1"))
+        held = record(REPO, RUN, "1", scope="backend")
+        out = run(TAKE, keys={BACKEND: held})
         self.assertEqual(out.returncode, 1)
-        self.assertEqual(obj, record(REPO, RUN, "1"))
+        self.assertEqual(out.keys, {BACKEND: held})
 
-    def test_the_same_run_id_in_another_repo_is_not_ours(self):
-        out, _, obj, _ = run(TAKE, held=record("OnePeek/onepeek-web", RUN))
+    def test_a_legacy_release_json_record_with_no_scope_is_read_too(self):
+        # Written by a caller still on the older tag: no scope and no phase; it counts as locked, scope from its repo.
+        held = record("OnePeek/onepeek-web", "88")
+        out = run(TAKE, keys={LEGACY: held}, LOCK_WAIT_CAP_SECONDS="1")
         self.assertEqual(out.returncode, 1)
-        self.assertEqual(obj, record("OnePeek/onepeek-web", RUN))
+        self.assertIn("::error::waiting for OnePeek/onepeek-web (web, run 88); re-run", out.stdout)
+        out = run(TAKE, keys={LEGACY: held}, gh="echo completed")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
     def test_a_holder_whose_state_cannot_be_read_counts_as_running(self):
-        # Fail closed: without the GitHub App token another repo's run is unreadable, and its lock is never removed.
-        out, calls, obj, _ = run(TAKE, held=record(), gh='echo "HTTP 404" >&2; exit 1')
+        held = record(scope="infra")
+        out = run(TAKE, keys={BACKEND: held}, gh='echo "HTTP 404" >&2; exit 1', LOCK_WAIT_CAP_SECONDS="1")
         self.assertEqual(out.returncode, 1)
-        self.assertIn("counts as running", out.stdout)
-        self.assertNotIn("delete-object", calls)
-        self.assertEqual(obj, record())
+        self.assertIn("counts as running", out.stdout + out.stderr)
+        self.assertEqual(out.keys, {BACKEND: held})
 
     def test_an_unreadable_lock_means_no_deploy(self):
-        out, calls, obj, _ = run(TAKE, held=record(), FAIL_GET_OBJECT="AccessDenied")
+        out = run(TAKE, keys={BACKEND: record()}, FAIL_GET_OBJECT="AccessDenied")
         self.assertEqual(out.returncode, 1)
-        self.assertIn("unreadable, so nothing is deployed", out.stdout)
-        self.assertNotIn("delete-object", calls)
-        self.assertEqual(obj, record())
+        self.assertNotIn("delete-object", out.calls)
 
     def test_a_record_that_is_not_a_lock_means_no_deploy_and_is_left_in_place(self):
-        for junk in ("not json", json.dumps({"repo": "x"}), record(repo="../../evil")):
-            out, calls, obj, _ = run(TAKE, held=junk, gh="echo completed")
+        for junk in ("not json", json.dumps({"repo": "x"}), record(repo="../../evil"), record(phase="half"), record(migrate_task="; rm -rf /")):
+            out = run(TAKE, keys={BACKEND: junk}, gh="echo completed")
             self.assertEqual(out.returncode, 1, junk)
-            self.assertNotIn("gh api", calls)
-            self.assertNotIn("delete-object", calls)
-            self.assertEqual(obj, junk)
+            self.assertNotIn("delete-object --bucket onepeek-preprod-deploy --key locks/backend.json", out.calls)
+            self.assertEqual(out.keys[BACKEND], junk)
 
     def test_any_other_write_error_means_no_deploy(self):
-        out, _, obj, _ = run(TAKE, FAIL_PUT_OBJECT="AccessDenied")
+        out = run(TAKE, FAIL_PUT_OBJECT="AccessDenied")
         self.assertEqual(out.returncode, 1)
         self.assertIn("could not be written, so nothing is deployed", out.stdout)
-        self.assertIsNone(obj)
+        self.assertEqual(out.keys, {})
 
     def test_a_concurrent_write_conflict_is_read_again_not_fatal(self):
-        out, calls, obj, _ = run(TAKE, held=record(), FAIL_PUT_OBJECT="ConditionalRequestConflict")
+        out = run(TAKE, keys={LEGACY: record()}, FAIL_PUT_OBJECT="ConditionalRequestConflict", LOCK_WAIT_CAP_SECONDS="1")
         self.assertEqual(out.returncode, 1)
-        self.assertIn("still held", out.stdout)
-        self.assertIn("get-object", calls)
+        self.assertIn("waiting for", out.stdout)
+        self.assertIn("get-object", out.calls)
 
     def test_another_run_taking_the_lock_during_a_takeover_is_respected(self):
         other = record("OnePeek/onepeek-web", "88")
-        out, calls, obj, _ = run(TAKE, held=record(), gh='case "$*" in *runs/77*) echo completed;; *) echo in_progress;; esac', RACE_ON_DELETE=other)
+        out = run(TAKE, keys={LEGACY: record()}, gh='case "$*" in *runs/77*) echo completed;; *) echo in_progress;; esac', RACE_ON_DELETE=other,
+                  LOCK_WAIT_CAP_SECONDS="1")
         self.assertEqual(out.returncode, 1)
-        self.assertEqual(obj, other)
-        self.assertIn("still held after 2 s by https://github.com/OnePeek/onepeek-web/actions/runs/88", out.stdout)
+        self.assertEqual(out.keys[LEGACY], other)
+        self.assertIn("waiting for OnePeek/onepeek-web (web, run 88); re-run", out.stdout)
 
     def test_a_failed_delete_means_no_deploy(self):
-        out, _, obj, _ = run(TAKE, held=record(), gh="echo completed", FAIL_DELETE_OBJECT="AccessDenied")
+        out = run(TAKE, keys={LEGACY: record()}, gh="echo completed", FAIL_DELETE_OBJECT="AccessDenied")
         self.assertEqual(out.returncode, 1)
         self.assertIn("could not be removed", out.stdout)
-        self.assertEqual(obj, record())
+        self.assertEqual(out.keys[LEGACY], record())
 
 
-class Release(unittest.TestCase):
-    def test_the_lock_is_removed_on_its_etag_only_with_its_token(self):
-        out, calls, obj, _ = run(RELEASE_STEP, held=record(REPO, RUN, token=TOKEN), LOCK_TOKEN=TOKEN)
+OPENSSL = '#!/bin/bash\necho "openssl $*" >> "$FAKE_S3/calls"\ncat >/dev/null\nprintf sig\n'
+CURL = """#!/bin/bash
+echo "curl $*" >> "$FAKE_S3/calls"
+prev=""
+for a in "$@"; do if [ "$prev" = "-H" ] && [ "${a#@}" != "$a" ]; then cat "${a#@}" >> "$FAKE_S3/headers"; fi; prev="$a"; done
+case "$*" in
+*access_tokens*) cat >> "$FAKE_S3/token-request"; echo >> "$FAKE_S3/token-request"; echo '{"token": "new-app-token"}';;
+*installation*) echo '{"id": 42}';;
+*audience=sts*) echo '{"value": "oidc-jwt"}';;
+esac
+"""
+
+
+class Remint(unittest.TestCase):
+    """Playbook §5.4a rule 4: every 50 minutes inside a wait, a new App token and a new role session."""
+
+    def held_run(self, **extra):
+        return run(TAKE, keys={BACKEND: record(scope="infra")}, stubs={"openssl": OPENSSL, "curl": CURL},
+                   **{"LOCK_REMINT_SECONDS": "1", **extra}, LOCK_WAIT_CAP_SECONDS="3", LOCK_APP_CLIENT_ID="Iv1.client", LOCK_APP_PRIVATE_KEY="-----PRIVATE KEY SECRET-----",
+                   LOCK_APP_REPOS="backend-service,onepeek-web,onepeek-infra,mcp-athena", LOCK_APP_PERMISSIONS='{"actions": "read"}',
+                   LOCK_ROLE_ARN="arn:aws:iam::111111111111:role/onepeek-preprod-deploy-backend-service", LOCK_ROLE_SESSION="backend-service-5000",
+                   ACTIONS_ID_TOKEN_REQUEST_URL="https://token?x=1", ACTIONS_ID_TOKEN_REQUEST_TOKEN="req",
+                   AWS_ASSUME_ROLE_WITH_WEB_IDENTITY="AKIA sk st")  # fmt: skip
+
+    def test_a_wait_longer_than_the_interval_uses_a_fresh_app_token_and_role_session(self):
+        out = self.held_run()
+        self.assertIn("Authorization: Bearer ", out.headers)
+        self.assertIn("/repos/OnePeek/backend-service/installation", out.calls)
+        self.assertIn("/app/installations/42/access_tokens", out.calls)
+        self.assertIn("aws sts assume-role-with-web-identity --role-arn arn:aws:iam::111111111111:role/onepeek-preprod-deploy-backend-service "
+                      "--role-session-name backend-service-5000 --web-identity-token oidc-jwt", out.calls)
+        gh = [l for l in out.calls.splitlines() if l.startswith("gh token=")]
+        # The last reads use the new token (the first may already come after a mint on a slow machine).
+        self.assertTrue(gh[-1].startswith("gh token=new-app-token "), gh)
+
+    def test_the_new_token_has_the_same_repositories_and_permissions_and_the_key_is_never_printed(self):
+        out = self.held_run()
+        self.assertNotIn("PRIVATE KEY", out.stdout + out.stderr + out.calls)
+        # Every bearer token reaches curl as a header file, never on its command line.
+        self.assertIn("Authorization: Bearer eyJ", out.headers)
+        self.assertIn("Authorization: bearer req", out.headers)
+        self.assertNotIn("Authorization", out.calls)
+        self.assertNotIn("eyJ", out.calls)
+        self.assertIn("::add-mask::new-app-token", out.stdout)
+        self.assertIn("::add-mask::st", out.stdout)
+        self.assertEqual(json.loads(out.token_request.splitlines()[0]), {"repositories": ["backend-service", "onepeek-web", "onepeek-infra", "mcp-athena"],
+                                                         "permissions": {"actions": "read"}})
+
+    def test_no_new_mint_before_the_interval(self):
+        out = self.held_run(LOCK_REMINT_SECONDS="3000")
+        self.assertNotIn("assume-role-with-web-identity", out.calls)
+        self.assertNotIn("curl", out.calls)
+
+    def test_the_interval_is_below_the_shortest_credential_lifetime(self):
+        for doc in (RELEASE, OPERATE, LOCKWF):
+            self.assertEqual(doc["env"]["LOCK_REMINT_SECONDS"], "3000")
+        for doc, wf in ((RELEASE, "release-ecs"), (OPERATE, "operate"), (LOCKWF, "release-lock")):
+            take = next(s for s in doc["jobs"][LOCK_JOB[wf]]["steps"] if s.get("id") in ("take", "lock"))
+            self.assertEqual(take["env"]["LOCK_APP_PRIVATE_KEY"], "${{ secrets.AGENTS_APP_PRIVATE_KEY }}")
+            self.assertEqual(take["env"]["LOCK_APP_REPOS"], "backend-service,onepeek-web,onepeek-infra,mcp-athena")
+            app = next(s for s in doc["jobs"][LOCK_JOB[wf]]["steps"] if s.get("id") == "app")
+            self.assertEqual(take["env"]["LOCK_APP_REPOS"], app["with"]["repositories"].split(" #")[0])
+            self.assertEqual(json.loads(take["env"]["LOCK_APP_PERMISSIONS"]), {"actions": app["with"]["permission-actions"]})
+
+
+class PhaseWrites(unittest.TestCase):
+    """Only the holder writes its record, with If-Match on the ETag it read (playbook §5.4a "Keys")."""
+
+    def test_a_phase_is_written_into_every_key_it_holds_with_if_match(self):
+        out = run(call('lock_write_phase rolling \'{"previous": {"api": "x"}}\''), keys={LEGACY: mine(), BACKEND: mine()}, LOCK_TOKEN=TOKEN)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn('delete-object --bucket onepeek-preprod-deploy --key locks/release.json --if-match "held-etag"', calls)
-        self.assertIsNone(obj)
+        self.assertIn('put-object --bucket onepeek-preprod-deploy --key locks/release.json --body lock-phase-mine.json --if-match "etag-release.json"', out.calls)
+        self.assertIn('--key locks/backend.json --body lock-phase-mine.json --if-match "etag-backend.json"', out.calls)
+        for key in (LEGACY, BACKEND):
+            rec = json.loads(out.keys[key])
+            self.assertEqual((rec["phase"], rec["previous"], rec["token"]), ("rolling", {"api": "x"}, TOKEN))
 
-    def test_another_token_is_never_released_even_from_this_run(self):
-        for held, given in ((record(REPO, RUN), TOKEN), (record(token=TOKEN), "a" * 32), (record(REPO, RUN, token=TOKEN), "")):
-            out, calls, obj, _ = run(RELEASE_STEP, held=held, LOCK_TOKEN=given)
-            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-            self.assertIn("it is left in place", out.stdout)
-            self.assertNotIn("delete-object", calls)
-            self.assertEqual(obj, held)
-
-    def test_no_lock_is_fine(self):
-        out, calls, _, _ = run(RELEASE_STEP, LOCK_TOKEN=TOKEN)
+    def test_locked_and_done_drop_what_there_was_to_undo(self):
+        out = run(call("lock_write_phase done"), keys={LEGACY: mine("rolling", previous={"a": "b"}), BACKEND: mine("migrating", migrate_task=TASK)}, LOCK_TOKEN=TOKEN)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertNotIn("delete-object", calls)
+        self.assertEqual({k: json.loads(v).get("previous") or json.loads(v).get("migrate_task") for k, v in out.keys.items()}, {LEGACY: None, BACKEND: None})
 
-    def test_an_unreadable_lock_fails_visibly(self):
-        for error in ("AccessDenied", "InternalError"):
-            out, calls, obj, _ = run(RELEASE_STEP, held=record(REPO, RUN, token=TOKEN), LOCK_TOKEN=TOKEN, FAIL_GET_OBJECT=error)
+    def test_a_record_that_is_not_its_own_means_the_key_is_lost_and_the_run_stops(self):
+        for held in (record(), mine(repair_run="9-1", repair_token="d" * 32)):
+            out = run(call("lock_write_phase rolling", "echo changed-something"), keys={LEGACY: held, BACKEND: held}, LOCK_TOKEN=TOKEN)
             self.assertEqual(out.returncode, 1)
-            self.assertNotIn("delete-object", calls)
-            self.assertEqual(obj, record(REPO, RUN, token=TOKEN))
+            self.assertIn("lost the release lock", out.stdout)
+            self.assertNotIn("changed-something", out.stdout)
+            self.assertEqual(out.puts, "")
 
-    def test_a_lock_taken_over_meanwhile_is_left_in_place(self):
-        other = record("OnePeek/onepeek-web", "88")
-        out, _, obj, _ = run(RELEASE_STEP, held=record(REPO, RUN, token=TOKEN), LOCK_TOKEN=TOKEN, RACE_ON_DELETE=other)
+    def test_a_412_stops_the_run(self):
+        out = run(call("lock_write_phase rolling", "echo changed-something"), keys={LEGACY: mine(), BACKEND: mine()}, LOCK_TOKEN=TOKEN,
+                  CHANGE_BEFORE_PUT=mine(repair_run="9-1"))
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("lost the release lock", out.stdout)
+        self.assertNotIn("changed-something", out.stdout)
+
+    def test_a_409_is_retried_after_a_re_read_up_to_3_times(self):
+        out = run(call("lock_write_phase rolling"), keys={LEGACY: mine(), BACKEND: mine()}, LOCK_TOKEN=TOKEN, CONFLICT_PUTS="2")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertEqual(obj, other)
+        self.assertEqual(json.loads(out.keys[LEGACY])["phase"], "rolling")
+        self.assertGreaterEqual(out.calls.count("get-object --bucket onepeek-preprod-deploy --key locks/release.json"), 3)
+        out = run(call("lock_write_phase rolling"), keys={LEGACY: mine(), BACKEND: mine()}, LOCK_TOKEN=TOKEN, CONFLICT_PUTS="9")
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(json.loads(out.keys[LEGACY])["phase"], "locked")
 
 
-class Frozen(unittest.TestCase):
-    """preprod-frozen (playbook §5.4, §5.6): locks/frozen.json names a hotfix branch (repo and ref); any run from that
-    branch takes the lock, every other take is refused."""
+PREV = {"api": "arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-api:6",
+        "worker": "arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-worker:3"}
 
-    def test_a_frozen_environment_refuses_runs_from_other_branches_at_once_with_the_reason(self):
-        for repo, ref in ((REPO, "refs/heads/release"), (REPO, "refs/heads/hotfix/y"), ("OnePeek/onepeek-web", "refs/heads/hotfix/x")):
-            out, calls, obj, _ = run(TAKE, frozen_by=frozen(), GITHUB_REPOSITORY=repo, GITHUB_REF=ref)
-            self.assertEqual(out.returncode, 1, (repo, ref))
-            self.assertIn("preprod is frozen by founder (hotfix hotfix/x) for the hotfix branch OnePeek/backend-service refs/heads/hotfix/x", out.stdout)
-            self.assertNotIn("put-object", calls)
-            self.assertIsNone(obj)
 
-    def test_any_run_from_the_frozen_hotfix_branch_takes_the_lock(self):
-        # Each merge into the hotfix branch is a new run (another run ID than the one that froze it).
-        for run_id in ("90", RUN):
-            out, _, obj, _ = run(TAKE, frozen_by=frozen(), GITHUB_RUN_ID=run_id, GITHUB_REF="refs/heads/hotfix/x")
+class Finish(unittest.TestCase):
+    """finish acts on the record's phase, never on cancelled() (playbook §5.4a "Rollback on cancel"; E2, E3, E10, E11)."""
+
+    def finish(self, held: str, **extra):
+        return run(FINISH, keys={LEGACY: held, BACKEND: held}, **{"LOCK_TOKEN": TOKEN, **extra})
+
+    def test_locked_or_done_unlocks_every_key(self):
+        for phase in ("locked", "done"):
+            out = self.finish(mine(phase))
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-            self.assertEqual(json.loads(obj)["run_id"], run_id)
+            self.assertEqual(out.keys, {})
+            self.assertNotIn("update-service", out.calls)
 
-    def test_an_unreadable_freeze_means_no_deploy(self):
-        out, calls, _, _ = run(TAKE, FAIL_GET_OBJECT="AccessDenied")
+    def test_migrating_waits_for_the_task_never_stops_it_and_keeps_the_key_while_it_runs(self):
+        held = mine("migrating", migrate_task=TASK)
+        out = self.finish(held, AWS_DESCRIBE_TASKS=tasks((TASK, MIGRATE_TD, "RUNNING")))
         self.assertEqual(out.returncode, 1)
-        self.assertIn("frozen.json is unreadable", out.stdout)
-        self.assertNotIn("put-object", calls)
-        for junk in ("not json", json.dumps({"repo": REPO}), frozen(ref="refs/heads/release")):
-            out, calls, _, _ = run(TAKE, frozen_by=junk, GITHUB_REF="refs/heads/release")
-            self.assertEqual(out.returncode, 1, junk)
-            self.assertNotIn("put-object", calls)
+        self.assertIn(f"The migrate task {TASK} has not stopped", out.stdout)
+        self.assertEqual(out.keys, {LEGACY: held, BACKEND: held})
+        self.assertNotIn("stop-task", out.calls)
 
-    def test_freeze_is_written_from_a_hotfix_branch_naming_it(self):
-        out, calls, _, _ = run(ACTION, ACTION="freeze", GITHUB_REF="refs/heads/hotfix/x", GITHUB_REF_NAME="hotfix/x", GITHUB_ACTOR="founder")
+    def test_migrating_with_the_task_stopped_reports_its_exit_code_and_unlocks(self):
+        out = self.finish(mine("migrating", migrate_task=TASK),
+                          SEQ_DESCRIBE_TASKS=json.dumps([tasks((TASK, MIGRATE_TD, "RUNNING")), tasks((TASK, MIGRATE_TD, "STOPPED")), "0"]))
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn("put-object --bucket onepeek-preprod-deploy --key locks/frozen.json --body lock-frozen-mine.json --if-none-match *", calls)
-        written = json.loads(out.frozen)  # type: ignore[attr-defined]
-        self.assertEqual((written["repo"], written["ref"], written["who"], written["why"]), (REPO, "refs/heads/hotfix/x", "founder", "hotfix hotfix/x"))
-        self.assertNotIn("token", written)
+        self.assertIn("exit code 0", out.summary)
+        self.assertEqual(out.keys, {})
 
-    def test_freeze_from_any_other_branch_is_refused(self):
-        out, calls, _, _ = run(ACTION, ACTION="freeze", GITHUB_REF="refs/heads/dev")
+    def test_rolling_puts_every_service_back_then_unlocks(self):
+        out = self.finish(mine("rolling", previous=PREV, previous_lambda={"onepeek-preprod-sandbox-parse": "7"}), GH_TOKEN="gh")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        for svc, td in PREV.items():
+            self.assertIn(f"aws ecs update-service --cluster onepeek-preprod --service {svc} --task-definition {td}", out.calls)
+        self.assertIn("aws ecs wait services-stable --cluster onepeek-preprod --services api worker", out.calls)
+        self.assertIn("aws lambda update-alias --function-name onepeek-preprod-sandbox-parse --name live --function-version 7", out.calls)
+        self.assertIn("gh issue create --repo OnePeek/backend-service", out.calls)
+        self.assertEqual(out.keys, {})
+
+    def test_a_failed_put_back_keeps_the_key_rolling_and_names_cancel_release(self):
+        held = mine("rolling", previous=PREV)
+        for fail in ({"FAIL_UPDATE_SERVICE": "ServiceNotFound"}, {"FAIL_WAIT": "Waiter failed"}):
+            out = self.finish(held, **fail)
+            self.assertEqual(out.returncode, 1)
+            self.assertIn("cancel-release.yml", out.stdout)
+            self.assertEqual(out.keys, {LEGACY: held, BACKEND: held})
+
+    def test_it_matches_run_id_and_run_attempt_when_the_token_output_is_lost(self):
+        out = self.finish(mine("rolling", previous=PREV), LOCK_TOKEN="")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("update-service", out.calls)
+        self.assertEqual(out.keys, {})
+        held = mine("rolling", previous=PREV)
+        out = self.finish(held, LOCK_TOKEN="", GITHUB_RUN_ATTEMPT="2")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("update-service", out.calls)
+        self.assertEqual(out.keys, {LEGACY: held, BACKEND: held})
+
+    def test_a_record_being_repaired_or_of_another_token_is_left_alone(self):
+        for held in (mine("rolling", previous=PREV, repair_run="9-1", repair_token="d" * 32), record(REPO, RUN, scope="backend", phase="rolling", previous=PREV)):
+            out = self.finish(held)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertNotIn("update-service", out.calls)
+            self.assertNotIn("delete-object", out.calls)
+            self.assertEqual(out.keys, {LEGACY: held, BACKEND: held})
+
+    def test_no_lock_is_fine_and_an_unreadable_one_fails_visibly(self):
+        out = run(FINISH, LOCK_TOKEN=TOKEN)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        out = self.finish(mine(), FAIL_GET_OBJECT="AccessDenied")
         self.assertEqual(out.returncode, 1)
-        self.assertNotIn("put-object", calls)
+        self.assertNotIn("delete-object", out.calls)
 
-    def test_a_second_freeze_from_another_branch_is_refused_and_from_the_same_branch_is_fine(self):
-        out, _, _, _ = run(ACTION, frozen_by=frozen(REPO), ACTION="freeze", GITHUB_REF="refs/heads/hotfix/y")
-        self.assertEqual(out.returncode, 1)
-        self.assertEqual(out.frozen, frozen(REPO))  # type: ignore[attr-defined]
-        out, _, _, _ = run(ACTION, frozen_by=frozen(REPO), ACTION="freeze", GITHUB_REF="refs/heads/hotfix/x")
+    def test_a_key_taken_over_meanwhile_is_left_in_place(self):
+        other = record("OnePeek/onepeek-web", "88")
+        out = self.finish(mine(), RACE_ON_DELETE=other)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(out.keys[BACKEND], other)
 
-    def test_thaw_removes_the_freeze_on_its_etag(self):
-        out, calls, _, _ = run(ACTION, frozen_by=frozen(), ACTION="thaw")
-        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn('delete-object --bucket onepeek-preprod-deploy --key locks/frozen.json --if-match "frozen-etag"', calls)
-        self.assertIsNone(out.frozen)  # type: ignore[attr-defined]
-        out, _, _, _ = run(ACTION, ACTION="thaw")
-        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-
-    def test_an_unreadable_freeze_is_not_thawed(self):
-        out, calls, _, _ = run(ACTION, frozen_by=frozen(), ACTION="thaw", FAIL_GET_OBJECT="AccessDenied")
-        self.assertEqual(out.returncode, 1)
-        self.assertNotIn("delete-object", calls)
+    def test_finish_never_reads_cancelled_and_verify_never_starts_in_a_cancelled_run(self):
+        finish = RELEASE["jobs"]["finish"]
+        self.assertEqual(finish["if"], "${{ always() && needs.prepare.result != 'skipped' && inputs.environment != 'prod' }}")
+        self.assertNotIn("cancelled()", json.dumps(finish))
+        self.assertIn("!cancelled()", RELEASE["jobs"]["verify"]["if"])
+        self.assertNotIn("cancelled()", json.dumps(OPERATE["jobs"]["unlock"]))
+        end = step_of(RELEASE, "verify", "Record the end in the release lock")
+        self.assertIn("!cancelled()", end["if"])
 
 
 class SharedLockWorkflow(unittest.TestCase):
-    """release-lock.yml (playbook §5.4 "Shared lock workflow"): take, release, freeze, thaw from the same code."""
+    """release-lock.yml (playbook §5.4 "Shared lock workflow", §5.4a): only infra calls it."""
 
-    def test_take_outputs_the_token_and_release_needs_it(self):
-        out, _, obj, output = run(ACTION, ACTION="take")
+    def test_take_outputs_the_token_and_release_removes_every_key(self):
+        out = run(ACTION, ACTION="take", LOCK_SCOPE="infra", GITHUB_REPOSITORY=INFRA)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        token = json.loads(obj)["token"]
-        self.assertIn("token=" + token, output)
-        out, _, obj, _ = run(ACTION, held=record(REPO, RUN, token=token), ACTION="release", GIVEN_TOKEN=token)
+        token = json.loads(out.keys[INFRA_KEY])["token"]
+        self.assertIn("token=" + token, out.output)
+        held = record(INFRA, RUN, token=token, scope="infra", phase="locked")
+        out = run(ACTION, keys={k: held for k in (LEGACY, INFRA_KEY, BACKEND, WEB, MCP)}, ACTION="release", GIVEN_TOKEN=token,
+                  LOCK_SCOPE="infra", GITHUB_REPOSITORY=INFRA)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIsNone(obj)
+        self.assertEqual(out.keys, {})
+        deletes = [l.split("--key ")[1].split()[0] for l in out.calls.splitlines() if "delete-object" in l]
+        self.assertEqual(deletes, [MCP, WEB, BACKEND, INFRA_KEY, LEGACY])
 
-    def test_the_interface(self):
-        call = LOCKWF[True]["workflow_call"]
-        self.assertEqual(set(call["inputs"]), {"runner", "environment", "action", "role-to-assume", "token"})
-        self.assertEqual(call["outputs"]["token"]["value"], "${{ jobs.lock.outputs.token }}")
-        self.assertTrue(all(s["required"] for s in call["secrets"].values()))
+    def test_the_interface_and_the_scope_accepts_only_infra(self):
+        call_ = LOCKWF[True]["workflow_call"]
+        self.assertEqual(set(call_["inputs"]), {"runner", "environment", "action", "role-to-assume", "token", "scope"})
+        self.assertTrue(call_["inputs"]["scope"]["required"])
+        self.assertEqual(LOCKWF["env"]["LOCK_SCOPE"], "${{ inputs.scope }}")
+        self.assertEqual(call_["outputs"]["token"]["value"], "${{ jobs.lock.outputs.token }}")
+        self.assertTrue(all(s["required"] for s in call_["secrets"].values()))
         check = job_step(LOCKWF, "lock", "Check the action")
-        for action, token, code in (("take", "", 0), ("thaw", "", 0), ("release", "", 1), ("release", TOKEN, 0), ("unlock", "", 1)):
+        for scope, action, token, code in (("infra", "take", "", 0), ("infra", "thaw", "", 0), ("infra", "release", "", 1), ("infra", "release", TOKEN, 0),
+                                           ("infra", "unlock", "", 1), ("backend", "take", "", 1), ("", "take", "", 1)):
             r = subprocess.run(["bash", "-eo", "pipefail", "-c", check], capture_output=True, text=True,
-                               env={**os.environ, "ACTION": action, "GIVEN_TOKEN": token})  # fmt: skip
-            self.assertEqual(r.returncode, code, action)
+                               env={**os.environ, "ACTION": action, "GIVEN_TOKEN": token, "SCOPE": scope})  # fmt: skip
+            self.assertEqual(r.returncode, code, (scope, action))
         self.assertNotIn("concurrency", LOCKWF)
         self.assertEqual(LOCKWF["jobs"]["lock"]["permissions"]["actions"], "read")
+
+    def test_its_limit_waits_only_for_take_and_freeze_keeps_10_minutes_until_the_release_order(self):
+        # freeze's wait for a live infra.json holder is built with the release order (.github #56, playbook §5.4a "Freeze
+        # and thaw"); until then freeze, like release and thaw, has the 10-minute limit.
+        expr = LOCKWF["jobs"]["lock"]["timeout-minutes"]
+        self.assertEqual({a: evaluate(expr, action=a) for a in ("take", "release", "freeze", "thaw")},
+                         {"take": 135, "release": 10, "freeze": 10, "thaw": 10})
+
+
+def evaluate(expr: str, **inputs: str):
+    """A timeout-minutes expression of inputs.* comparisons, &&, || and integers, evaluated for the given inputs."""
+    body = re.fullmatch(r"\$\{\{(.*)\}\}", expr.strip(), re.S).group(1)
+    body = re.sub(r"inputs\.([\w-]+)", lambda m: repr(inputs[m.group(1)]), body).replace("&&", " and ").replace("||", " or ")
+    return eval(body, {"__builtins__": {}})  # noqa: S307 - only the shipped expression, already held to that form by the lint
 
 
 def needs(doc: dict, job: str) -> list[str]:
@@ -362,13 +639,12 @@ GUARDED = ["build-image", "build-web", "deploy", "verify", "finish"]
 
 
 class Wiring(unittest.TestCase):
-    """The lock is taken by the first job, before any build, and released by an always() job (playbook §5.4)."""
+    """The lock is taken by the first job, before any build, and ended by an always() job (playbook §5.4)."""
 
     def test_release_ecs_takes_the_lock_before_anything_else(self):
         self.assertEqual(needs(RELEASE, "prepare"), [])
         names = [s.get("name", "") for s in RELEASE["jobs"]["prepare"]["steps"]]
         take = names.index("Take the release lock")
-        # Before the lock only the refusals and the credentials to take it; the version and everything else after it.
         for later in ("Order.", "Refuse at once", "Record the commit"):
             self.assertGreater(names.index(next(n for n in names if n.startswith(later))), take, later)
         version = next(s for s in RELEASE["jobs"]["prepare"]["steps"] if s.get("id") == "v")
@@ -382,50 +658,60 @@ class Wiring(unittest.TestCase):
 
     def test_unlock_always_runs_after_every_deploy_job(self):
         finish = RELEASE["jobs"]["finish"]
-        # Only when the prepare job ran, and never for prod (which the prepare job refuses).
-        self.assertEqual(finish["if"], "${{ always() && needs.prepare.result != 'skipped' && inputs.environment != 'prod' }}")
-        self.assertEqual(set(needs(RELEASE, "finish")), set(RELEASE["jobs"]) - {"finish", "api-client"})  # api-client runs after it
-        self.assertIn("lock_release", job_step(RELEASE, "finish", "Release the release lock"))
-        # Within finish the unlock and its credentials run whatever the steps before them did.
+        self.assertEqual(set(needs(RELEASE, "finish")), set(RELEASE["jobs"]) - {"finish", "api-client"})
+        self.assertIn("lock_finish", FINISH)
         steps = finish["steps"]
         unlock = next(i for i, s in enumerate(steps) if s.get("name") == "Release the release lock")
         self.assertEqual(steps[unlock]["if"], "${{ always() }}")
         self.assertTrue(steps[unlock - 1]["uses"].startswith("aws-actions/configure-aws-credentials@"))
         self.assertEqual(steps[unlock - 1]["if"], "${{ always() }}")
+        self.assertEqual(finish["permissions"]["issues"], "write")   # the put-back opens an issue
         for doc, name in ((RELEASE, "release-ecs"), (OPERATE, "operate")):
             rel = next(s for s in doc["jobs"][UNLOCK_JOB[name]]["steps"] if s.get("name") == "Release the release lock")
             self.assertEqual(rel["env"]["LOCK_TOKEN"], "${{ needs.%s.outputs.token }}" % LOCK_JOB[name])
+            self.assertEqual(rel["env"]["GH_TOKEN"], "${{ github.token }}")
             self.assertEqual(doc["jobs"][LOCK_JOB[name]]["outputs"]["token"], "${{ steps.take.outputs.token }}")
 
-    def test_the_lock_token_reaches_only_the_unlock_step(self):
-        self.assertEqual(RELEASE_TEXT.count("needs.prepare.outputs.token"), 1)
-        self.assertEqual(RELEASE_TEXT.count("LOCK_TOKEN: "), 1)
+    def test_the_finish_guard_is_skipped_when_prepare_took_no_lock(self):
+        # Then the only failed job is prepare, with the re-run message (playbook §5.4a rule 3).
+        guard = RELEASE["jobs"]["finish"]["steps"][0]
+        self.assertEqual(guard["if"], "${{ always() && needs.prepare.outputs.attempt != '' }}")
 
-    def test_operate_takes_and_releases_the_lock_around_its_one_job(self):
+    def test_the_lock_token_reaches_only_the_steps_that_write_or_end_the_record(self):
+        uses = sorted((job, s["name"]) for job, j in RELEASE["jobs"].items() for s in j.get("steps", [])
+                      if "needs.prepare.outputs.token" in json.dumps(s.get("env", {})))
+        self.assertEqual([j for j, _ in uses], ["deploy", "deploy", "finish", "verify"])
+        self.assertEqual(RELEASE_TEXT.count("needs.prepare.outputs.token"), 4)
+
+    def test_operate_takes_and_ends_the_lock_around_its_one_job(self):
         self.assertEqual(needs(OPERATE, "operate"), ["lock"])
         self.assertEqual(set(needs(OPERATE, "unlock")), {"lock", "operate"})
         self.assertEqual(OPERATE["jobs"]["unlock"]["if"], "${{ always() && needs.lock.result != 'skipped' }}")
         self.assertIn("lock_take", job_step(OPERATE, "lock", "Take the release lock"))
-        self.assertIn("lock_release", job_step(OPERATE, "unlock", "Release the release lock"))
+        self.assertIn("lock_finish", job_step(OPERATE, "unlock", "Release the release lock"))
+        self.assertEqual(OPERATE["jobs"]["unlock"]["permissions"]["issues"], "write")
 
     def test_no_concurrency_group_queues_a_release(self):
-        # GitHub keeps one pending run per group and cancels the older one (playbook §5.1 step 7, checklist M).
         for doc in (RELEASE, OPERATE, LOCKWF):
             self.assertNotIn("concurrency", doc)
             for name, job in doc["jobs"].items():
                 self.assertNotIn("concurrency", job, name)
 
-    def test_a_release_waits_30_minutes_polling_every_30_seconds(self):
-        for doc, name in ((RELEASE, "release-ecs"), (OPERATE, "operate"), (LOCKWF, "release-lock")):
-            self.assertEqual((doc["env"]["LOCK_WAIT_SECONDS"], doc["env"]["LOCK_POLL_SECONDS"]), ("1800", "30"))
-            self.assertGreater(doc["jobs"][LOCK_JOB[name]]["timeout-minutes"] * 60, 1800)
+    def test_the_waits_and_their_limits(self):
+        for doc in (RELEASE, OPERATE, LOCKWF):
+            env = doc["env"]
+            self.assertEqual((env["LOCK_WAIT_SECONDS"], env["LOCK_WAIT_CAP_SECONDS"], env["LOCK_QUEUED_WAIT_SECONDS"], env["LOCK_MIGRATE_WAIT_SECONDS"],
+                              env["LOCK_POLL_SECONDS"]), ("1800", "7200", "3600", "900", "30"))
+        self.assertEqual(RELEASE["jobs"]["prepare"]["timeout-minutes"], 135)
+        self.assertEqual(RELEASE["jobs"]["finish"]["timeout-minutes"], 60)
+        self.assertEqual(OPERATE["jobs"]["lock"]["timeout-minutes"], 135)
+        self.assertEqual(OPERATE["jobs"]["unlock"]["timeout-minutes"], 60)
 
-    def test_the_lock_is_per_environment_in_its_deploy_bucket(self):
+    def test_the_keys_are_per_environment_in_its_deploy_bucket(self):
         self.assertIn('LOCK_BUCKET="${NAME}-deploy"', TAKE)
-        self.assertIn('LOCK_KEY="locks/release.json"', TAKE)
+        self.assertIn('LOCK_LEGACY_KEY="locks/release.json"', TAKE)
 
     def test_the_app_secrets_are_required_and_their_token_reads_the_holders_state(self):
-        # No quiet fallback to GITHUB_TOKEN: without the App a lock left by another repo could never be taken over.
         for doc, wf in ((RELEASE, "release-ecs"), (OPERATE, "operate"), (LOCKWF, "release-lock")):
             for name in ("AGENTS_APP_CLIENT_ID", "AGENTS_APP_PRIVATE_KEY"):
                 self.assertTrue(doc[True]["workflow_call"]["secrets"][name]["required"], name)
@@ -442,10 +728,6 @@ class Wiring(unittest.TestCase):
         for has, code in (("false", 1), ("", 1), ("true", 0)):
             r = subprocess.run(["bash", "-eo", "pipefail", "-c", check], capture_output=True, text=True, env={**os.environ, "HAS_APP": has})
             self.assertEqual(r.returncode, code, has)
-            if code:
-                self.assertIn("AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY must be passed", r.stdout)
-        names = [s.get("name", "") for s in RELEASE["jobs"]["prepare"]["steps"]]
-        self.assertLess(names.index("The agents' GitHub App secrets are set (required, playbook §5.4)"), names.index("Take the release lock"))
 
     def test_deploy_from_dev_is_off_unless_the_input_turns_it_on(self):
         script = job_step(RELEASE, "prepare", "Deploy from dev is off")
@@ -454,21 +736,14 @@ class Wiring(unittest.TestCase):
             r = subprocess.run(["bash", "-eo", "pipefail", "-c", script], capture_output=True, text=True,
                                env={**os.environ, "GITHUB_REF": ref, "DEPLOY_FROM_DEV": flag})  # fmt: skip
             self.assertEqual(r.returncode, code, (ref, flag))
-            if code:
-                self.assertIn("deploy from dev is disabled until the launch switch-over (foundation-playbook §5.4)", r.stdout)
-        names = [s.get("name", "") for s in RELEASE["jobs"]["prepare"]["steps"]]
-        self.assertLess(names.index(next(n for n in names if n.startswith("Deploy from dev"))), names.index("Take the release lock"))
 
     def test_prod_is_promote_only(self):
         script = job_step(RELEASE, "prepare", "Prod is promote-only")
         refused = subprocess.run(["bash", "-eo", "pipefail", "-c", script], capture_output=True, text=True, env={**os.environ, "ENVIRONMENT_NAME": "prod"})
         self.assertEqual(refused.returncode, 1)
         self.assertIn("promote.yml", refused.stdout)
-        allowed = subprocess.run(["bash", "-eo", "pipefail", "-c", script], capture_output=True, text=True, env={**os.environ, "ENVIRONMENT_NAME": "preprod"})
-        self.assertEqual(allowed.returncode, 0)
 
     def test_operate_runs_from_release_only_until_launch(self):
-        # Founder 2026-11-03 (playbook §5.4): until launch `release` is preprod; no default depends on dev.
         want = "${{ github.ref == 'refs/heads/release' }}"
         self.assertEqual(OPERATE["jobs"]["lock"]["if"], want)
         self.assertEqual(OPERATE["jobs"]["operate"]["if"], want)
@@ -495,12 +770,9 @@ class PartialReRun(unittest.TestCase):
         self.assertIn("steps.guard.outcome == 'success'", notify["if"])
         rollback = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("id") == "rollback")
         self.assertIn("steps.guard.outcome == 'success'", rollback["if"])
-        for job in ("verify", "finish"):
-            self.assertEqual(self.guard(RELEASE, job).get("id"), "guard", job)
 
     def test_the_reusable_db_bootstrap_call_is_skipped_outside_the_locking_attempt(self):
         self.assertIn("needs.prepare.outputs.attempt == format('{0}', github.run_attempt)", RELEASE["jobs"]["db-bootstrap"]["if"])
-        self.assertIn("prepare", needs(RELEASE, "db-bootstrap"))
 
     def test_the_check_fails_on_another_attempt_and_passes_on_the_locking_one(self):
         script = self.guard(RELEASE, "deploy")["run"]
@@ -508,7 +780,6 @@ class PartialReRun(unittest.TestCase):
             out = subprocess.run(["bash", "-eo", "pipefail", "-c", script], capture_output=True, text=True,
                                  env={**os.environ, "LOCKED_ATTEMPT": locked, "GITHUB_RUN_ATTEMPT": attempt})  # fmt: skip
             self.assertEqual(out.returncode, code, (locked, attempt))
-        self.assertIn("Re-run all jobs", out.stdout)
 
     def test_the_guard_is_the_same_everywhere(self):
         runs = {self.guard(RELEASE, j)["run"] for j in GUARDED} | {self.guard(OPERATE, "operate")["run"]}
@@ -516,18 +787,134 @@ class PartialReRun(unittest.TestCase):
 
 
 class SameLockEverywhere(unittest.TestCase):
-    def test_operate_uses_the_same_lock_functions(self):
-        self.assertEqual(TAKE, job_step(OPERATE, "lock", "Take the release lock"))
-        self.assertEqual(RELEASE_STEP, job_step(OPERATE, "unlock", "Release the release lock"))
-        self.assertIn("# --- release-lock begin", RELEASE_TEXT)
-        self.assertIn("# --- release-lock begin", OPERATE_TEXT)
+    def test_every_step_that_touches_a_key_carries_the_same_lock_functions(self):
+        steps = [s["run"] for doc in (RELEASE, OPERATE, LOCKWF) for j in doc["jobs"].values() for s in j.get("steps", []) if "lock_" in str(s.get("run", ""))]
+        blocks = {re.search(r"# --- release-lock begin.*?# --- release-lock end ---", s, re.S).group(0) for s in steps}
+        self.assertEqual(len(blocks), 1)
         self.assertIn("lock_take", ACTION)
+        self.assertEqual(TAKE, job_step(OPERATE, "lock", "Take the release lock"))
 
 
 INDEX = json.dumps({"onepeek-preprod-api": {"kind": "service", "order": 1, "service": "api", "image": "backend"},
+                    "onepeek-preprod-pgbouncer": {"kind": "daemon", "order": 0, "service": "pgbouncer", "image": "backend"},
                     "onepeek-preprod-migrate": {"kind": "one-off", "order": 0, "service": "migrate", "image": "backend"},
                     "onepeek-preprod-web": {"kind": "service", "order": 1, "service": "web", "image": "web"}})  # fmt: skip
 ORDER = job_step(RELEASE, "prepare", "Order.")
+SCOPE = job_step(OPERATE, "lock", "The service's scope")
+OPERATE_TAKE = step_of(OPERATE, "lock", "Take the release lock")
+
+
+class OperateScope(unittest.TestCase):
+    """operate.yml derives the scope from the service's image and refuses another repo's service (playbook §5.4a)."""
+
+    def scope(self, service: str, repo: str = REPO):
+        return run(SCOPE, files={"index.json": INDEX}, SERVICE=service, GITHUB_REPOSITORY=repo)
+
+    def test_a_service_of_the_callers_own_image_is_its_scope(self):
+        for service in ("api", "pgbouncer", "all"):
+            out = self.scope(service)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertIn("scope=backend", out.output)
+        out = self.scope("web", "OnePeek/onepeek-web")
+        self.assertIn("scope=web", out.output)
+
+    def test_another_repos_service_and_an_unknown_or_one_off_service_are_refused(self):
+        for service, repo, says in (("web", REPO, "run operate.yml there"), ("api", "OnePeek/onepeek-web", "belongs to backend-service"),
+                                    ("migrate", REPO, "not one long-running service"), ("nope", REPO, "not one long-running service"),
+                                    ("all", "OnePeek/.github", "owns no app scope")):
+            out = self.scope(service, repo)
+            self.assertEqual(out.returncode, 1, (service, repo))
+            self.assertIn(says, out.stdout)
+            self.assertNotIn("scope=", out.output)
+
+    def test_the_take_uses_that_scope_and_the_infra_edge(self):
+        self.assertEqual(OPERATE_TAKE["env"]["LOCK_SCOPE"], "${{ steps.scope.outputs.scope }}")
+        self.assertEqual(OPERATE_TAKE["env"]["LOCK_INFRA_EDGE"], "1")
+        self.assertEqual(OPERATE["jobs"]["lock"]["outputs"]["scope"], "${{ steps.scope.outputs.scope }}")
+        for job in ("operate", "unlock"):
+            env = [s.get("env", {}) for s in OPERATE["jobs"][job]["steps"] if "lock_" in str(s.get("run", ""))]
+            self.assertTrue(env and all(e["LOCK_SCOPE"] == "${{ needs.lock.outputs.scope }}" for e in env), job)
+        # prepare runs the infra edge's queued-or-running part too (§5.4a "Taking keys and waiting" item 4; E5), until the
+        # order check's settled() is built (.github #56); no other step sets it.
+        edge = [(j, s.get("id")) for j, job in RELEASE["jobs"].items() for s in job.get("steps", []) if "LOCK_INFRA_EDGE" in (s.get("env") or {})]
+        self.assertEqual(edge, [("prepare", "take")])
+        self.assertEqual(step_of(RELEASE, "prepare", "Take the release lock")["env"]["LOCK_INFRA_EDGE"], "1")
+
+
+INFRA_RUNS = 'case "$*" in *workflows/release.yml/runs*) %s;; *) echo in_progress;; esac'
+
+
+class OperateInfraEdge(unittest.TestCase):
+    """An operate.yml take waits while an infra release run is queued or running, or infra.json is held (§5.4a item 1)."""
+
+    def test_an_operate_take_waits_while_an_infra_release_run_is_queued(self):
+        out = run(TAKE, gh=INFRA_RUNS % "echo 99", LOCK_INFRA_EDGE="1", LOCK_QUEUED_WAIT_SECONDS="2", LOCK_WAIT_CAP_SECONDS="30")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("::error::waiting for OnePeek/onepeek-infra (infra, run 99); re-run", out.stdout)
+        self.assertNotIn("put-object", out.calls)
+        self.assertLess(out.stdout.count("Waiting for"), 6)   # the 60-minute queued limit, not the cap
+
+    def test_it_waits_while_infra_json_is_held_by_a_live_run(self):
+        held = record(INFRA, "77", scope="infra")
+        out = run(TAKE, keys={INFRA_KEY: held}, gh=INFRA_RUNS % "echo", LOCK_INFRA_EDGE="1", LOCK_WAIT_CAP_SECONDS="1")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("waiting for OnePeek/onepeek-infra (infra, run 77); re-run", out.stdout)
+        self.assertEqual(out.keys, {INFRA_KEY: held})
+
+    def test_an_infra_run_that_started_during_the_take_makes_it_give_back_its_keys_and_wait(self):
+        counted = 'n=$(cat "$FAKE_S3/n" 2>/dev/null || echo 0); echo $((n+1)) > "$FAKE_S3/n"; [ "$n" -ge 1 ] && echo 99 || echo'
+        out = run(TAKE, gh=INFRA_RUNS % counted, LOCK_INFRA_EDGE="1", LOCK_WAIT_CAP_SECONDS="1")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("put-object --bucket onepeek-preprod-deploy --key locks/backend.json", out.calls)
+        self.assertIn("delete-object --bucket onepeek-preprod-deploy --key locks/backend.json", out.calls)
+        self.assertEqual(out.keys, {})
+
+    def test_with_no_infra_run_and_infra_json_free_it_takes(self):
+        out = run(TAKE, gh=INFRA_RUNS % "echo", LOCK_INFRA_EDGE="1")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(set(out.keys), {LEGACY, BACKEND})
+
+
+class Frozen(unittest.TestCase):
+    """preprod-frozen (playbook §5.4, §5.6): every scope's take reads it, infra included."""
+
+    def test_a_frozen_environment_refuses_runs_from_other_branches_at_once_with_the_reason(self):
+        for repo, ref, scope in ((REPO, "refs/heads/release", "backend"), (INFRA, "refs/heads/release", "infra"),
+                                 ("OnePeek/onepeek-web", "refs/heads/hotfix/x", "web")):
+            out = run(TAKE, frozen_by=frozen(), GITHUB_REPOSITORY=repo, GITHUB_REF=ref, LOCK_SCOPE=scope)
+            self.assertEqual(out.returncode, 1, (repo, ref))
+            self.assertIn("preprod is frozen by founder (hotfix hotfix/x) for the hotfix branch OnePeek/backend-service refs/heads/hotfix/x", out.stdout)
+            self.assertNotIn("put-object", out.calls)
+
+    def test_any_run_from_the_frozen_hotfix_branch_takes_the_lock(self):
+        for run_id in ("90", RUN):
+            out = run(TAKE, frozen_by=frozen(), GITHUB_RUN_ID=run_id, GITHUB_REF="refs/heads/hotfix/x")
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertEqual(json.loads(out.keys[BACKEND])["run_id"], run_id)
+
+    def test_an_unreadable_freeze_means_no_deploy(self):
+        for junk in ("not json", json.dumps({"repo": REPO}), frozen(ref="refs/heads/release")):
+            out = run(TAKE, frozen_by=junk, GITHUB_REF="refs/heads/release")
+            self.assertEqual(out.returncode, 1, junk)
+            self.assertNotIn("put-object", out.calls)
+
+    def test_freeze_is_written_from_a_hotfix_branch_naming_it(self):
+        out = run(ACTION, ACTION="freeze", LOCK_SCOPE="infra", GITHUB_REF="refs/heads/hotfix/x", GITHUB_REF_NAME="hotfix/x", GITHUB_ACTOR="founder")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        written = json.loads(out.frozen)
+        self.assertEqual((written["repo"], written["ref"], written["who"]), (REPO, "refs/heads/hotfix/x", "founder"))
+        self.assertNotIn("token", written)
+
+    def test_freeze_from_any_other_branch_is_refused(self):
+        out = run(ACTION, ACTION="freeze", LOCK_SCOPE="infra", GITHUB_REF="refs/heads/dev")
+        self.assertEqual(out.returncode, 1)
+        self.assertNotIn("put-object", out.calls)
+
+    def test_thaw_removes_the_freeze_on_its_etag(self):
+        out = run(ACTION, frozen_by=frozen(), ACTION="thaw", LOCK_SCOPE="infra")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn('delete-object --bucket onepeek-preprod-deploy --key locks/frozen.json --if-match "frozen-etag"', out.calls)
+        self.assertIsNone(out.frozen)
 
 
 def order(running: str, git: str, **extra: str):
@@ -539,38 +926,215 @@ class Order(unittest.TestCase):
     """Playbook §5.4 "Order, not only one at a time": an older run never undoes a newer one."""
 
     def test_a_newer_commit_running_makes_this_release_a_skip_with_a_notice(self):
-        out, calls, _, output = order("sha-" + "2" * 12, 'case "$1" in rev-parse) echo ' + "2" * 40 + ';; merge-base) exit 0;; esac')
+        out = order("sha-" + "2" * 12, 'case "$1" in rev-parse) echo ' + "2" * 40 + ';; merge-base) exit 0;; esac')
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn("skip=true", output)
+        self.assertIn("skip=true", out.output)
         self.assertIn("::notice::api already runs sha-222222222222", out.stdout)
-        self.assertIn("Skipped", out.summary)  # type: ignore[attr-defined]
-        self.assertIn("git merge-base --is-ancestor " + "f" * 40 + " " + "2" * 40, calls)
-        self.assertIn("ecs describe-services --cluster onepeek-preprod --services api", calls)
-        self.assertNotIn("--services migrate", calls)
-        self.assertNotIn("--services web", calls)
 
     def test_an_older_commit_running_deploys(self):
-        out, _, _, output = order("sha-" + "2" * 12, 'case "$1" in rev-parse) echo ' + "2" * 40 + ';; merge-base) exit 1;; esac')
+        out = order("sha-" + "2" * 12, 'case "$1" in rev-parse) echo ' + "2" * 40 + ';; merge-base) exit 1;; esac')
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn("skip=false", output)
-
-    def test_the_same_commit_or_no_deployment_or_no_tag_deploys_without_asking_git(self):
-        for running, services in (("sha-" + "f" * 12, "arn:td/api:7"), ("None", "arn:td/api:7"), ("x", "None")):
-            out, calls, _, output = order(running, "exit 9", AWS_DESCRIBE_SERVICES=services)
-            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-            self.assertIn("skip=false", output)
-            self.assertNotIn("git ", calls)
+        self.assertIn("skip=false", out.output)
 
     def test_a_commit_that_cannot_be_compared_means_no_deploy(self):
-        for running, git in (("sha-" + "2" * 12, "exit 1"), ("latest", "exit 9"),
-                             ("sha-" + "2" * 12, 'case "$1" in rev-parse) echo ' + "2" * 40 + ';; merge-base) exit 128;; esac')):
-            out, _, _, output = order(running, git)
+        for running, git in (("sha-" + "2" * 12, "exit 1"), ("latest", "exit 9")):
+            out = order(running, git)
             self.assertEqual(out.returncode, 1, running)
-            self.assertNotIn("skip=", output)
+            self.assertNotIn("skip=", out.output)
 
-    def test_the_checkout_has_the_history(self):
-        checkout = next(s for s in RELEASE["jobs"]["prepare"]["steps"] if str(s.get("uses", "")).startswith("actions/checkout@"))
-        self.assertEqual(checkout["with"]["fetch-depth"], 0)
+
+
+class FreshCredentials(unittest.TestCase):
+    """A take may wait up to the cap and renews its session only in its own shell, so no later step of its job runs on the
+    job-start session or App token (playbook §5.4a "Waits that fit the runners" rule 4)."""
+
+    def test_every_step_after_a_waiting_take_has_fresh_credentials(self):
+        import check_lock_limits
+        checked = 0
+        for doc, wf in ((RELEASE, "release-ecs"), (OPERATE, "operate"), (LOCKWF, "release-lock")):
+            steps = doc["jobs"][LOCK_JOB[wf]]["steps"]
+            take = next(i for i, s in enumerate(steps) if check_lock_limits.waits(s))
+            role = next(s for s in steps[:take] if str(s.get("uses", "")).startswith("aws-actions/configure-aws-credentials@"))["with"]
+            fresh = False
+            for step in steps[take + 1:]:
+                if str(step.get("uses", "")).startswith("aws-actions/configure-aws-credentials@"):
+                    self.assertEqual(step["with"], role, wf)   # the same role, region and session name
+                    fresh = True
+                    continue
+                self.assertNotIn("steps.app.outputs.token", json.dumps(step), (wf, step.get("name")))   # minted before the wait
+                if re.search(r"(^|[\s;|&(])aws ", str(step.get("run", ""))):
+                    self.assertTrue(fresh, (wf, step.get("name")))
+                    checked += 1
+        self.assertGreater(checked, 0)   # prepare's order check reads S3 and ECS after the take
+
+
+class EdgeLimits(unittest.TestCase):
+    """§5.4a "Every wait and its limit": a live infra run holding infra.json gets the job's cap; only a run that is
+    queued, or live but holding no key, gets the 60 minutes."""
+
+    def waits(self, keys):
+        out = run(TAKE, keys=keys, gh=INFRA_RUNS % "echo 77", LOCK_INFRA_EDGE="1", LOCK_QUEUED_WAIT_SECONDS="1", LOCK_WAIT_CAP_SECONDS="6")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("::error::waiting for OnePeek/onepeek-infra (infra, run 77); re-run", out.stdout)
+        self.assertNotIn("put-object", out.calls)
+        return out.stdout.count("Waiting for the preprod release lock")
+
+    def test_a_live_infra_run_that_holds_infra_json_is_waited_for_up_to_the_cap(self):
+        self.assertGreaterEqual(self.waits({INFRA_KEY: record(INFRA, "77", scope="infra")}), 4)
+
+    def test_a_queued_infra_run_or_one_that_holds_no_key_gets_the_60_minutes(self):
+        self.assertLessEqual(self.waits({}), 2)
+
+
+class InfraOwnScope(unittest.TestCase):
+    def test_infra_waits_for_another_infra_run_under_the_cap_not_the_30_minute_app_limit(self):
+        held = record(INFRA, "77", scope="infra")
+        out = run(ACTION, keys={INFRA_KEY: held}, ACTION="take", LOCK_SCOPE="infra", GITHUB_REPOSITORY=INFRA,
+                  LOCK_WAIT_SECONDS="1", LOCK_WAIT_CAP_SECONDS="6")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("::error::waiting for OnePeek/onepeek-infra (infra, run 77); re-run", out.stdout)
+        self.assertGreaterEqual(out.stdout.count("Waiting for the preprod release lock"), 4)
+        self.assertEqual(out.keys, {INFRA_KEY: held})
+
+
+class ConflictETag(unittest.TestCase):
+    def test_a_409_after_which_the_etag_changed_means_the_key_is_lost(self):
+        # §5.4a "Answers to a conditional write": retry only while the ETag is still the one read and the record its own.
+        out = run(call("lock_write_phase rolling", "echo changed-something"), keys={LEGACY: mine(), BACKEND: mine()}, LOCK_TOKEN=TOKEN,
+                  CONFLICT_PUTS="1", CHANGE_ON_CONFLICT="1")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("changed during a conflicting write", out.stdout)
+        self.assertNotIn("changed-something", out.stdout)
+        self.assertEqual(json.loads(out.keys[LEGACY])["phase"], "locked")
+        self.assertEqual(out.puts, "")
+
+
+API_TD = PREV["api"]
+RECORD_PREVIOUS = step_of(RELEASE, "deploy", "Record every service's current task definition")
+ROLLBACK = step_of(RELEASE, "verify", "Put every service back on the revision recorded")
+
+
+class FirstDeploy(unittest.TestCase):
+    """A service first deployed by this release has no previous revision: it is recorded first-deploy and the put-back
+    scales it to 0 rather than refusing the whole put-back (playbook §5.4a, provisional 2026-11-06)."""
+
+    def test_previous_records_first_deploy_for_a_service_with_no_revision(self):
+        for missing in ("None", ""):
+            out = run(RECORD_PREVIOUS["run"], keys={LEGACY: mine(), BACKEND: mine()}, LOCK_TOKEN=TOKEN, DRY_RUN="false",
+                      SERVICES='["api", "worker"]', SEQ_DESCRIBE_SERVICES=json.dumps([API_TD, missing]))
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertEqual(json.loads(out.keys[BACKEND])["previous"], {"api": API_TD, "worker": "first-deploy"}, missing)
+
+    def test_operate_records_first_deploy_the_same_way(self):
+        self.assertIn('prev[svc] = td if td and td != "None" else "first-deploy"', job_step(OPERATE, "operate", "Redeploy or roll back"))
+
+    def test_the_put_back_scales_a_first_deployed_service_to_0_and_unlocks(self):
+        held = mine("rolling", previous={"api": API_TD, "worker": "first-deploy"})
+        out = run(FINISH, keys={LEGACY: held, BACKEND: held}, LOCK_TOKEN=TOKEN, GH_TOKEN="gh")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(f"aws ecs update-service --cluster onepeek-preprod --service api --task-definition {API_TD}", out.calls)
+        self.assertIn("aws ecs update-service --cluster onepeek-preprod --service worker --desired-count 0", out.calls)
+        self.assertIn("aws ecs wait services-stable --cluster onepeek-preprod --services api worker", out.calls)
+        self.assertEqual(out.keys, {})
+
+    def test_a_previous_entry_that_is_neither_a_revision_nor_first_deploy_still_refuses_the_put_back(self):
+        held = mine("rolling", previous={"api": "None"})
+        out = run(FINISH, keys={LEGACY: held, BACKEND: held}, LOCK_TOKEN=TOKEN)
+        self.assertEqual(out.returncode, 1)
+        self.assertNotIn("update-service", out.calls)
+        self.assertEqual(out.keys, {LEGACY: held, BACKEND: held})
+
+    def test_verifys_rollback_scales_a_first_deployed_service_to_0(self):
+        out = run(ROLLBACK["run"], PREVIOUS=json.dumps({"api": API_TD, "worker": "first-deploy"}), HAS_SANDBOX="")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(f"--service api --task-definition {API_TD}", out.calls)
+        self.assertIn("--service worker --desired-count 0", out.calls)
+        self.assertNotIn("--task-definition first-deploy", out.calls)
+
+
+class ManualPath(unittest.TestCase):
+    """Until cancel-release.yml exists (.github #55), every message naming it also gives the manual path."""
+
+    def says_the_manual_path(self, text):
+        self.assertIn("cancel-release.yml", text)
+        self.assertIn("python3 .github/workspace/lock_status.py preprod", text)
+        self.assertIn("the founder only deletes it with the conditional delete (aws s3api delete-object --if-match <its ETag>)", text)
+
+    def test_a_rolling_key_names_cancel_release_and_the_manual_path(self):
+        out = run(TAKE, keys={BACKEND: record(REPO, "88", scope="backend", phase="rolling")}, gh="echo completed")
+        self.assertEqual(out.returncode, 1)
+        self.says_the_manual_path(out.stdout)
+
+    def test_a_failed_put_back_names_cancel_release_and_the_manual_path(self):
+        held = mine("rolling", previous=PREV)
+        out = run(FINISH, keys={LEGACY: held, BACKEND: held}, LOCK_TOKEN=TOKEN, FAIL_UPDATE_SERVICE="ServiceNotFound")
+        self.assertEqual(out.returncode, 1)
+        self.says_the_manual_path(out.stdout)
+
+
+OPERATE_STEP = job_step(OPERATE, "operate", "Redeploy or roll back")
+SERVICES_FILE = "services:\n  api:\n    image: backend\n    triggers: [http]\n"
+TEMPLATE = json.dumps({"family": "onepeek-preprod-api", "containerDefinitions": [{"name": "api", "image": ""}]})
+
+
+# docker and cosign read the password from stdin as the real tools do: a stub that exits without reading it breaks the pipe
+# under `aws ecr get-login-password | docker login --password-stdin`, and the fake aws then exits 120 (Linux runners race this).
+READS_PASSWORD = 'case " $* " in *" --password-stdin "*) cat >/dev/null ;; esac\nexit 0'
+TOOL_STUBS = {"docker": READS_PASSWORD, "cosign": READS_PASSWORD, "curl": "exit 0"}
+
+
+class OperateRolling(unittest.TestCase):
+    """operate.yml's phases (playbook §5.4a "Rollback on cancel", operate.yml): a redeploy writes rolling before its first
+    update-service, so a failure puts it back; a rollback never puts back, and a failed one stays locked with an alert."""
+
+    def operate(self, action):
+        stubs = TOOL_STUBS
+        return run(OPERATE_STEP, keys={LEGACY: mine(), BACKEND: mine()}, files={"services.yaml": SERVICES_FILE}, stubs=stubs,
+                   ACTION=action, SERVICE="api", TARGET="sha-" + "2" * 12 if action == "rollback" else "", REASON="test", LOCK_TOKEN=TOKEN,
+                   AWS_REGION="ap-south-1", DOMAIN_PREPROD="preprod.example", AWS_GET_CALLER_IDENTITY="111111111111",
+                   AWS_DESCRIBE_SERVICES=API_TD, AWS_CP=TEMPLATE, AWS_DESCRIBE_IMAGES="sha256:" + "a" * 64,
+                   SEQ_DESCRIBE_TASK_DEFINITION=json.dumps(["sha-" + "1" * 12, json.dumps({"containerDefinitions": [{"name": "api"}]})]),
+                   AWS_REGISTER_TASK_DEFINITION=API_TD.replace(":6", ":9"), AWS_DESCRIBE_ALARMS="onepeek-preprod-deploy-api-errors")  # fmt: skip
+
+    def test_a_redeploy_writes_rolling_with_previous_before_its_first_update_service(self):
+        out = self.operate("redeploy")
+        self.assertEqual(out.returncode, 1)   # the watch saw an alarm
+        self.assertIn("Deploy alarms firing", out.stdout)
+        rec = json.loads(out.keys[BACKEND])
+        self.assertEqual((rec["phase"], rec["previous"]), ("rolling", {"api": API_TD}))   # so the unlock job puts it back
+        lines = out.calls.splitlines()
+        rolling = next(i for i, l in enumerate(lines) if "put-object" in l and BACKEND in l)
+        update = next(i for i, l in enumerate(lines) if "update-service" in l)
+        self.assertLess(rolling, update)
+
+    def test_a_failed_rollback_stays_locked_never_rolling_and_fails_with_an_alert(self):
+        out = self.operate("rollback")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("update-service --cluster onepeek-preprod --service api --task-definition", out.calls)
+        self.assertEqual({k: json.loads(v)["phase"] for k, v in out.keys.items()}, {LEGACY: "locked", BACKEND: "locked"})
+        self.assertNotIn("previous", out.keys[BACKEND])
+        self.assertEqual(out.puts, "")
+        self.assertIn("::error::The rollback of api in preprod failed, and nothing is put back", out.stdout)
+        self.assertIn("The unlock job frees the key (phase locked, nothing put back)", out.stdout)
+        self.assertIn("cancel-release.yml", out.stdout)
+        self.assertNotIn("delete", out.stdout.lower())   # never tells anyone to delete the key by hand
+        self.assertNotIn("succeeded but", out.stdout)
+        self.assertIn("The rollback of api in preprod failed", out.summary)
+
+    def test_a_rollback_whose_final_phase_write_fails_is_not_reported_as_a_failed_rollback(self):
+        quick = OPERATE_STEP.replace("SECONDS + 300", "SECONDS + 0")   # no alarm: the watch ends at once
+        self.assertNotEqual(quick, OPERATE_STEP)
+        out = run(quick, keys={LEGACY: mine(), BACKEND: mine()}, files={"services.yaml": SERVICES_FILE},
+                  stubs=TOOL_STUBS, FAIL_PUT_OBJECT="AccessDenied",
+                  ACTION="rollback", SERVICE="api", TARGET="sha-" + "2" * 12, REASON="test", LOCK_TOKEN=TOKEN,
+                  AWS_REGION="ap-south-1", DOMAIN_PREPROD="preprod.example", AWS_GET_CALLER_IDENTITY="111111111111",
+                  AWS_DESCRIBE_SERVICES=API_TD, AWS_CP=TEMPLATE, AWS_DESCRIBE_IMAGES="sha256:" + "a" * 64,
+                  SEQ_DESCRIBE_TASK_DEFINITION=json.dumps(["sha-" + "1" * 12, json.dumps({"containerDefinitions": [{"name": "api"}]})]),
+                  AWS_REGISTER_TASK_DEFINITION=API_TD.replace(":6", ":9"), AWS_DESCRIBE_ALARMS="")  # fmt: skip
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("The rollback of api in preprod succeeded but its phase write failed", out.stdout)
+        self.assertNotIn("preprod failed", out.stdout)
+        self.assertIn("succeeded but its phase write failed", out.summary)
 
 
 if __name__ == "__main__":

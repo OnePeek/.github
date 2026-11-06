@@ -181,6 +181,42 @@ class Rule3Timeouts(unittest.TestCase):
         self.assertTrue(run("private", "OnePeek/onepeek-infra", "other.yml", lock))
         self.assertTrue(run("private", "OnePeek/backend-service", "sandbox.yml", lock))
 
+    def test_the_release_lock_waits_are_named_exceptions(self):
+        # foundation-playbook §5.4a "Waits that fit the runners": each waiting job of OnePeek/.github, by name.
+        for name, job, limit in (("release-ecs.yml", "prepare", 135), ("release-ecs.yml", "finish", 60), ("operate.yml", "lock", 135),
+                                 ("operate.yml", "unlock", 60), ("release-lock.yml", "lock", 135)):
+            self.assertEqual(lint.TIMEOUT_EXCEPTIONS[("OnePeek/.github", name, job)], limit)
+            text = reusable(STATEFUL_PUBLIC, timeout=str(limit)).replace("  j:", f"  {job}:")
+            self.assertEqual(run("public", "OnePeek/.github", name, text), [], (name, job))
+            over = reusable(STATEFUL_PUBLIC, timeout=str(limit + 1)).replace("  j:", f"  {job}:")
+            self.assertTrue(any("rule 3" in e for e in run("public", "OnePeek/.github", name, over)), (name, job))
+        # Any other job of these workflows keeps the class cap (150 for stateful).
+        self.assertTrue(run("public", "OnePeek/.github", "release-ecs.yml", reusable(STATEFUL_PUBLIC, timeout="151").replace("  j:", "  verify:")))
+
+    def test_an_expression_limit_is_read_as_its_larger_value(self):
+        expr = "${{ (inputs.action == 'take' || inputs.action == 'freeze') && 135 || 10 }}"
+        text = reusable(STATEFUL_PUBLIC, timeout=f'"{expr}"').replace("  j:", "  lock:")
+        self.assertEqual(run("public", "OnePeek/.github", "release-lock.yml", text), [])
+        self.assertTrue(run("public", "OnePeek/.github", "release-lock.yml", text.replace("135", "136")))
+        self.assertTrue(run("public", "OnePeek/.github", "release-lock.yml", reusable(STATEFUL_PUBLIC, timeout='"${{ inputs.minutes }}"')))
+        self.assertEqual(lint.timeout_minutes(expr), 135)
+        self.assertIsNone(lint.timeout_minutes(True))
+
+    def test_an_expression_that_could_hide_a_larger_limit_is_refused(self):
+        # Only inputs.* comparisons, &&, ||, parentheses and bare integers: any other context, function or quoted value
+        # could give a number the lint never sees (ci-runners.md §5.4 rule 3).
+        for expr in ("${{ vars.T || 10 }}", "${{ inputs.a && '500' || 10 }}", "${{ inputs.a && fromJSON('500') || 10 }}",
+                     "${{ format('{0}0', 50) }}", "${{ inputs.minutes || 10 }}", "${{ github.event.inputs.t == 'x' && 20 || 10 }}",
+                     "${{ (inputs.a == 'x' && 20 || 10 }}", "${{ 10 20 }}", "${{ 1.5e3 }}", "${{ inputs.a == 'x' }}"):
+            self.assertIsNone(lint.timeout_minutes(expr), expr)
+            text = reusable(STATEFUL_PUBLIC, timeout=f'"{expr}"').replace("  j:", "  lock:")
+            self.assertTrue(any("rule 3" in e for e in run("public", "OnePeek/.github", "release-lock.yml", text)), expr)
+
+    def test_an_integer_inside_a_comparison_is_not_a_value_the_expression_gives(self):
+        self.assertEqual(lint.timeout_minutes("${{ inputs.n == 500 && 20 || 10 }}"), 20)
+        self.assertEqual(lint.timeout_minutes("${{ inputs.action != 'take' && 10 || (inputs.x == 'y' && 30 || 135) }}"), 135)
+        self.assertEqual(lint.timeout_minutes("${{ 45 }}"), 45)
+
     def test_stateful_allows_more_than_fast(self):
         self.assertEqual(run("private", "OnePeek/x", "c.yml", own(STATEFUL_PRIVATE, "120")), [])
         self.assertTrue(run("private", "OnePeek/x", "c.yml", own(FAST_PRIVATE, "120")))
