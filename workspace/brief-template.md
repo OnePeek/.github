@@ -4,14 +4,17 @@ The coordinator writes every builder or reviewer brief in this shape (AGENTS.md 
 comes from the packet and the files named here, never from the coordinator's summary of them. A brief that cannot fill
 a field is not ready, so close the gap first.
 
+The brief's first line, outside the block below, is the lane: exactly `Lane: feature`, `Lane: hotfix` or `Lane: docs`.
+`packet.py --task` and the merge tools read only the first non-empty line of a brief or pull request body
+(`development-cycle.md` §2b), so a task file copied from this template starts with that line, unfenced.
+
 ```
-Lane: feature | hotfix
 Role: builder | reviewer | docs drafter        Model: opus | sonnet (rule in AGENTS.md "Running agents" 3)
 Repo: OnePeek/<repo>   Base: origin/<dev|main>   Branch: <type>/<topic> (existing PR: #<n>, or "new")
 
 Env: shell state does not persist between commands; prefix every command that needs it with
-  `export ONEPEEK_WORKSPACE=<the folder holding the repos> &&` (pitfalls.md 37). Read docs from origin/main
-  (`git -C "$ONEPEEK_WORKSPACE/onepeek-docs" show origin/main:<path>`), never from a shared checkout that may be stale.
+  `export ONEPEEK_WORKSPACE=<the folder holding the repos> &&` (pitfalls.md 37). Read docs from origin/main or the docs
+  commit named below (`git -C "$ONEPEEK_WORKSPACE/onepeek-docs" show <ref>:<path>`), never from a shared checkout that may be stale.
 
 Symptom (unblock lane): the failing run's link, the log line, and the behaviour the docs expect (file §section).
   Never a guessed cause: the builder reproduces first and reports the cause it finds (2026-11-06, T-58).
