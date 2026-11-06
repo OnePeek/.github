@@ -33,6 +33,8 @@ Never the builder's report or summary, so its view of the work cannot steer your
 | Normal | 30 minutes | Check traceability and contracts, and that the tests mean something. Run one mutation per area, and the gates on your own worktree |
 | High risk | 45 minutes | Everything in Normal, plus hostile inputs for every rule, every fail-closed path, the permission scope, and one mutation per rule |
 
+Full high-risk depth (every rule) is for the merge gate, IAM and security, secrets and release paths. Other high-risk changes (local tooling, tests) get mutations and hostile inputs for the rules the change adds or alters, not for the whole file (founder, 2026-11-06).
+
 ## 4. Procedure
 1. **Make a throwaway worktree at the exact head,** and record its full commit:
    - `git fetch origin pull/<n>/head`;
@@ -40,7 +42,7 @@ Never the builder's report or summary, so its view of the work cannot steer your
 2. **Traceability.** Every spec line is implemented, and every code line traces to the spec. Code that does not trace is drift, and drift is blocking.
 3. **Patterns.** Check that the change follows the repo's existing patterns: layering, naming, configuration, errors. A deviation with no stated reason is a should-fix.
 4. **Tests.** They must mean something: not tautological, and they test behaviour, not internals. Run the mutations yourself.
-5. **Gates.** Run the repo's gates on your worktree, and `done_check.py <worktree> --pr <repo>#<n>`. In infra, run `terraform test` yourself: `local_ci.py --native` skips it.
+5. **Gates.** Do not re-run the gates the builder already reported (local CI, `done_check.py`, the full suite): quote the builder's lines and spend the time on mutations and hostile inputs. Run only the tests your mutations touch, with the unmutated baseline in the same invocation. Re-run a gate yourself only when the builder's report lacks its line or the head moved since. In infra, run `terraform test` yourself when the change touches Terraform.
 6. **Bots.** Wait at most 10 minutes for CodeRabbit on the head. Triage each thread as real, wrong or nit, with evidence. If CodeRabbit is still pending, your verdict is provisional.
 7. **Pitfalls.** Check the diff against every line of `pitfalls.md`. A new kind of mistake gets a proposed line in your report.
 8. **Check the remote head again** just before your verdict. If it has moved, your verdict covers only the head you reviewed: say so.
@@ -59,6 +61,8 @@ Every finding has its `file:line`, its evidence (the command you ran and its out
 **Round 2** checks only the round-1 findings and the new changes. There is no round 3. If one would be needed, say whether the design is unclear or the change needs rework, and the orchestrator decides.
 
 ## 6. Report
+**One verdict per message, as soon as it is ready** (founder, 2026-11-06: a ready verdict for the head of a merge chain waited 20 minutes behind four others). For each pull request, send the orchestrator its verdict with `SendMessage` (to `main`) the moment you have it, then go on to the next; your final hand-back only summarises. Review in the order the brief gives (the merge chain first), and expect at most 2-3 pull requests per run.
+
 1. The `Read:` line with the commits.
 2. The findings, ranked, with their evidence.
 3. The mutations: what you changed, and the test that failed.
