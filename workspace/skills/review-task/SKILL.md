@@ -61,7 +61,7 @@ Every finding has its `file:line`, its evidence (the command you ran and its out
 **Round 2** checks only the round-1 findings and the new changes. There is no round 3. If one would be needed, say whether the design is unclear or the change needs rework, and the orchestrator decides.
 
 ## 6. Report
-**One verdict per message, as soon as it is ready** (founder, 2026-11-06: a ready verdict for the head of a merge chain waited 20 minutes behind four others). For each pull request, send the orchestrator its verdict with `SendMessage` (to `main`) the moment you have it, then go on to the next; your final hand-back only summarises. Review in the order the brief gives (the merge chain first), and expect at most 2-3 pull requests per run.
+**One verdict per message, as soon as it is ready** (founder, 2026-11-06: a ready verdict for the head of a merge chain waited 20 minutes behind four others). The `spec-reviewer` agent has no `SendMessage` tool and its hand-back ends the run, so a run reviews **one pull request** (or one pull request plus its tiny dependants) and hands back its verdict at once; the orchestrator resumes the same reviewer with the next one, in merge-chain order, so its context carries over.
 
 1. The `Read:` line with the commits.
 2. The findings, ranked, with their evidence.
