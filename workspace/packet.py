@@ -29,7 +29,7 @@ def run(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, capture_output=True, text=True, check=False)
 
 
-LANE = re.compile(r"Lane:[ \t]*(feature|hotfix|docs)[ \t]*", re.I)  # the whole first line: no bullet, indent, bold
+LANE = re.compile(r"Lane:[ \t]*(feature|hotfix|docs)[ \t]*", re.I | re.ASCII)  # the whole first line: no bullet, indent, bold
 SETEXT = re.compile(r" {0,3}(?:=+|-+)[ \t]*")  # under the first line it makes that line a heading, not a statement
 LANES = ("feature", "hotfix", "docs")
 

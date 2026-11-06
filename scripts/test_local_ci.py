@@ -613,6 +613,33 @@ class LinuxContainerL2(unittest.TestCase):
         for code in ("npx eslint .", "terraform fmt -check", "python3 scripts/tool.py", "echo hello # bash x"):
             self.assertFalse(lc.wants_linux(lc.strip_comments(code)), code)
 
+    NETWORK_TOOLS = ("uv", "uvx", "pip", "pip3", "pipx", "npm", "npx", "pnpm", "pnpx", "yarn", "apt-get", "curl", "wget")
+
+    def test_every_container_step_of_the_shared_workflows_gets_network_exactly_when_it_calls_a_network_tool(self):
+        # The contract step (`uvx ...`) ran with `--network none`, so uv could not reach PyPI (T-64). The expectation here
+        # comes from whole shell words, independently of NEEDS_NETWORK.
+        seen = []
+        for f in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            for job in (yaml.safe_load(f.read_text(encoding="utf-8")).get("jobs") or {}).values():
+                for step in job.get("steps") or []:
+                    code = lc.strip_comments(step.get("run") or "")
+                    if not code or not lc.wants_linux(code):
+                        continue
+                    words = re.findall(r"[^\s;|&()`'\"]+", code)
+                    calls = any(w.rsplit("/", 1)[-1] in self.NETWORK_TOOLS for w in words) or \
+                        bool(re.search(r"\bgit (clone|fetch|pull)\b|\bdocker pull\b", code))
+                    seen.append(f"{f.name}: {step.get('name')}")
+                    self.assertEqual(bool(lc.NEEDS_NETWORK.search(code)), calls, seen[-1])
+        self.assertIn("contract.yml: The contract logic's own tests (onepeek-infra pull requests)", seen)
+
+    def test_network_is_given_by_full_tool_name_and_withheld_otherwise(self):
+        self.assertTrue(lc.NEEDS_NETWORK.search("uvx --with pyyaml==6.0.3 python -m unittest scripts/test_contract.py"))
+        for tool in self.NETWORK_TOOLS:
+            self.assertTrue(lc.NEEDS_NETWORK.search(f"{tool} install x"), tool)
+        for code in ("python3 -m unittest discover -s scripts -p 'test_*.py'", "python -m pytest scripts/", "bash scripts/t.sh",
+                     "uvicorn app:main", "python scripts/pipeline.py", "curly --x"):
+            self.assertIsNone(lc.NEEDS_NETWORK.search(code), code)
+
     def test_the_image_tag_is_the_hash_of_the_dockerfile(self):
         d = pathlib.Path(tempfile.mkdtemp())
         f = d / "Dockerfile"
@@ -658,6 +685,31 @@ class LinuxContainerL2(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual([(c, bool(l)) for c, l in seen], [("python3", True), ("npx", False)])
         self.assertEqual(seen[0][1][1], "img:1")
+
+    # infra checks.yml, job collector-config, verbatim: it ran in the container and failed with `docker: command not found` (T-67).
+    INFRA_COLLECTOR_STEP = ("docker version --format 'Docker {{.Server.Version}}'\n"
+                            "uvx --with pyyaml==6.0.3 python -m unittest scripts/test_collector_config.py\n")
+
+    def test_a_step_that_calls_docker_stays_on_the_host(self):
+        infra = pathlib.Path(os.environ.get("ONEPEEK_WORKSPACE") or ROOT.parent) / "onepeek-infra/.github/workflows/checks.yml"
+        if infra.is_file():  # the fixture is the real step while infra's checkout is beside this repo
+            steps = yaml.safe_load(infra.read_text(encoding="utf-8"))["jobs"]["collector-config"]["steps"]
+            self.assertIn(self.INFRA_COLLECTOR_STEP, [st.get("run") for st in steps])
+        d = make_repo_with(job_yaml())
+        (d / "scripts").mkdir()
+        (d / "scripts/boot.sh").write_text("docker run --rm x\n", encoding="utf-8")
+        (d / ".github/workflows/checks.yml").write_text(job_yaml(self.INFRA_COLLECTOR_STEP, "scripts/boot.sh --x",
+                                                                 "python3 -m unittest discover -s scripts"), encoding="utf-8")
+        seen = []
+
+        def fake_step(cmd, cwd, env, shell, linux=None):
+            seen.append(linux is not None)
+            return 0, "", 0.0
+        with mock.patch.object(lc.platform, "system", return_value="Darwin"), mock.patch.object(lc, "docker_ready", return_value=True), \
+                mock.patch.object(lc, "ensure_image", return_value="img:1"), mock.patch.object(lc, "run_step", fake_step), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+        self.assertEqual(seen, [False, False, True])  # both docker steps on the host, the plain script tests in the container
 
     def test_native_turns_it_off(self):
         _, seen, _ = self.run_darwin("--native")
