@@ -957,6 +957,17 @@ class RevertPush(unittest.TestCase):
         self.assertEqual(sw._revert_push("onepeek-web", "dev", bad, self.ws), f"already reverted by {head[:12]}")
         self.assertEqual(self.remote_head(), head)
 
+    def test_a_push_the_remote_does_not_show_is_a_failure(self):  # proven by the remote, never by its output (pitfall 32)
+        bad = commit(self.repo, {"a.txt": "bad\n"}, "pin move")
+        git(self.repo, "push", "-q", "origin", "dev")
+        real = sw.git
+
+        def lagging(cwd, *args):
+            return "0" * 40 + "\trefs/heads/dev\n" if args[:1] == ("ls-remote",) else real(cwd, *args)
+        with mock.patch.object(sw, "git", lagging), self.assertRaises(sw.ReadError) as e:
+            sw._revert_push("onepeek-web", "dev", bad, self.ws)
+        self.assertIn("is not origin/dev", str(e.exception))
+
     def test_a_sha_not_on_the_trunk_is_refused(self):
         base = git(self.repo, "rev-parse", "HEAD").strip()
         commit(self.repo, {"c.txt": "c\n"}, "on dev")
