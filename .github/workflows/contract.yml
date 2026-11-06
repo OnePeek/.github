@@ -61,6 +61,14 @@ jobs:
           permission-contents: read
           permission-pull-requests: read
 
+      - name: OnePeek/.github at this workflow's own commit (the peer-ref script, §6.5)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OnePeek/.github
+          ref: ${{ job.workflow_sha }}
+          path: _shared
+          persist-credentials: false
+
       - name: The other repos' ref (dev; the release candidate for a release pull request; release for a hotfix)
         id: ref
         env:
@@ -70,34 +78,23 @@ jobs:
           OWNER: ${{ github.repository_owner }}
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
+          # The rule lives in scripts/peer_ref.py (delivery-pipelines §6.5), the same file the peer-ref action runs.
           case "${ROLE}" in backend|web|infra) ;; *) echo "::error::role must be backend, web or infra, not '${ROLE}'."; exit 1 ;; esac
-          case "${BASE_REF}" in dev|release) ;; *) echo "::error::base_ref must be dev or release, not '${BASE_REF}'."; exit 1 ;; esac
+          repos=
           for side in backend web infra; do
             [ "${side}" = "${ROLE}" ] && continue
             case "${side}" in backend) repo=backend-service ;; web) repo=onepeek-web ;; infra) repo=onepeek-infra ;; esac
-            if [ "${BASE_REF}" = dev ]; then
-              ref=dev
-            elif [[ "${HEAD_REF}" == hotfix/* ]]; then
-              ref=release   # a hotfix ships against what is live
-            else
-              # The release candidate (delivery-pipelines §6.1): the head commit of the open dev -> release pull request,
-              # which is exactly what its promotion ships, else the release branch, which is what runs. Fails closed.
-              if ! heads=$(gh api "repos/${OWNER}/${repo}/pulls?state=open&base=release&head=${OWNER}:dev" --jq '.[].head.sha'); then
-                echo "::error::Cannot read ${repo}'s open pull requests into release, so its release candidate is unknown."
-                exit 1
-              fi
-              if [ -z "${heads}" ]; then
-                ref=release
-              elif [[ "${heads}" =~ ^[0-9a-f]{40}$ ]]; then   # one line only: =~ anchors to the whole value
-                ref="${heads}"
-              else
-                echo "::error::${repo}: expected at most one open dev -> release pull request with a commit SHA, got: ${heads}"
-                exit 1
-              fi
-            fi
-            echo "${side} is taken at ${ref}"
-            echo "${side}=${ref}" >> "$GITHUB_OUTPUT"
+            repos="${repos:+${repos},}${repo}"
           done
+          lines=$(python3 _shared/scripts/peer_ref.py --base "${BASE_REF}" --head "${HEAD_REF}" --owner "${OWNER}" --repos "${repos}" --commits)
+          while IFS='= ' read -r repo ref sha; do
+            [ -n "${repo}" ] || continue
+            case "${repo}" in onepeek-infra) key=infra ;; backend-service) key=backend ;; onepeek-web) key=web ;; esac
+            echo "${repo} is taken at ${ref}"
+            echo "${key}=${ref}" >> "$GITHUB_OUTPUT"
+            echo "peer: ${repo}@${sha}"   # the merge tool reads this line from the job log before a promotion merges
+            echo "peer: ${repo}@${sha}" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "${lines}"
 
       - name: This pull request
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

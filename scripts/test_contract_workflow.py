@@ -37,8 +37,10 @@ def run(name: str, env: dict[str, str], gh: str = "echo gh must not be called >&
         stub = Path(d, "gh")
         stub.write_text(f'#!/bin/bash\necho "gh $*" >> "{d}/calls"\n{gh}\n')
         stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
-        out = subprocess.run(["bash", "-eo", "pipefail", "-c", step(name)["run"]], capture_output=True, text=True,
-                             env={**os.environ, **env, "OWNER": "OnePeek", "GITHUB_OUTPUT": str(output), "PATH": f"{d}:{os.environ['PATH']}"})  # fmt: skip
+        Path(d, "_shared").symlink_to(WORKFLOW.parents[2])  # the step's `_shared` checkout of OnePeek/.github
+        out = subprocess.run(["bash", "-eo", "pipefail", "-c", step(name)["run"]], capture_output=True, text=True, cwd=d,
+                             env={**os.environ, **env, "OWNER": "OnePeek", "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": f"{d}/summary", "PATH": f"{d}:{os.environ['PATH']}"})  # fmt: skip
+        out.summary = Path(d, "summary").read_text() if Path(d, "summary").exists() else ""  # type: ignore[attr-defined]
         calls = Path(d, "calls")
         out.calls = calls.read_text() if calls.exists() else ""  # type: ignore[attr-defined]
         return out, output.read_text() if output.exists() else ""
@@ -55,14 +57,21 @@ def checkouts(role: str) -> dict[str, str]:
 
 
 def resolve(role: str, base: str, head: str = "feature/x", gh: str | None = None) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
-    out, output = run("The other repos' ref", {"ROLE": role, "BASE_REF": base, "HEAD_REF": head}, *([gh] if gh else []))
+    out, output = run("The other repos' ref", {"ROLE": role, "BASE_REF": base, "HEAD_REF": head}, gh or NO_PULLS)
     return out, dict(line.split("=", 1) for line in output.split())
 
 
 SHA_BACKEND, SHA_WEB, SHA_INFRA = "b" * 40, "c" * 40, "d" * 40
 # Open dev -> release pull requests: backend and infra have one, web has none.
+SHA_DEV, SHA_RELEASE = "e" * 40, "f" * 40
+COMMITS = f"""*repos/OnePeek/*/commits/dev*) echo {SHA_DEV};;
+*repos/OnePeek/*/commits/release*) echo {SHA_RELEASE};;
+"""
+NO_PULLS = f"""case "$*" in
+{COMMITS}*) echo "unexpected: $*" >&2; exit 9;;
+esac"""
 OPEN_RELEASE_PRS = f"""case "$*" in
-*repos/OnePeek/backend-service/pulls?state=open\\&base=release\\&head=OnePeek:dev*) echo {SHA_BACKEND};;
+{COMMITS}*repos/OnePeek/backend-service/pulls?state=open\\&base=release\\&head=OnePeek:dev*) echo {SHA_BACKEND};;
 *repos/OnePeek/onepeek-infra/pulls?state=open\\&base=release\\&head=OnePeek:dev*) echo {SHA_INFRA};;
 *repos/OnePeek/onepeek-web/pulls?state=open\\&base=release\\&head=OnePeek:dev*) ;;
 *) echo "unexpected: $*" >&2; exit 9;;
@@ -90,12 +99,12 @@ class OtherRef(unittest.TestCase):
 
     def test_only_the_dev_head_counts_as_the_release_candidate(self):
         out, _ = resolve("infra", "release", "dev", OPEN_RELEASE_PRS)
-        self.assertEqual(out.calls.count("base=release&head=OnePeek:dev"), 2, out.calls)  # type: ignore[attr-defined]
+        self.assertEqual(out.calls.count("pulls?state=open&base=release&head=OnePeek:dev"), 2, out.calls)  # type: ignore[attr-defined]
 
     def test_an_unreadable_pull_request_list_fails_closed(self):
         out, refs = resolve("infra", "release", "dev", 'echo "HTTP 403: Resource not accessible" >&2; exit 1')
         self.assertEqual(out.returncode, 1)
-        self.assertIn("release candidate is unknown", out.stdout)
+        self.assertIn("release candidate is unknown", out.stderr)
         self.assertEqual(refs, {})
 
     def test_anything_but_one_commit_sha_fails_closed(self):
@@ -107,7 +116,7 @@ class OtherRef(unittest.TestCase):
         out, refs = resolve("backend", "dev")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(refs, {"web": "dev", "infra": "dev"})
-        self.assertEqual(out.calls, "")  # type: ignore[attr-defined]
+        self.assertNotIn("pulls", out.calls)  # type: ignore[attr-defined]
 
     def test_a_hotfix_pull_request_into_release_checks_the_other_repos_at_release(self):
         self.assertEqual(resolve("infra", "release", "hotfix/fix-x")[1], {"backend": "release", "web": "release"})
@@ -119,13 +128,29 @@ class OtherRef(unittest.TestCase):
         self.assertEqual(resolve("backend", "main")[0].returncode, 1)
         self.assertEqual(resolve("docs", "dev")[0].returncode, 1)
 
+    def test_the_peer_revision_is_recorded_in_the_job_summary(self):
+        out, _ = resolve("web", "release", "dev", OPEN_RELEASE_PRS)
+        want = [f"peer: backend-service@{SHA_BACKEND}", f"peer: onepeek-infra@{SHA_INFRA}"]
+        self.assertEqual(out.summary.splitlines(), want)  # type: ignore[attr-defined]
+        self.assertEqual([ln for ln in out.stdout.splitlines() if ln.startswith("peer:")], want)  # the log line the merge tool reads
+        # A branch ref is recorded as the commit it is at (ruling 2).
+        self.assertEqual(resolve("infra", "dev")[0].summary.splitlines(),  # type: ignore[attr-defined]
+                         [f"peer: backend-service@{SHA_DEV}", f"peer: onepeek-web@{SHA_DEV}"])
+        self.assertEqual(resolve("infra", "release", "dev", OPEN_RELEASE_PRS)[0].summary.splitlines()[-1],  # type: ignore[attr-defined]
+                         "peer: onepeek-web@" + SHA_RELEASE)
+
+    def test_the_rule_is_the_shared_script_not_a_copy_in_the_workflow(self):
+        run_text = step("The other repos' ref")["run"]
+        self.assertIn("_shared/scripts/peer_ref.py", run_text)
+        self.assertNotIn("pulls?state=open", run_text)
+
     def test_event_inputs_never_inline_into_the_script(self):
         self.assertNotIn("${{", step("The other repos' ref")["run"])
 
     def test_every_other_repo_is_checked_out_at_its_own_ref_with_the_app_token(self):
         refs = {"onepeek-infra": "infra", "backend-service": "backend", "onepeek-web": "web"}
         for s in STEPS:
-            if "repository" in s.get("with", {}):
+            if "repository" in s.get("with", {}) and s["with"]["path"] != "_shared":
                 repo = s["with"]["repository"].split("/")[-1]
                 self.assertEqual(s["with"]["ref"], "${{ steps.ref.outputs." + refs[repo] + " }}")
                 self.assertEqual(s["with"]["token"], "${{ steps.app.outputs.token }}")
@@ -171,9 +196,9 @@ class ServiceListJob(unittest.TestCase):
 
 class Sides(unittest.TestCase):
     def test_each_role_checks_out_itself_at_the_pull_request_and_what_it_is_checked_against(self):
-        self.assertEqual(checkouts("backend"), {"_backend": "this pull request", "_infra": "onepeek-infra"})
-        self.assertEqual(checkouts("web"), {"_web": "this pull request", "_infra": "onepeek-infra"})
-        self.assertEqual(checkouts("infra"), {"_infra": "this pull request", "_backend": "backend-service", "_web": "onepeek-web"})
+        self.assertEqual(checkouts("backend"), {"_shared": ".github", "_backend": "this pull request", "_infra": "onepeek-infra"})
+        self.assertEqual(checkouts("web"), {"_shared": ".github", "_web": "this pull request", "_infra": "onepeek-infra"})
+        self.assertEqual(checkouts("infra"), {"_shared": ".github", "_infra": "this pull request", "_backend": "backend-service", "_web": "onepeek-web"})
 
     def test_the_checks_run_infras_one_contract_script_with_each_roles_sides(self):
         script = step("The contract between repos")["run"]
