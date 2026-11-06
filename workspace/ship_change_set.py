@@ -361,8 +361,9 @@ def is_warn(c: dict, warn: list[tuple[str, str, str]], repo: str) -> bool:
 GREEN = ("pass", "skipping")  # any other bucket, or none, is red or pending (§6.6 fail closed on every shape)
 
 
-def wait_green(repo: str, n: int, may_rerun: bool) -> None:
-    deadline, reran = time.time() + CHECK_TIMEOUT_S, False
+def wait_green(repo: str, n: int, may_rerun: bool, deadline: float | None = None) -> None:
+    """deadline: an end shared by several waits (green_head's), else CHECK_TIMEOUT_S from now."""
+    deadline, reran = deadline or time.time() + CHECK_TIMEOUT_S, False
     warn, until = warn_checks()
     told = False
     while time.time() < deadline:
@@ -536,13 +537,22 @@ def base_unchanged(repo: str, n: int, tested: set[str], branch: str) -> bool:
     return tested == {base_head(repo, branch)}
 
 
+HEAD_MOVES_MAX = 5  # a head that keeps moving stops the pull request instead of waiting forever (ruling T-56)
+
+
 def green_head(repo: str, n: int, may_rerun: bool) -> str:
-    """Wait for the required checks to be green and return the head they were green on (asked again if it moved)."""
+    """Wait for the required checks to be green and return the head they were green on (asked again if it moved).
+    After HEAD_MOVES_MAX moves in one wait it STOPs, naming the heads. All its waits share one CHECK_TIMEOUT_S deadline,
+    so a merge run stays inside the watcher's MERGE_TIMEOUT_S (T-56 round 2)."""
+    heads, deadline = [pr_info(repo, n)["headRefOid"]], time.time() + CHECK_TIMEOUT_S
     while True:
-        head = pr_info(repo, n)["headRefOid"]
-        wait_green(repo, n, may_rerun)
-        if pr_info(repo, n)["headRefOid"] == head:
-            return head
+        wait_green(repo, n, may_rerun, deadline)
+        heads.append(pr_info(repo, n)["headRefOid"])
+        if heads[-1] == heads[-2]:
+            return heads[-1]
+        if len(heads) - 1 >= HEAD_MOVES_MAX:
+            raise SystemExit(f"STOP {repo}#{n}: head moved {HEAD_MOVES_MAX} times while its checks ran "
+                             f"({' -> '.join(h[:7] for h in heads)}); nothing after it is merged")
         say(f"{repo}#{n}: head moved while its checks ran; waiting again")
 
 
