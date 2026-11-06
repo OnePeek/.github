@@ -3,10 +3,10 @@
 Usage: peer_ref.py --base <base_ref> --head <head_ref> --owner <owner> --repos onepeek-infra,backend-service
 
 Prints one `<repo>=<ref>` line per repo and nothing else on stdout. With --commits each line is `<repo>=<ref> <sha>`,
-the commit the ref is at (a dev or release ref resolved to its head; one more read, `GET /repos/<owner>/<repo>/commits/<ref>`):
-the callers record `peer: <repo>@<sha>` from it, and ship_change_set.py re-checks that line before a promotion merges. Errors go to stderr as `::error::` lines, exit 1.
-Reads only `GET /repos/<owner>/<repo>/pulls?state=open&base=release&head=<owner>:dev` through `gh api` (GH_TOKEN).
-Standard library only.
+the 40-hex commit the ref names now: the callers check out that commit and record `peer: <repo>@<sha>` from it, and
+ship_change_set.py re-checks that line before a promotion merges. Errors go to stderr as `::error::` lines, exit 1.
+Reads `GET /repos/<owner>/<repo>/pulls?state=open&base=release&head=<owner>:dev` and, for --commits with a branch ref,
+`GET /repos/<owner>/<repo>/commits/<ref>`, through `gh api` (GH_TOKEN). Standard library only.
 
   pull request into dev                 -> dev
   hotfix/* head into release            -> release (a hotfix ships against what is live)
@@ -51,7 +51,10 @@ def commit(owner: str, repo: str, ref: str) -> str:
     """The commit ref is at (a SHA is its own commit, with no read)."""
     if SHA.fullmatch(ref):
         return ref
-    out = subprocess.run(["gh", "api", f"repos/{owner}/{repo}/commits/{ref}", "--jq", ".sha"], capture_output=True, text=True, check=False)
+    try:
+        out = subprocess.run(["gh", "api", f"repos/{owner}/{repo}/commits/{ref}", "--jq", ".sha"], capture_output=True, text=True, check=False)
+    except OSError as e:
+        raise Refused(f"Cannot read {repo}'s commit at {ref} ({e}), so the version it is checked at is unknown.")
     sha = out.stdout.strip()
     if out.returncode != 0 or not SHA.fullmatch(sha):
         raise Refused(f"Cannot read {repo}'s commit at {ref}, so the version it is checked at is unknown.")

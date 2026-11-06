@@ -82,19 +82,19 @@ class OtherRef(unittest.TestCase):
     def test_dev_for_a_pull_request_into_dev(self):
         out, refs = resolve("infra", "dev")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertEqual(refs, {"backend": "dev", "web": "dev"})
+        self.assertEqual(refs, {"backend": SHA_DEV, "web": SHA_DEV})
 
     def test_a_release_pull_request_checks_each_other_repo_at_the_head_of_its_open_release_pull_request(self):
         # delivery-pipelines §6.1: the release candidate is the exact commit that repo's promotion ships, never a moving dev.
         out, refs = resolve("web", "release", "dev", OPEN_RELEASE_PRS)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(refs, {"backend": SHA_BACKEND, "infra": SHA_INFRA})
-        self.assertEqual(resolve("backend", "release", "dev", OPEN_RELEASE_PRS)[1], {"web": "release", "infra": SHA_INFRA})
+        self.assertEqual(resolve("backend", "release", "dev", OPEN_RELEASE_PRS)[1], {"web": SHA_RELEASE, "infra": SHA_INFRA})
 
     def test_a_repo_with_no_open_release_pull_request_is_checked_at_release_what_runs(self):
         out, refs = resolve("infra", "release", "dev", OPEN_RELEASE_PRS)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertEqual(refs, {"backend": SHA_BACKEND, "web": "release"})
+        self.assertEqual(refs, {"backend": SHA_BACKEND, "web": SHA_RELEASE})
         self.assertNotIn("dev", refs.values())
 
     def test_only_the_dev_head_counts_as_the_release_candidate(self):
@@ -115,14 +115,14 @@ class OtherRef(unittest.TestCase):
     def test_pull_requests_into_dev_never_ask_github(self):
         out, refs = resolve("backend", "dev")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertEqual(refs, {"web": "dev", "infra": "dev"})
+        self.assertEqual(refs, {"web": SHA_DEV, "infra": SHA_DEV})
         self.assertNotIn("pulls", out.calls)  # type: ignore[attr-defined]
 
     def test_a_hotfix_pull_request_into_release_checks_the_other_repos_at_release(self):
-        self.assertEqual(resolve("infra", "release", "hotfix/fix-x")[1], {"backend": "release", "web": "release"})
+        self.assertEqual(resolve("infra", "release", "hotfix/fix-x")[1], {"backend": SHA_RELEASE, "web": SHA_RELEASE})
 
     def test_a_hotfix_branch_into_dev_is_still_dev(self):
-        self.assertEqual(resolve("infra", "dev", "hotfix/fix-x")[1], {"backend": "dev", "web": "dev"})
+        self.assertEqual(resolve("infra", "dev", "hotfix/fix-x")[1], {"backend": SHA_DEV, "web": SHA_DEV})
 
     def test_any_other_base_or_role_refuses(self):
         self.assertEqual(resolve("backend", "main")[0].returncode, 1)
@@ -138,6 +138,14 @@ class OtherRef(unittest.TestCase):
                          [f"peer: backend-service@{SHA_DEV}", f"peer: onepeek-web@{SHA_DEV}"])
         self.assertEqual(resolve("infra", "release", "dev", OPEN_RELEASE_PRS)[0].summary.splitlines()[-1],  # type: ignore[attr-defined]
                          "peer: onepeek-web@" + SHA_RELEASE)
+
+    def test_each_peer_is_checked_out_at_the_commit_it_records(self):  # §6.5 Interface: the output is the commit, not the branch
+        for role, base, head in (("web", "release", "dev"), ("infra", "dev", "x"), ("backend", "release", "hotfix/x")):
+            out, refs = resolve(role, base, head, OPEN_RELEASE_PRS)
+            short = {"backend-service": "backend", "onepeek-web": "web", "onepeek-infra": "infra"}
+            recorded = dict(ln[len("peer: "):].split("@") for ln in out.summary.splitlines())  # type: ignore[attr-defined]
+            self.assertEqual(refs, {short[r]: sha for r, sha in recorded.items()}, (role, base, head))
+            self.assertTrue(all(re.fullmatch(r"[0-9a-f]{40}", v) for v in refs.values()), refs)
 
     def test_the_rule_is_the_shared_script_not_a_copy_in_the_workflow(self):
         run_text = step("The other repos' ref")["run"]

@@ -219,7 +219,7 @@ def pr_info(repo: str, n: int) -> dict:
 def read_checks(repo: str, n: int, required: bool) -> list[dict]:
     """`gh pr checks` exits non-zero while checks are pending or failed but still prints them; an empty result is
     only taken from its own "no ... checks reported" message, and any other failure stops the run."""
-    cmd = ["gh", "pr", "checks", str(n), "-R", f"{ORG}/{repo}", "--json", "name,bucket,link"]
+    cmd = ["gh", "pr", "checks", str(n), "-R", f"{ORG}/{repo}", "--json", "name,bucket,link,workflow"]
     r = subprocess.run([*cmd, *(["--required"] if required else [])], capture_output=True, text=True, check=False)
     if r.stdout.strip().startswith("["):
         return json.loads(r.stdout)
@@ -527,7 +527,15 @@ def rerun_failed(repo: str, n: int) -> None:
         time.sleep(POLL_S)  # let the re-runs register before the checks are read again
 
 
-PEER_LINE = re.compile(r"peer: ([a-z][a-z-]*)@([0-9a-f]{40})\s*$", re.M)
+PEER_LINE = re.compile(r"peer: (\S+)@([0-9a-f]{40})\s*$", re.M)
+# The peer records every promotion must carry (delivery-pipelines §6.5 Build rulings 2, the fail-closed table): per
+# promoted repo, (workflow, check name) exactly as `gh pr checks --json workflow,name` prints it -> the peers it records.
+PEER_CHECKS = {
+    "backend-service": {("checks", "contract"): ("onepeek-infra", "onepeek-web"), ("image-smoke", "image-smoke"): ("onepeek-infra",)},
+    "onepeek-web": {("checks", "contract"): ("onepeek-infra", "backend-service"), ("image", "build"): ("onepeek-infra",),
+                    ("e2e", "identity"): ("backend-service", "onepeek-infra")},
+    "onepeek-infra": {("checks", "contract"): ("backend-service", "onepeek-web")},
+}
 
 
 def peer_records(repo: str, n: int) -> list[dict]:
@@ -539,8 +547,19 @@ def peer_records(repo: str, n: int) -> list[dict]:
         if c["bucket"] != "pass" or not m:
             continue
         log = gh("api", f"repos/{ORG}/{repo}/actions/jobs/{m.group(1)}/logs")
-        out += [{"job": m.group(1), "name": c["name"], "peer": p, "sha": sha} for p, sha in PEER_LINE.findall(log)]
+        out += [{"job": m.group(1), "workflow": c.get("workflow"), "name": c["name"], "peer": p, "sha": sha} for p, sha in PEER_LINE.findall(log)]
     return out
+
+
+def record_problems(repo: str, records: list[dict]) -> list[str]:
+    """Why the records do not prove the promotion (fail closed): a peer outside peer_ref.REPOS, or a (check, peer)
+    record of the table that is missing."""
+    if repo not in PEER_CHECKS:
+        return [f"no peer records are defined for {repo}"]
+    bad = [f"{r['workflow']}/{r['name']} names {r['peer']}, which is not one of {', '.join(peer_ref.REPOS)}" for r in records if r["peer"] not in peer_ref.REPOS]
+    have = {(r["workflow"], r["name"], r["peer"]) for r in records}
+    return bad + [f"{wf}/{name} has no `peer: {p}@<commit>` line in its job log" for (wf, name), peers in PEER_CHECKS[repo].items()
+                  for p in peers if (wf, name, p) not in have]
 
 
 def peer_candidate(peer: str) -> str:
@@ -559,9 +578,15 @@ def promotion_merge_of(peer: str, recorded: str, current: str) -> bool:
 def stale_peers(repo: str, n: int) -> list[dict]:
     """The recorded peers whose release candidate has changed since the check ran (a promotion merge commit with an
     equal tree does not count)."""
+    records = peer_records(repo, n)
+    problems = record_problems(repo, records)
+    if problems:
+        raise SystemExit(f"STOP {repo}#{n}: " + "; ".join(problems) + "; nothing is merged")
     stale, now = [], {}
-    for rec in peer_records(repo, n):
-        cur = now.setdefault(rec["peer"], peer_candidate(rec["peer"]))
+    for rec in records:
+        if rec["peer"] not in now:  # each peer's candidate is resolved once per pass
+            now[rec["peer"]] = peer_candidate(rec["peer"])
+        cur = now[rec["peer"]]
         if cur != rec["sha"] and not promotion_merge_of(rec["peer"], rec["sha"], cur):
             stale.append({**rec, "now": cur})
     return stale
@@ -569,13 +594,22 @@ def stale_peers(repo: str, n: int) -> list[dict]:
 
 def recheck_peers(repo: str, n: int) -> None:
     """Right before a promotion merges (§6.5 Build rulings 2): every check that read a peer is still about the peer's
-    current release candidate. When not, re-run that check once; refuse if it is still behind."""
+    current release candidate. When not, re-run that check once; refuse if it is still behind. A missing record, or
+    a peer_ref refusal, is a STOP, never a pass."""
+    try:
+        _recheck_peers(repo, n)
+    except peer_ref.Refused as e:
+        raise SystemExit(f"STOP {repo}#{n}: {e}") from None
+
+
+def _recheck_peers(repo: str, n: int) -> None:
     stale = stale_peers(repo, n)
     if not stale:
         return
     for rec in stale:
         say(f"{repo}#{n}: {rec['name']} tested {rec['peer']}@{rec['sha'][:7]}, its release candidate is now {rec['now'][:7]}; re-running it once")
-        gh("run", "rerun", "-R", f"{ORG}/{repo}", "--job", rec["job"])
+    for job in dict.fromkeys(rec["job"] for rec in stale):  # a job that recorded two stale peers is re-run once
+        gh("run", "rerun", "-R", f"{ORG}/{repo}", "--job", job)
     time.sleep(POLL_S)  # let the re-runs register before the checks are read again
     green_head(repo, n, may_rerun=False)
     stale = stale_peers(repo, n)
@@ -955,12 +989,12 @@ def main(argv: list[str]) -> int:
                     say(f"{repo}#{n}: only the docs pin changed and the green run tested the current base; merging without a new CI run")
         method = merge_method(repo, info[(repo, n)]["baseRefName"])
         base_ref = info[(repo, n)]["baseRefName"]
-        if base_ref == RELEASE_BASE and repo in CHAIN:  # the lock again, right before the merge (§2c step 3)
+        if base_ref == RELEASE_BASE and repo in CHAIN and not info[(repo, n)]["headRefName"].startswith("hotfix/"):
+            recheck_peers(repo, n)  # a promotion: the peers it was checked against are still their release candidates
+        if base_ref == RELEASE_BASE and repo in CHAIN:  # the lock again, the last gate before the merge (§2c step 3, §6.5)
             why = lock_problem(RELEASE_ENV, release_lock(RELEASE_ENV, a.aws_profile))
             if why:
                 raise SystemExit(f"STOP {repo}#{n}: {why}")
-        if base_ref == RELEASE_BASE and repo in CHAIN and not info[(repo, n)]["headRefName"].startswith("hotfix/"):
-            recheck_peers(repo, n)  # a promotion: the peers it was checked against are still their release candidates
         keep = [] if base_ref == RELEASE_BASE else ["--delete-branch"]  # a release pull request's head is `dev`: never deleted
         gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, *keep, "--match-head-commit", head)
         merged = pr_info(repo, n)

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -79,6 +80,27 @@ class Rule(unittest.TestCase):
         self.assertNotIn("commits/" + I, calls)  # a SHA is its own commit: no read
         self.assertEqual(peer("dev", "x", "onepeek-web", self.OPEN, "OnePeek", "--commits")[0].stdout, f"onepeek-web=dev {'e' * 40}\n")
 
+    def test_commits_reads_exactly_the_documented_endpoints(self):  # §6.5 Interface: the pulls list, then commits/<branch ref>
+        _, calls = peer("release", "dev", "onepeek-web,onepeek-infra", self.OPEN, "OnePeek", "--commits")
+        paths = [c.split()[2] for c in calls.splitlines()]
+        self.assertEqual(paths, ["repos/OnePeek/onepeek-web/pulls?state=open&base=release&head=OnePeek:dev",
+                                 "repos/OnePeek/onepeek-infra/pulls?state=open&base=release&head=OnePeek:dev",
+                                 "repos/OnePeek/onepeek-web/commits/release"])
+        for line in peer("release", "dev", "onepeek-web", self.OPEN, "OnePeek", "--commits")[0].stdout.splitlines():
+            self.assertRegex(line, r"^onepeek-web=release [0-9a-f]{40}$")
+
+    def test_a_commit_read_that_cannot_start_fails_closed(self):  # gh missing or not executable: OSError, refused
+        sys.path.insert(0, str(SCRIPT.parent))
+        try:
+            import peer_ref
+        finally:
+            sys.path.pop(0)
+        with mock.patch.object(peer_ref.subprocess, "run", side_effect=FileNotFoundError("gh")):
+            with self.assertRaises(peer_ref.Refused):
+                peer_ref.commit("OnePeek", "onepeek-web", "dev")
+            with self.assertRaises(peer_ref.Refused):
+                peer_ref.candidate("OnePeek", "onepeek-web")
+
     def test_commits_that_cannot_be_read_fail_closed(self):
         out, _ = peer("dev", "x", "onepeek-web", "exit 1", "OnePeek", "--commits")
         self.assertEqual((out.returncode, out.stdout), (1, ""))
@@ -148,10 +170,20 @@ class Action(unittest.TestCase):
         r, outputs, summary = self.run_action("release", "dev", "onepeek-infra,backend-service,onepeek-web,mcp-athena",
                                               answers(onepeek_infra=f"echo {I}", backend_service=f"echo {B}", onepeek_web="true", mcp_athena="true"))
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(outputs, {"infra": I, "backend": B, "web": "release", "mcp": "release"})
         f = "f" * 40
+        self.assertEqual(outputs, {"infra": I, "backend": B, "web": f, "mcp": f})  # the commit, never a branch name (S2)
         self.assertEqual(summary, [f"peer: onepeek-infra@{I}", f"peer: backend-service@{B}", f"peer: onepeek-web@{f}", f"peer: mcp-athena@{f}"])
         self.assertEqual([ln for ln in r.stdout.splitlines() if ln.startswith("peer:")], summary)  # also in the log
+
+    def test_a_dev_ref_is_output_as_its_commit(self):
+        r, outputs, summary = self.run_action("dev", "feature/x", "onepeek-web", answers())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((outputs, summary), ({"web": "e" * 40}, ["peer: onepeek-web@" + "e" * 40]))
+
+    def test_every_output_is_declared_and_maps_to_the_resolving_step(self):  # a composite action exposes only declared outputs
+        self.assertEqual(self.STEP["id"], "resolve")
+        self.assertEqual({k: v["value"] for k, v in ACTION["outputs"].items()},
+                         {k: "${{ steps.resolve.outputs.%s }}" % k for k in ("infra", "backend", "web", "mcp")})
 
     def test_a_refusal_fails_the_step_and_writes_nothing(self):
         r, outputs, summary = self.run_action("release", "dev", "onepeek-web", 'exit 1')
@@ -164,6 +196,7 @@ class Action(unittest.TestCase):
 # workflow-lint.yml's service-list job reads onepeek-infra's service list at `dev`: it is .github's own lint, not a check
 # of a change against a peer's release (§6.5 Build rulings 3), so exactly this job is allowed a fixed ref.
 FIXED_REF_OK = {("workflow-lint.yml", "service-list", "onepeek-infra", "dev")}
+SHARED_SCRIPT = re.compile(r"(^|[\s;&|(])python3?\s+[\x22']?_shared/scripts/peer_ref\.py[\x22']?\s", re.M)
 
 
 def violations(text: str, name: str = "x.yml") -> list[str]:
@@ -172,18 +205,22 @@ def violations(text: str, name: str = "x.yml") -> list[str]:
     found = []
     for job_id, job in (doc.get("jobs") or {}).items():
         steps = job.get("steps") or []
+        # A source of a peer's ref is only the peer-ref action or a run step calling the `_shared` checkout's script.
         sources = {s["id"] for s in steps if s.get("id") and (str(s.get("uses", "")).lower().startswith("onepeek/.github/actions/peer-ref@")
-                                                              or "peer_ref.py" in str(s.get("run", "")))}
+                                                              or SHARED_SCRIPT.search(str(s.get("run", ""))))}
         for s in steps:
-            if re.search(r"pulls\?state=open[^\n]*base=release|base=release[^\n]*state=open", str(s.get("run", ""))):
+            run = str(s.get("run", "")).lower()
+            # Any read of the open pull requests into release, in any order or flag form (`?state=open&base=release`,
+            # `-f state=open -f base=release`, `--base release --state open`).
+            if re.search(r"\bbase\W{1,3}release\b", run) and re.search(r"\bstate\W{1,3}open\b", run):
                 found.append(f"{name}:{job_id}: computes a peer's release candidate itself")
-            if not str(s.get("uses", "")).startswith("actions/checkout@"):
+            if not str(s.get("uses", "")).lower().startswith("actions/checkout@"):
                 continue
             w = s.get("with") or {}
-            repo, ref = str(w.get("repository", "")), str(w.get("ref", ""))
+            repo, ref = str(w.get("repository", "")).lower(), str(w.get("ref", ""))
             if any(repo.endswith("/" + p) for p in PEERS) and (name, job_id, repo.split("/")[-1], ref) not in FIXED_REF_OK and not any(f"steps.{i}.outputs." in ref for i in sources):
                 found.append(f"{name}:{job_id}: checks out {repo} at '{ref}', not a peer-ref output")
-            if repo == "OnePeek/.github" and w.get("path") == "_shared" and ref != "${{ job.workflow_sha }}" and name == "contract.yml":
+            if repo == "onepeek/.github" and w.get("path") == "_shared" and ref != "${{ job.workflow_sha }}" and name == "contract.yml":
                 found.append(f"{name}:{job_id}: _shared must be at ${{{{ job.workflow_sha }}}}, not '{ref}'")
     return found
 
@@ -251,6 +288,45 @@ jobs:
       - run: gh api "repos/${OWNER}/${repo}/pulls?state=open&base=release&head=${OWNER}:dev" --jq '.[].head.sha'
 """
         self.assertEqual(len(violations(wf)), 1)
+
+    def test_every_form_of_the_open_pulls_into_release_read_fails(self):
+        for run in ('gh api repos/o/r/pulls -X GET -f state=open -f base=release --jq ".[].head.sha"',
+                    "gh api repos/o/r/pulls -X GET -f base=release -f state=open",
+                    "gh api 'repos/o/r/pulls?base=release&state=open'",
+                    "gh pr list -R o/r --base release --state open --json headRefOid",
+                    "GH API REPOS/O/R/PULLS -F STATE=OPEN -F BASE=RELEASE"):
+            self.assertEqual(len(violations("jobs:\n  j:\n    steps:\n      - run: %s\n" % run)), 1, run)
+        self.assertEqual(violations("jobs:\n  j:\n    steps:\n      - run: gh pr list --base release --state merged\n"), [])
+
+    PEER_CHECKOUT = """
+jobs:
+  e2e:
+    steps:
+      - id: peer
+        %s
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: %s
+          ref: ${{ steps.peer.outputs.backend }}
+"""
+
+    def test_a_peer_named_in_any_letter_case_is_still_a_peer(self):
+        for repo in ("OnePeek/Backend-Service", "ONEPEEK/BACKEND-SERVICE"):
+            wf = self.PEER_CHECKOUT % ("run: echo backend=dev >> $GITHUB_OUTPUT", repo)
+            self.assertEqual(len(violations(wf)), 1, repo)
+        wf = (self.PEER_CHECKOUT % ("run: echo x", "OnePeek/Backend-Service")).replace("actions/checkout@", "Actions/Checkout@")
+        self.assertEqual(len(violations(wf)), 1)
+
+    def test_only_the_action_or_a_call_of_the_shared_script_is_a_source(self):
+        ok = ("uses: OnePeek/.github/actions/peer-ref@" + "a" * 40, "run: python3 _shared/scripts/peer_ref.py --base x --commits",
+              'run: lines=$(python3 "_shared/scripts/peer_ref.py" --base x)')
+        for src in ok:
+            self.assertEqual(violations(self.PEER_CHECKOUT % (src, "OnePeek/backend-service")), [], src)
+        bad = ("run: echo peer_ref.py; echo backend=dev >> $GITHUB_OUTPUT", "run: python3 scripts/peer_ref.py --base x",
+               "run: cat _shared/scripts/peer_ref.py", "run: echo python3 _shared/scripts/peer_ref.py.bak x",
+               "uses: evil/actions/peer-ref@" + "a" * 40)
+        for src in bad:
+            self.assertEqual(len(violations(self.PEER_CHECKOUT % (src, "OnePeek/backend-service"))), 1, src)
 
 
 if __name__ == "__main__":

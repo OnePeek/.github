@@ -1,7 +1,8 @@
 # The other repos' ref for a cross-repo check (onepeek-docs architecture/lld/infra/delivery-pipelines.md §6.5).
 # Callers pin it like a shared workflow: uses: OnePeek/.github/actions/peer-ref@<sha> # vX.Y.Z
-# Outputs one value per repo, keyed by its short name (infra, backend, web, mcp), and writes `peer: <repo>@<ref>` to
-# the job log and summary, always a commit (the merge tool reads the log before a promotion merges).
+# Outputs each repo's commit, keyed by its short name (infra, backend, web, mcp): the caller checks out that commit, so
+# the `peer: <repo>@<sha>` line it writes to the job log and summary names exactly what was tested (the merge tool reads
+# the log before a promotion merges).
 name: The other repos' ref
 description: Which version of another repo a pull request is checked against (dev; release for a hotfix; the release candidate for a promotion).
 inputs:
@@ -17,10 +18,24 @@ inputs:
   token:
     description: A token that reads the repos' pull requests.
     required: true
+outputs:
+  infra:
+    description: The commit onepeek-infra is checked out at.
+    value: ${{ steps.resolve.outputs.infra }}
+  backend:
+    description: The commit backend-service is checked out at.
+    value: ${{ steps.resolve.outputs.backend }}
+  web:
+    description: The commit onepeek-web is checked out at.
+    value: ${{ steps.resolve.outputs.web }}
+  mcp:
+    description: The commit mcp-athena is checked out at.
+    value: ${{ steps.resolve.outputs.mcp }}
 runs:
   using: composite
   steps:
     - name: Resolve the refs
+      id: resolve
       shell: bash
       env:
         BASE: ${{ inputs.base }}
@@ -35,8 +50,8 @@ runs:
         while IFS='= ' read -r repo ref sha; do
           [ -n "${repo}" ] || continue
           case "${repo}" in onepeek-infra) key=infra ;; backend-service) key=backend ;; onepeek-web) key=web ;; mcp-athena) key=mcp ;; esac
-          echo "${repo} is taken at ${ref}"
-          echo "${key}=${ref}" >> "$GITHUB_OUTPUT"
+          echo "${repo} is taken at ${ref} (${sha})"
+          echo "${key}=${sha}" >> "$GITHUB_OUTPUT"
           # The recorded peer revision: always a commit, in the log (the merge tool reads it there) and the summary.
           echo "peer: ${repo}@${sha}"
           echo "peer: ${repo}@${sha}" >> "$GITHUB_STEP_SUMMARY"

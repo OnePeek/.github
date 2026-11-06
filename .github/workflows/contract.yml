@@ -90,8 +90,8 @@ jobs:
           while IFS='= ' read -r repo ref sha; do
             [ -n "${repo}" ] || continue
             case "${repo}" in onepeek-infra) key=infra ;; backend-service) key=backend ;; onepeek-web) key=web ;; esac
-            echo "${repo} is taken at ${ref}"
-            echo "${key}=${ref}" >> "$GITHUB_OUTPUT"
+            echo "${repo} is taken at ${ref} (${sha})"
+            echo "${key}=${sha}" >> "$GITHUB_OUTPUT"   # checked out at this commit, so the record below is what was tested
             echo "peer: ${repo}@${sha}"   # the merge tool reads this line from the job log before a promotion merges
             echo "peer: ${repo}@${sha}" >> "$GITHUB_STEP_SUMMARY"
           done <<< "${lines}"
