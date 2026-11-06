@@ -328,8 +328,11 @@ class MergeTimeout(Base):
                         "spec = importlib.util.spec_from_file_location('ship_watch', sys.argv[1])\n"
                         "sw = importlib.util.module_from_spec(spec); spec.loader.exec_module(sw)\n"
                         "sw.exit_on_signals()\n"
-                        "sw._merge_process(['sh', '-c', 'touch \"$0\"; sleep 1.5; touch \"$1\"', sys.argv[2], sys.argv[3]],"
-                        " pathlib.Path('.'))\n")
+                        "try:\n"
+                        "    sw._merge_process(['sh', '-c', 'touch \"$0\"; sleep 1.5; touch \"$1\"', sys.argv[2],"
+                        " sys.argv[3]], pathlib.Path('.'))\n"
+                        "except sw.Stop as e:\n"
+                        "    sys.exit(e.code)\n")
                 watcher = subprocess.Popen([sys.executable, "-c", code, sw.__file__, str(started), str(merged)],
                                            cwd=here, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 for _ in range(200):  # counted, never a wall-clock cap on turns (pitfall 33)
@@ -342,6 +345,7 @@ class MergeTimeout(Base):
                 time.sleep(2.5)  # past the run's own merge at 1.5 s
                 self.assertFalse(merged.exists())
 
+    @unittest.skipUnless(hasattr(os, "waitid"), "os.waitid: Linux, and macOS from Python 3.13")
     def test_a_group_holding_only_a_zombie_still_times_out(self):  # #82 round 2 review, finding 2 (macOS EPERM)
         class Exited(subprocess.Popen):
             def communicate(self, *a, **k):
@@ -662,6 +666,43 @@ class FailClosed(Base):
                      ["api", "graphql", "-fquery=query { x }"], ["api", "graphql", "--raw-field=query=query { x }"],
                      ["api", "graphql", "-f", f"query={sw.scs.REVIEW_THREADS}", "-F", "n=1"]):
             self.assertTrue(sw.allowed(args), args)
+
+
+class StopSignal(Base):
+    """T-96: a SIGTERM or SIGHUP inside any `except SystemExit` region of a pass still ends the watcher."""
+
+    def setUp(self):
+        super().setUp()
+        for sig in (sw.signal.SIGTERM, sw.signal.SIGHUP):
+            self.addCleanup(sw.signal.signal, sig, sw.signal.getsignal(sig))
+
+    def main_with_a_signal(self, where: str, sig) -> int:
+        ws = pathlib.Path(self.tmp.name)
+        (ws / ".ship").mkdir(exist_ok=True)
+        (ws / ".ship" / "reviews.json").write_text('{"onepeek-web#1": "h1"}')
+        fake = FakeGh(world(("onepeek-web", pr("onepeek-web", 1))))
+        real_deps, real_checks, calls = sw.scs.with_dependencies, sw.scs.checks, []
+
+        def kill(*a, **k):
+            os.kill(os.getpid(), sig)
+            time.sleep(1)  # the handler runs here, inside the caller's try
+            raise AssertionError("the signal was not delivered")
+
+        def deps(*a, **k):  # the first call orders all pull requests, the second the merge queue
+            calls.append(a)
+            return kill() if where == f"with_dependencies#{len(calls)}" else real_deps(*a, **k)
+        with mock.patch.object(sw, "GH_RUN", fake), mock.patch.dict(sw.os.environ, {"ONEPEEK_WORKSPACE": str(ws)}), \
+                mock.patch("builtins.print"), mock.patch.object(sw.scs, "with_dependencies", side_effect=deps), \
+                mock.patch.object(sw.scs, "checks", side_effect=kill if where == "read_prs" else real_checks):
+            return sw.main(["--once", "--go", "--out", str(ws / ".ship")])
+
+    def test_each_except_systemexit_region(self):
+        (pathlib.Path(self.tmp.name) / ".github" / ".git").mkdir(parents=True)
+        for where, sig in (("read_prs", sw.signal.SIGTERM), ("with_dependencies#1", sw.signal.SIGTERM),
+                           ("with_dependencies#2", sw.signal.SIGTERM), ("with_dependencies#2", sw.signal.SIGHUP)):
+            with self.subTest(where=where, sig=sig.name):
+                self.assertEqual(self.main_with_a_signal(where, sig), 128 + sig)
+        self.assertEqual(self.merged, [])
 
 
 class Main(Base):
