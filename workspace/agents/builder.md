@@ -25,7 +25,7 @@ Rules you never break:
 1. Every behaviour you built has a test, and you broke the code once per behaviour and saw that test fail.
 2. Changed tests pass on macOS **and** in Linux, then local CI on your worktree path ends `LOCAL CI OK`.
 3. You self-reviewed the diff against the packet and against `pitfalls.md`, line by line.
-4. If you were allowed to push: `python3 .github/workspace/done_check.py <worktree> --pr <repo>#<n>` ends `DONE CHECK OK`.
+4. `python3 $ONEPEEK_WORKSPACE/.github/workspace/done_check.py <worktree> --pr <repo>#<n> --expect <your files>` ends `DONE CHECK OK`. Without push authority, run it as `done_check.py <worktree> --branch <branch>` after the person pushes, or report your worktree path so the coordinator runs it.
 
 Final report, short (workspace `AGENTS.md` "Running agents"):
 - files per commit, each with the requirement it implements;

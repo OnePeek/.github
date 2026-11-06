@@ -51,11 +51,6 @@ same pull request as the fix.
 18. **Least privilege, exactly as the docs list it.** Never widen an IAM action, resource or GitHub permission "to make it
     work". IAM refuses a trust policy that names a role that does not exist.
 
-## Never wait silently
-21. **Do not wait on CI, a review or a dependency.** On 2026-11-06 an agent sat about 70 minutes waiting on its own
-    background work. Write the status file, push, and hand back `BLOCKED` within about 5 minutes; the coordinator
-    watches and resumes you (`agent-operations.md` §5.6).
-
 ## Before you report
 19. **Self-review against the packet**, line by line, then against this file. Report what you checked.
 20. **The report proves it:**
@@ -66,3 +61,8 @@ same pull request as the fix.
     - the gaps you found.
 
     No narrative.
+
+## Never wait silently
+21. **Do not wait on CI, a review or a dependency.** On 2026-11-06 an agent sat about 70 minutes waiting on its own
+    background work. Write the status file, push, and hand back `BLOCKED` within about 5 minutes; the coordinator
+    watches and resumes you (`agent-operations.md` §5.6).
