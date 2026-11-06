@@ -5,6 +5,7 @@ Run once after cloning the repos side by side, and again after a repo adds a ski
     python3 .github/workspace/setup.py            # from the workspace root (the folder holding the repos)
     python3 .github/workspace/setup.py --check    # report what is missing or stale; exit 1 if anything is
     python3 .github/workspace/setup.py --sync-repos   # copy the shared skills and agents into every code repo
+    python3 .github/workspace/setup.py --sync-repos --check   # report that drift only, write nothing; exit 1 on drift
 
 Shared skills and agents (review-spec, fix-docs-gap, preflight, spec-reviewer) are written once, in .github/workspace/skills and
 .github/workspace/agents. `--sync-repos` copies them into each repo in SYNC_REPOS with a "synced" note after the front
@@ -191,11 +192,18 @@ def print_hygiene_hints() -> None:
     print("  agents keep at most one scratch copy (worktree) and remove it and its caches when they finish.")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--check", action="store_true", help="report only; exit 1 if anything is missing or stale")
-    ap.add_argument("--sync-repos", action="store_true", help="copy the shared skills and agents into every code repo")
-    a = ap.parse_args()
+    ap.add_argument("--check", action="store_true", help="report only, never write; exit 1 if anything is missing or stale")
+    ap.add_argument("--sync-repos", action="store_true", help="copy the shared skills and agents into every code repo "
+                                                              "(with --check: report the drift only, exit 1 on drift)")
+    a = ap.parse_args(argv)
+    if a.sync_repos and a.check:  # --check never writes (2026-11-07): it used to sync first
+        drift = sync_problems(write=False)
+        for d in drift:
+            print(f"drift   {d}")
+        print("REPOS IN SYNC" if not drift else "REPOS NEED setup.py --sync-repos")
+        return 1 if drift else 0
     if a.sync_repos:
         problems = sync_problems(write=True)
         for p in problems:
