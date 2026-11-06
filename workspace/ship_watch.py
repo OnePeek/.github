@@ -73,7 +73,7 @@ def _merge_process(cmd: list[str], cwd: pathlib.Path) -> subprocess.CompletedPro
     """One merge run, in its own session: past MERGE_TIMEOUT_S its whole process group (gh, git, their children) is
     killed and MergeTimeout raised (ruling T-56). Its own session keeps it out of the terminal's group, so Ctrl-C or any
     other exception in the wait kills the group too, then goes on up: a run never outlives the watcher (T-56 round 2).
-    SIGTERM and SIGHUP reach this path as SystemExit (exit_on_signals). A group holding only the exited child's zombie
+    SIGTERM and SIGHUP reach this path as Stop (exit_on_signals). A group holding only the exited child's zombie
     refuses the kill on macOS (PermissionError); it has nothing left to kill. Its pipes are never read after the kill, so a stray child holding them cannot hang the watcher."""
     child = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                              start_new_session=True)
@@ -93,11 +93,20 @@ def _merge_process(cmd: list[str], cwd: pathlib.Path) -> subprocess.CompletedPro
     return subprocess.CompletedProcess(cmd, child.returncode, out, err)
 
 
+class Stop(BaseException):
+    """SIGTERM or SIGHUP. A BaseException but not SystemExit, so no `except SystemExit` or `except Exception` in a pass
+    swallows it (T-96); main() alone ends on it, with `code` (128 + the signal)."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.code = 128 + signum
+
+
 def exit_on_signals() -> None:
-    """SIGTERM and SIGHUP raise SystemExit(128 + signal), so a running merge run's group is killed on the way out
-    (#82 round 2 review); by default they end the watcher at once and leave the run free to merge."""
+    """SIGTERM and SIGHUP raise Stop, so a running merge run's group is killed on the way out (#82 round 2 review);
+    by default they end the watcher at once and leave the run free to merge."""
     def leave(signum: int, _frame: object) -> None:
-        raise SystemExit(128 + signum)
+        raise Stop(signum)
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, leave)
 
@@ -540,19 +549,23 @@ def main(argv: list[str]) -> int:
     if not dry and not (ws and (pathlib.Path(ws) / ".github" / ".git").exists()):
         raise SystemExit("merging needs ONEPEEK_WORKSPACE, the folder holding the repos (ship_change_set.py runs there)")
     exit_on_signals()
-    while True:
-        try:
-            s = one_pass(cfg, out, dry, time.time(), pathlib.Path(ws) if ws else None)
-        except Exception as e:  # noqa: BLE001 - a pass that breaks merges nothing; the loop keeps running
+    try:
+        while True:
+            try:
+                s = one_pass(cfg, out, dry, time.time(), pathlib.Path(ws) if ws else None)
+            except Exception as e:  # noqa: BLE001 - a pass that breaks merges nothing; the loop keeps running
+                if a.once:
+                    raise
+                print(f"{time.strftime('%H:%M:%S')} pass failed, nothing merged: {e!r}", flush=True)
+                time.sleep(INTERVAL_S)
+                continue
+            print(markdown(s), end="", flush=True)
             if a.once:
-                raise
-            print(f"{time.strftime('%H:%M:%S')} pass failed, nothing merged: {e!r}", flush=True)
+                return 1 if any(x.startswith("read failed") for x in s["alerts"]) else 0
             time.sleep(INTERVAL_S)
-            continue
-        print(markdown(s), end="", flush=True)
-        if a.once:
-            return 1 if any(x.startswith("read failed") for x in s["alerts"]) else 0
-        time.sleep(INTERVAL_S)
+    except Stop as e:  # a merge run in flight was already killed on the way up (_merge_process)
+        print(f"{time.strftime('%H:%M:%S')} stopped by signal {e.args[0]}", flush=True)
+        return e.code
 
 
 if __name__ == "__main__":
