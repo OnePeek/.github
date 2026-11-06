@@ -6,6 +6,7 @@ import io
 import os
 import pathlib
 import shutil
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -205,18 +206,52 @@ class PinsStep(unittest.TestCase):
         self.assertLess(steps.index(step), len(steps) - 1)
         self.assertGreater(steps.index(step), next(i for i, s in enumerate(steps) if (s.get("with") or {}).get("path") == "_shared"))
 
-    def test_it_uses_the_pinned_checkout_or_this_repo(self) -> None:
+    def test_it_uses_the_pinned_checkout_or_this_repo_with_pyyaml_in_a_venv(self) -> None:
         run = self.step()["run"]
         d = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, d, True)
         for where in ("_shared/scripts", "scripts"):
             (d / where).mkdir(parents=True)
             (d / where / "check_caller_inputs.py").write_text(f"import sys; print('{where}', *sys.argv[1:])\n")
+        # A stand-in python3 whose `-m venv DIR` makes DIR/bin/pip (records its arguments) and DIR/bin/python (the real
+        # one), so the step runs without the network; any other call fails.
+        fake = d / "bin"
+        fake.mkdir()
+        (fake / "python3").write_text(
+            "#!/bin/sh\n[ \"$1 $2\" = \"-m venv\" ] || exit 9\nmkdir -p \"$3/bin\"\n"
+            f"printf '#!/bin/sh\\necho \"$*\" >> {d}/pip.log\\n' > \"$3/bin/pip\"\n"
+            f"printf '#!/bin/sh\\nexec {sys.executable} \"$@\"\\n' > \"$3/bin/python\"\n"
+            "chmod +x \"$3/bin/pip\" \"$3/bin/python\"\n")
+        (fake / "python3").chmod(0o755)
         for sha, want in (("a" * 40, "_shared/scripts . --shared _shared"), ("", "scripts . --shared .")):
+            temp = pathlib.Path(tempfile.mkdtemp(dir=d))
             r = subprocess.run(["bash", "-eo", "pipefail", "-c", run], cwd=d, capture_output=True, text=True,
-                               env={"SHA": sha, "PATH": os.environ["PATH"]})
+                               env={"SHA": sha, "RUNNER_TEMP": str(temp), "PATH": f"{fake}:/usr/bin:/bin"})
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stdout.strip(), want)
+        self.assertEqual((d / "pip.log").read_text().splitlines(), ["install --quiet pyyaml==6.0.3"] * 2)
+
+    def test_a_failing_check_fails_the_step(self) -> None:
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "scripts").mkdir()
+        (d / "scripts/check_caller_inputs.py").write_text("import sys; print('x.yml:1: j calls y.yml@v1 without required input a'); sys.exit(1)\n")
+        temp = d / "t"
+        temp.mkdir()
+        venv = temp / "cci/bin"
+        venv.mkdir(parents=True)
+        (venv / "pip").write_text("#!/bin/sh\nexit 0\n")
+        (venv / "python").write_text(f"#!/bin/sh\nexec {sys.executable} \"$@\"\n")
+        fake = d / "bin"
+        fake.mkdir()
+        (fake / "python3").write_text("#!/bin/sh\nexit 0\n")  # the venv is already made above
+        for f in (venv / "pip", venv / "python", fake / "python3"):
+            f.chmod(0o755)
+        r = subprocess.run(["bash", "-eo", "pipefail", "-c", self.step()["run"]], cwd=d, capture_output=True, text=True,
+                           env={"SHA": "", "RUNNER_TEMP": str(temp), "PATH": f"{fake}:/usr/bin:/bin"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("without required input a", r.stdout)
+        self.assertNotIn("continue-on-error", self.step())
 
 
 if __name__ == "__main__":

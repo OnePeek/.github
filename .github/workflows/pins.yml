@@ -50,6 +50,18 @@ jobs:
           path: _shared
           persist-credentials: false
 
+      # delivery-pipelines.md §6.4a (F35): every call passes the called workflow's required inputs and secrets. The
+      # script needs PyYAML, which our runner image lacks, so it runs in a venv with the pin workflow-lint.yml uses.
+      - name: Every reusable-workflow call passes its required inputs and secrets
+        env:
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          shared=.
+          [ -n "${SHA}" ] && shared=_shared
+          python3 -m venv "${RUNNER_TEMP}/cci"
+          "${RUNNER_TEMP}/cci/bin/pip" install --quiet pyyaml==6.0.3
+          "${RUNNER_TEMP}/cci/bin/python" "${shared}/scripts/check_caller_inputs.py" . --shared "${shared}"
+
       - name: Does this event run the docs rule
         id: docs
         env:
