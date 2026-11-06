@@ -637,9 +637,10 @@ def main(argv: list[str] | None = None) -> int:
             if rc:
                 return rc
 
-    if skipped:
+    # A skipped terraform test is listed once, with the failures below (not also here), except under --list.
+    if shown := [s for s in skipped if a.list or not s.startswith("terraform test skipped: ")]:
         print("\nSkipped (CI runs these):")
-        for s in skipped:
+        for s in shown:
             print(f"  - {s}")
     if a.list:
         return 0
@@ -682,15 +683,81 @@ def calls_docker_script(cmd: str, cwd: pathlib.Path) -> bool:
     return bool(first) and not first.startswith("/") and path.is_file() and bool(re.search(r"\bdocker\b", path.read_text(encoding="utf-8", errors="ignore")))
 
 
+SERVICE_TIMEOUT = 120  # seconds a job's services get to report healthy (T-73)
+
+
+def service_argv(name: str, spec: dict, ctx: dict) -> list[str]:
+    """`docker run -d` for one entry of a job's `services:`, as declared: image, env, ports, volumes, options.
+    ValueError when a value cannot be used here (an expression the laptop cannot fill, credentials, an unknown key)."""
+    if unknown := sorted(set(spec) - {"image", "env", "ports", "volumes", "options"}):
+        raise ValueError(f"service key {unknown[0]} is not supported here")
+    vals = {k: expand(str(v), ctx) for k, v in {"image": spec.get("image", ""), "options": spec.get("options") or "",
+                                               **(spec.get("env") or {})}.items()}
+    if bad := next((k for k, v in vals.items() if EXPR.search(v)), None):
+        raise ValueError(f"{bad} holds an expression the laptop cannot fill")
+    if not vals["image"]:
+        raise ValueError("no image")
+    argv = ["docker", "run", "-d", "--name", name, "--label", f"onepeek-local-ci={os.getpid()}"]
+    for k in spec.get("env") or {}:
+        argv += ["-e", f"{k}={vals[k]}"]
+    for port in spec.get("ports") or []:
+        argv += ["-p", str(port)]
+    for vol in spec.get("volumes") or []:
+        argv += ["-v", str(vol)]
+    return argv + shlex.split(vals["options"]) + [vals["image"]]
+
+
+@contextlib.contextmanager
+def job_services(label0: str, job: dict, a):
+    """Start the job's `services:` containers as CI does, wait until each is healthy (or running, without a health
+    check), and always remove them, by their own names only (pitfall 35). Yields "" or why the job cannot run here."""
+    names: list[str] = []
+    try:
+        services = job.get("services") or {}
+        if not services or a.list:
+            yield ""
+            return
+        if a.skip_docker or not docker_ready():
+            yield "its services need Docker, which " + ("--skip-docker turns off" if a.skip_docker else "is not available")
+            return
+        try:
+            for svc, spec in services.items():
+                name = re.sub(r"[^A-Za-z0-9_.-]", "-", f"local-ci-{os.getpid()}-{label0}-{svc}")
+                argv = service_argv(name, spec or {}, a.ctx)
+                names.append(name)
+                if (r := subprocess.run(argv, capture_output=True, text=True)).returncode:
+                    raise ValueError(f"exit {r.returncode}: {(r.stdout + r.stderr).strip()[-300:]}")
+        except ValueError as e:
+            yield f"service {svc} did not start: {e}"
+            return
+        deadline = time.monotonic() + SERVICE_TIMEOUT
+        for svc, name in zip(services, names):
+            fmt = "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}"
+            while (state := subprocess.run(["docker", "inspect", "-f", fmt, name], capture_output=True, text=True).stdout.strip()) \
+                    not in ("healthy", "running"):
+                if state not in ("starting", "created") or time.monotonic() > deadline:
+                    yield f"service {svc} is {state or 'gone'}, not healthy, after {SERVICE_TIMEOUT}s at most"
+                    return
+                time.sleep(1)
+        yield ""
+    finally:
+        for name in names:
+            subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True)
+
+
 def run_job(label0: str, job: dict, wf_env: dict, inputs: dict, repo: pathlib.Path, a, skipped: list) -> int:
-    runs = "\n".join(str(st.get("run") or "") + " " + str(st.get("working-directory") or "") for st in job.get("steps") or [])
-    if not a.list and USES_SIBLINGS.search(runs):
-        with sibling_checkouts(repo, a.own) as (ok, reason):
-            if not ok:
-                skipped.append(f"{label0} (SKIP: needs the other repos checked out as _backend/_web/_infra: {reason})")
-                return 0
-            return run_job_steps(label0, job, wf_env, inputs, repo, a, skipped)
-    return run_job_steps(label0, job, wf_env, inputs, repo, a, skipped)
+    with job_services(label0, job, a) as problem:
+        if problem:  # a job CI runs with its databases never passes here without them (T-73)
+            print(f"FAIL  {label0}: {problem}")
+            return failed(a, label0, problem)
+        runs = "\n".join(str(st.get("run") or "") + " " + str(st.get("working-directory") or "") for st in job.get("steps") or [])
+        if not a.list and USES_SIBLINGS.search(runs):
+            with sibling_checkouts(repo, a.own) as (ok, reason):
+                if not ok:
+                    skipped.append(f"{label0} (SKIP: needs the other repos checked out as _backend/_web/_infra: {reason})")
+                    return 0
+                return run_job_steps(label0, job, wf_env, inputs, repo, a, skipped)
+        return run_job_steps(label0, job, wf_env, inputs, repo, a, skipped)
 
 
 def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: pathlib.Path, a, skipped: list) -> int:
@@ -888,7 +955,8 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
     return 0
 
 
-BUILD_INPUTS = {"context", "file", "platforms", "tags", "build-args", "secrets", "load", "push", "target", "cache-from", "cache-to"}
+BUILD_INPUTS = {"context", "file", "platforms", "tags", "build-args", "secrets", "load", "push", "target", "cache-from", "cache-to",
+                "provenance"}
 
 
 def build_command(step: dict, inputs: dict, ctx: dict, repo: pathlib.Path, workdir: str) -> tuple[list[str], dict[str, str], list[str]]:
@@ -915,6 +983,8 @@ def build_command(step: dict, inputs: dict, ctx: dict, repo: pathlib.Path, workd
         argv += ["--platform", w["platforms"]]
     if w.get("target"):
         argv += ["--target", w["target"]]
+    if w.get("provenance"):  # backend image-smoke.yml builds with `provenance: false`, as release-ecs.yml does (T-74)
+        argv.append(f"--provenance={w['provenance'].lower()}")
     for line in filter(None, (x.strip() for x in w.get("build-args", "").splitlines())):
         argv += ["--build-arg", line]
     env: dict[str, str] = {}
