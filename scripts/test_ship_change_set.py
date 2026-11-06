@@ -1024,6 +1024,28 @@ class ConflictFlow(DocsPin):
             self.assertEqual(ship.main(["backend-service#2"]), 0)  # on docs main: fine
 
 
+class PeerCheckNames(unittest.TestCase):
+    """Review round 2 of #59: GitHub names a passing reusable-workflow call `<caller> / <called>`."""
+
+    def test_every_contract_row_uses_the_reusable_call_name(self):
+        for repo, rows in ship.PEER_CHECKS.items():
+            for workflow, name in rows:
+                if workflow == "checks":
+                    self.assertEqual(name, "contract / contract", repo)
+
+    def test_read_checks_asks_for_the_workflow_field(self):
+        seen = {}
+
+        def fake(cmd, **kw):
+            seen["cmd"] = cmd
+            return mock.Mock(stdout="[]", stderr="", returncode=0)
+
+        with mock.patch.object(ship.subprocess, "run", side_effect=fake):
+            ship.read_checks("onepeek-web", 1, False)
+        fields = seen["cmd"][seen["cmd"].index("--json") + 1].split(",")
+        self.assertIn("workflow", fields)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1277,17 +1299,17 @@ class PeerRecheck(unittest.TestCase):
     @staticmethod
     def records(backend=A, drop=None, extra=()):
         """onepeek-web's full set of records (§6.5 table), backend-service recorded at `backend`."""
-        rows = [("70", "checks", "contract", "onepeek-infra"), ("70", "checks", "contract", "backend-service"),
+        rows = [("70", "checks", "contract / contract", "onepeek-infra"), ("70", "checks", "contract / contract", "backend-service"),
                 ("71", "image", "build", "onepeek-infra"), ("77", "e2e", "identity", "backend-service"), ("77", "e2e", "identity", "onepeek-infra")]
         out = [{"job": j, "workflow": w, "name": c, "peer": p, "sha": backend if p == "backend-service" else A} for j, w, c, p in rows]
         return [r for r in out if (r["workflow"], r["name"], r["peer"]) != drop] + list(extra)
 
     def test_the_table_is_the_one_in_delivery_pipelines(self):  # §6.5 Build rulings 2, row by row
         self.assertEqual(ship.PEER_CHECKS, {
-            "backend-service": {("checks", "contract"): ("onepeek-infra", "onepeek-web"), ("image-smoke", "image-smoke"): ("onepeek-infra",)},
-            "onepeek-web": {("checks", "contract"): ("onepeek-infra", "backend-service"), ("image", "build"): ("onepeek-infra",),
+            "backend-service": {("checks", "contract / contract"): ("onepeek-infra", "onepeek-web"), ("image-smoke", "image-smoke"): ("onepeek-infra",)},
+            "onepeek-web": {("checks", "contract / contract"): ("onepeek-infra", "backend-service"), ("image", "build"): ("onepeek-infra",),
                             ("e2e", "identity"): ("backend-service", "onepeek-infra")},
-            "onepeek-infra": {("checks", "contract"): ("backend-service", "onepeek-web")},
+            "onepeek-infra": {("checks", "contract / contract"): ("backend-service", "onepeek-web")},
         })
         self.assertEqual(set(ship.PEER_CHECKS), set(ship.CHAIN))  # every promoted repo has its rows
 
@@ -1297,7 +1319,7 @@ class PeerRecheck(unittest.TestCase):
         self.assertEqual(sorted(asked), ["backend-service", "onepeek-infra"])  # each peer resolved once per pass
 
     def test_a_missing_record_refuses_and_never_reads_a_candidate(self):
-        for drop in (("e2e", "identity", "onepeek-infra"), ("checks", "contract", "backend-service"), ("image", "build", "onepeek-infra")):
+        for drop in (("e2e", "identity", "onepeek-infra"), ("checks", "contract / contract", "backend-service"), ("image", "build", "onepeek-infra")):
             err, reruns, _, _, asked = self.run_recheck([self.records(drop=drop)], [A])
             self.assertIn(f"STOP onepeek-web#9: {drop[0]}/{drop[1]} has no `peer: {drop[2]}@<commit>` line", err, drop)
             self.assertEqual((reruns, asked), ([], []))

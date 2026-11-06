@@ -531,10 +531,10 @@ PEER_LINE = re.compile(r"peer: (\S+)@([0-9a-f]{40})\s*$", re.M)
 # The peer records every promotion must carry (delivery-pipelines §6.5 Build rulings 2, the fail-closed table): per
 # promoted repo, (workflow, check name) exactly as `gh pr checks --json workflow,name` prints it -> the peers it records.
 PEER_CHECKS = {
-    "backend-service": {("checks", "contract"): ("onepeek-infra", "onepeek-web"), ("image-smoke", "image-smoke"): ("onepeek-infra",)},
-    "onepeek-web": {("checks", "contract"): ("onepeek-infra", "backend-service"), ("image", "build"): ("onepeek-infra",),
+    "backend-service": {("checks", "contract / contract"): ("onepeek-infra", "onepeek-web"), ("image-smoke", "image-smoke"): ("onepeek-infra",)},
+    "onepeek-web": {("checks", "contract / contract"): ("onepeek-infra", "backend-service"), ("image", "build"): ("onepeek-infra",),
                     ("e2e", "identity"): ("backend-service", "onepeek-infra")},
-    "onepeek-infra": {("checks", "contract"): ("backend-service", "onepeek-web")},
+    "onepeek-infra": {("checks", "contract / contract"): ("backend-service", "onepeek-web")},
 }
 
 
