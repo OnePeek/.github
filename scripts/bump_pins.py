@@ -1,4 +1,4 @@
-"""Rewrite `OnePeek/.github/.github/workflows/<name>.yml@<sha> # <tag>` pins in a repo to one tag's commit.
+"""Rewrite `OnePeek/.github/.github/workflows/<name>.yml@<sha> # <tag>` and `OnePeek/.github/actions/<name>@<sha> # <tag>` pins in a repo to one tag's commit.
 
 Usage: bump_pins.py <repo-dir> <tag> <sha>   (the 40-character commit the tag points at; look it up with
 `git rev-parse <tag>^{commit}`). Used until Dependabot's bump of these refs is proven (decision 146).
@@ -9,7 +9,7 @@ import re
 import sys
 from pathlib import Path
 
-PIN = re.compile(r"(OnePeek/\.github/\.github/workflows/[\w.-]+\.yml)@[0-9a-f]{40}(?:[ \t]*#[^\n]*)?")
+PIN = re.compile(r"(OnePeek/\.github/(?:\.github/workflows/[\w.-]+\.yml|actions/[\w.-]+))@[0-9a-f]{40}(?:[ \t]*#[^\n]*)?")
 
 
 def bump(text: str, tag: str, sha: str) -> str:

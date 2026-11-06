@@ -19,6 +19,12 @@ class T(unittest.TestCase):
         self.assertIn(f"x.yml@{NEW} # v1.2.0\n", out)
         self.assertIn(f"actions/checkout@{OLD} # v7", out)
 
+    def test_bumps_the_action_pin_too(self):
+        t = f"      - uses: OnePeek/.github/actions/peer-ref@{OLD} # v1.1.0\n      - uses: OnePeek/.github/actions-x/y@{OLD} # v1\n"
+        out = b.bump(t, "v1.2.0", NEW)
+        self.assertIn(f"actions/peer-ref@{NEW} # v1.2.0\n", out)
+        self.assertIn(f"actions-x/y@{OLD} # v1", out)  # only OnePeek/.github/actions/<name> moves
+
     def test_main_rewrites_files_and_rejects_bad_args(self):
         with tempfile.TemporaryDirectory() as d:
             w = Path(d) / ".github/workflows"
