@@ -51,7 +51,8 @@ Read the real sources. The brief only points to them.
   - values come from configuration, never literals;
   - nothing secret goes in the repo;
   - a new dependency needs a one-line reason, a pinned version, and a release at least 7 days old.
-- **Stay within size:** about 100 changed lines in the unblock lane, about 400 in the feature lane. If the task is growing past that, stop and report.
+- **Stay within size per task:** about 100 changed lines in the unblock lane, about 400 per feature slice. If the task grows past that, stop and report. There is **no size cap on a batch** pull request.
+- **Ship in the batch, not your own pull request** (founder, 2026-11-07; `operating-model.md` §8 Batch pull requests): build on your task branch, then merge it into the batch branch the brief names and push. Open the batch pull request only if it does not exist yet, and add your change to its body's list (task id, commit, one line). Never open a pull request for a single task unless the brief says it is a blocker that ships alone.
 - **Never edit shared files** (`pitfalls.md`, any `AGENTS.md`, `founder-decisions.md`, `agent-operations.md`, `operating-model.md`). Put the line you propose in your report.
 
 ## 5. Status and blocks
@@ -69,7 +70,7 @@ Read the real sources. The brief only points to them.
 | Tests | The reproducing test passes, and so do the tests of the area you touched | Every packet test, and the repo's full gates |
 | Mutations | One per changed behaviour, each shown failing a test | One per behaviour, plus hostile inputs for high risk |
 | Platforms | macOS, and Linux for shell, workflow or script changes | The same |
-| Local CI | `python3 "$ONEPEEK_WORKSPACE/.github/workspace/local_ci.py" <worktree>` ends `LOCAL CI OK`. In infra, also run `terraform test` yourself, because `--native` skips it | The same |
+| Local CI | `python3 "$ONEPEEK_WORKSPACE/.github/workspace/local_ci.py" <worktree> --keep-going` ends `LOCAL CI OK`; on NOT OK, report every failure at once (pitfall 43). In infra, also run `terraform test` yourself, because `--native` skips it | The same |
 | Self-review | The diff against your plan, and against every pitfall line | The same |
 | Push | Then check that `git ls-remote origin refs/heads/<branch>` equals `git rev-parse HEAD` | The same |
 | Done check | `done_check.py <worktree> --pr <repo>#<n> --expect <your files>` ends `DONE CHECK OK` | The same |

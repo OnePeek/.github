@@ -30,7 +30,7 @@ Never the builder's report or summary, so its view of the work cannot steer your
 | Class | Time limit | You must |
 |---|---|---|
 | Unblock, after merge | 15 minutes | Check that it restores the documented behaviour. Break the fix once and see the reproducing test fail. Look for side effects |
-| Normal | 30 minutes | Check traceability and contracts, and that the tests mean something. Run one mutation per area, and the gates on your own worktree |
+| Normal | 30 minutes | Check traceability and contracts, and that the tests mean something. Run one mutation per area; quote the builder's gate lines (§4.5) |
 | High risk | 45 minutes | Everything in Normal, plus hostile inputs for every rule, every fail-closed path, the permission scope, and one mutation per rule |
 
 Full high-risk depth (every rule) is for the merge gate, IAM and security, secrets and release paths. Other high-risk changes (local tooling, tests) get mutations and hostile inputs for the rules the change adds or alters, not for the whole file (founder, 2026-11-06).
@@ -61,7 +61,7 @@ Every finding has its `file:line`, its evidence (the command you ran and its out
 **Round 2** checks only the round-1 findings and the new changes. There is no round 3. If one would be needed, say whether the design is unclear or the change needs rework, and the orchestrator decides.
 
 ## 6. Report
-**One verdict per message, as soon as it is ready** (founder, 2026-11-06: a ready verdict for the head of a merge chain waited 20 minutes behind four others). The `spec-reviewer` agent has no `SendMessage` tool and its hand-back ends the run, so a run reviews **one pull request** (or one pull request plus its tiny dependants) and hands back its verdict at once; the orchestrator resumes the same reviewer with the next one, in merge-chain order, so its context carries over.
+**One verdict per message, as soon as it is ready** (founder, 2026-11-06: a ready verdict for the head of a merge chain waited 20 minutes behind four others). The `spec-reviewer` agent has no `SendMessage` tool and its hand-back ends the run, so a run reviews **one pull request** (or one pull request plus its tiny dependants) and hands back its verdict at once; in a batch pull request it gives one verdict per task commit; the orchestrator resumes the same reviewer with the next one, in merge-chain order, so its context carries over.
 
 1. The `Read:` line with the commits.
 2. The findings, ranked, with their evidence.

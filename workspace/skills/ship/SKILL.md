@@ -22,7 +22,7 @@ description: The shipper's procedure. Watch every open pull request, CI run, run
 `ship_change_set.py` enforces these rules. Check them yourself too.
 
 - **Unblock lane** (`Lane: hotfix` as the body's first non-empty line after leading HTML comments; a `Lane:` line anywhere else does not count, `development-cycle.md` §2b):
-  - Rule: the fast checks are green; CodeRabbit threads do not block and become follow-ups (`agent-operations.md` §6.6). A real defect already named by the reviewer or the orchestrator holds the hotfix until it is fixed; unread or untriaged bot threads do not. The tools cannot see that hold, so the orchestrator records it: it changes the body's first line to `Lane: feature` (the review gates then apply) and restores `Lane: hotfix` once the fix is ready. Report any hotfix with a named defect that is still `Lane: hotfix`.
+  - Rule: the fast checks are green; CodeRabbit threads do not block and become follow-ups (`agent-operations.md` §6.6). A real defect already named by the reviewer or the orchestrator holds the hotfix until it is fixed; unread or untriaged bot threads do not. The tools cannot see that hold, so the orchestrator records it: it changes the body's first line to `Lane: feature` (the review gates then apply) and restores `Lane: hotfix` once the fix is ready. This is a hold on a hotfix, not a lane change; restoring the line ends the hold. Report any hotfix with a named defect that is still `Lane: hotfix`.
   - After it merges: add it to the reviewer's post-merge queue in your report.
 - **Feature lane:**
   - the unblock-lane rule;

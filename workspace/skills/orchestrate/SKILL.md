@@ -15,7 +15,7 @@ description: The orchestrator's procedure (the main session in the OnePeek works
    - the runner status;
    - the latest `ship-status.md`;
    - `git worktree list` in each repo, to find agent worktrees left behind.
-   - check that the shared `.github` and `onepeek-docs` checkouts are on `main`, then `git -C <repo> pull --ff-only origin main`, so the tools and docs agents read are current (F38: a 79-commit-stale docs checkout lacked `operating-model.md`).
+   - check that the shared `.github` and `onepeek-docs` checkouts are on `main`, then `git -C <repo> pull --ff-only origin main` and `python3 .github/workspace/setup.py --sync-repos --check` (re-sync if it drifts); after any merge to `workspace/ship_*.py` or `packet.py`, restart the watcher (F41), so the tools and docs agents read are current (F38: a 79-commit-stale docs checkout lacked `operating-model.md`).
 4. Write the session plan into the task list: the 3 to 6 items you will finish, in order, each with its lane and its owner.
 5. Send the founder one line: what is done, what is next, and what you need from them, if anything.
 
@@ -62,7 +62,7 @@ Your own docs rulings are never "mechanical". The reviewer reviews the code buil
    - Builder B takes `backend-service`, `onepeek-web` and the other repos.
    - A builder stays on one repo lane per session.
 3. **File ownership.** Never give two builders tasks that touch the same file. Check the file list of every open pull request (`gh pr view <n> --json files`). Put the tasks one after the other, or stack the pull requests.
-   - **One file, one open pull request per lane:** a further fix to a file that an open unblock-lane pull request already changes is a new commit on that pull request, briefed to its builder, not a new stacked pull request.
+   - **Batch pull requests** (founder, 2026-11-07): name one batch branch per repo and lane per window (`batch/<repo>-<lane>-<yyyymmdd>-<n>`, about 60-90 minutes); every brief in that repo and lane says "merge your task branch into <batch>". Close the batch on its window, never on size. A blocker that stops merges ships alone. Merge-tool, IAM and security changes in a batch get the reviewer before the merge (F43).
    - A stacked pull request is based on the trunk with a `Depends on:` line, never on another pull request's branch (F39).
 4. **Work-in-progress limit:**
    - Each builder has 1 task at a time.
@@ -70,7 +70,7 @@ Your own docs rulings are never "mechanical". The reviewer reviews the code buil
    - The shipper is always on.
    - **At most 4 background agents**, briefed through the agent types `builder`, `spec-reviewer` and `shipper`.
    - **More than 3 high-risk pull requests waiting for review:** run two reviewers and one builder (the watcher script keeps merging); back to one reviewer at three or fewer (founder, 2026-11-06).
-   - **Brief a reviewer one pull request per run** (it has no `SendMessage`, and its hand-back ends the run): resume the same reviewer with the next pull request, so its context carries over, until it nears 150k tokens. Never batch 5-6 pull requests into one run: the verdict for the head of the chain then waits for all the others (2026-11-06).
+   - **Brief a reviewer one pull request per run** (it has no `SendMessage`, and its hand-back ends the run): resume the same reviewer with the next pull request, so its context carries over, until it nears 150k tokens or has done two tasks, whichever comes first (agents slowed or stopped reporting after about two tasks on 2026-11-06). Never batch 5-6 pull requests into one run: the verdict for the head of the chain then waits for all the others (2026-11-06).
    - **Tell the reviewer not to re-run the builder's gates** (quote the builder's lines) and to keep full high-risk depth for the merge gate, IAM, security, secrets and release paths (review-task §3, §4.5).
    - **Order the reviewer's queue by the merge chain:** the pull request that unblocks the most others first (2026-11-06: #73 placed last held eight pull requests for 20 minutes).
 5. **Idle rule.** A slot with nothing in the unblock or feature queue stays idle. Never invent work. Never start feature work while something blocks merging.

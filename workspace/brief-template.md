@@ -20,7 +20,7 @@ Symptom (unblock lane only; a feature brief leaves it out): the failing run's li
   Never a guessed cause: the builder reproduces first and reports the cause it finds (2026-11-06, T-58).
 
 Spec (read in full before anything else):
-  - Packet: python3 "$ONEPEEK_WORKSPACE/.github/workspace/packet.py" <unit> --out .context/<unit>.md, from the worktree
+  - Packet: python3 "$ONEPEEK_WORKSPACE/.github/workspace/packet.py" <unit> --task <this brief file> --out .context/<unit>.md, from the worktree (--task or --pr makes its first line show the lane)
     (backend: uv run app context <unit>); ONEPEEK_WORKSPACE is the folder holding all the repos (agent-operations.md §4.3)
   - Docs commit: onepeek-docs@<sha> (main, or the change set's open docs PR #<n>)
   - Sections that decide this slice: <file §section>, ...
@@ -37,7 +37,7 @@ Slice (about 400 changed lines at most, generated files and merges aside):
   - Build: <behaviour 1>, <behaviour 2>, ...
   - Files expected to change: <paths>
   - Do NOT touch: <paths other open PRs own>
-  - Files an open unblock-lane PR of this lane already changes: add the fix there as a commit (PR #<n>), never a new stacked PR
+  - Batch: merge your task branch into `batch/<repo>-<lane>-<yyyymmdd>-<n>` and push; open its PR only if none exists (body: Lane line, then the change list); never a PR of your own unless this brief says the task is a blocker that ships alone
   - Base: the trunk (dev or main) with `Depends on: OnePeek/<repo>#<n>` for any order; never another PR's branch (F39)
 
 Known traps for this slice: <pitfalls.md numbers, or new ones>
