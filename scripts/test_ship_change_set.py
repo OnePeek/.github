@@ -1653,3 +1653,23 @@ class ToolPushSourceInMain(unittest.TestCase):
                 self.assertRaisesRegex(SystemExit, "head 2222222 is neither the gated head 1111111"):
             ship.resolve_pin("backend-service", 2)
         rf.assert_not_called()
+
+
+class HeadKeepsMoving(unittest.TestCase):
+    """Ruling T-56: green_head STOPs the pull request after the head moves HEAD_MOVES_MAX (5) times in one wait."""
+
+    def heads(self, moves: int, stable: bool):
+        seq = [f"{i}" * 40 for i in range(moves + 1)] + ([str(moves) * 40] if stable else [])
+        with mock.patch.object(ship, "pr_info", side_effect=[{"headRefOid": h} for h in seq]), \
+                mock.patch.object(ship, "wait_green") as wait, mock.patch.object(ship, "say"):
+            return ship.green_head("onepeek-web", 3, False), wait.call_count
+
+    def test_four_moves_then_still_returns_the_last_head(self) -> None:
+        self.assertEqual(self.heads(4, True), ("4" * 40, 5))
+
+    def test_five_or_six_moves_stop_naming_the_heads(self) -> None:
+        for moves in (5, 6):
+            with self.subTest(moves=moves), self.assertRaises(SystemExit) as e:
+                self.heads(moves, False)
+            self.assertIn("head moved 5 times", str(e.exception))
+            self.assertIn("0000000 -> 1111111 -> 2222222 -> 3333333 -> 4444444 -> 5555555", str(e.exception))

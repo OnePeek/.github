@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import pathlib
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -249,6 +252,53 @@ class Queue(Base):
         self.assertEqual([(r["pr"], r["post_merge_review_due"]) for r in rows], [("onepeek-web#1", True)])
 
 
+class MergeTimeout(Base):
+    """Ruling T-56: a merge run past MERGE_TIMEOUT_S is killed with its whole process group, alerted and measured,
+    and the queue goes on."""
+
+    def test_a_hung_run_and_its_children_are_killed(self):
+        ticks = pathlib.Path(self.tmp.name) / "ticks"
+        cmd = ["sh", "-c", f'(for i in $(seq 50); do echo x >> "{ticks}"; sleep 0.1; done) & wait']
+        start = time.monotonic()
+        with mock.patch.object(sw, "MERGE_TIMEOUT_S", 0.5), self.assertRaises(sw.MergeTimeout) as e:
+            sw._merge_process(cmd, pathlib.Path(self.tmp.name))
+        self.assertLess(time.monotonic() - start, 4)
+        self.assertEqual(e.exception.args[0], 0.5)
+        size = ticks.stat().st_size
+        time.sleep(0.6)
+        self.assertEqual(ticks.stat().st_size, size)  # the grandchild in the group stopped too
+
+    def test_a_run_that_finishes_in_time_returns_its_output(self):
+        r = sw._merge_process([sys.executable, "-c", "print('ok'); raise SystemExit(3)"], pathlib.Path(self.tmp.name))
+        self.assertEqual((r.returncode, r.stdout), (3, "ok\n"))
+
+    def test_the_queue_goes_on_after_a_timeout(self):
+        def merge(cmd, cwd):
+            self.merged.append(cmd[2])
+            if cmd[2] == "onepeek-docs#1":
+                raise sw.MergeTimeout(3600)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        fake = FakeGh(world(("onepeek-docs", pr("onepeek-docs", 1)), ("onepeek-web", pr("onepeek-web", 4))))
+        with mock.patch.object(sw, "MERGE_RUN", merge):
+            s = self.run_pass(fake)
+        self.assertEqual(self.merged, ["onepeek-docs#1", "onepeek-web#4"])
+        self.assertIn("merge run for onepeek-docs#1 timed out after 3600 s", s["alerts"])
+        self.assertIn("merged onepeek-web#4", s["actions"])
+        rows = [json.loads(x) for x in (self.out / "measures.jsonl").read_text().splitlines()]
+        self.assertEqual([r["pr"] for r in rows], ["onepeek-docs#1", "onepeek-web#4"])
+        self.assertEqual(rows[0], {"pr": "onepeek-docs#1", "merge_timed_out_after_s": 3600})
+
+    def test_the_merge_timeout_covers_the_checks_wait(self):
+        self.assertEqual(sw.MERGE_TIMEOUT_S, sw.scs.CHECK_TIMEOUT_S + 15 * 60)
+
+    def test_a_measures_write_error_does_not_abort_the_pass(self):  # #71 follow-up
+        (self.out / "measures.jsonl").mkdir(parents=True)
+        fake = FakeGh(world(("onepeek-docs", pr("onepeek-docs", 1)), ("onepeek-web", pr("onepeek-web", 4))))
+        s = self.run_pass(fake)
+        self.assertEqual(self.merged, ["onepeek-docs#1", "onepeek-web#4"])
+        self.assertTrue(any(a.startswith("onepeek-docs#1: measures unreadable") for a in s["alerts"]), s["alerts"])
+
+
 class WarnOnly(Base):
     """Decision 173: the sandbox checks warn but never block, while ship_watch.yaml lists them."""
 
@@ -325,6 +375,14 @@ class Rerun(Base):
     def test_other_red_check_not_rerun(self):
         fake, _ = self.red("tests / unit")
         self.assertEqual(self.reruns(fake), [])
+
+    def test_one_run_with_two_red_checks_is_rerun_once(self):  # #71 follow-up
+        cs = [{"name": n, "bucket": "fail", "link": "https://x/runs/42/job/1"} for n in ("flaky / job", "flaky / other")]
+        fake = FakeGh(world(("onepeek-web", pr("onepeek-web", 7))), checks={"onepeek-web#7": cs})
+        self.run_pass(fake, cfg=dict(CFG, known_flakes=["flaky / job", "flaky / other"]))
+        self.assertEqual(self.reruns(fake), ["42"])
+        self.assertEqual(set(json.loads((self.out / "state.json").read_text())["reruns"]),
+                         {"onepeek-web#7@h7:flaky / job", "onepeek-web#7@h7:flaky / other"})
 
     def test_never_rerun_twice_on_the_same_head(self):
         fake, s = self.red("flaky / job", state={"reruns": {"onepeek-web#7@h7:flaky / job": NOW - 60}})

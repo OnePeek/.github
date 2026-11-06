@@ -536,13 +536,21 @@ def base_unchanged(repo: str, n: int, tested: set[str], branch: str) -> bool:
     return tested == {base_head(repo, branch)}
 
 
+HEAD_MOVES_MAX = 5  # a head that keeps moving stops the pull request instead of waiting forever (ruling T-56)
+
+
 def green_head(repo: str, n: int, may_rerun: bool) -> str:
-    """Wait for the required checks to be green and return the head they were green on (asked again if it moved)."""
+    """Wait for the required checks to be green and return the head they were green on (asked again if it moved).
+    After HEAD_MOVES_MAX moves in one wait it STOPs, naming the heads."""
+    heads = [pr_info(repo, n)["headRefOid"]]
     while True:
-        head = pr_info(repo, n)["headRefOid"]
         wait_green(repo, n, may_rerun)
-        if pr_info(repo, n)["headRefOid"] == head:
-            return head
+        heads.append(pr_info(repo, n)["headRefOid"])
+        if heads[-1] == heads[-2]:
+            return heads[-1]
+        if len(heads) - 1 >= HEAD_MOVES_MAX:
+            raise SystemExit(f"STOP {repo}#{n}: head moved {HEAD_MOVES_MAX} times while its checks ran "
+                             f"({' -> '.join(h[:7] for h in heads)}); nothing after it is merged")
         say(f"{repo}#{n}: head moved while its checks ran; waiting again")
 
 

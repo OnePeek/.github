@@ -35,6 +35,7 @@ import json
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -64,8 +65,26 @@ def _gh_process(args: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
 
 
+class MergeTimeout(Exception):
+    pass
+
+
 def _merge_process(cmd: list[str], cwd: pathlib.Path) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
+    """One merge run, in its own session: past MERGE_TIMEOUT_S its whole process group (gh, git, their children) is
+    killed and MergeTimeout raised (ruling T-56). Its pipes are never read after the kill, so a stray child holding
+    them cannot hang the watcher."""
+    child = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             start_new_session=True)
+    try:
+        out, err = child.communicate(timeout=MERGE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+        raise MergeTimeout(MERGE_TIMEOUT_S) from None
+    return subprocess.CompletedProcess(cmd, child.returncode, out, err)
 
 
 GH_RUN = _gh_process  # the one GitHub call layer (tests replace it)
@@ -137,6 +156,7 @@ _spec = importlib.util.spec_from_file_location("ship_change_set", HERE / "ship_c
 scs = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(scs)
 scs.subprocess = types.SimpleNamespace(run=_scs_run)  # its checks and review-threads readers, through GH_RUN
+MERGE_TIMEOUT_S = scs.CHECK_TIMEOUT_S + 15 * 60  # one merge run at most: its checks' wait plus 15 min (ruling T-56)
 
 
 def load_config(path: pathlib.Path) -> dict:
@@ -389,13 +409,18 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
         alerts.append(f"dependency cycle or order problem: {e}")
     alerts += [f"read failed, nothing merged or re-run this pass: {e}" for e in errors]
     if not errors:
+        reran: set[str] = set()
         for key, run_id in todo:
             repo = key.split("#", 1)[0]
             if dry:
                 actions.append(f"would re-run {key} (run {run_id})")
                 continue
+            if run_id in reran:  # one run holding several red checks is re-run once (#71 follow-up)
+                done[key] = now
+                continue
             try:
                 gh("run", "rerun", run_id, "-R", f"{ORG}/{repo}", "--failed")
+                reran.add(run_id)
                 done[key] = now
                 actions.append(f"re-ran {key} (run {run_id})")
             except ReadError as e:
@@ -414,18 +439,25 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
             if dry:
                 actions.append(f"would merge {p['label']}")
                 continue
-            r = MERGE_RUN([sys.executable, str(HERE / "ship_change_set.py"), p["label"], "--go",
-                           "--config", cfg.get("path") or str(HERE / "ship_watch.yaml")], root)
-            if r.returncode != 0:
+            try:
+                r = MERGE_RUN([sys.executable, str(HERE / "ship_change_set.py"), p["label"], "--go",
+                               "--config", cfg.get("path") or str(HERE / "ship_watch.yaml")], root)
+            except MergeTimeout as e:  # killed; the queue goes on with the next pull request
+                alerts.append(f"merge run for {p['label']} timed out after {e.args[0]} s")
+                r, row = None, {"pr": p["label"], "merge_timed_out_after_s": e.args[0]}
+            if r is not None and r.returncode != 0:
                 last = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-1:] or ["no output"]
                 actions.append(f"skipped {p['label']}: {last[0][:300]}")
                 continue
-            actions.append(f"merged {p['label']}" + ("; post-merge review due" if scs.hotfix(p) else ""))
-            due += [p["label"]] if scs.hotfix(p) else []
+            if r is not None:
+                actions.append(f"merged {p['label']}" + ("; post-merge review due" if scs.hotfix(p) else ""))
+                due += [p["label"]] if scs.hotfix(p) else []
             try:
+                if r is not None:
+                    row = dict(measure(repo, n, done), post_merge_review_due=scs.hotfix(p))
                 with (out / "measures.jsonl").open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(dict(measure(repo, n, done), post_merge_review_due=scs.hotfix(p))) + "\n")
-            except (ReadError, ValueError, KeyError, TypeError) as e:
+                    f.write(json.dumps(row) + "\n")
+            except (ReadError, ValueError, KeyError, TypeError, OSError) as e:  # never aborts the pass
                 alerts.append(f"{p['label']}: measures unreadable: {e}")
     open_labels = {p["label"] for p in prs}
     status = {"at": iso(now), "mode": "dry-run" if dry else "go", "alerts": alerts, "actions": actions,
