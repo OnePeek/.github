@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""The done-gate a builder runs before it reports (workspace pitfalls.md 3; AGENTS.md "Running agents").
+"""The done-gate a builder runs before it reports (workspace pitfalls.md 3; agent-operations.md §5.4 step 5).
 
-    python3 .github/workspace/done_check.py <worktree> [--pr <repo>#<n>] [--branch <name>]
+    python3 .github/workspace/done_check.py <worktree> [--pr <repo>#<n>] [--branch <name>] [--expect <file> ...]
 
 It fails when the work that was reported is not the work that was pushed:
-  1. the worktree has uncommitted or untracked files (`.context/` is ignored: packets are never committed);
-  2. HEAD is not on the remote branch (`--branch`, else the pull request's head branch, else the upstream);
-  3. with `--pr`: the pull request's files are not exactly the files HEAD changes against the pull request's base,
-     or the pull request's head commit is not HEAD.
-It prints one line per problem and ends `DONE CHECK OK` or `DONE CHECK FAILED`. Exit 0 only when OK.
+  1. the worktree is not a linked worktree (`git worktree add`, agent-operations.md §4.3);
+  2. the worktree has uncommitted or untracked files (only untracked files under a top-level `.context/` are ignored:
+     packets and status files are never committed; a tracked file there that changed still fails);
+  3. HEAD is not on the remote branch (`--branch`, else the pull request's head branch, else the upstream);
+  4. with `--pr`: the pull request's head commit is not HEAD, `--branch` is not its head branch, the base cannot be
+     fetched, HEAD does not contain the current base, or the pull request's files are not exactly the files HEAD changes
+     against the base;
+  5. with `--expect`: the pull request's files are not exactly the files the builder reports.
+With `--pr` it always prints the pull request's files, and a WARN when the change is over the slice cap of
+agent-operations.md §4.5 (generated files aside). It prints one line per problem and ends `DONE CHECK OK` or
+`DONE CHECK FAILED`. Exit 0 only when OK.
 """
 from __future__ import annotations
 
@@ -19,22 +25,36 @@ import subprocess
 import sys
 import time
 
-IGNORED_PREFIXES = (".context/",)
+CONTEXT_DIR = ".context"  # untracked files under it are never committed
+SLICE_CAP = 400  # changed lines, generated files aside (agent-operations.md §4.5)
+GENERATED_NAMES = ("pnpm-lock.yaml", "uv.lock")
+GENERATED_SUFFIXES = (".lock",)
+GENERATED_DIRS = ("rendered",)
 
 
 def run(cmd: list[str], cwd: pathlib.Path) -> str:
-    return subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True).stdout
+    return subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, encoding="utf-8",
+                          errors="surrogateescape").stdout
+
+
+def nul_fields(out: str) -> list[str]:
+    return [f for f in out.split("\0") if f]
 
 
 def dirty_files(status: str) -> list[str]:
-    """Paths from `git status --porcelain=v1 -uall`, minus the ignored prefixes."""
-    out = []
-    for line in status.splitlines():
-        if len(line) < 4:
+    """Paths from `git status --porcelain=v1 -z -uall`, minus untracked files under a top-level `.context/`."""
+    out, fields, i = [], status.split("\0"), 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if len(entry) < 4:
             continue
-        path = line[3:].split(" -> ")[-1].strip().strip('"')
-        if not path.startswith(IGNORED_PREFIXES):
-            out.append(path)
+        xy, path = entry[:2], entry[3:]
+        if "R" in xy or "C" in xy:
+            i += 1  # the next field is the rename's or copy's source path
+        if xy == "??" and path.split("/", 1)[0] == CONTEXT_DIR:
+            continue
+        out.append(path)
     return out
 
 
@@ -47,6 +67,18 @@ def compare_files(pr_files: list[str], changed: list[str]) -> list[str]:
         problems.append("changed locally but not in the pull request: " + ", ".join(missing))
     if extra:
         problems.append("in the pull request but not in this worktree's HEAD: " + ", ".join(extra))
+    return problems
+
+
+def compare_expected(pr_files: list[str], expected: list[str]) -> list[str]:
+    """Problems when the pull request's file list differs from the files the builder reports."""
+    problems = []
+    missing = sorted(set(expected) - set(pr_files))
+    extra = sorted(set(pr_files) - set(expected))
+    if missing:
+        problems.append("reported but not in the pull request: " + ", ".join(missing))
+    if extra:
+        problems.append("in the pull request but not reported: " + ", ".join(extra))
     return problems
 
 
@@ -63,7 +95,7 @@ PR_READ_TRIES, PR_READ_WAIT = 4, 5  # GitHub's API can show the old head for a f
 def read_pr(repo: str, number: str, head: str, worktree: pathlib.Path, sleep=time.sleep) -> dict:
     """The pull request as GitHub reports it, re-read briefly while its head still lags a fresh push."""
     for attempt in range(PR_READ_TRIES):
-        info = json.loads(run(["gh", "pr", "view", number, "-R", repo, "--json", "headRefName,headRefOid,baseRefName,files"],
+        info = json.loads(run(["gh", "pr", "view", number, "-R", repo, "--json", "headRefName,headRefOid,baseRefName"],
                               worktree))
         if info.get("headRefOid") == head or attempt == PR_READ_TRIES - 1:
             return info
@@ -71,23 +103,82 @@ def read_pr(repo: str, number: str, head: str, worktree: pathlib.Path, sleep=tim
     return info
 
 
-def check(worktree: pathlib.Path, pr: str | None, branch: str | None) -> list[str]:
+def pr_files(repo: str, number: str, worktree: pathlib.Path) -> list[str]:
+    """Every path the pull request changes, paginated (the `files` field of `gh pr view` stops at 100). A rename lists
+    its old path too, to match `git diff --no-renames`. One JSON string per line, so no path can split a line."""
+    out = run(["gh", "api", "--paginate", f"repos/{repo}/pulls/{number}/files?per_page=100",
+               "--jq", ".[] | (.filename, (.previous_filename // empty)) | @json"], worktree)
+    return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+
+def generated(path: str) -> bool:
+    parts = path.split("/")
+    return parts[-1] in GENERATED_NAMES or parts[-1].endswith(GENERATED_SUFFIXES) or \
+        any(p in GENERATED_DIRS for p in parts[:-1])
+
+
+def changed_lines(numstat: str) -> int:
+    """Added plus deleted lines from `git diff --numstat -z --no-renames`, generated and binary files aside."""
+    total = 0
+    for entry in nul_fields(numstat):
+        added, deleted, path = entry.split("\t", 2)
+        if added == "-" or generated(path):
+            continue
+        total += int(added) + int(deleted)
+    return total
+
+
+def linked_worktree_problem(worktree: pathlib.Path) -> str | None:
+    dirs = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir", "--git-dir"], worktree).splitlines()
+    common, own = (pathlib.Path(d).resolve() for d in dirs[:2])
+    if common == own:
+        return "not a linked worktree: work in `git worktree add --detach <scratchpad>/<name> origin/<branch>`"
+    return None
+
+
+def check(worktree: pathlib.Path, pr: str | None, branch: str | None, expect: list[str] | None = None) -> list[str]:
     problems: list[str] = []
-    dirty = dirty_files(run(["git", "status", "--porcelain=v1", "-uall"], worktree))
+    why = linked_worktree_problem(worktree)
+    if why:
+        problems.append(why)
+    dirty = dirty_files(run(["git", "status", "--porcelain=v1", "-z", "-uall"], worktree))
     if dirty:
         problems.append("uncommitted or untracked: " + ", ".join(dirty))
     head = run(["git", "rev-parse", "HEAD"], worktree).strip()
-    base_ref = None
+    if expect is not None and not pr:
+        problems.append("--expect needs --pr: the expected files are compared with the pull request's")
     if pr:
         repo, number = parse_pr(pr)
         info = read_pr(repo, number, head, worktree)
+        if branch and branch != info["headRefName"]:
+            problems.append(f"--branch {branch} is not the pull request's head branch {info['headRefName']}")
         branch = branch or info["headRefName"]
         base_ref = info["baseRefName"]
         if info["headRefOid"] != head:
             problems.append(f"the pull request's head is {info['headRefOid'][:7]}, not HEAD {head[:7]}: push HEAD")
-        run(["git", "fetch", "-q", "origin", base_ref], worktree)
-        changed = [p for p in run(["git", "diff", "--name-only", f"origin/{base_ref}...HEAD"], worktree).split() if p]
-        problems += compare_files([f["path"] for f in info["files"]], changed)
+        files = pr_files(repo, number, worktree)
+        print(f"pull request files ({len(files)}):")
+        for f in files:
+            print(f"  {f}")
+        if expect is not None:
+            problems += compare_expected(files, expect)
+        try:
+            run(["git", "fetch", "-q", "origin", base_ref], worktree)
+        except subprocess.CalledProcessError as e:
+            problems.append(f"could not fetch origin/{base_ref}: {(e.stderr or '').strip()}")
+            return problems  # every later step would compare against a stale base
+        try:
+            run(["git", "merge-base", "--is-ancestor", f"origin/{base_ref}", "HEAD"], worktree)
+        except subprocess.CalledProcessError as e:
+            problems.append(f"HEAD does not contain the current origin/{base_ref}: merge it in" if e.returncode == 1
+                            else f"could not compare HEAD with origin/{base_ref}: {(e.stderr or '').strip()}")
+        diff = ["git", "diff", "-z", "--no-renames", f"origin/{base_ref}...HEAD"]
+        changed = nul_fields(run([*diff[:2], "--name-only", *diff[2:]], worktree))
+        problems += compare_files(files, changed)
+        lines = changed_lines(run([*diff[:2], "--numstat", *diff[2:]], worktree))
+        if lines > SLICE_CAP:
+            print(f"WARN  {lines} changed lines (generated files aside), over the slice cap of {SLICE_CAP} "
+                  "(agent-operations.md §4.5): split the slice")
     if branch:
         remote = run(["git", "ls-remote", "origin", f"refs/heads/{branch}"], worktree).split()
         if not remote:
@@ -110,10 +201,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("worktree", type=pathlib.Path)
     ap.add_argument("--pr", help="<repo>#<n>, for example onepeek-infra#177")
     ap.add_argument("--branch", help="the remote branch HEAD was pushed to")
+    ap.add_argument("--expect", nargs="+", metavar="FILE", help="the files the builder reports as changed")
     args = ap.parse_args(argv)
     try:
-        problems = check(args.worktree.resolve(), args.pr, args.branch)
-    except (subprocess.CalledProcessError, ValueError, KeyError, json.JSONDecodeError) as e:
+        problems = check(args.worktree.resolve(), args.pr, args.branch, args.expect)
+    except (subprocess.CalledProcessError, ValueError, KeyError, TypeError, OSError, json.JSONDecodeError) as e:
         problems = [f"could not check: {e}"]  # fail closed (pitfalls.md 14)
     for p in problems:
         print(f"FAIL  {p}")
