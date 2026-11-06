@@ -9,7 +9,7 @@
 # Callers (each repo with a release branch), in checks.yml:
 #   release-gate:
 #     needs: depends-on
-#     if: ${{ github.event_name == 'pull_request' && github.base_ref == 'release' }}
+#     if: github.event_name == 'pull_request' && github.base_ref == 'release'   # §8.1 ruling; the gate also refuses any other event
 #     uses: OnePeek/.github/.github/workflows/release-gate.yml@<sha> # <tag>
 #     permissions: { contents: read, actions: read, pull-requests: read }
 #     with:
