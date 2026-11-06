@@ -18,6 +18,7 @@ CFG = {"repos": ["onepeek-docs", ".github", "onepeek-infra", "onepeek-web"], "au
        "warn": [("onepeek-infra", "sandbox", "apply-test")]}
 NOW = 1_800_000_000.0
 GREEN = [{"name": "depends-on / depends-on", "bucket": "pass", "link": "https://x/runs/11/job/1"}]
+HOT = {"body": "Lane: hotfix"}
 BOT_DONE = {"name": "CodeRabbit", "bucket": "pass", "link": "https://coderabbit.ai"}
 
 
@@ -156,6 +157,17 @@ class Classify(unittest.TestCase):
             ("BLOCKED", "no review at h5", {"reviews": {"onepeek-web#5": {"sha": "h5", "class": "normal code"}}}),
             ("READY", "", {"author": {"login": "app/dependabot", "is_bot": True}, "all_checks": GREEN, "reviews": {}}),
             ("BLOCKED", "no review at h5", {"author": {"login": "app/dependabot", "is_bot": False}, "reviews": {}}),
+            # operating-model §3, ruling T-53: a hotfix needs green checks only; review and threads come after the merge
+            ("READY", "post-merge review due", {**HOT, "threads": ["a.py:3"], "reviews": {},
+                                                "all_checks": [{"name": "CodeRabbit", "bucket": "pending"}]}),
+            ("BLOCKED", "red: x", {**HOT, "checks": [{"name": "x", "bucket": "fail"}]}),
+            ("BLOCKED", "pending: x", {**HOT, "checks": [{"name": "x", "bucket": "pending"}]}),
+            ("BLOCKED", "no checks", {**HOT, "checks": []}),
+            ("BLOCKED", "CONFLICTING", {**HOT, "mergeable": "CONFLICTING"}),
+            ("HOLD", "not in ship_watch.yaml", {**HOT, "author": {"login": "someone"}}),
+            ("HOLD", "release", {**HOT, "baseRefName": "release"}),
+            ("BLOCKED", "1 unresolved review thread(s)", {"body": "Lane: hot fix", "threads": ["a.py:3"]}),
+            ("BLOCKED", "no review at h5", {"body": "Lane: hotfix\nLane: feature", "reviews": {}}),
         ]
         for want, why_part, change in cases:
             with self.subTest(want=want, change=change):
@@ -218,7 +230,19 @@ class Queue(Base):
         self.run_pass(FakeGh(world(("onepeek-web", pr("onepeek-web", 1)))), state={"reruns": {"onepeek-web#1@h0:x": 1}})
         rows = [json.loads(x) for x in (self.out / "measures.jsonl").read_text().splitlines()]
         self.assertEqual(rows, [{"pr": "onepeek-web#1", "merged_at": "2026-11-06T03:30:00Z", "hours_open_to_merge": 3.5,
-                                 "review_rounds": 2, "bot_threads": 2, "reruns": 1}])
+                                 "review_rounds": 2, "bot_threads": 2, "reruns": 1, "post_merge_review_due": False}])
+
+    def test_a_hotfix_merges_past_threads_and_review_and_records_the_review_due(self):
+        hot = {"body": "Lane: hotfix"}
+        fake = FakeGh(world(("onepeek-web", pr("onepeek-web", 1, **hot)), ("onepeek-web", pr("onepeek-web", 2))),
+                      threads={"onepeek-web#1": ["a.py"], "onepeek-web#2": ["b.py"]},
+                      bot={"name": "CodeRabbit", "bucket": "pending"})
+        s = self.run_pass(fake, reviews={})
+        self.assertEqual(self.merged, ["onepeek-web#1"])
+        self.assertIn("merged onepeek-web#1; post-merge review due", s["actions"])
+        self.assertEqual(s["post_merge_review_due"], ["onepeek-web#1"])
+        rows = [json.loads(x) for x in (self.out / "measures.jsonl").read_text().splitlines()]
+        self.assertEqual([(r["pr"], r["post_merge_review_due"]) for r in rows], [("onepeek-web#1", True)])
 
 
 class WarnOnly(Base):

@@ -9,9 +9,11 @@ lines, unresolved review threads, mergeable, draft, release or not), the org's r
 onepeek-infra sandbox.yml run and the open release workflow runs. Each pull request is READY, BLOCKED (one reason) or
 HOLD (a release, a draft, or an author not in the allow-list). READY also needs the review gates (§6.6, F36):
 CodeRabbit finished on the head and the coordinator's $ONEPEEK_WORKSPACE/.ship/reviews.json naming that head (bots on
-the list exempt). A check is green only when it is `pass` or `skipping`. Every GitHub call goes through one layer that
-allows reads only. Any read failure, or an odd shape (a missing field, a non-list, a corrupt state or reviews file),
-fails the pass closed: an alert says why, nothing is merged or re-run, and `--once` exits 1; the loop keeps running.
+the list exempt), except for a `Lane: hotfix` pull request (operating-model §3): green checks merge it, and its review
+is due after the merge (`post_merge_review_due` in ship-status and measures.jsonl). A check is green only when it is
+`pass` or `skipping`. Every GitHub call goes through one layer that allows reads only. Any read failure, or an odd
+shape (a missing field, a non-list, a corrupt state or reviews file), fails the pass closed: an alert says why, nothing
+is merged or re-run, and `--once` exits 1; the loop keeps running.
 
 READY ones merge one per `ship_change_set.py --go` run (so one docs pull request per run), docs first, then in the
 fixed order; a run that fails is recorded and the queue goes on (F32). A red check is re-run once only when it is the
@@ -236,6 +238,8 @@ def classify(p: dict, cfg: dict) -> tuple[str, str]:
         return "BLOCKED", f"pending: {', '.join(pending)}"
     if not hard:
         return "BLOCKED", "no checks reported"
+    if scs.hotfix(p):  # the body read in this pass, never cached; threads and review come after the merge
+        return "READY", "Lane: hotfix, post-merge review due"
     if p["threads"]:
         return "BLOCKED", f"{len(p['threads'])} unresolved review thread(s): {', '.join(p['threads'])}"
     why = scs.review_problem(p["label"], p["headRefOid"], p.get("author"), p["all_checks"], cfg["reviews"],
@@ -352,7 +356,7 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
     done = dict(state["reruns"]) if isinstance(state.get("reruns"), dict) else {}
     prs = read_prs(cfg, errors)
     ci = read_ci(cfg, errors)
-    progress, todo = {}, []
+    progress, todo, due = {}, [], []
     for p in prs:
         p["class"], p["reason"] = classify(p, cfg)
         fp = [p["headRefOid"], p["class"], p["reason"]]
@@ -404,7 +408,8 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
             alerts.append(f"merge queue not ordered, nothing merged: {e}")
         for repo, n in queue:
             p = by_key[(repo, n)]
-            if p["baseRefName"] == scs.RELEASE_BASE or p["isDraft"] is not False or p["threads"]:  # defence in depth
+            if (p["baseRefName"] == scs.RELEASE_BASE or p["isDraft"] is not False  # defence in depth
+                    or (p["threads"] and not scs.hotfix(p))):
                 continue
             if dry:
                 actions.append(f"would merge {p['label']}")
@@ -415,15 +420,16 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
                 last = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-1:] or ["no output"]
                 actions.append(f"skipped {p['label']}: {last[0][:300]}")
                 continue
-            actions.append(f"merged {p['label']}")
+            actions.append(f"merged {p['label']}" + ("; post-merge review due" if scs.hotfix(p) else ""))
+            due += [p["label"]] if scs.hotfix(p) else []
             try:
                 with (out / "measures.jsonl").open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(measure(repo, n, done)) + "\n")
+                    f.write(json.dumps(dict(measure(repo, n, done), post_merge_review_due=scs.hotfix(p))) + "\n")
             except (ReadError, ValueError, KeyError, TypeError) as e:
                 alerts.append(f"{p['label']}: measures unreadable: {e}")
     open_labels = {p["label"] for p in prs}
     status = {"at": iso(now), "mode": "dry-run" if dry else "go", "alerts": alerts, "actions": actions,
-              "warned": warned, "ci": ci,
+              "warned": warned, "ci": ci, "post_merge_review_due": due,
               "prs": [{k: p.get(k) for k in ("label", "title", "url", "class", "reason", "headRefOid", "baseRefName",
                                               "isDraft", "mergeable", "checks", "threads", "dep_states")} for p in prs]}
     new_state = {"prs": progress, "no_runner_since": no_runner, "reds": reds,

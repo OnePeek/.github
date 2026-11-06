@@ -1436,3 +1436,58 @@ class OpenDependencyNeedsADraft(unittest.TestCase):
                 mock.patch.object(ship, "say", side_effect=lines.append):
             self.assertEqual(ship.main(["onepeek-infra#3"]), 1)
         self.assertTrue(any("as a draft" in l for l in lines), lines)
+
+
+class HotfixLane(unittest.TestCase):
+    """operating-model §3, ruling T-53: a `Lane: hotfix` pull request merges on green checks, without the review record
+    or the thread refusal; the lane is read from the body right before the merge, and anything else is feature."""
+
+    def test_only_a_plain_hotfix_line_outside_a_release_is_hotfix(self) -> None:
+        for body, base, want in (("Lane: hotfix", "dev", True), ("- **Lane:** hotfix (CI red)", "main", True),
+                                 ("", "dev", False), (None, "dev", False), ("Lane: feature", "dev", False),
+                                 ("Lane: hot fix", "dev", False), ("Lane: hotfix\nLane: feature", "dev", False),
+                                 ("<!-- Lane: hotfix -->", "dev", False), ({"x": 1}, "dev", False),
+                                 ("Lane: hotfix", "release", False)):
+            with self.subTest(body=body, base=base):
+                self.assertIs(ship.hotfix({"body": body, "baseRefName": base}), want)
+
+    def test_the_review_gate_passes_a_hotfix_without_a_review_or_coderabbit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(ship.os.environ, {"ONEPEEK_WORKSPACE": tmp}), \
+                mock.patch.object(ship, "read_checks", return_value=[{"name": "CodeRabbit", "bucket": "pending"}]):
+            i = {"headRefOid": "h3", "baseRefName": "dev", "author": {"login": "Karan-98-Mehta"}}
+            self.assertIsNone(REAL_GATE("onepeek-web", 3, dict(i, body="Lane: hotfix")))
+            self.assertIn("no review at h3", REAL_GATE("onepeek-web", 3, dict(i, body="")))
+
+    def go(self, bodies: list[str]):
+        """main --go on one pull request with an unresolved thread; `bodies` are the bodies successive reads return."""
+        state = {"state": "OPEN", "baseRefName": "dev", "isDraft": False, "mergeable": "MERGEABLE", "headRefName": "b",
+                 "headRefOid": "c" * 40, "mergeCommit": {"oid": "d" * 40}, "isCrossRepository": False,
+                 "headRepositoryOwner": {"login": "OnePeek"}, "author": {"login": "Karan-98-Mehta"}}
+        merged = []
+
+        def pr_info(repo, n):
+            return dict(state, body=bodies.pop(0) if len(bodies) > 1 else bodies[0])
+
+        def gh(*args):
+            if args[:2] == ("pr", "merge"):
+                merged.append(args)
+                state["state"] = "MERGED"
+            return '["app/x.py",4]\n' if args[:2] == ("api", "graphql") else ""
+        with mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "pr_info", pr_info), \
+                mock.patch.object(ship, "gh", side_effect=gh), mock.patch.object(ship, "wait_green"), \
+                mock.patch.object(ship, "remove_worktrees"), mock.patch.object(ship, "say") as say:
+            try:
+                rc = ship.main(["backend-service#2", "--go"])
+            except SystemExit as e:
+                rc = str(e)
+        return rc, merged, [c.args[0] for c in say.call_args_list]
+
+    def test_a_hotfix_merges_past_an_unresolved_thread_and_a_review_is_due(self) -> None:
+        rc, merged, said = self.go(["Lane: hotfix"])
+        self.assertEqual((rc, len(merged)), (0, 1))
+        self.assertIn("backend-service#2: Lane: hotfix, post-merge review due (operating-model §3)", said)
+
+    def test_the_lane_is_read_again_before_the_merge(self) -> None:  # hotfix when planned, feature by the merge
+        rc, merged, _ = self.go(["Lane: hotfix"] * 4 + ["Lane: feature"])
+        self.assertIn("unresolved review thread", rc)
+        self.assertEqual(merged, [])
