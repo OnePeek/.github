@@ -34,7 +34,7 @@ Authority (what the person allowed for this task): commit + push to the branch: 
 Done means (all of it, in the report):
   1. Gap check first: if the spec is silent or contradicts, stop and report the gap (file §section). Never invent.
   2. Every behaviour has a test; one mutation per behaviour shown failing.
-  3. Gates: changed tests on macOS and in Linux; then local CI on the worktree path -> `LOCAL CI OK`.
+  3. Gates: changed tests on macOS, and in Linux for shell, workflow and script tests; then local CI on the worktree path -> `LOCAL CI OK`.
   4. Self-review against the packet and pitfalls.md, listing what was checked.
   5. `python3 .github/workspace/done_check.py <worktree> --pr <repo>#<n>` -> `DONE CHECK OK`.
 Report: the `Read:` line first; then files per commit; the last line of each gate; mutations; the DONE CHECK line; gaps; what is left. No narrative.

@@ -70,6 +70,12 @@ def compare_files(pr_files: list[str], changed: list[str]) -> list[str]:
     return problems
 
 
+def context_paths(pr_files: list[str]) -> list[str]:
+    """Problems when the pull request commits a `.context/` file: packets and status files are never committed (agent-operations.md §5.5)."""
+    found = sorted(f for f in pr_files if f.split("/", 1)[0] == ".context")
+    return ["the pull request commits .context/ files, which are never committed: " + ", ".join(found)] if found else []
+
+
 def compare_expected(pr_files: list[str], expected: list[str]) -> list[str]:
     """Problems when the pull request's file list differs from the files the builder reports."""
     problems = []
@@ -160,6 +166,7 @@ def check(worktree: pathlib.Path, pr: str | None, branch: str | None, expect: li
         print(f"pull request files ({len(files)}):")
         for f in files:
             print(f"  {f}")
+        problems += context_paths(files)
         if expect is not None:
             problems += compare_expected(files, expect)
         try:

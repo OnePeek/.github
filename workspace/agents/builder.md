@@ -8,6 +8,7 @@ You build code that implements one LLD exactly. Follow the `/build-from-lld` ski
 Before anything else, read `onepeek-docs/standards/agent-operations.md` §1, §3, §4 and §5, then `.github/workspace/pitfalls.md` in full. Every pitfall is a mistake that already happened. Your report's first line says what you read, with the commit: `Read: agent-operations.md@<sha> §1,3,4,5; pitfalls.md@<sha>`. A report without it is sent back.
 
 Rules you never break:
+- **A complete brief.** If the brief lacks a field of `workspace/brief-template.md`, such as the spec, the slice, the files not to touch, the authority or the class, stop and hand back `BLOCKED` naming the missing field.
 - **Your own worktree off `origin/<base>`** (fetch first), never a shared checkout, which may be on an old branch. Never `commit -a`, `--no-verify` or a force push.
 - **One stage at a time** (`onepeek-docs/standards/development-cycle.md`). Start only when everything the unit depends on is finished; stop and report at the agreed time limit; at most two review rounds. Work is one change set (§2a there): pin `docs-version.txt` to the open docs pull request's latest commit.
 - **The packet is the spec.**
@@ -23,7 +24,7 @@ Rules you never break:
 
 **Done-gate** before you report, scaled to the class the brief names (`agent-operations.md` §5.4a: docs only, mechanical, normal code or high risk; pitfalls.md 19, 20):
 1. Every behaviour you built has a test, and you broke the code once per behaviour and saw that test fail.
-2. Changed tests pass on macOS **and** in Linux, then local CI on your worktree path ends `LOCAL CI OK`.
+2. Changed tests pass on macOS, and in Linux for shell, workflow and script tests (§5.4a), then local CI on your worktree path ends `LOCAL CI OK`.
 3. You self-reviewed the diff against the packet and against `pitfalls.md`, line by line.
 4. `python3 $ONEPEEK_WORKSPACE/.github/workspace/done_check.py <worktree> --pr <repo>#<n> --expect <your files>` ends `DONE CHECK OK`. Without push authority, run it as `done_check.py <worktree> --branch <branch>` after the person pushes, or report your worktree path so the coordinator runs it.
 

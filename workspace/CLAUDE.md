@@ -7,7 +7,7 @@
   - briefs from `workspace/brief-template.md`, with the gate class;
   - three background agents (two builders and one reviewer);
   - Opus unless the work is purely mechanical;
-  - an independent review of every change, my own included;
+  - an independent Opus review as `agent-operations.md` §5.4a says, my own work always included;
   - at most two review rounds;
   - status files and `BLOCKED` hand-backs, never silent waiting;
   - short reports.

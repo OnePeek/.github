@@ -270,6 +270,13 @@ class Check(unittest.TestCase):
         self.assertIn("in the pull request but not reported: c.txt", problems)
         self.assertIn("  c.txt", out)
 
+    def test_a_pull_request_committing_a_context_file_fails(self):
+        # Review round 2 of #60: .context/status.md was committed and nothing caught it.
+        head = self.r.commit({".context/status.md": "phase: done\n"})
+        with self.with_gh(FakeGh([head], [".context/status.md"])):
+            problems, _ = self.check("x#1", None)
+        self.assertTrue(any(".context/status.md" in p for p in problems), problems)
+
     def test_expect_without_pr_fails(self):
         self.assertTrue(any("--expect needs --pr" in p for p in self.check(None, None, ["a.txt"])[0]))
 
@@ -325,6 +332,19 @@ class PrFilesJq(unittest.TestCase):
                                   capture_output=True, text=True).stdout
         with mock.patch.object(dc, "run", side_effect=run):
             self.assertEqual(dc.pr_files("OnePeek/x", "1", pathlib.Path(".")), ["new name.py", "old.py", "a\nb.txt"])
+
+
+
+class ContextNeverCommitted(unittest.TestCase):
+    """Review round 2 of #60: a committed .context/status.md slipped through, because done_check skips only untracked ones."""
+
+    def test_a_committed_context_file_fails(self):
+        problems = dc.context_paths(["workspace/x.py", ".context/status.md"])
+        self.assertEqual(len(problems), 1)
+        self.assertIn(".context/status.md", problems[0])
+
+    def test_a_folder_merely_named_like_it_passes(self):
+        self.assertEqual(dc.context_paths(["docs/.context-notes.md", "a/.context/b.md"]), [])
 
 
 if __name__ == "__main__":
