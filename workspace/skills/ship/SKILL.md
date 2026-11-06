@@ -21,8 +21,8 @@ description: The shipper's procedure. Watch every open pull request, CI run, run
 ## 2. When a pull request may merge
 `ship_change_set.py` enforces these rules. Check them yourself too.
 
-- **Unblock lane** (`Lane: hotfix`):
-  - Rule: the fast checks are green and there are no open real threads.
+- **Unblock lane** (`Lane: hotfix` as the body's first non-empty line after leading HTML comments; a `Lane:` line anywhere else does not count, `development-cycle.md` §2b):
+  - Rule: the fast checks are green; CodeRabbit threads do not block and become follow-ups (`agent-operations.md` §6.6). A real defect already named by the reviewer or the orchestrator holds the hotfix until it is fixed; unread or untriaged bot threads do not. The tools cannot see that hold, so the orchestrator records it: it changes the body's first line to `Lane: feature` (the review gates then apply) and restores `Lane: hotfix` once the fix is ready. Report any hotfix with a named defect that is still `Lane: hotfix`.
   - After it merges: add it to the reviewer's post-merge queue in your report.
 - **Feature lane:**
   - the unblock-lane rule;
@@ -67,3 +67,6 @@ Send the orchestrator a summary once a day.
 - Merge past a red fast check or an open real defect.
 - Merge an unreviewed feature head.
 - Write into `reviews.json`, or reply to or resolve a thread yourself. The orchestrator posts them until the founder allows thread replies for this role.
+
+## Pin rounds (founder, 2026-11-06; operating-model §8 Shipping 9)
+- One pin round per `.github` merge train: merge only the newest tag's round, after the train's last `.github` merge. List older open pin pull requests in your report as superseded; the orchestrator closes them.
