@@ -28,3 +28,16 @@ warn_checks:
   - {repo: onepeek-infra, workflow: sandbox, name: sweep}
   - {repo: onepeek-infra, workflow: sandbox, name: unlock}
   - {repo: onepeek-infra, workflow: sandbox, name: apply-test}
+# Ruling F43 (founder 2026-11-07): a pull request changing any of these paths is reviewed before its merge in every
+# lane, hotfix included: ship_change_set.py reads its changed files live (renames under both names) and then needs the
+# coordinator's reviews.json record at its head. Globs over the repo path: `**/` any folders (none too), a trailing
+# `/**` anything below, `*` within one segment. Missing or malformed means every hotfix needs a review (fail closed).
+review_required_paths:
+  - workspace/ship_change_set.py
+  - workspace/ship_watch.py
+  - workspace/packet.py
+  - workspace/done_check.py
+  - .github/workflows/**
+  - bootstrap/**
+  - "**/iam*.tf"
+  - "**/*policy*.tf"

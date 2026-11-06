@@ -21,10 +21,14 @@ Order: docs (merge commit into main) -> .github (squash into main, then wait for
 design system -> backend -> web -> the other repos (squash into dev). After .github merges, every later pull
 request's `OnePeek/.github` workflow pins move to the new tag in one commit, so callers never run on a stale
 or unmerged workflow; every caller repo whose pins were not moved inside the set (one outside it, or one merged
-before .github, such as onepeek-docs) then gets a pin-move pull request to the same tag (foundation-playbook §8a P2),
-with a note when it was more than one minor version behind. Pin moves are safe to re-run: an existing branch or pull
-request for the tag is updated (never a second one), no local branch is created or deleted, and a failure in one caller
-is reported at the end without stopping the others. `--order repoA,repoB,...` replaces the fixed
+before .github, such as onepeek-docs) then gets the move to the same tag (foundation-playbook §8a P2): pushed straight
+to its trunk (dev; main for onepeek-docs and marketing-website; never release) when the commit changes only pinned
+`uses: OnePeek/.github/...@<sha> # vX.Y.Z` lines (ruling T-86), the push read back from the remote and recorded in
+$ONEPEEK_WORKSPACE/.ship/direct-pushes.jsonl for the watcher, which checks the trunk's CI on it and reverts it when red;
+anything else gets a pin-move pull request, with a note when it was more than one minor version behind. Every repo of
+ship_watch.yaml's `repos` that is not checked out, or whose trunk cannot be read, is listed and fails the run (T-61).
+Pin moves are safe to re-run: an existing branch or pull request for the tag is updated (never a second one), no local
+branch is created or deleted, and a failure in one caller is reported at the end without stopping the others. `--order repoA,repoB,...` replaces the fixed
 order (§8a P1, development-cycle §2a item 7: the consumer that validates a contract strictly merges before the
 producer); it names every repo in the set once. A pull request whose body says `Depends on: OnePeek/<repo>#<n>` (§8a P1,
 lesson L26) merges after that one (the order is otherwise kept), a listed pull request outside the set must already be
@@ -39,6 +43,13 @@ when clean (§8a P6). A required check that failed before an earlier repo in the
 (it may have needed that repo); a second failure stops the run. Nothing is merged past a red required check, except
 the warn-only checks ship_watch.yaml lists in `warn_checks` (decision 173: the sandbox workflow's, until `warn_until`),
 which are not waited on; deleting the list makes them block again.
+
+Review gates (agent-operations §6.6, F36): a pull request merges only with the coordinator's reviews.json record at its
+exact head (or class mechanical or docs only); review threads and CodeRabbit never block a merge (ruling T-100). A
+`Lane: hotfix` pull request skips the record (reviewed after the merge) unless it changes a path of ship_watch.yaml's
+`review_required_paths` (ruling F43), read live right before the merge. A batch pull request (head `batch/...` or
+`process/...`) merges with a merge commit so each task commit stays revertable (T-98). Right before each merge the base
+and the lane are read again, and a change since the plan stops the run (T-94).
 
 Run it from the workspace root (the folder holding the repos side by side). Needs `gh` signed in.
 """
@@ -203,10 +214,15 @@ def release_run(prev: str) -> tuple[dict | None, str]:
     return (runs[0] if runs else None), head
 
 
-def merge_method(repo: str, base: str) -> str:
-    """docs, and every pull request into `release` (dev to release), merge with a merge commit; squash would break the
-    release branch's history and release-please. Everything else squashes into dev."""
-    return "--merge" if repo == DOCS or base == RELEASE_BASE else "--squash"
+BATCH_PREFIXES = ("batch/", "process/")  # a batch pull request's head branch (operating-model §8, ruling T-98)
+
+
+def merge_method(repo: str, base: str, head: str = "") -> str:
+    """docs, every pull request into `release` (dev to release), and a batch pull request (its head branch starts with
+    `batch/` or `process/`, ruling T-98: each task commit stays revertable) merge with a merge commit; squash would
+    break the release branch's history and release-please. Everything else squashes into dev."""
+    batch = isinstance(head, str) and head.startswith(BATCH_PREFIXES)
+    return "--merge" if repo == DOCS or base == RELEASE_BASE or batch else "--squash"
 
 
 def parse(item: str) -> tuple[str, int]:
@@ -442,9 +458,15 @@ def pr_commits(repo: str, n: int) -> set[str]:
     return set(gh("api", "--paginate", f"repos/{ORG}/{repo}/pulls/{n}/commits?per_page=100", "--jq", ".[].sha").split())
 
 
+PR_FILES_MAX = 3000  # GitHub lists at most this many files of a pull request; a list that long may be cut short
+
+
 def pr_files(repo: str, n: int) -> list[str]:
-    """The paths a pull request changes (GitHub lists at most 3,000)."""
-    return gh("api", "--paginate", f"repos/{ORG}/{repo}/pulls/{n}/files?per_page=100", "--jq", ".[].filename").split()
+    """The paths a pull request changes, every page, a renamed file under both its names (GitHub lists at most 3,000),
+    one JSON string per line so a path with a space or a newline stays whole."""
+    out = gh("api", "--paginate", f"repos/{ORG}/{repo}/pulls/{n}/files?per_page=100", "--jq",
+             ".[] | .filename, (.previous_filename // empty) | @json")
+    return [json.loads(line) for line in out.splitlines() if line.strip()]
 
 
 def pin_at(text: str) -> tuple[int, str] | None:
@@ -622,18 +644,126 @@ def rewrite_pins(wt: pathlib.Path, tag: str, sha: str) -> tuple[list[str], set[s
     return changed, old
 
 
-def callers() -> list[str]:
-    """Every repo checked out beside .github whose workflows pin OnePeek/.github (§8a P2), read at its base branch."""
-    out = []
-    for d in sorted(p for p in ROOT.iterdir() if (p / ".git").exists() and p.name != ".github"):
-        base = BASE.get(d.name, "dev")
-        subprocess.run(["git", "-C", str(d), "fetch", "-q", "origin", base], capture_output=True, check=False)
+def expected_repos(path: pathlib.Path | None = None) -> list[str] | None:
+    """Every OnePeek repo but .github, from the `repos` of ship_watch.yaml (--config); None when it is unreadable."""
+    rows = read_config(path).get("repos")
+    if not isinstance(rows, list) or not rows or not all(isinstance(r, str) and r for r in rows):
+        return None
+    return [r for r in rows if r != ".github"]
+
+
+def callers() -> tuple[list[str], list[str]]:
+    """(callers, skipped). Callers: every repo checked out beside .github whose workflows pin OnePeek/.github at its
+    trunk (§8a P2). Skipped (T-61, T-86): a repo of ship_watch.yaml's `repos` that is not checked out, or one whose
+    trunk could not be fetched or searched; the run lists them and fails rather than leaving one unmoved silently."""
+    out, skipped = [], []
+    present = sorted(p for p in ROOT.iterdir() if (p / ".git").exists() and p.name != ".github")
+    expected = expected_repos()
+    if expected is None:
+        skipped.append(f"every repo: `repos` in {CONFIG[0]} is unreadable, so no caller list can be complete")
+    else:
+        skipped += [f"{r}: not checked out in {ROOT}" for r in expected if not (ROOT / r / ".git").exists()]
+    for d in present:
+        base = trunk(d.name)
+        f = subprocess.run(["git", "-C", str(d), "fetch", "-q", "origin", base], capture_output=True, text=True, check=False)
+        if f.returncode != 0:
+            skipped.append(f"{d.name}: cannot fetch {base}: {(f.stderr or f.stdout).strip()[:200]}")
+            continue
         r = subprocess.run(["git", "-C", str(d), "grep", "-q", "-i", "-E", "uses:[[:space:]]*[\"']?OnePeek/[.]github([/@[:space:]\"']|$)",
                             f"origin/{base}", "--", ".github/workflows"],
-                           capture_output=True, check=False)
+                           capture_output=True, text=True, check=False)
         if r.returncode == 0:
             out.append(d.name)
-    return out
+        elif r.returncode != 1:  # 1 is "no match"; anything else is an error, never "not a caller"
+            skipped.append(f"{d.name}: cannot search {base}: {(r.stderr or r.stdout).strip()[:200]}")
+    return out, skipped
+
+
+PURE_PIN = re.compile(r"(?P<pre>[ \t]*(?:-[ \t]+)?uses:[ \t]*)OnePeek/\.github/(?P<path>[^@\s\"'#]+)@(?P<sha>[0-9a-f]{40})"
+                      r"[ \t]+#[ \t]*(?P<tag>v\d+\.\d+\.\d+)[ \t]*")
+
+
+def pure_pin_diff(wt: pathlib.Path, base: str, tag: str, sha: str) -> str | None:
+    """Why the change from `base` to HEAD is not a pure pin move (ruling T-86), or None when it is: only files under
+    .github/workflows/ change, and every changed line, removed and added alike, is exactly
+    `uses: OnePeek/.github/<path>@<40-hex sha> # vX.Y.Z`; the added lines are at `sha` and `tag`, and pair one for one
+    with the removed lines, which they equal apart from the sha and the tag. Anything else falls back to a pull
+    request."""
+    files = git(wt, "diff", "--name-only", "-z", base, "HEAD").split("\0")
+    other = [f for f in files if f and not re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", f)]
+    if other:
+        return f"it changes {', '.join(other)}"
+    minus, plus = [], []
+    for line in git(wt, "diff", "-U0", "--no-color", base, "HEAD").splitlines():
+        if line.startswith(("+++", "---")):
+            continue
+        if line[:1] in "+-":
+            m = PURE_PIN.fullmatch(line[1:])
+            if not m:
+                return f"a changed line is not a pinned `uses:` line: {line[:120]!r}"
+            (plus if line[0] == "+" else minus).append(m)
+    if not plus or len(plus) != len(minus):
+        return f"{len(minus)} line(s) removed but {len(plus)} added"
+    for old, new in zip(minus, plus):
+        if (new["sha"], new["tag"]) != (sha, tag):
+            return f"an added pin is {new['sha'][:7]} # {new['tag']}, not {sha[:7]} # {tag}"
+        if (old["pre"], old["path"]) != (new["pre"], new["path"]):
+            return f"a pin line changed more than its sha and tag: {old.group(0)!r} -> {new.group(0)!r}"
+    return None
+
+
+def direct_pushes_file() -> pathlib.Path:
+    return pathlib.Path(os.environ.get("ONEPEEK_WORKSPACE") or ROOT) / ".ship" / "direct-pushes.jsonl"
+
+
+def record_direct_push(repo: str, branch: str, sha: str, parent: str, tag: str) -> None:
+    """One JSON line per direct push (ruling T-86) for ship_watch.py: it checks the trunk's CI on `sha` from
+    `verify_after` on, and reverts the commit when it is red."""
+    path = direct_pushes_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    row = {"repo": repo, "branch": branch, "sha": sha, "parent": parent, "tag": tag, "pushed_at": now,
+           "verify_after": now, "by": "ship_change_set.py pin move"}
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def push_pin_move(repo: str, tag: str, sha: str) -> tuple[str, str | None]:
+    """Ruling T-86 (founder 2026-11-07 02:10): move every pin on the caller's trunk (dev; main for onepeek-docs and
+    marketing-website) to tag@sha in one commit pushed straight to the trunk, when that commit is a pure pin move
+    (pure_pin_diff). Never a release branch, never forced: the push fails if the trunk moved. The remote is then read
+    back and the push recorded for the watcher. Returns ("pushed", commit), ("current", None) when the trunk already
+    pins the tag, or ("not pure", why) when the change is anything else, for a pin-move pull request instead."""
+    src, base = ROOT / repo, trunk(repo)
+    if base == RELEASE_BASE or base not in ("dev", "main"):
+        raise SystemExit(f"STOP {repo}: refusing a direct pin push to {base}")
+    git(src, "fetch", "-q", "origin", base)
+    parent = git(src, "rev-parse", f"refs/remotes/origin/{base}").strip()
+    with tempfile.TemporaryDirectory(prefix=f"pins-direct-{repo}-") as tmp:
+        wt = pathlib.Path(tmp) / "wt"
+        git(src, "worktree", "add", "-q", "--detach", str(wt), parent)
+        try:
+            changed, _ = rewrite_pins(wt, tag, sha)
+            if not changed:
+                say(f"{repo}: {base} already pins {tag}; nothing to push")
+                return "current", None
+            git(wt, "add", "--", *changed)
+            git(wt, "commit", "-q", "-m", f"chore: pin OnePeek/.github workflows to {tag} (ship_change_set)")
+            why = pure_pin_diff(wt, parent, tag, sha)
+            if why:
+                say(f"{repo}: not a pure pin move ({why}); opening a pin-move pull request instead")
+                return "not pure", why
+            new = git(wt, "rev-parse", "HEAD").strip()
+            git(wt, "push", "-q", "origin", f"HEAD:refs/heads/{base}")  # plain: rejected if the trunk moved
+        finally:
+            git(src, "worktree", "remove", "--force", str(wt))
+    remote = git(src, "ls-remote", "origin", f"refs/heads/{base}").split()
+    if not remote or remote[0] != new:
+        raise SystemExit(f"STOP {repo}: pushed {new[:7]} to {base}, but the remote {base} is "
+                         f"{(remote[0] if remote else 'missing')[:7]}")
+    record_direct_push(repo, base, new, parent, tag)
+    say(f"{repo}: pins -> {tag} pushed to {base} ({new[:7]}); recorded for the watcher's CI check")
+    return "pushed", new
 
 
 def open_pin_move(repo: str, tag: str, sha: str) -> str | None:
@@ -683,14 +813,21 @@ def open_pin_move(repo: str, tag: str, sha: str) -> str | None:
 
 
 def pin_moves(moved: set[str], tag: str, sha: str) -> list[str]:
-    """A pin-move pull request in every caller whose pins were not moved inside the set (§8a P2), including one merged
-    before .github; a failure in one caller is collected and the others still run. Returns the failures."""
-    failures = []
-    for repo in callers():
+    """Every caller whose pins were not moved inside the set (§8a P2), including one merged before .github, gets the
+    move: pushed straight to its trunk when it is a pure pin move (ruling T-86), else a pin-move pull request. A
+    failure in one caller is collected and the others still run; every repo it could not check is listed (T-61).
+    Returns the failures and the skipped repos."""
+    found, skipped = callers()
+    failures = [f"skipped {s}" for s in skipped]
+    for s in skipped:
+        say(f"pin move skipped: {s}")
+    for repo in found:
         if repo in moved:
             continue
         try:
-            open_pin_move(repo, tag, sha)
+            how, _ = push_pin_move(repo, tag, sha)
+            if how == "not pure":
+                open_pin_move(repo, tag, sha)
         except SystemExit as e:
             failures.append(f"{repo}: {e}")
             say(f"{repo}: pin move failed, going on with the others: {e}")
@@ -807,20 +944,86 @@ def hotfix(i: dict) -> bool:
     return i.get("baseRefName") != RELEASE_BASE and packet.lane_of(i.get("body")) == "hotfix"
 
 
+def review_required_paths(path: pathlib.Path | None = None) -> list[str] | None:
+    """Ruling F43: the `review_required_paths` globs of ship_watch.yaml (--config); a pull request changing any of them
+    is reviewed before its merge even in the hotfix lane. None when the key is missing or not a list of non-empty
+    strings, which the caller reads as "every path needs a review" (fail closed)."""
+    rows = read_config(path).get("review_required_paths")
+    if not isinstance(rows, list) or not rows or not all(isinstance(r, str) and r.strip() for r in rows):
+        return None
+    return rows
+
+
+def glob_re(pattern: str) -> re.Pattern:
+    """A path glob as a regex over the whole path: `**/` is any number of folders (none too), a trailing `/**` anything
+    below the folder, `*` and `?` stay inside one path segment; everything else is literal."""
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif pattern.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif pattern[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif pattern[i] == "?":
+            out, i = out + "[^/]", i + 1
+        else:
+            out, i = out + re.escape(pattern[i]), i + 1
+    return re.compile(out, re.S)
+
+
+def review_required(repo: str, n: int, path: pathlib.Path | None = None) -> list[str]:
+    """The pull request's changed paths (read live, every page, renames under both names) that match
+    `review_required_paths` (ruling F43). Fails closed: an unreadable or empty file list, a list GitHub may have cut
+    short, or no readable globs stop it with SystemExit, so the caller treats the hotfix as needing a review."""
+    globs = review_required_paths(path)
+    if globs is None:
+        raise SystemExit(f"{repo}#{n}: review_required_paths in {path or CONFIG[0]} is missing or malformed")
+    files = pr_files(repo, n)
+    if not files:
+        raise SystemExit(f"{repo}#{n}: GitHub listed no changed files")
+    if len(files) >= PR_FILES_MAX:
+        raise SystemExit(f"{repo}#{n}: {len(files)} changed files; GitHub may have cut the list short")
+    pats = [glob_re(g) for g in globs]
+    return [f for f in files if any(p.fullmatch(f) for p in pats)]
+
+
 def review_gate(repo: str, n: int, i: dict) -> str | None:
     """agent-operations.md §6.6 "Review gates for merging" (F36) for the pull request's head `i["headRefOid"]`, read
     live; the bot allow-list is the `authors` of ship_watch.yaml (--config). An unreadable record is a problem.
-    A hotfix pull request has none: it is reviewed after the merge (operating-model §3)."""
+    A hotfix pull request has none (it is reviewed after the merge, operating-model §3), unless it changes a path of
+    `review_required_paths` (ruling F43: merge-tool and security changes are reviewed before the merge in every lane)
+    or its changed paths cannot be read; then it needs the record at its head like a feature pull request."""
+    why_review = ""
     if hotfix(i):
-        return None
+        try:
+            hits = review_required(repo, n)
+        except SystemExit as e:
+            hits, why_review = [], f"its changed paths could not be checked ({e})"
+        if not hits and not why_review:
+            return None
+        why_review = why_review or f"it changes {', '.join(hits)} (review_required_paths)"
+        say(f"{repo}#{n}: Lane: hotfix, but {why_review}: it needs the review record at its head (ruling F43)")
+        why_review = f" (a hotfix that needs a review: {why_review})"
     try:
         reviews = read_reviews()
     except (OSError, ValueError) as e:
-        return f"{repo}#{n}: cannot read the review record: {e}"
+        return f"{repo}#{n}: cannot read the review record: {e}{why_review}"
     authors = read_config().get("authors")
-    why = review_problem(f"{repo}#{n}", i["headRefOid"], i.get("author"), read_checks(repo, n, False), reviews,
+    why = review_problem(f"{repo}#{n}", i["headRefOid"], i.get("author"), [], reviews,
                          authors if isinstance(authors, list) else [])
-    return f"{repo}#{n}: {why}" if why else None
+    return f"{repo}#{n}: {why}{why_review}" if why else None
+
+
+def review_exempt(repo: str, n: int, i: dict) -> bool:
+    """True when the pull request merges without a review before the merge: a hotfix (operating-model §3) that changes
+    no path of `review_required_paths` (ruling F43). Any read error means not exempt."""
+    if not hotfix(i):
+        return False
+    try:
+        return not review_required(repo, n)
+    except SystemExit:
+        return False
 
 
 def refresh_one(repo: str, n: int) -> int:
@@ -861,8 +1064,9 @@ REVIEW_THREADS = """query($owner: String!, $repo: String!, $n: Int!, $endCursor:
 
 
 def unresolved_threads(repo: str, n: int) -> list[str]:
-    """`path:line` of every review thread not resolved (agent-operations.md §6.4, F11). A thread whose resolution is not
-    `true` counts as unresolved, and a failed or unreadable query stops the run (fail closed, pitfalls.md 14)."""
+    """`path:line` of every review thread not resolved (agent-operations.md §6.4, F11), for ship_watch.py's report; no
+    merge waits on it (ruling T-100). A thread whose resolution is not `true` counts as unresolved, and a failed or
+    unreadable query stops (fail closed, pitfalls.md 14)."""
     out = gh("api", "graphql", "--paginate", "-f", f"query={REVIEW_THREADS}", "-f", f"owner={ORG}", "-f", f"repo={repo}",
              "-F", f"n={n}", "--jq", ".data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved != true)"
              " | [.path, (.line // .originalLine)] | @json")
@@ -896,15 +1100,14 @@ def read_reviews(path: pathlib.Path | None = None) -> dict:
 
 def review_problem(label: str, head: str, author: dict | None, all_checks: list[dict], reviews: dict,
                    bots: list[str]) -> str | None:
-    """Why the pull request may not merge yet under the review gates (F36, pitfalls.md 30), or None: CodeRabbit has
-    finished on the head (`pass` or `skipping`) and the recorded review is at exactly this head (or the recorded class
-    is mechanical or docs only, at this head). A bot author on the allow-list is exempt."""
+    """Why the pull request may not merge yet under the review gates (F36, pitfalls.md 30), or None: the recorded
+    review is at exactly this head (or the recorded class is mechanical or docs only, at this head). A bot author on
+    the allow-list is exempt. CodeRabbit is no gate (ruling T-100, founder 2026-11-07): `all_checks` is no longer read
+    and stays only for ship_watch.py's call."""
+    del all_checks
     author = author or {}
     if author.get("is_bot") is True and author.get("login") in bots:
         return None
-    bot = [c.get("bucket") for c in all_checks if c.get("name") == "CodeRabbit"]
-    if not bot or any(b not in ("pass", "skipping") for b in bot):
-        return f"no review at {head}: CodeRabbit {'/'.join(map(str, bot)) or 'has not reported'} on the head"
     r = reviews.get(label)
     if r == head or (isinstance(r, dict) and r.get("sha") == head and r.get("class") in REVIEWED_CLASSES):
         return None
@@ -914,36 +1117,37 @@ def review_problem(label: str, head: str, author: dict | None, all_checks: list[
 RETARGET_LIMIT = 200  # stacked pull requests read per branch; more than this stops (as ship_watch.PR_LIMIT does)
 
 
-def retarget_stacked(repo: str, n: int, branch: str) -> list[str]:
-    """Before a merge deletes `branch`, move each open pull request based on it to the repo's merge base: GitHub closes a
-    pull request whose base branch is deleted (F39: .github#76, infra#192). Bodies are left alone. A failure, or a list
-    that may be cut short, stops the merge. Returns the pull requests moved, for the STOP of a merge that then fails."""
-    target = BASE.get(repo, "dev")
+def trunk(repo: str) -> str:
+    """The branch a repo's ordinary pull requests merge into: main for onepeek-docs, .github and marketing-website, else
+    dev."""
+    return BASE.get(repo, "dev")
+
+
+def retarget_stacked(repo: str, n: int, branch: str, target: str) -> list[str]:
+    """Before a merge deletes `branch`, move each open pull request based on it to `target`, the repo's trunk (main
+    computes it once): GitHub closes a pull request whose base branch is deleted (F39: .github#76, infra#192). Bodies
+    are left alone. A failure, or a list that may be cut short, stops the merge, naming the ones moved and the one
+    whose edit failed (it may have been applied; T-72c). Returns the pull requests moved, for the STOP of a merge that
+    then fails."""
     moved: list[str] = []
+    editing = None
     try:
         stacked = json.loads(gh("pr", "list", "-R", f"{ORG}/{repo}", "--base", branch, "--state", "open",
                                 "--json", "number", "--limit", str(RETARGET_LIMIT + 1)))
         if len(stacked) > RETARGET_LIMIT:
             raise ValueError(f"more than {RETARGET_LIMIT} open pull requests are based on it: the list may be cut short")
         for m in sorted(p["number"] for p in stacked):
+            editing = f"{repo}#{m}"
             gh("pr", "edit", str(m), "-R", f"{ORG}/{repo}", "--base", target)
-            moved.append(f"{repo}#{m}")
+            moved.append(editing)
+            editing = None
             say(f"{repo}#{m}: retargeted from {branch} to {target} before {repo}#{n} merges")
     except (SystemExit, ValueError, KeyError, TypeError) as e:
         undo = f"; already retargeted to {target}, move back to {branch}: {', '.join(moved)}" if moved else ""
-        raise SystemExit(f"STOP {repo}#{n}: could not retarget the pull requests based on {branch} ({e}){undo}; "
+        maybe = f"; {editing} possibly retargeted, check its base" if editing else ""
+        raise SystemExit(f"STOP {repo}#{n}: could not retarget the pull requests based on {branch} ({e}){undo}{maybe}; "
                          "not merged, nothing after it is merged") from None
     return moved
-
-
-def refuse_unresolved(repo: str, n: int) -> None:
-    """Right before a merge: stop while the pull request has any unresolved review thread, naming each one."""
-    threads = unresolved_threads(repo, n)
-    if threads:
-        for t in threads:
-            say(f"{repo}#{n}: unresolved review thread {t}")
-        raise SystemExit(f"STOP {repo}#{n}: {len(threads)} unresolved review thread(s); fix or answer and resolve "
-                         "each one, then run again; nothing after it is merged")
 
 
 def main(argv: list[str]) -> int:
@@ -1051,7 +1255,8 @@ def main(argv: list[str]) -> int:
             if repo != ".github":
                 problems += docs_pin_problems(repo, n, info[(repo, n)]["headRefName"])
 
-    say("plan: " + " -> ".join(f"{r}#{n} ({merge_method(r, info[(r, n)]['baseRefName'])[2:]} into {info[(r, n)]['baseRefName']})"
+    say("plan: " + " -> ".join(f"{r}#{n} ({merge_method(r, info[(r, n)]['baseRefName'], info[(r, n)].get('headRefName', ''))[2:]} "
+                               f"into {info[(r, n)]['baseRefName']})"
                                for r, n in prs))
     for p in problems:
         say(f"problem: {p}")
@@ -1101,38 +1306,51 @@ def main(argv: list[str]) -> int:
                     head = green_head(repo, n, may_rerun=False)
                 else:
                     say(f"{repo}#{n}: only the docs pin changed and the green run tested the current base; merging without a new CI run")
-        method = merge_method(repo, info[(repo, n)]["baseRefName"])
+        method = merge_method(repo, info[(repo, n)]["baseRefName"], info[(repo, n)].get("headRefName", ""))
         base_ref = info[(repo, n)]["baseRefName"]
         if base_ref == RELEASE_BASE and repo in CHAIN:  # the lock again, right before the merge (§2c step 3)
             why = lock_problem(RELEASE_ENV, release_lock(RELEASE_ENV, a.aws_profile))
             if why:
                 raise SystemExit(f"STOP {repo}#{n}: {why}")
         keep = [] if base_ref == RELEASE_BASE else ["--delete-branch"]  # a release pull request's head is `dev`: never deleted
-        live = dict(info[(repo, n)], body=pr_info(repo, n).get("body"))  # the lane, read again now (never cached)
+        fresh = pr_info(repo, n)  # the lane and the base, read again now (never cached; T-94)
+        if fresh.get("baseRefName") != base_ref:
+            raise SystemExit(f"STOP {repo}#{n}: the base changed since the plan ({base_ref} -> "
+                             f"{fresh.get('baseRefName')}); run again; nothing after it is merged")
+        live = dict(info[(repo, n)], body=fresh.get("body"))
         lanes = ["hotfix" if hotfix(x) else "feature" for x in (info[(repo, n)], live)]
         if lanes[0] != lanes[1]:
             raise SystemExit(f"STOP {repo}#{n}: the lane changed since the plan ({lanes[0]} -> {lanes[1]}); run "
                              "again; nothing after it is merged")
-        if lanes[1] == "feature":
-            refuse_unresolved(repo, n)  # every review thread read and resolved before the merge (§6.4)
-        reviewed = info[(repo, n)]["headRefOid"]  # the review gates, again, right before the merge (F36)
-        why = review_gate(repo, n, live) if lanes[1] == "feature" else None
+        # Review threads never block a merge (ruling T-100). The review gates, again, right before the merge (F36); a
+        # hotfix skips them only when it changes no review_required_paths path, read live again (ruling F43).
+        reviewed = info[(repo, n)]["headRefOid"]
+        exempt = review_exempt(repo, n, live)
+        why = None if exempt else review_gate(repo, n, live)
         if not why and head != reviewed and head not in TOOL_PUSHED:
             why = f"{repo}#{n}: head {head[:7]} is neither the reviewed head {reviewed[:7]} nor a commit this run pushed"
         if why:
             raise SystemExit(f"STOP {why}; nothing after it is merged")
-        retargeted = retarget_stacked(repo, n, info[(repo, n)]["headRefName"]) if keep else []  # its branch is deleted on merge (F39)
-        undo = (f"; {', '.join(retargeted)} were retargeted to {BASE.get(repo, 'dev')} before it: move them back to "
-                f"{info[(repo, n)]['headRefName']}") if retargeted else ""
+        target = trunk(repo)
+        branch = info[(repo, n)]["headRefName"]
+        retargeted = retarget_stacked(repo, n, branch, target) if keep else []  # its branch is deleted on merge (F39)
+        moved_back = (f"{', '.join(retargeted)} were retargeted to {target} before it: move them back to {branch}"
+                      if retargeted else "")
+        undo = f"; {moved_back}" if moved_back else ""
         try:
             gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, *keep, "--match-head-commit", head)
         except SystemExit as e:
             raise SystemExit(f"{e}{undo}") from None
-        merged = pr_info(repo, n)
+        try:
+            merged = pr_info(repo, n)
+        except SystemExit as e:  # T-72c: the merge may have happened; never advise moving them back blind
+            raise SystemExit(f"STOP {repo}#{n}: could not read it after the merge ({e}); check the merge state first"
+                             + (f"; if it did not merge, {moved_back}" if moved_back else "")
+                             + "; nothing after it is merged") from None
         if merged["state"] != "MERGED":
             raise SystemExit(f"STOP {repo}#{n}: merge did not complete ({merged['state']}){undo}")
         say(f"{repo}#{n}: merged {merged['mergeCommit']['oid'][:7]}")
-        if hotfix(live):
+        if exempt:
             say(f"{repo}#{n}: Lane: hotfix, post-merge review due (operating-model §3)")
         if repo == DOCS:
             docs_merge = merged["mergeCommit"]["oid"]
@@ -1150,7 +1368,8 @@ def main(argv: list[str]) -> int:
     if failures:
         for f in failures:
             say(f"pin move failed: {f}")
-        say(f"{len(failures)} pin move(s) failed; fix and re-run them (they are safe to re-run)")
+        say(f"{len(failures)} pin move(s) failed or skipped; every caller must get the move: fix and re-run them "
+            "(they are safe to re-run)")
         return 1
     return 0
 

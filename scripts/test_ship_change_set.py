@@ -183,7 +183,7 @@ class WarnOnly(unittest.TestCase):
 
 
 class ReviewGate(unittest.TestCase):
-    """agent-operations.md §6.6 review gates (F36): CodeRabbit finished on the head and a review recorded at it."""
+    """agent-operations.md §6.6 review gates (F36): a review recorded at the head; CodeRabbit is no gate (T-100)."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -199,14 +199,15 @@ class ReviewGate(unittest.TestCase):
         with mock.patch.object(ship, "read_checks", return_value=cs):
             return REAL_GATE("onepeek-web", 3, {"headRefOid": "h3", "author": author or {"login": "Karan-98-Mehta"}})
 
-    def test_review_at_the_head_and_coderabbit_finished(self):
-        self.assertIsNone(self.gate({"onepeek-web#3": "h3"}))
-        self.assertIsNone(self.gate({"onepeek-web#3": "h3"}, bot="skipping"))
-        self.assertIsNone(self.gate({"onepeek-web#3": {"sha": "h3", "class": "mechanical"}}))
+    def test_review_at_the_head_passes_whatever_coderabbit_says(self):  # ruling T-100: kills restoring the bot gate
+        for bot in ("pass", "skipping", "pending", "fail", None):
+            with self.subTest(bot=bot):
+                self.assertIsNone(self.gate({"onepeek-web#3": "h3"}, bot=bot))
+                self.assertIsNone(self.gate({"onepeek-web#3": {"sha": "h3", "class": "mechanical"}}, bot=bot))
 
     def test_blocked_without_it(self):
-        for reviews, bot in (({}, "pass"), ({"onepeek-web#3": "h2"}, "pass"), ({"onepeek-web#3": "h3"}, "pending"),
-                             ({"onepeek-web#3": "h3"}, None), ({"onepeek-web#3": {"sha": "h3", "class": "normal code"}}, "pass")):
+        for reviews, bot in (({}, "pass"), ({"onepeek-web#3": "h2"}, "pass"), ({"onepeek-web#3": "h2"}, None),
+                             ({"onepeek-web#3": {"sha": "h3", "class": "normal code"}}, "pass")):
             with self.subTest(reviews=reviews, bot=bot):
                 self.assertIn("no review at h3", self.gate(reviews, bot))
 
@@ -232,7 +233,7 @@ class ReviewGate(unittest.TestCase):
                 "author": {"login": "Karan-98-Mehta"}}
         with mock.patch.object(ship, "pr_info", return_value=info), mock.patch.object(ship, "say"), \
                 mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "no_conflicts"), \
-                mock.patch.object(ship, "green_head", return_value="h4"), mock.patch.object(ship, "refuse_unresolved"), \
+                mock.patch.object(ship, "green_head", return_value="h4"), \
                 mock.patch.object(ship, "gh") as gh, self.assertRaisesRegex(SystemExit, "neither the reviewed head"):
             ship.main(["onepeek-web#3", "--go"])
         gh.assert_not_called()
@@ -245,7 +246,8 @@ class Retarget(unittest.TestCase):  # F39: a pull request stacked on the merged 
 
     def merge(self, listed: str, edit_fails: bool = False, repo: str = "onepeek-web", base: str = "dev",
               merge_fails: str = "", head_ref: str = "fix/404-page") -> list[tuple]:
-        """`merge_fails`: "exit" makes `gh pr merge` fail, "state" leaves the pull request open after it."""
+        """`merge_fails`: "exit" makes `gh pr merge` fail, "state" leaves the pull request open after it, "read" makes
+        the read after it fail."""
         calls: list[tuple] = []
         start = dict(self.INFO, baseRefName=base, headRefName=head_ref)
 
@@ -259,10 +261,12 @@ class Retarget(unittest.TestCase):  # F39: a pull request stacked on the merged 
 
         def info(r, n):
             merged = any(c[:2] == ("pr", "merge") for c in calls) and merge_fails != "state"
+            if merged and merge_fails == "read":
+                raise SystemExit("STOP: `gh pr view 3 ...` failed: HTTP 502")
             return dict(start, state="MERGED", mergeCommit={"oid": "m1"}) if merged else start
         with mock.patch.object(ship, "pr_info", side_effect=info), mock.patch.object(ship, "say"), \
                 mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "no_conflicts"), \
-                mock.patch.object(ship, "green_head", return_value="h3"), mock.patch.object(ship, "refuse_unresolved"), \
+                mock.patch.object(ship, "green_head", return_value="h3"), \
                 mock.patch.object(ship, "remove_worktrees"), mock.patch.object(ship, "gh", side_effect=gh), \
                 mock.patch.object(ship, "wait_tag", return_value=("v9.9.9", "t1")), mock.patch.object(ship, "pin_moves", return_value=[]), \
                 mock.patch.object(ship, "retarget_stacked", REAL_RETARGET):
@@ -284,7 +288,7 @@ class Retarget(unittest.TestCase):  # F39: a pull request stacked on the merged 
         for repo, target in ((".github", "main"), ("onepeek-docs", "main"), ("marketing-website", "main"), ("onepeek-infra", "dev")):
             with self.subTest(repo=repo), mock.patch.object(ship, "say"), \
                     mock.patch.object(ship, "gh", side_effect=lambda *a: '[{"number": 7}]' if a[:2] == ("pr", "list") else "") as gh:
-                self.assertEqual(REAL_RETARGET(repo, 3, "b"), [f"{repo}#7"])
+                self.assertEqual(REAL_RETARGET(repo, 3, "b", ship.trunk(repo)), [f"{repo}#7"])
                 gh.assert_any_call("pr", "edit", "7", "-R", f"OnePeek/{repo}", "--base", target)
 
     def test_more_than_the_limit_stops_before_any_edit(self):
@@ -309,8 +313,9 @@ class Retarget(unittest.TestCase):  # F39: a pull request stacked on the merged 
                 raise SystemExit("HTTP 422")
             return '[{"number": 9}, {"number": 7}]' if args[:2] == ("pr", "list") else ""
         with mock.patch.object(ship, "gh", side_effect=gh), mock.patch.object(ship, "say"), \
-                self.assertRaisesRegex(SystemExit, "already retargeted to dev, move back to b: onepeek-web#7;"):
-            REAL_RETARGET("onepeek-web", 3, "b")
+                self.assertRaisesRegex(SystemExit, "already retargeted to dev, move back to b: onepeek-web#7; "
+                                       "onepeek-web#9 possibly retargeted, check its base; not merged"):
+            REAL_RETARGET("onepeek-web", 3, "b", "dev")
 
     def test_a_stacked_pull_request_is_retargeted_before_the_merge(self):
         calls = self.merge('[{"number": 9}, {"number": 7}]')
@@ -437,8 +442,10 @@ class PinMoves(unittest.TestCase):
         git_repo(self.root, "backend-service", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))
         git_repo(self.root, "onepeek-docs", "jobs:\n  s:\n" + USES.format(OLD, "v1.4.0"), base="main")
         git_repo(self.root, "mcp-athena", "jobs:\n  s:\n    uses: onepeek/.github/.github/workflows/x.yml@main\n")
-        git_repo(self.root, "marketing-website", "jobs:\n  s:\n    uses: OnePeek/.github-other/x.yml@main\n")
-        self.assertEqual(ship.callers(), ["backend-service", "mcp-athena", "onepeek-docs"])
+        git_repo(self.root, "marketing-website", "jobs:\n  s:\n    uses: OnePeek/.github-other/x.yml@main\n", base="main")
+        with mock.patch.object(ship, "expected_repos", return_value=["backend-service", "onepeek-docs", "mcp-athena",
+                                                                      "marketing-website"]):
+            self.assertEqual(ship.callers(), (["backend-service", "mcp-athena", "onepeek-docs"], []))
 
     def fake_gh(self, prs: list | None = None, calls: list | None = None):
         """`gh pr list` answers the open pull requests for the branch; `gh pr create` answers a new URL."""
@@ -560,8 +567,8 @@ class PinMoves(unittest.TestCase):
             if repo == "mcp-athena":
                 raise SystemExit("STOP: `git -C x push ...` failed: denied")
             done_for.append(repo)
-        with mock.patch.object(ship, "callers", return_value=["mcp-athena", "onepeek-web", "plugin-owl"]), \
-                mock.patch.object(ship, "open_pin_move", side_effect=open_pin_move):
+        with mock.patch.object(ship, "callers", return_value=(["mcp-athena", "onepeek-web", "plugin-owl"], [])), \
+                mock.patch.object(ship, "push_pin_move", side_effect=lambda r, t, s: open_pin_move(r, t, s) or ("pushed", "x")):
             failures = ship.pin_moves(set(), "v1.8.2", NEW)
         self.assertEqual(done_for, ["onepeek-web", "plugin-owl"])
         self.assertEqual(len(failures), 1)
@@ -703,8 +710,8 @@ class DeclaredDependencies(unittest.TestCase):
                 mock.patch.object(ship, "bump_pins", return_value=None), mock.patch.object(ship, "rerun_failed"), \
                 mock.patch.object(ship, "move_docs_pin", return_value=(None, True)), mock.patch.object(ship, "tested_bases", return_value=set()), \
                 mock.patch.object(ship.subprocess, "run", return_value=done(0, "onepeek-docs@" + "c" * 40)), \
-                mock.patch.object(ship, "callers", return_value=["backend-service", "onepeek-docs", "onepeek-web"]), \
-                mock.patch.object(ship, "open_pin_move", side_effect=lambda r, t, s: moved_to.append(r)):
+                mock.patch.object(ship, "callers", return_value=(["backend-service", "onepeek-docs", "onepeek-web"], [])), \
+                mock.patch.object(ship, "push_pin_move", side_effect=lambda r, t, s: moved_to.append(r) or ("pushed", "x")):
             self.assertEqual(ship.main(["onepeek-docs#1", ".github#2", "backend-service#3", "--go"]), 0)
         self.assertEqual(moved_to, ["onepeek-docs", "onepeek-web"])  # docs merged before .github; web is outside the set
 
@@ -1257,7 +1264,7 @@ class ConflictFlow(DocsPin):
 
 
 class ReviewThreads(unittest.TestCase):
-    """agent-operations.md §6.4 (F11): nothing merges while a review thread is unresolved."""
+    """unresolved_threads is read for ship_watch.py's report; no merge waits on a thread (ruling T-100)."""
 
     def test_each_unresolved_thread_is_named_by_path_and_line(self) -> None:
         calls = []
@@ -1269,18 +1276,12 @@ class ReviewThreads(unittest.TestCase):
         self.assertIn("n=60", args)
         self.assertIn("$endCursor", args[args.index("-f") + 1])
 
-    def test_no_unresolved_thread_passes_and_any_one_stops(self) -> None:
-        with mock.patch.object(ship, "gh", return_value=""):
-            ship.refuse_unresolved("x", 1)
-        with mock.patch.object(ship, "gh", return_value='["a.py",3]\n'), mock.patch.object(ship, "say") as said, \
-                self.assertRaises(SystemExit) as stop:
-            ship.refuse_unresolved("x", 1)
-        self.assertIn("1 unresolved review thread", str(stop.exception))
-        said.assert_any_call("x#1: unresolved review thread a.py:3")
+    def test_no_merge_code_reads_threads_any_more(self) -> None:  # T-100: the refusal is gone, not just unused
+        self.assertFalse(hasattr(ship, "refuse_unresolved"))
 
     def test_a_failed_query_stops(self) -> None:  # fail closed: gh() raises SystemExit on a non-zero exit
         with mock.patch.object(ship.subprocess, "run", return_value=done(1, "", "HTTP 502")), self.assertRaises(SystemExit):
-            ship.refuse_unresolved("x", 1)
+            ship.unresolved_threads("x", 1)
 
     @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
     def test_the_jq_filter_keeps_only_threads_not_resolved(self) -> None:
@@ -1298,24 +1299,29 @@ class ReviewThreads(unittest.TestCase):
         with mock.patch.object(ship, "gh", return_value=out):
             self.assertEqual(ship.unresolved_threads("x", 1), ["open.py:7", "outdated.py:9", "odd.py:2"])
 
-    def test_go_stops_before_the_merge_while_a_thread_is_unresolved(self) -> None:
-        merged = []
-        info = {"state": "OPEN", "baseRefName": "dev", "isDraft": False, "mergeable": "MERGEABLE", "headRefName": "b",
-                "headRefOid": "c" * 40, "body": "", "mergeCommit": None, "isCrossRepository": False}
+    def test_an_unresolved_thread_no_longer_stops_a_feature_merge_with_a_record(self) -> None:  # ruling T-100
+        merged, state = [], {"s": "OPEN"}
+        info = {"baseRefName": "dev", "isDraft": False, "mergeable": "MERGEABLE", "headRefName": "b",
+                "headRefOid": "c" * 40, "body": "Lane: feature", "mergeCommit": {"oid": "d" * 40}, "isCrossRepository": False,
+                "author": {"login": "Karan-98-Mehta"}}
 
         def gh(*args):
             if args[:2] == ("pr", "merge"):
                 merged.append(args)
+                state["s"] = "MERGED"
             if args[:2] == ("api", "graphql"):
                 return '["app/x.py",4]\n'
             return ""
-        with mock.patch.object(ship, "docs_pin_problems", return_value=[]), \
-                mock.patch.object(ship, "pr_info", return_value=info), mock.patch.object(ship, "gh", side_effect=gh), \
-                mock.patch.object(ship, "wait_green"), mock.patch.object(ship, "remove_worktrees"), \
-                self.assertRaises(SystemExit) as stop:
-            ship.main(["backend-service#2", "--go"])
-        self.assertIn("unresolved review thread", str(stop.exception))
-        self.assertEqual(merged, [])
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(ship.os.environ, {"ONEPEEK_WORKSPACE": tmp}), \
+                mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "review_gate", REAL_GATE), \
+                mock.patch.object(ship, "read_checks", return_value=[{"name": "CodeRabbit", "bucket": "pending"}]), \
+                mock.patch.object(ship, "pr_info", side_effect=lambda r, n: dict(info, state=state["s"])), \
+                mock.patch.object(ship, "gh", side_effect=gh), mock.patch.object(ship, "say"), \
+                mock.patch.object(ship, "wait_green"), mock.patch.object(ship, "remove_worktrees"):
+            (pathlib.Path(tmp) / ".ship").mkdir()
+            (pathlib.Path(tmp) / ".ship" / "reviews.json").write_text(json.dumps({"backend-service#2": "c" * 40}))
+            self.assertEqual(ship.main(["backend-service#2", "--go"]), 0)
+        self.assertEqual(len(merged), 1)
 
 
 if __name__ == "__main__":
@@ -1540,7 +1546,8 @@ class OpenDependencyNeedsADraft(unittest.TestCase):
 
 class HotfixLane(unittest.TestCase):
     """operating-model §3, ruling T-53: a `Lane: hotfix` pull request merges on green checks, without the review record
-    or the thread refusal; the lane is read from the body right before the merge, and anything else is feature."""
+    (unless it changes a review_required_paths path, ruling F43); the lane is read from the body right before the
+    merge, and anything else is feature. Threads block no lane (T-100)."""
 
     def test_only_a_plain_hotfix_line_outside_a_release_is_hotfix(self) -> None:
         for body, base, want in (("Lane: hotfix", "dev", True), ("<!-- hint -->\nLane: hotfix\nLane: feature", "main", True),
@@ -1555,6 +1562,7 @@ class HotfixLane(unittest.TestCase):
 
     def test_the_review_gate_passes_a_hotfix_without_a_review_or_coderabbit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(ship.os.environ, {"ONEPEEK_WORKSPACE": tmp}), \
+                mock.patch.object(ship, "pr_files", return_value=["scripts/check_pins.py"]), mock.patch.object(ship, "say"), \
                 mock.patch.object(ship, "read_checks", return_value=[{"name": "CodeRabbit", "bucket": "pending"}]):
             i = {"headRefOid": "h3", "baseRefName": "dev", "author": {"login": "Karan-98-Mehta"}}
             self.assertIsNone(REAL_GATE("onepeek-web", 3, dict(i, body="Lane: hotfix")))
@@ -1578,6 +1586,7 @@ class HotfixLane(unittest.TestCase):
             return '["app/x.py",4]\n' if args[:2] == ("api", "graphql") else ""
         with mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "pr_info", pr_info), \
                 mock.patch.object(ship, "gh", side_effect=gh), mock.patch.object(ship, "wait_green"), \
+                mock.patch.object(ship, "pr_files", return_value=["scripts/x.py"]), \
                 mock.patch.object(ship, "remove_worktrees"), mock.patch.object(ship, "say") as say:
             try:
                 rc = ship.main(["backend-service#2", "--go"])
@@ -1590,10 +1599,10 @@ class HotfixLane(unittest.TestCase):
         self.assertEqual((rc, len(merged)), (0, 1))
         self.assertIn("backend-service#2: Lane: hotfix, post-merge review due (operating-model §3)", said)
 
-    def test_a_docs_lane_still_refuses_an_unresolved_thread(self) -> None:  # ruling T-53 round 3: docs keeps the gates
-        rc, merged, _ = self.go(["Lane: docs"])
-        self.assertIn("unresolved review thread", rc)
-        self.assertEqual(merged, [])
+    def test_a_docs_lane_merges_past_a_thread_but_is_no_hotfix(self) -> None:  # T-100; T-53 round 3: docs keeps the gates
+        rc, merged, said = self.go(["Lane: docs"])
+        self.assertEqual((rc, len(merged)), (0, 1))
+        self.assertNotIn("backend-service#2: Lane: hotfix, post-merge review due (operating-model §3)", said)
 
     def test_the_lane_is_read_again_before_the_merge(self) -> None:  # hotfix when planned, feature by the merge
         for bodies in (["Lane: hotfix"] * 4 + ["Lane: feature"], ["Lane: feature"] * 4 + ["Lane: hotfix"]):
@@ -1605,7 +1614,7 @@ class HotfixLane(unittest.TestCase):
     def test_a_feature_head_pushed_by_the_tool_still_needs_the_review(self) -> None:  # review round 2, finding 3
         with mock.patch.object(ship, "green_head", side_effect=lambda *a, **k: ship.TOOL_PUSHED.setdefault("f" * 40, "c" * 40) and "f" * 40), \
                 mock.patch.dict(ship.TOOL_PUSHED, {}), \
-                mock.patch.object(ship, "refuse_unresolved"), mock.patch.object(ship, "no_conflicts"), \
+                mock.patch.object(ship, "no_conflicts"), \
                 mock.patch.object(ship, "review_gate", side_effect=[None, "backend-service#2: no review at cccc"]):  # plan, merge
             rc, merged, _ = self.go(["Lane: feature"])
         self.assertIn("no review at cccc", rc)
@@ -1787,3 +1796,399 @@ class HeadKeepsMoving(unittest.TestCase):
                 self.heads(moves, False)
             self.assertIn("head moved 5 times", str(e.exception))
             self.assertIn("0000000 -> 1111111 -> 2222222 -> 3333333 -> 4444444 -> 5555555", str(e.exception))
+
+
+def feature_info(**kw) -> dict:
+    return {"state": "OPEN", "baseRefName": "dev", "headRefName": "fix/x", "headRefOid": "c" * 40, "isDraft": False,
+            "mergeable": "MERGEABLE", "body": "Lane: hotfix", "isCrossRepository": False,
+            "headRepositoryOwner": {"login": "OnePeek"}, "author": {"login": "Karan-98-Mehta"},
+            "mergeCommit": {"oid": "d" * 40}, **kw}
+
+
+def go_once(info, files=None, reviews=None, gate=None, on_merge_read=None):
+    """main --go on backend-service#2. `info(k)` gives the pull request at its k-th read, `files` the pr_files answers
+    in turn, `reviews` the reviews.json content. Returns (exit code or STOP text, merge calls, lines said)."""
+    merged, reads, said = [], [0], []
+
+    def pr_info(r, n):
+        reads[0] += 1
+        i = info(reads[0])
+        return dict(i, state="MERGED") if merged else i
+
+    def gh(*args):
+        if args[:2] == ("pr", "merge"):
+            merged.append(args)
+        return ""
+    answers = list(files or [["scripts/x.py"]])
+
+    def pr_files(r, n):
+        a = answers.pop(0) if len(answers) > 1 else answers[0]
+        if isinstance(a, BaseException):
+            raise a
+        return a
+    with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(ship.os.environ, {"ONEPEEK_WORKSPACE": tmp}), \
+            mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "pr_info", pr_info), \
+            mock.patch.object(ship, "gh", side_effect=gh), mock.patch.object(ship, "wait_green"), \
+            mock.patch.object(ship, "review_gate", gate or REAL_GATE), \
+            mock.patch.object(ship, "pr_files", side_effect=pr_files), \
+            mock.patch.object(ship, "remove_worktrees"), mock.patch.object(ship, "say", side_effect=said.append):
+        (pathlib.Path(tmp) / ".ship").mkdir()
+        (pathlib.Path(tmp) / ".ship" / "reviews.json").write_text(json.dumps(reviews or {}))
+        try:
+            rc = ship.main(["backend-service#2", "--go"])
+        except SystemExit as e:
+            rc = str(e)
+    return rc, merged, said
+
+
+class ReviewRequiredPaths(unittest.TestCase):
+    """Ruling F43: a hotfix that changes a merge-tool or security path is reviewed before its merge."""
+
+    def required(self, files):
+        with mock.patch.object(ship, "pr_files", return_value=files):
+            return ship.review_required("x", 1)
+
+    def test_the_configured_globs_match_exactly_their_paths(self) -> None:
+        hits = ["workspace/ship_change_set.py", "workspace/ship_watch.py", "workspace/packet.py", "workspace/done_check.py",
+                ".github/workflows/ci.yml", ".github/workflows/sub/x.yaml", "bootstrap/main.tf", "bootstrap/a/b/c",
+                "iam.tf", "stacks/aws/iam_roles.tf", "modules/x/bucket_policy.tf", "policy.tf", "a/b/scp-policy-x.tf"]
+        misses = ["scripts/test_ship_change_set.py", "workspace/ship_change_set.pyc", "x/workspace/ship_change_set.py",
+                  "workspace/ship_watch.yaml", ".github/workflowsx/ci.yml", "github/workflows/ci.yml", "bootstrapper/x",
+                  "bootstrap", "stacks/iam.tf.json", "stacks/iam/main.tf", "docs/policy.md", "policy/main.tf",
+                  "WORKSPACE/SHIP_CHANGE_SET.PY", "workspace/ship_change_set.py\n.x"]
+        self.assertEqual(self.required(hits + misses), hits)
+
+    def test_glob_rules(self) -> None:
+        for glob, path, want in (("**/a.tf", "a.tf", True), ("**/a.tf", "x/y/a.tf", True), ("**/a.tf", "xa.tf", False),
+                                 ("d/**", "d/x", True), ("d/**", "d", False), ("*.tf", "x/y.tf", False),
+                                 ("a?.tf", "ab.tf", True), ("a?.tf", "a/.tf", False), ("a.b", "axb", False)):
+            with self.subTest(glob=glob, path=path):
+                self.assertIs(bool(ship.glob_re(glob).fullmatch(path)), want)
+
+    def test_a_missing_or_malformed_list_or_file_list_fails_closed(self) -> None:
+        for body in ("repos: [x]\n", "review_required_paths: []\n", "review_required_paths: ['']\n",
+                     "review_required_paths: x\n", "review_required_paths: [1]\n", "{"):
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as tmp:
+                cfg = pathlib.Path(tmp) / "c.yaml"
+                cfg.write_text(body)
+                with mock.patch.object(ship, "pr_files", return_value=["scripts/x.py"]), \
+                        self.assertRaisesRegex(SystemExit, "missing or malformed"):
+                    ship.review_required("x", 1, cfg)
+        for files, why in (([], "no changed files"), (["f"] * ship.PR_FILES_MAX, "cut the list short")):
+            with self.subTest(why=why), self.assertRaisesRegex(SystemExit, why):
+                self.required(files)
+        with mock.patch.object(ship.subprocess, "run", return_value=done(1, "", "HTTP 502")), self.assertRaises(SystemExit):
+            ship.review_required("x", 1)
+
+    def test_files_are_read_on_every_page_with_renames_under_both_names(self) -> None:
+        calls = []
+        out = '"workspace/new.py"\n"workspace/ship_change_set.py"\n"a b\\nc.py"\n'
+        with mock.patch.object(ship, "gh", side_effect=lambda *a: calls.append(a) or out):
+            self.assertEqual(ship.pr_files("x", 1), ["workspace/new.py", "workspace/ship_change_set.py", "a b\nc.py"])
+        self.assertEqual(calls[0][:3], ("api", "--paginate", "repos/OnePeek/x/pulls/1/files?per_page=100"))
+        if shutil.which("jq"):
+            jq = calls[0][calls[0].index("--jq") + 1]
+            page = [{"filename": "workspace/new.py", "previous_filename": "workspace/ship_change_set.py"},
+                    {"filename": "a b\nc.py"}]
+            got = subprocess.run(["jq", "-r", jq], input=json.dumps(page), check=True, capture_output=True, text=True).stdout
+            self.assertEqual(got, out)
+
+    def gate(self, files, reviews=None, body="Lane: hotfix"):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(ship.os.environ, {"ONEPEEK_WORKSPACE": tmp}), \
+                mock.patch.object(ship, "say"), mock.patch.object(ship, "pr_files",
+                                                                   side_effect=files if callable(files) else lambda r, n: files):
+            (pathlib.Path(tmp) / ".ship").mkdir()
+            (pathlib.Path(tmp) / ".ship" / "reviews.json").write_text(json.dumps(reviews or {}))
+            return REAL_GATE("onepeek-web", 3, {"headRefOid": "h3", "baseRefName": "dev", "body": body,
+                                                "author": {"login": "Karan-98-Mehta"}})
+
+    def test_a_hotfix_changing_a_required_path_needs_the_record_at_its_head(self) -> None:
+        self.assertIsNone(self.gate(["scripts/check_pins.py", "README.md"]))
+        why = self.gate(["README.md", "workspace/ship_change_set.py"])
+        self.assertIn("no review at h3 (a hotfix that needs a review: it changes workspace/ship_change_set.py "
+                      "(review_required_paths))", why)
+        self.assertIn("no review at h3", self.gate(["infra/iam.tf"], {"onepeek-web#3": "h2"}))
+        self.assertIsNone(self.gate(["infra/iam.tf"], {"onepeek-web#3": "h3"}))
+
+    def test_a_hotfix_whose_files_cannot_be_read_needs_the_record(self) -> None:
+        def broken(r, n):
+            raise SystemExit("STOP: `gh api --paginate ...` failed: HTTP 502")
+        for files in (broken, []):
+            with self.subTest(files=files):
+                self.assertIn("could not be checked", self.gate(files))
+        self.assertIsNone(self.gate(broken, {"onepeek-web#3": "h3"}))
+
+    def test_the_plan_stops_a_hotfix_changing_the_merge_tool(self) -> None:
+        rc, merged, said = go_once(lambda k: feature_info(), files=[["workspace/ship_change_set.py"]])
+        self.assertEqual((rc, merged), (1, []))
+        self.assertTrue(any(s.startswith("problem: backend-service#2: no review at") for s in said), said)
+        self.assertTrue(any("Lane: hotfix, but it changes workspace/ship_change_set.py" in s for s in said), said)
+
+    def test_the_files_are_read_again_right_before_the_merge(self) -> None:
+        rc, merged, _ = go_once(lambda k: feature_info(), files=[["scripts/x.py"], [".github/workflows/a.yml"]])  # plan, merge
+        self.assertIn("no review at", rc)
+        self.assertEqual(merged, [])
+        rc, merged, said = go_once(lambda k: feature_info(), files=[["scripts/x.py"]])
+        self.assertEqual((rc, len(merged)), (0, 1))
+        self.assertIn("backend-service#2: Lane: hotfix, post-merge review due (operating-model §3)", said)
+
+    def test_a_file_read_error_right_before_the_merge_needs_the_record(self) -> None:  # fail closed at the merge too
+        rc, merged, _ = go_once(lambda k: feature_info(), files=[["scripts/x.py"], SystemExit("HTTP 502")])
+        self.assertIn("could not be checked", rc)
+        self.assertEqual(merged, [])
+
+    def test_a_reviewed_hotfix_on_a_required_path_merges_with_no_review_due_line(self) -> None:
+        rc, merged, said = go_once(lambda k: feature_info(), files=[["workspace/packet.py"]],
+                                   reviews={"backend-service#2": "c" * 40})
+        self.assertEqual((rc, len(merged)), (0, 1))
+        self.assertNotIn("backend-service#2: Lane: hotfix, post-merge review due (operating-model §3)", said)
+
+
+class BatchMerge(unittest.TestCase):
+    """Ruling T-98: a batch pull request merges with a merge commit, so each task commit stays revertable."""
+
+    def test_method_by_head_branch(self) -> None:
+        for head, want in (("batch/2026-11-07", "--merge"), ("process/2026-11-07", "--merge"), ("feat/x", "--squash"),
+                           ("processing/x", "--squash"), ("feat/batch/x", "--squash"), ("Batch/x", "--squash"),
+                           ("batch", "--squash"), ("", "--squash"), (None, "--squash")):
+            with self.subTest(head=head):
+                self.assertEqual(ship.merge_method("backend-service", "dev", head), want)
+        self.assertEqual(ship.merge_method(".github", "main", "process/2026-11-07"), "--merge")
+        self.assertEqual(ship.merge_method(".github", "main", "fix/x"), "--squash")
+
+    def test_go_merges_a_batch_with_a_merge_commit_and_says_so_in_the_plan(self) -> None:
+        rc, merged, said = go_once(lambda k: feature_info(headRefName="process/2026-11-07"))
+        self.assertEqual(rc, 0)
+        self.assertIn("--merge", merged[0])
+        self.assertNotIn("--squash", merged[0])
+        self.assertIn("plan: backend-service#2 (merge into dev)", said)
+
+
+class BaseChange(unittest.TestCase):
+    """T-94: the base is read again with the body right before the merge; a change since the plan stops."""
+
+    def test_a_base_changed_since_the_plan_stops_before_the_merge(self) -> None:
+        reads = []
+
+        def info(k):
+            reads.append(k)
+            return feature_info(baseRefName="dev" if k == 1 else "main")
+        with mock.patch.object(ship, "green_head", return_value="c" * 40), mock.patch.object(ship, "no_conflicts"):
+            rc, merged, _ = go_once(info)
+        self.assertIn("STOP backend-service#2: the base changed since the plan (dev -> main)", rc)
+        self.assertEqual(merged, [])
+
+    def test_a_missing_base_stops_too(self) -> None:
+        def info(k):
+            i = feature_info()
+            return i if k == 1 else {x: v for x, v in i.items() if x != "baseRefName"}
+        with mock.patch.object(ship, "green_head", return_value="c" * 40), mock.patch.object(ship, "no_conflicts"):
+            rc, merged, _ = go_once(info)
+        self.assertIn("the base changed since the plan (dev -> None)", rc)
+        self.assertEqual(merged, [])
+
+
+class RetargetMessages(Retarget):
+    """T-72c: the retarget STOPs say what may have happened; the target base is computed once."""
+
+    def test_a_failed_read_after_the_merge_says_check_the_merge_state_and_lists_the_retargeted(self) -> None:
+        with self.assertRaises(SystemExit) as stop:
+            self.merge('[{"number": 7}]', merge_fails="read")
+        self.assertIn("could not read it after the merge (STOP: `gh pr view 3 ...` failed: HTTP 502); check the merge "
+                      "state first; if it did not merge, onepeek-web#7 were retargeted to dev before it: move them back "
+                      "to fix/404-page", str(stop.exception))
+        with self.assertRaisesRegex(SystemExit, r"check the merge state first; nothing after it is merged$"):
+            self.merge("[]", merge_fails="read")
+
+    def test_the_failed_edit_is_named_as_possibly_retargeted(self) -> None:
+        with self.assertRaisesRegex(SystemExit, r"\(STOP: `gh pr edit 7 \.\.\.` failed: HTTP 422\); onepeek-web#7 possibly "
+                                                r"retargeted, check its base; not merged"):
+            self.merge('[{"number": 7}]', edit_fails=True)
+        with mock.patch.object(ship, "gh", return_value="not json"), mock.patch.object(ship, "say"), \
+                self.assertRaises(SystemExit) as stop:
+            REAL_RETARGET("onepeek-web", 3, "b", "dev")
+        self.assertNotIn("possibly", str(stop.exception))  # nothing was being edited
+
+    def test_the_target_base_is_computed_once_and_used_for_the_edit_and_the_message(self) -> None:
+        with mock.patch.object(ship, "trunk", side_effect=["dev-x"]) as trunk, \
+                self.assertRaisesRegex(SystemExit, "onepeek-web#7 were retargeted to dev-x before it"):
+            calls = self.merge('[{"number": 7}]', merge_fails="exit")
+        self.assertEqual(trunk.call_count, 1)
+        with mock.patch.object(ship, "trunk", side_effect=["dev-x"]):
+            calls = self.merge('[{"number": 7}]')
+        self.assertIn(("pr", "edit", "7", "-R", "OnePeek/onepeek-web", "--base", "dev-x"), calls)
+        self.assertEqual([ship.trunk(r) for r in ("onepeek-docs", ".github", "marketing-website", "onepeek-infra")],
+                         ["main", "main", "main", "dev"])
+
+
+class DirectPinPush(unittest.TestCase):
+    """Ruling T-86: after a .github merge a pure pin move is pushed straight to each caller's trunk and recorded for the
+    watcher; anything else falls back to a pull request; release is never touched; a skipped caller fails the run."""
+
+    def setUp(self) -> None:
+        self.root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        for p in (mock.patch.object(ship, "ROOT", self.root), mock.patch.object(ship, "say"),
+                  mock.patch.dict(ship.os.environ, {"ONEPEEK_WORKSPACE": str(self.root)})):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def bare(self, repo: str) -> str:
+        return str(self.root / "origins" / f"{repo}.git")
+
+    def rev(self, repo: str, ref: str) -> str:
+        return sh("git", "--git-dir", self.bare(repo), "rev-parse", ref).strip()
+
+    def records(self) -> list[dict]:
+        f = self.root / ".ship" / "direct-pushes.jsonl"
+        return [json.loads(x) for x in f.read_text().splitlines()] if f.exists() else []
+
+    def test_a_pure_pin_move_is_pushed_to_the_trunk_read_back_and_recorded(self) -> None:
+        for repo, base in (("onepeek-web", "dev"), ("onepeek-docs", "main"), ("marketing-website", "main")):
+            with self.subTest(repo=repo):
+                git_repo(self.root, repo, "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0") + "  t:\n" + USES.format(OLD, "v1.7.0"),
+                         base=base)
+                before = self.rev(repo, base)
+                with mock.patch.object(ship, "gh") as gh:
+                    how, new = ship.push_pin_move(repo, "v1.8.2", NEW)
+                gh.assert_not_called()  # no pull request
+                self.assertEqual((how, self.rev(repo, base)), ("pushed", new))
+                self.assertEqual(self.rev(repo, f"{new}^"), before)  # one plain commit on top, never forced
+                text = sh("git", "--git-dir", self.bare(repo), "show", f"{base}:.github/workflows/ci.yml")
+                self.assertEqual(text.count(f"@{NEW} # v1.8.2"), 2)
+                self.assertEqual(sh("git", "--git-dir", self.bare(repo), "for-each-ref", "--format=%(refname)").split(),
+                                 [f"refs/heads/{base}"])
+                row = self.records()[-1]
+                self.assertEqual({k: row[k] for k in ("repo", "branch", "sha", "parent", "tag")},
+                                 {"repo": repo, "branch": base, "sha": new, "parent": before, "tag": "v1.8.2"})
+                self.assertRegex(row["verify_after"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+
+    def test_anything_but_pinned_uses_lines_falls_back_to_a_pull_request(self) -> None:
+        for name, workflow in (("untagged", "    uses: OnePeek/.github/.github/workflows/x.yml@main\n"),
+                               ("text after the tag", USES.format(OLD, "v1.7.0").rstrip("\n") + " (keep)\n"),
+                               ("quoted", f"    uses: \"OnePeek/.github/.github/workflows/x.yml@{OLD}\" # v1.7.0\n"),
+                               ("lower case", f"    uses: onepeek/.github/.github/workflows/x.yml@{OLD} # v1.7.0\n"),
+                               ("no comment", f"    uses: OnePeek/.github/.github/workflows/x.yml@{OLD}\n")):
+            with self.subTest(name=name):
+                repo = f"r-{name.replace(' ', '-')}"
+                git_repo(self.root, repo, "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0") + workflow)
+                before = self.rev(repo, "dev")
+                how, why = ship.push_pin_move(repo, "v1.8.2", NEW)
+                self.assertEqual(how, "not pure")
+                self.assertEqual(self.rev(repo, "dev"), before)
+                self.assertEqual(self.records(), [])
+        opened = []
+        with mock.patch.object(ship, "callers", return_value=(["r-untagged", "onepeek-web"], [])), \
+                mock.patch.object(ship, "push_pin_move", side_effect=lambda r, t, s: ("not pure", "x") if r == "r-untagged"
+                                  else ("pushed", "y")), \
+                mock.patch.object(ship, "open_pin_move", side_effect=lambda r, t, s: opened.append(r)):
+            self.assertEqual(ship.pin_moves(set(), "v1.8.2", NEW), [])
+        self.assertEqual(opened, ["r-untagged"])
+
+    def test_pure_pin_diff_refuses_other_files_and_unpaired_or_reshaped_lines(self) -> None:
+        src = git_repo(self.root, "onepeek-web", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))
+        base = sh("git", "-C", str(src), "rev-parse", "HEAD").strip()
+        wf = src / ".github/workflows/ci.yml"
+        for name, edit, extra, want in (
+                ("pure", USES.format(NEW, "v1.8.2"), None, None),
+                ("other file", USES.format(NEW, "v1.8.2"), "README.md", "it changes README.md"),
+                ("other path", USES.format(NEW, "v1.8.2").replace("secret-scan", "osv-scan"), None, "more than its sha"),
+                ("other sha", USES.format("c" * 40, "v1.8.2"), None, "not bbbbbbb # v1.8.2"),
+                ("other tag", USES.format(NEW, "v1.8.3"), None, "not bbbbbbb # v1.8.2"),
+                ("extra pin", USES.format(NEW, "v1.8.2") * 2, None, "1 line(s) removed but 2 added"),
+                ("prose", USES.format(NEW, "v1.8.2") + "    run: echo hi\n", None, "not a pinned `uses:` line"),
+                ("indent", "  " + USES.format(NEW, "v1.8.2"), None, "more than its sha")):
+            with self.subTest(name=name):
+                sh("git", "-C", str(src), "reset", "-q", "--hard", base)
+                wf.write_text("jobs:\n  s:\n" + edit)
+                if extra:
+                    (src / extra).write_text("x")
+                sh("git", "-C", str(src), "add", "-A")
+                sh("git", "-C", str(src), "commit", "-q", "-m", name)
+                why = ship.pure_pin_diff(src, base, "v1.8.2", NEW)
+                if want is None:
+                    self.assertIsNone(why)
+                else:
+                    self.assertIn(want, why or "")
+
+    def test_release_is_never_touched(self) -> None:
+        src = git_repo(self.root, "backend-service", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))
+        sh("git", "-C", str(src), "push", "-q", "origin", "dev:refs/heads/release")
+        release = self.rev("backend-service", "release")
+        ship.push_pin_move("backend-service", "v1.8.2", NEW)
+        self.assertEqual(self.rev("backend-service", "release"), release)
+        self.assertNotEqual(self.rev("backend-service", "dev"), release)
+        for bad in ("release", "feat/x"):
+            with self.subTest(trunk=bad), mock.patch.object(ship, "trunk", return_value=bad), \
+                    self.assertRaisesRegex(SystemExit, f"refusing a direct pin push to {bad}"):
+                ship.push_pin_move("backend-service", "v1.8.3", "c" * 40)
+        self.assertEqual(self.rev("backend-service", "release"), release)
+
+    def test_a_trunk_that_moved_is_never_overwritten_and_not_recorded(self) -> None:
+        git_repo(self.root, "onepeek-web", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))
+        real_git, theirs = ship.git, []
+
+        def git(cwd, *args):
+            if args[:1] == ("push",) and not theirs:
+                other = self.root / "other"
+                sh("git", "clone", "-q", "-b", "dev", self.bare("onepeek-web"), str(other))
+                sh("git", "-C", str(other), "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q",
+                   "--allow-empty", "-m", "someone else")
+                sh("git", "-C", str(other), "push", "-q", "origin", "HEAD")
+                theirs.append(sh("git", "-C", str(other), "rev-parse", "HEAD").strip())
+            return real_git(cwd, *args)
+        with mock.patch.object(ship, "git", side_effect=git), self.assertRaises(SystemExit):
+            ship.push_pin_move("onepeek-web", "v1.8.2", NEW)
+        self.assertEqual(self.rev("onepeek-web", "dev"), theirs[0])
+        self.assertEqual(self.records(), [])
+
+    def test_a_push_the_remote_does_not_show_is_a_failure_and_not_recorded(self) -> None:
+        git_repo(self.root, "onepeek-web", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))
+        real_git = ship.git
+
+        def git(cwd, *args):
+            return "f" * 40 + "\trefs/heads/dev\n" if args[:1] == ("ls-remote",) else real_git(cwd, *args)
+        with mock.patch.object(ship, "git", side_effect=git), self.assertRaisesRegex(SystemExit, "but the remote dev is fffffff"):
+            ship.push_pin_move("onepeek-web", "v1.8.2", NEW)
+        self.assertEqual(self.records(), [])
+
+    def test_already_at_the_tag_pushes_nothing(self) -> None:
+        git_repo(self.root, "onepeek-web", "jobs:\n  s:\n" + USES.format(NEW, "v1.8.2"))
+        before = self.rev("onepeek-web", "dev")
+        self.assertEqual(ship.push_pin_move("onepeek-web", "v1.8.2", NEW), ("current", None))
+        self.assertEqual((self.rev("onepeek-web", "dev"), self.records()), (before, []))
+
+    def test_every_repo_it_could_not_check_is_listed_and_fails_the_run(self) -> None:
+        git_repo(self.root, "onepeek-web", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))
+        git_repo(self.root, "plugin-owl", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"), base="main")  # no dev to fetch
+        with mock.patch.object(ship, "expected_repos", return_value=["onepeek-web", "mcp-athena", "plugin-owl"]):
+            found, skipped = ship.callers()
+            self.assertEqual(found, ["onepeek-web"])
+            self.assertEqual([s.split(":")[0] for s in skipped], ["mcp-athena", "plugin-owl"])
+            failures = ship.pin_moves(set(), "v1.8.2", NEW)
+        self.assertEqual([f.split(":")[0] for f in failures], ["skipped mcp-athena", "skipped plugin-owl"])
+        self.assertEqual(self.records()[0]["repo"], "onepeek-web")  # the others still got the move
+        with mock.patch.object(ship, "expected_repos", return_value=None):
+            self.assertIn("every repo", ship.callers()[1][0])
+        for body in ("authors: [x]\n", "repos: []\n", "repos: [1]\n"):
+            with self.subTest(body=body):
+                cfg = self.root / "c.yaml"
+                cfg.write_text(body)
+                self.assertIsNone(ship.expected_repos(cfg))
+        self.assertIn("backend-service", ship.expected_repos(ship.CONFIG[0]))
+        self.assertNotIn(".github", ship.expected_repos(ship.CONFIG[0]))
+
+    def test_a_grep_error_is_a_skip_never_not_a_caller(self) -> None:
+        git_repo(self.root, "onepeek-web", "jobs:\n  s:\n" + USES.format(OLD, "v1.7.0"))
+        real = subprocess.run
+
+        def run(cmd, **kw):
+            return done(128, "", "fatal: bad object") if "grep" in cmd else real(cmd, **kw)
+        with mock.patch.object(ship, "expected_repos", return_value=["onepeek-web"]), \
+                mock.patch.object(ship.subprocess, "run", side_effect=run):
+            self.assertEqual(ship.callers(), ([], ["onepeek-web: cannot search dev: fatal: bad object"]))
+
+    def test_main_fails_the_run_when_a_caller_was_skipped(self) -> None:
+        with mock.patch.object(ship, "callers", return_value=([], ["mcp-athena: not checked out in /x"])):
+            failures = ship.pin_moves(set(), "v1.8.2", NEW)
+        self.assertEqual(failures, ["skipped mcp-athena: not checked out in /x"])
