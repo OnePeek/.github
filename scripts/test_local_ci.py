@@ -6,8 +6,11 @@ import re
 import os
 import pathlib
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -498,6 +501,336 @@ class GithubRepoJobs(unittest.TestCase):
         with contextlib.redirect_stdout(buf), mock.patch.object(lc, "uv_problem", return_value=""):
             self.assertEqual(lc.main([str(ROOT), "--list", "--jobs", "service-list"]), 0)
         self.assertIn("workflow-lint.yml:service-list: Tests, then the drift check\n", buf.getvalue())
+
+
+# --- Foundation playbook §8c: L1 to L4 ---------------------------------------------------------------------------------
+def make_repo_with(workflow: str) -> pathlib.Path:
+    return LocalCi.repo(None, workflow)
+
+
+def job_yaml(*steps: str) -> str:
+    body = "".join(f"      - run: |\n{''.join('          ' + ln + chr(10) for ln in st.splitlines())}" for st in steps)
+    return f"on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n{body}"
+
+
+class CommentsL1(unittest.TestCase):
+    """L1: skip patterns are matched with shell comments removed; a skipped `terraform test` is never silent."""
+
+    def bin_with_terraform(self, marker: pathlib.Path) -> str:
+        b = pathlib.Path(tempfile.mkdtemp())
+        (b / "terraform").write_text(f"#!/bin/sh\necho \"$@\" >> {marker}\n", encoding="utf-8")
+        (b / "terraform").chmod(0o755)
+        return f"{b}:{os.environ['PATH']}"
+
+    def run_main(self, steps, *args, path=None):
+        d = make_repo_with(job_yaml(*steps))
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"PATH": path or os.environ["PATH"]}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = lc.main([str(d), "--jobs", "a", *args])
+        return rc, out.getvalue(), err.getvalue(), d
+
+    def test_strip_comments_cases(self):
+        self.assertEqual(lc.strip_comments("# aws s3 ls\nls"), "\nls")
+        self.assertEqual(lc.strip_comments("ls # aws s3 ls"), "ls ")
+        self.assertEqual(lc.strip_comments('echo "#aws "'), 'echo "#aws "')
+        self.assertEqual(lc.strip_comments("echo '#aws ' x"), "echo '#aws ' x")
+        self.assertEqual(lc.strip_comments('echo "unclosed # aws s3'), 'echo "unclosed # aws s3')
+
+    def test_a_hash_inside_a_word_is_not_a_comment(self):
+        # shlex comment mode would hide the aws command here; the shell does not treat url#fragment as a comment.
+        cmd = "echo url#fragment; aws s3 rm x"
+        self.assertEqual(lc.strip_comments(cmd), cmd)
+        self.assertTrue(lc.REMOTE.search(lc.strip_comments(cmd)))
+        rc, out, _, d = self.run_main([cmd + "; touch ran"])
+        self.assertEqual(rc, 0)
+        self.assertFalse((d / "ran").exists())
+        self.assertIn("needs GitHub or AWS", out)
+
+    def test_a_comment_mentioning_aws_does_not_skip_the_terraform_test_step(self):
+        marker = pathlib.Path(tempfile.mkdtemp()) / "calls"
+        step = "# no aws credentials are needed: init uses -backend=false\nterraform -chdir=. init -backend=false -input=false\nterraform -chdir=. test"
+        rc, out, _, _ = self.run_main([step], path=self.bin_with_terraform(marker))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(marker.read_text(encoding="utf-8").splitlines(), ["-chdir=. init -backend=false -input=false", "-chdir=. test"])
+
+    def test_code_that_calls_aws_is_still_skipped(self):
+        rc, out, _, d = self.run_main(["touch ran\naws s3 ls"])
+        self.assertEqual(rc, 0)
+        self.assertFalse((d / "ran").exists())
+
+    def test_a_hash_inside_quotes_is_code(self):
+        rc, _, _, d = self.run_main(['echo "#aws "; touch ran'])
+        self.assertEqual(rc, 0)
+        self.assertTrue((d / "ran").exists())
+
+    def test_release_fails_on_a_skipped_terraform_test_and_otherwise_warns_and_lists_it_first(self):
+        step = "terraform -chdir=. test\naws s3 ls"
+        rc, out, err, _ = self.run_main([step, "gh api repos/x"], "--release")
+        self.assertEqual(rc, 1)
+        self.assertIn("terraform test skipped", out)
+        rc, out, err, _ = self.run_main(["gh api repos/x", step])
+        self.assertEqual(rc, 0)
+        self.assertIn("WARN", err + out)
+        self.assertIn("terraform test skipped", err + out)
+        listed = out.split("Skipped (CI runs these):")[1].splitlines()
+        self.assertIn("terraform test skipped", listed[1])
+
+
+class LinuxContainerL2(unittest.TestCase):
+    def test_which_steps_run_in_the_container(self):
+        for code in ("python3 -m unittest discover -s scripts -p 'test_*.py'", "python -m pytest scripts/", "bash scripts/t.sh",
+                     "scripts/run.sh --x", "cd x && ./check.sh"):
+            self.assertTrue(lc.wants_linux(code), code)
+        for code in ("npx eslint .", "terraform fmt -check", "python3 scripts/tool.py", "echo hello # bash x"):
+            self.assertFalse(lc.wants_linux(lc.strip_comments(code)), code)
+
+    def test_the_image_tag_is_the_hash_of_the_dockerfile(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        f = d / "Dockerfile"
+        f.write_text("FROM x\n", encoding="utf-8")
+        first = lc.image_tag(f)
+        self.assertEqual(lc.image_tag(f), first)
+        f.write_text("FROM y\n", encoding="utf-8")
+        self.assertNotEqual(lc.image_tag(f), first)
+        self.assertRegex(lc.image_tag(), r"^onepeek-local-ci:[0-9a-f]{16}$")
+
+    def test_the_dockerfile_pins_its_base_by_digest(self):
+        text = (ROOT / "workspace/local-ci/Dockerfile").read_text(encoding="utf-8")
+        self.assertRegex(text, r"(?m)^FROM public\.ecr\.aws/ubuntu/ubuntu@sha256:[0-9a-f]{64}$")
+
+    def run_darwin(self, *args, docker=True):
+        d = make_repo_with(job_yaml("python3 -m unittest discover -s scripts", "npx eslint ."))
+        seen = []
+
+        def fake_step(cmd, cwd, env, shell, linux=None):
+            seen.append((cmd.split()[0], linux))
+            return 0, "", 0.0
+        out = io.StringIO()
+        with mock.patch.object(lc.platform, "system", return_value="Darwin"), mock.patch.object(lc, "docker_ready", return_value=docker), \
+                mock.patch.object(lc, "ensure_image", return_value="img:1"), mock.patch.object(lc, "run_step", fake_step), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = lc.main([str(d), "--jobs", "a", *args])
+        return rc, seen, out.getvalue()
+
+    def test_only_script_tests_run_in_the_container_on_macos(self):
+        rc, seen, _ = self.run_darwin()
+        self.assertEqual(rc, 0)
+        self.assertEqual([(c, bool(l)) for c, l in seen], [("python3", True), ("npx", False)])
+        self.assertEqual(seen[0][1][1], "img:1")
+
+    def test_native_turns_it_off(self):
+        _, seen, _ = self.run_darwin("--native")
+        self.assertEqual([bool(l) for _, l in seen], [False, False])
+
+    def test_without_docker_release_fails_and_otherwise_runs_natively(self):
+        self.assertEqual(self.run_darwin("--release", docker=False)[0], 1)
+        rc, seen, _ = self.run_darwin(docker=False)
+        self.assertEqual(rc, 0)
+        self.assertEqual([bool(l) for _, l in seen], [False, False])
+
+    def test_linux_is_not_used_off_macos(self):
+        d = make_repo_with(job_yaml("python3 -m unittest discover -s scripts"))
+        calls = []
+        with mock.patch.object(lc.platform, "system", return_value="Linux"), \
+                mock.patch.object(lc, "run_step", lambda *a: calls.append(a) or (0, "", 0.0)), contextlib.redirect_stdout(io.StringIO()):
+            lc.main([str(d), "--jobs", "a"])
+        self.assertEqual(len(calls), 1)
+
+    @unittest.skipUnless(shutil.which("docker") and subprocess.run(["docker", "info"], capture_output=True).returncode == 0, "Docker is needed")
+    def test_the_container_has_bash_5(self):
+        repo = pathlib.Path(tempfile.mkdtemp())
+        rc, out, _ = lc.container_step('echo "bash=${BASH_VERSINFO[0]}"; echo "x=$FOO"', repo, {"FOO": "bar"}, repo, {}, False, lc.ensure_image())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("bash=5", out)
+        self.assertIn("x=bar", out)
+
+
+class BuildImageL3(unittest.TestCase):
+    def build_step(self, **with_):
+        return {"uses": "docker/build-push-action@abc # v6", "with": {"context": ".", "load": True, "push": False,
+                                                                      "tags": "lci-test:boot", **with_}}
+
+    def test_a_load_build_is_translated(self):
+        step = self.build_step(file="images/Dockerfile", platforms="linux/arm64", **{"build-args": "A=1\nB=${{ github.sha }}"})
+        argv, env, tags = lc.build_command(step, {}, {"github.sha": "abc123"}, pathlib.Path("."), ".")
+        self.assertEqual(tags, ["lci-test:boot"])
+        self.assertEqual(argv[:4], ["docker", "buildx", "build", "--load"])
+        for pair in (["-t", "lci-test:boot"], ["-f", "images/Dockerfile"], ["--platform", "linux/arm64"], ["--build-arg", "A=1"], ["--build-arg", "B=abc123"]):
+            self.assertTrue(any(argv[i:i + 2] == pair for i in range(len(argv))), pair)
+        self.assertEqual(argv[-1], ".")
+
+    def test_what_cannot_be_translated_is_refused(self):
+        for step in (self.build_step(push=True), self.build_step(**{"made-up": "x"}), self.build_step(tags="${{ steps.m.outputs.tags }}"),
+                     self.build_step(secrets="npm_token=${{ secrets.NODE_AUTH_TOKEN }}")):
+            with mock.patch.object(lc, "packages_token", return_value=""), self.assertRaises(ValueError):
+                lc.build_command(step, {}, {}, pathlib.Path("."), ".")
+
+    def test_an_npm_token_secret_comes_from_the_gh_login(self):
+        with mock.patch.object(lc, "packages_token", return_value="tok"):
+            argv, env, _ = lc.build_command(self.build_step(secrets="npm_token=${{ secrets.NODE_AUTH_TOKEN }}"), {}, {}, pathlib.Path("."), ".")
+        self.assertIn("id=npm_token,env=LOCAL_CI_SECRET_NPM_TOKEN", argv)
+        self.assertEqual(env, {"LOCAL_CI_SECRET_NPM_TOKEN": "tok"})
+        self.assertNotIn("tok", argv)
+
+    def job(self, build):
+        wf = ("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: docker/build-push-action@abc\n        with:\n"
+              + "".join(f"          {k}: {v}\n" for k, v in build.items())
+              + "      - run: |\n          echo lci-test:boot\n          touch ran\n")
+        return make_repo_with(wf)
+
+    def run_main(self, d, *args, build_rc=0):
+        calls = []
+        real = subprocess.run
+
+        def fake(argv, *a, **k):
+            if isinstance(argv, list) and argv[:3] in (["docker", "image", "rm"], ["docker", "buildx", "build"]):
+                calls.append(argv[:3] + [argv[-1]])
+                return subprocess.CompletedProcess(argv, build_rc if argv[2] == "build" else 0, "", "")
+            return real(argv, *a, **k)
+        out = io.StringIO()
+        with mock.patch.object(lc.subprocess, "run", fake), mock.patch.object(lc, "docker_ready", return_value=True), contextlib.redirect_stdout(out):
+            rc = lc.main([str(d), "--jobs", "a", *args])
+        return rc, calls, out.getvalue()
+
+    def test_the_tag_is_removed_then_built_and_the_next_step_runs(self):
+        d = self.job({"context": ".", "load": "true", "push": "false", "tags": "lci-test:boot"})
+        rc, calls, out = self.run_main(d)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(calls[0], ["docker", "image", "rm", "lci-test:boot"])
+        self.assertEqual(calls[1][:3], ["docker", "buildx", "build"])
+        self.assertTrue((d / "ran").exists())
+
+    def test_a_failed_build_fails_the_run(self):
+        d = self.job({"load": "true", "push": "false", "tags": "lci-test:boot"})
+        self.assertEqual(self.run_main(d, build_rc=1)[0], 1)
+        self.assertFalse((d / "ran").exists())
+
+    def test_an_untranslatable_build_removes_its_tag_and_skips_the_steps_that_use_it(self):
+        for build in ({"push": "true", "tags": "lci-test:boot"}, {"load": "true", "push": "false", "tags": "lci-test:boot", "made-up": "1"}):
+            d = self.job(build)
+            rc, calls, out = self.run_main(d)
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(calls, [["docker", "image", "rm", "lci-test:boot"]])
+            self.assertFalse((d / "ran").exists())
+            self.assertIn("needs the image a skipped build makes", out)
+
+    def test_skip_docker_never_leaves_a_stale_image_standing_in(self):
+        d = self.job({"load": "true", "push": "false", "tags": "lci-test:boot"})
+        rc, calls, out = self.run_main(d, "--skip-docker")
+        self.assertEqual(calls, [["docker", "image", "rm", "lci-test:boot"]])
+        self.assertFalse((d / "ran").exists())
+
+
+class SharedPinL4(unittest.TestCase):
+    """L4: the shared workflows are read at the caller's pin, not from whatever the shared checkout is on."""
+
+    def git(self, cwd, *args):
+        r = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip()
+
+    def shared_wf(self, code: str) -> str:
+        return f"on:\n  workflow_call:\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: {code}\n"
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.origin = self.tmp / "origin.git"
+        self.git(self.tmp, "init", "-q", "--bare", "-b", "main", str(self.origin))
+        self.ws = self.tmp / "ws"
+        self.ws.mkdir()
+        self.shared = self.ws / ".github"
+        self.git(self.ws, "clone", "-q", str(self.origin), str(self.shared))
+        (self.shared / ".github/workflows").mkdir(parents=True)
+        self.wf = self.shared / ".github/workflows/w.yml"
+        self.wf.write_text(self.shared_wf("exit 0"), encoding="utf-8")
+        self.git(self.shared, "add", "-A")
+        self.git(self.shared, "commit", "-qm", "A")
+        self.A = self.git(self.shared, "rev-parse", "HEAD")
+        self.wf.write_text(self.shared_wf("exit 1"), encoding="utf-8")
+        self.git(self.shared, "commit", "-qam", "B")
+        self.B = self.git(self.shared, "rev-parse", "HEAD")
+        self.git(self.shared, "push", "-q", "origin", "main")
+        self.old = lc.WORKSPACE
+        lc.WORKSPACE = self.ws
+        lc._SHARED.clear()
+
+    def tearDown(self):
+        lc.cleanup_shared()
+        lc.WORKSPACE = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def caller(self, pin: str) -> pathlib.Path:
+        wf = f"on: [pull_request]\njobs:\n  c:\n    uses: OnePeek/.github/.github/workflows/w.yml@{pin} # v1\n"
+        return make_repo_with(wf)
+
+    def run_main(self, d, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.dict(os.environ, {"ONEPEEK_SHARED_GITHUB": ""}):
+            rc = lc.main([str(d), *args])
+        return rc, out.getvalue()
+
+    def test_the_pin_decides_not_the_checkout(self):
+        self.assertEqual(self.git(self.shared, "rev-parse", "HEAD"), self.B)
+        self.assertEqual(self.run_main(self.caller(self.A))[0], 0)
+        self.assertEqual(self.run_main(self.caller(self.B))[0], 1)
+
+    def test_shared_reads_the_given_worktree_and_says_so(self):
+        d = self.caller(self.A)
+        rc, out = self.run_main(d, "--shared", str(self.shared))
+        self.assertEqual(rc, 1)
+        self.assertIn(f"shared workflows from {self.shared.resolve()} (main {self.B[:7]}), not the pin", out)
+
+    def test_the_environment_variable_does_the_same(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.dict(os.environ, {"ONEPEEK_SHARED_GITHUB": str(self.shared)}):
+            rc = lc.main([str(self.caller(self.A))])
+        self.assertEqual(rc, 1)
+        self.assertIn("not the pin", out.getvalue())
+
+    def test_a_pin_missing_locally_is_fetched_and_an_unknown_one_fails(self):
+        other = self.tmp / "other"
+        self.git(self.tmp, "clone", "-q", str(self.origin), str(other))
+        (other / ".github/workflows/w.yml").write_text(self.shared_wf("exit 0"), encoding="utf-8")
+        self.git(other, "commit", "-qam", "C")
+        C = self.git(other, "rev-parse", "HEAD")
+        self.git(other, "push", "-q", "origin", "main")
+        self.assertNotEqual(subprocess.run(["git", "cat-file", "-e", C + "^{commit}"], cwd=self.shared).returncode, 0)
+        self.assertEqual(self.run_main(self.caller(C))[0], 0)
+        rc, out = self.run_main(self.caller("f" * 40))
+        self.assertEqual(rc, 1)
+        self.assertIn("could not be fetched", out)
+
+    def cli(self, d, *args, **kw):
+        env = {**os.environ, "ONEPEEK_WORKSPACE": str(self.ws), "ONEPEEK_SHARED_GITHUB": ""}
+        return subprocess.Popen([sys.executable, str(ROOT / "workspace/local_ci.py"), str(d), *args], env=env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kw)
+
+    def worktrees(self) -> int:
+        return len(self.git(self.shared, "worktree", "list").splitlines())
+
+    def test_the_worktree_is_removed_after_the_run_and_the_first_line_names_the_path(self):
+        d = self.caller(self.A)
+        p = self.cli(d.name, cwd=d.parent)
+        out, _ = p.communicate(timeout=120)
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(out.splitlines()[0], f"local CI on {d.resolve()}")
+        self.assertEqual(self.worktrees(), 1)
+
+    def test_the_worktree_is_removed_after_sigterm(self):
+        self.wf.write_text(self.shared_wf("sleep 30"), encoding="utf-8")
+        self.git(self.shared, "commit", "-qam", "slow")
+        slow = self.git(self.shared, "rev-parse", "HEAD")
+        p = self.cli(self.caller(slow))
+        for _ in range(100):
+            if self.worktrees() == 2:
+                break
+            time.sleep(0.2)
+        self.assertEqual(self.worktrees(), 2)
+        time.sleep(0.5)
+        p.send_signal(signal.SIGTERM)
+        p.communicate(timeout=30)
+        self.assertEqual(self.worktrees(), 1)
 
 
 if __name__ == "__main__":
