@@ -986,13 +986,15 @@ class EdgeLimits(unittest.TestCase):
         self.assertEqual(out.returncode, 1)
         self.assertIn("::error::waiting for OnePeek/onepeek-infra (infra, run 77); re-run", out.stdout)
         self.assertNotIn("put-object", out.calls)
-        return out.stdout.count("Waiting for the preprod release lock")
+        return out
 
     def test_a_live_infra_run_that_holds_infra_json_is_waited_for_up_to_the_cap(self):
-        self.assertGreaterEqual(self.waits({INFRA_KEY: record(INFRA, "77", scope="infra")}), 4)
+        # The cap is wall-clock time (bash SECONDS), so it is asserted as time: more than 5 real seconds of the 6 s cap.
+        # The 1-second queued limit would end it after one wait. A count of waits shrinks on a loaded machine (pitfall 33).
+        self.assertGreaterEqual(self.waits({INFRA_KEY: record(INFRA, "77", scope="infra")}).elapsed, 5)
 
     def test_a_queued_infra_run_or_one_that_holds_no_key_gets_the_60_minutes(self):
-        self.assertLessEqual(self.waits({}), 2)
+        self.assertLessEqual(self.waits({}).stdout.count("Waiting for the preprod release lock"), 2)
 
 
 class InfraOwnScope(unittest.TestCase):
@@ -1002,7 +1004,9 @@ class InfraOwnScope(unittest.TestCase):
                   LOCK_WAIT_SECONDS="1", LOCK_WAIT_CAP_SECONDS="6")
         self.assertEqual(out.returncode, 1)
         self.assertIn("::error::waiting for OnePeek/onepeek-infra (infra, run 77); re-run", out.stdout)
-        self.assertGreaterEqual(out.stdout.count("Waiting for the preprod release lock"), 4)
+        # Asserted as time, not as a count of waits (pitfall 33): more than 5 real seconds of the 6 s cap, where the
+        # 1-second app limit would end it after one wait.
+        self.assertGreaterEqual(out.elapsed, 5)
         self.assertEqual(out.keys, {INFRA_KEY: held})
 
 
