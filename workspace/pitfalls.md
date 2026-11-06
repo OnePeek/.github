@@ -10,7 +10,7 @@ same pull request as the fix.
    `git fetch` first. Never edit, stash or commit in a shared checkout.
 2. **Never `commit -a`, `--no-verify` or a force push.** Push a detached worktree with `git push origin HEAD:<branch>`.
 3. **Commit every file you changed.** On 2026-11-06 a builder pushed a commit holding 2 of its 6 changed files, and CI went
-   green on the wrong code. Run `python3 .github/workspace/done_check.py <worktree> --pr <repo>#<n>` before you report.
+   green on the wrong code. Run `python3 $ONEPEEK_WORKSPACE/.github/workspace/done_check.py <worktree> --pr <repo>#<n>` before you report.
    It must end `DONE CHECK OK`.
 4. **Run local CI on your worktree path**, not on the repo name. `local_ci.py <repo>` reads the shared checkout. For a
    `.github` change, set `ONEPEEK_WORKSPACE` to a folder whose `.github` links to your worktree, so the shared lint is yours.
@@ -18,7 +18,8 @@ same pull request as the fix.
 ## Match the real environment
 5. **CI runs Linux, not macOS.** macOS has bash 3.2, CI has bash 5, and pipes behave differently. Run script tests in a
    Linux container. `local_ci.py` does this from L2 on; until then, mount the worktree and run the changed tests:
-   `docker run --rm -v "<worktree>:/w" -w /w python:3.14-slim sh -c 'apt-get update -qq && apt-get install -qq -y git >/dev/null && python3 -m unittest <test files>'`.
+   `docker run --rm -v "<worktree>:/w" -w /w python:3.14-slim sh -c 'apt-get update -qq && apt-get install -qq -y git >/dev/null && pip install -q <the test dependencies CI installs> && python3 -m unittest <test files>'`
+   (for `.github`, `pyyaml==6.0.3`, as `workflow-lint.yml` installs it).
 6. **Use the tool versions CI really uses.** Read them from the one constant that CI uses, never from your laptop. On
    2026-11-06 a local CI container ran Python 3.12 while CI ran 3.14.
 7. **Verify platform behaviour in the official docs before you rely on it** (GitHub contexts, AWS IAM, Terraform, ECS).
