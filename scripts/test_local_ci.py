@@ -133,7 +133,8 @@ class LocalCi(unittest.TestCase):
         d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 3\n")
         self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
 
-    def test_keep_going_runs_every_step_and_lists_every_failure(self):
+    @mock.patch.object(lc, "uv_problem", return_value="")  # never the laptop's own uv, as in the other main() tests
+    def test_keep_going_runs_every_step_and_lists_every_failure(self, _uv_problem):
         # T-69: the default stops at the first failure, so faults surfaced one per run; --keep-going shows them all at once.
         d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
                       "      - name: first\n        run: 'echo noise >&2; echo boom-a; exit 3'\n      - run: touch after-a\n"

@@ -664,7 +664,7 @@ class DocsPin(unittest.TestCase):
         return prs, pr_info, gh, run
 
     def go(self, pins: dict, only_pin: bool = True, bodies: dict | None = None, go: bool = True,
-           base_moved: bool = False) -> int:
+           base_moved: bool = False, on_green=None) -> int:
         prs, pr_info, gh, run = self.harness(pins, bodies)
 
         def move(repo, branch, green, merge_sha):
@@ -673,7 +673,7 @@ class DocsPin(unittest.TestCase):
             return "f" * 40, only_pin
         with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "gh", side_effect=gh), \
                 mock.patch.object(ship.subprocess, "run", side_effect=run), mock.patch.object(ship, "remove_worktrees"), \
-                mock.patch.object(ship, "wait_green", side_effect=lambda r, n, m: self.events.append(("green", r))), \
+                mock.patch.object(ship, "wait_green", side_effect=on_green or (lambda r, n, m: self.events.append(("green", r)))), \
                 mock.patch.object(ship, "tested_bases", return_value={"b" * 40}), \
                 mock.patch.object(ship, "base_head", return_value="c" * 40 if base_moved else "b" * 40), \
                 mock.patch.object(ship, "wait_head"), mock.patch.object(ship, "move_docs_pin", side_effect=move), \
@@ -1024,7 +1024,7 @@ class ConflictFlow(DocsPin):
                 i["isCrossRepository"] = True
             return i
 
-        def refresh(repo, branch, base, label, head, push=True):
+        def refresh(repo, branch, base, label, head, push=True, source=None):
             self.refreshed.append((repo, label, push))
             state[(repo, 2)] = after_refresh
             return "f" * 40 if push else ""
@@ -1114,7 +1114,8 @@ class ConflictFlow(DocsPin):
         with mock.patch.object(ship, "pr_info", side_effect=lambda r, n: info if r == "backend-service" else pr_info(r, n)), \
                 mock.patch.object(ship, "gh", side_effect=gh), mock.patch.object(ship, "branch_pin", return_value=pin), \
                 mock.patch.object(ship, "refresh_docs_pin", return_value="f" * 40) as rf, \
-                mock.patch.object(ship, "say"), mock.patch.object(ship, "DOCS_PR", list(docs_pr)):
+                mock.patch.object(ship, "say"), mock.patch.object(ship, "DOCS_PR", list(docs_pr)), \
+                mock.patch.dict(ship.GATED, {("backend-service", 2): info["headRefOid"]}, clear=True):
             return ship.resolve_pin("backend-service", 2), rf
 
     def test_resolve_pin_refreshes_a_pin_of_the_docs_pull_request(self) -> None:
@@ -1436,3 +1437,219 @@ class OpenDependencyNeedsADraft(unittest.TestCase):
                 mock.patch.object(ship, "say", side_effect=lines.append):
             self.assertEqual(ship.main(["onepeek-infra#3"]), 1)
         self.assertTrue(any("as a draft" in l for l in lines), lines)
+
+
+class HotfixLane(unittest.TestCase):
+    """operating-model §3, ruling T-53: a `Lane: hotfix` pull request merges on green checks, without the review record
+    or the thread refusal; the lane is read from the body right before the merge, and anything else is feature."""
+
+    def test_only_a_plain_hotfix_line_outside_a_release_is_hotfix(self) -> None:
+        for body, base, want in (("Lane: hotfix", "dev", True), ("<!-- hint -->\nLane: hotfix\nLane: feature", "main", True),
+                                 ("- Lane: hotfix", "dev", False), ("```\nLane: hotfix\n```", "dev", False),
+                                 ("## Lane: hotfix", "dev", False), ("Lane: hotfix\n---", "dev", False),
+                                 ("fix it\nLane: hotfix", "dev", False), ("", "dev", False), (None, "dev", False),
+                                 ("Lane: feature", "dev", False), ("Lane: docs", "main", False),
+                                 ("Lane: hot fix", "dev", False), ("<!-- Lane: hotfix -->", "dev", False),
+                                 ({"x": 1}, "dev", False), ("Lane: hotfix", "release", False)):
+            with self.subTest(body=body, base=base):
+                self.assertIs(ship.hotfix({"body": body, "baseRefName": base}), want)
+
+    def test_the_review_gate_passes_a_hotfix_without_a_review_or_coderabbit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(ship.os.environ, {"ONEPEEK_WORKSPACE": tmp}), \
+                mock.patch.object(ship, "read_checks", return_value=[{"name": "CodeRabbit", "bucket": "pending"}]):
+            i = {"headRefOid": "h3", "baseRefName": "dev", "author": {"login": "Karan-98-Mehta"}}
+            self.assertIsNone(REAL_GATE("onepeek-web", 3, dict(i, body="Lane: hotfix")))
+            for body in ("", "Lane: docs"):  # only hotfix skips the review gates
+                self.assertIn("no review at h3", REAL_GATE("onepeek-web", 3, dict(i, body=body)))
+
+    def go(self, bodies: list[str]):
+        """main --go on one pull request with an unresolved thread; `bodies` are the bodies successive reads return."""
+        state = {"state": "OPEN", "baseRefName": "dev", "isDraft": False, "mergeable": "MERGEABLE", "headRefName": "b",
+                 "headRefOid": "c" * 40, "mergeCommit": {"oid": "d" * 40}, "isCrossRepository": False,
+                 "headRepositoryOwner": {"login": "OnePeek"}, "author": {"login": "Karan-98-Mehta"}}
+        merged = []
+
+        def pr_info(repo, n):
+            return dict(state, body=bodies.pop(0) if len(bodies) > 1 else bodies[0])
+
+        def gh(*args):
+            if args[:2] == ("pr", "merge"):
+                merged.append(args)
+                state["state"] = "MERGED"
+            return '["app/x.py",4]\n' if args[:2] == ("api", "graphql") else ""
+        with mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "pr_info", pr_info), \
+                mock.patch.object(ship, "gh", side_effect=gh), mock.patch.object(ship, "wait_green"), \
+                mock.patch.object(ship, "remove_worktrees"), mock.patch.object(ship, "say") as say:
+            try:
+                rc = ship.main(["backend-service#2", "--go"])
+            except SystemExit as e:
+                rc = str(e)
+        return rc, merged, [c.args[0] for c in say.call_args_list]
+
+    def test_a_hotfix_merges_past_an_unresolved_thread_and_a_review_is_due(self) -> None:
+        rc, merged, said = self.go(["Lane: hotfix"])
+        self.assertEqual((rc, len(merged)), (0, 1))
+        self.assertIn("backend-service#2: Lane: hotfix, post-merge review due (operating-model §3)", said)
+
+    def test_a_docs_lane_still_refuses_an_unresolved_thread(self) -> None:  # ruling T-53 round 3: docs keeps the gates
+        rc, merged, _ = self.go(["Lane: docs"])
+        self.assertIn("unresolved review thread", rc)
+        self.assertEqual(merged, [])
+
+    def test_the_lane_is_read_again_before_the_merge(self) -> None:  # hotfix when planned, feature by the merge
+        for bodies in (["Lane: hotfix"] * 4 + ["Lane: feature"], ["Lane: feature"] * 4 + ["Lane: hotfix"]):
+            with self.subTest(bodies=bodies[-1]):
+                rc, merged, _ = self.go(bodies)
+                self.assertIn("the lane changed since the plan", rc)
+                self.assertEqual(merged, [])
+
+    def test_a_feature_head_pushed_by_the_tool_still_needs_the_review(self) -> None:  # review round 2, finding 3
+        with mock.patch.object(ship, "green_head", side_effect=lambda *a, **k: ship.TOOL_PUSHED.setdefault("f" * 40, "c" * 40) and "f" * 40), \
+                mock.patch.dict(ship.TOOL_PUSHED, {}), \
+                mock.patch.object(ship, "refuse_unresolved"), mock.patch.object(ship, "no_conflicts"), \
+                mock.patch.object(ship, "review_gate", side_effect=[None, "backend-service#2: no review at cccc"]):  # plan, merge
+            rc, merged, _ = self.go(["Lane: feature"])
+        self.assertIn("no review at cccc", rc)
+        self.assertEqual(merged, [])
+        with mock.patch.object(ship, "green_head", side_effect=lambda *a, **k: ship.TOOL_PUSHED.setdefault("f" * 40, "c" * 40) and "f" * 40), \
+                mock.patch.dict(ship.TOOL_PUSHED, {}), mock.patch.object(ship, "no_conflicts"):
+            rc, merged, _ = self.go(["Lane: hotfix"])  # a hotfix on a tool-pushed head merges without one
+        self.assertEqual((rc, len(merged)), (0, 1))
+
+
+class ToolPushSource(unittest.TestCase):
+    """Ruling T-55 (the #71 post-merge review): a tool push (docs-pin move, pin bump, docs-pin refresh) builds only on
+    the head that passed the gates, or on a commit this run pushed on it; never on a commit pushed since the gate."""
+
+    GATE, LATER = "1" * 40, "9" * 40
+    setUp, origin, advance_dev = RefreshDocsPin.setUp, RefreshDocsPin.origin, RefreshDocsPin.advance_dev
+
+    def test_the_source_must_be_the_gated_head_or_a_commit_this_run_pushed(self) -> None:
+        with mock.patch.dict(ship.GATED, {("r", 1): self.GATE}, clear=True), \
+                mock.patch.dict(ship.TOOL_PUSHED, {"f" * 40: self.GATE}, clear=True):
+            self.assertEqual(ship.tool_source("r", 1, self.GATE), self.GATE)
+            self.assertEqual(ship.tool_source("r", 1, "f" * 40), "f" * 40)
+            with self.assertRaisesRegex(SystemExit, f"head 9999999 is neither the gated head 1111111"):
+                ship.tool_source("r", 1, self.LATER)
+            with self.assertRaisesRegex(SystemExit, "gated head none"):
+                ship.tool_source("r", 2, self.GATE)
+
+    def builder_pushes_after_the_gate(self) -> tuple[str, str]:
+        """The gated head of feat/x, then an unreviewed commit a builder pushes on top of it."""
+        gated = self.origin("rev-parse", "feat/x").strip()
+        sh("git", "-C", str(self.src), "switch", "-q", "feat/x")
+        (self.src / "unreviewed.txt").write_text("x\n")
+        commit_all(self.src, "unreviewed")
+        sh("git", "-C", str(self.src), "push", "-q", "origin", "feat/x")
+        sh("git", "-C", str(self.src), "switch", "-q", "dev")
+        return gated, self.origin("rev-parse", "feat/x").strip()
+
+    def test_a_refresh_from_the_gated_head_never_lands_on_a_later_commit(self) -> None:
+        gated, later = self.builder_pushes_after_the_gate()
+        self.advance_dev({"docs-version.txt": f"# docs\nonepeek-docs@{DOCS_MERGE}\n"})
+        with self.assertRaisesRegex(SystemExit, " push "):  # the fast-forward push is refused: the branch is past the source
+            ship.refresh_docs_pin("backend-service", "feat/x", "dev", "onepeek-docs#7", "4" * 40, source=gated)
+        self.assertEqual(self.origin("rev-parse", "feat/x").strip(), later)
+
+    def test_a_pin_bump_builds_on_the_source(self) -> None:
+        sh("git", "-C", str(self.src), "switch", "-q", "feat/x")
+        (self.src / ".github/workflows/ci.yml").write_text(
+            "jobs:\n  a:\n    uses: OnePeek/.github/.github/workflows/x.yml@v1.0.0\n")
+        commit_all(self.src, "pinned")
+        sh("git", "-C", str(self.src), "push", "-q", "origin", "feat/x")
+        sh("git", "-C", str(self.src), "switch", "-q", "dev")
+        gated, later = self.builder_pushes_after_the_gate()
+        with self.assertRaisesRegex(SystemExit, " push "):
+            ship.bump_pins("backend-service", "feat/x", "v1.1.0", "a" * 40, source=gated)
+        self.assertEqual(self.origin("rev-parse", "feat/x").strip(), later)
+        new = ship.bump_pins("backend-service", "feat/x", "v1.1.0", "a" * 40, source=later)
+        self.assertEqual(self.origin("rev-parse", f"{new}^").strip(), later)
+
+
+class ToolPushSourceInMain(unittest.TestCase):
+    """The bypass of the #71 review, reproduced: a commit pushed after the gate must not merge under a tool's commit."""
+
+    LATER = "9" * 40
+    setUp, harness, go = DocsPin.setUp, DocsPin.harness, DocsPin.go
+
+    def test_a_docs_pin_move_on_a_commit_pushed_after_the_gate_stops(self) -> None:
+        def later_after_docs(r, n, m):  # the builder pushes while the docs pull request merges
+            self.events.append(("green", r))
+            if r == "onepeek-docs":
+                self.heads["backend-service"] = self.LATER
+        with mock.patch.dict(ship.TOOL_PUSHED, {self.LATER: "x"}), \
+                self.assertRaisesRegex(SystemExit, "head 9999999 is neither the gated head 2222222"):
+            self.go({("backend-service", 2): DOCS_OLDER}, on_green=later_after_docs)  # a stale entry is not kept
+        self.assertNotIn("backend-service", [e[1] for e in self.events if e[0] in ("pin", "merge")])
+
+    def test_a_pin_bump_on_a_commit_pushed_after_the_gate_stops(self) -> None:
+        (self.root / ".github" / ".git").mkdir(parents=True)
+        prs, pr_info, gh, run = self.harness({("backend-service", 2): DOCS_HEAD})
+        bumped = []
+
+        def info(r, n):
+            i = pr_info(r, n)
+            if r == ".github":
+                i["baseRefName"] = "main"
+                i["headRefOid"] = "6" * 40
+                if (r, n) in self.merged:
+                    i["mergeCommit"] = {"oid": "7" * 40}
+            return i
+
+        def gh2(*args):
+            out = gh(*args)
+            if args[:2] == ("pr", "merge") and ".github" in args[4]:
+                self.heads["backend-service"] = self.LATER  # pushed while .github merged and tagged
+            return out
+        with mock.patch.object(ship, "pr_info", side_effect=info), mock.patch.object(ship, "gh", side_effect=gh2), \
+                mock.patch.object(ship.subprocess, "run", side_effect=run), mock.patch.object(ship, "remove_worktrees"), \
+                mock.patch.object(ship, "wait_green"), mock.patch.object(ship, "rerun_failed"), \
+                mock.patch.object(ship, "wait_tag", return_value=("v9.9.9", "7" * 40)), \
+                mock.patch.object(ship, "bump_pins", side_effect=lambda *a, **k: bumped.append(k) or "f" * 40), \
+                mock.patch.object(ship, "move_docs_pin", return_value=(None, True)), \
+                mock.patch.object(ship, "pin_moves", return_value=[]), mock.patch.object(ship, "wait_head"), \
+                mock.patch.object(ship, "docs_pin_problems", return_value=[]), \
+                self.assertRaisesRegex(SystemExit, "head 9999999 is neither the gated head 2222222"):
+            ship.main([".github#5", "backend-service#2", "--go"])
+        self.assertEqual(bumped, [])
+        self.assertNotIn(("merge", "backend-service", "f" * 40), self.events)
+
+    def test_a_pin_bump_on_the_gated_head_is_bound_to_it_and_merges(self) -> None:
+        (self.root / ".github" / ".git").mkdir(parents=True)
+        prs, pr_info, gh, run = self.harness({("backend-service", 2): DOCS_HEAD})
+        bumped = []
+
+        def info(r, n):
+            i = pr_info(r, n)
+            if r == ".github":
+                i.update(baseRefName="main", headRefOid="6" * 40)
+                if (r, n) in self.merged:
+                    i["mergeCommit"] = {"oid": "7" * 40}
+            return i
+
+        def bump(*a, **k):
+            bumped.append(k["source"])
+            self.heads["backend-service"] = "f" * 40
+            return "f" * 40
+        with mock.patch.object(ship, "pr_info", side_effect=info), mock.patch.object(ship, "gh", side_effect=gh), \
+                mock.patch.object(ship.subprocess, "run", side_effect=run), mock.patch.object(ship, "remove_worktrees"), \
+                mock.patch.object(ship, "wait_green"), mock.patch.object(ship, "rerun_failed"), \
+                mock.patch.object(ship, "wait_tag", return_value=("v9.9.9", "7" * 40)), \
+                mock.patch.object(ship, "bump_pins", side_effect=bump), mock.patch.object(ship, "no_conflicts"), \
+                mock.patch.object(ship, "pin_moves", return_value=[]), mock.patch.object(ship, "wait_head"), \
+                mock.patch.object(ship, "docs_pin_problems", return_value=[]):
+            self.assertEqual(ship.main([".github#5", "backend-service#2", "--go"]), 0)
+        self.assertEqual(bumped, ["2" * 40])
+        self.assertEqual(ship.TOOL_PUSHED, {"f" * 40: "2" * 40})
+        self.assertIn(("merge", "backend-service", "f" * 40), self.events)
+
+    def test_a_docs_pin_refresh_on_a_commit_pushed_after_the_gate_stops(self) -> None:
+        prs, pr_info, gh, run = self.harness({("backend-service", 2): DOCS_OLDER})
+        with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "gh", side_effect=gh), \
+                mock.patch.object(ship, "branch_pin", return_value=DOCS_OLDER), mock.patch.object(ship, "say"), \
+                mock.patch.object(ship, "refresh_docs_pin", return_value="f" * 40) as rf, \
+                mock.patch.object(ship, "DOCS_PR", [1]), \
+                mock.patch.dict(ship.GATED, {("backend-service", 2): "1" * 40}, clear=True), \
+                self.assertRaisesRegex(SystemExit, "head 2222222 is neither the gated head 1111111"):
+            ship.resolve_pin("backend-service", 2)
+        rf.assert_not_called()

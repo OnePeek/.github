@@ -29,25 +29,41 @@ def run(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, capture_output=True, text=True, check=False)
 
 
-LANE = re.compile(r"^[ \t]*(?:[-*+][ \t]+)?(?:#+[ \t]+)?(?:\*\*|__)?Lane:(?:\*\*|__)?[ \t]*(.*)$", re.M | re.I)
-COMMENT = re.compile(r"<!--.*?-->", re.S)  # a template's `<!-- Lane: feature|hotfix -->` hint is not a statement
-LANES = ("feature", "hotfix")
+LANE = re.compile(r"Lane:[ \t]*(feature|hotfix|docs)[ \t]*", re.I | re.ASCII)  # the whole first line: no bullet, indent, bold
+SETEXT = re.compile(r" {0,3}(?:=+|-+)[ \t]*")  # under the first line it makes that line a heading, not a statement
+LANES = ("feature", "hotfix", "docs")
 
 
-def lane_of(text: str | None) -> str:
-    """The lane a task or pull request states in a line containing `Lane:` (a bullet and bold are fine:
-    `- **Lane:** hotfix`), `feature` or `hotfix` (development-cycle §2b); feature when it says none. The first word after
-    it is the value, so `Lane: hotfix (preprod down)` is hotfix; `hot fix`, an empty value or any other word is an
-    error, never silently the default."""
-    found = []
-    for m in LANE.finditer(COMMENT.sub("", text or "")):
-        words = m.group(1).replace("*", " ").replace("`", " ").split()
-        found.append(words[0].lower() if words else "")
-    if not found:
+def lane_of(text: object) -> str:
+    """The lane a task or pull request states (development-cycle §2b, operating-model §3): `feature`, `hotfix` or
+    `docs`; feature otherwise (ruling T-53 round 3). Leading blank lines and leading whole-line HTML comments (a
+    template's `<!-- Lane: feature|hotfix -->` hint) are skipped; the first remaining line alone decides, and only when
+    it is exactly `Lane: <lane>` (any case) and the next line does not underline it as a heading. A bullet, indent,
+    bold, quote, trailing words, a later line, an unclosed comment or a non-string body are all feature."""
+    if not isinstance(text, str):
         return "feature"
-    if len(set(found)) > 1 or found[0] not in LANES:
-        raise ValueError(f"Lane must be one of {', '.join(LANES)}, got: {', '.join(repr(f) for f in found)}")
-    return found[0]
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    i = 0
+    while i < len(lines):
+        if lines[i].strip(" \t") == "":
+            i += 1
+        elif lines[i].startswith("<!--"):  # a whole-line comment: opens at column 0, closes at the end of a line
+            rest = "\n".join(lines[i:])[4:]
+            end = rest.find("-->")
+            if end < 0 or rest.startswith((">", "->")) or "--!>" in rest[:end]:  # unclosed, or HTML ends it elsewhere
+                return "feature"
+            after = rest[end + 3:].split("\n", 1)
+            if after[0].strip(" \t"):  # text after `-->` on its line: that line is content, so not a statement
+                return "feature"
+            i += rest[:end + 3].count("\n") + 1
+        else:
+            break
+    if i >= len(lines):
+        return "feature"
+    m = LANE.fullmatch(lines[i])
+    if not m or (i + 1 < len(lines) and SETEXT.fullmatch(lines[i + 1])):
+        return "feature"
+    return m.group(1).lower()
 
 
 def docs_dir(repo: pathlib.Path, docs: pathlib.Path | None, env: dict | None = None) -> pathlib.Path:
@@ -65,8 +81,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("unit", help="module ID, platform/<part>, clients/<client> or infra/<part>")
     ap.add_argument("--refine", action="store_true", help="packet for refining a minimum module LLD")
     ap.add_argument("--out", type=pathlib.Path, help="write the packet to this file instead of stdout")
-    ap.add_argument("--task", type=pathlib.Path, help="the task text; a `Lane: feature|hotfix` line in it sets the lane")
-    ap.add_argument("--pr", metavar="REPO#N", help="read the `Lane:` line from this OnePeek pull request's body (gh)")
+    ap.add_argument("--task", type=pathlib.Path, help="the task text; its first line `Lane: feature|hotfix|docs` sets the lane")
+    ap.add_argument("--pr", metavar="REPO#N", help="read the lane from the first line of this OnePeek pull request's body (gh)")
     ap.add_argument("--repo", type=pathlib.Path, default=pathlib.Path.cwd(), help="the repo (default: current folder)")
     ap.add_argument("--docs", type=pathlib.Path, help="the onepeek-docs clone (default: $ONEPEEK_WORKSPACE/onepeek-docs, "
                     "else ../onepeek-docs next to the repo)")
@@ -80,11 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(body.stderr)
             return body.returncode
         text += "\n" + body.stdout
-    try:
-        lane = lane_of(text)
-    except ValueError as e:
-        print(e, file=sys.stderr)
-        return 1
+    lane = lane_of(text)
 
     pin_file = a.repo / "docs-version.txt"
     pin = re.search(r"onepeek-docs@([0-9a-f]{40})", pin_file.read_text()) if pin_file.exists() else None

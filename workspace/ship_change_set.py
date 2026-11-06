@@ -68,6 +68,9 @@ def _load(name: str):
 
 depends_on = _load("check_depends_on")
 check_pins = _load("check_pins")
+_packet_spec = importlib.util.spec_from_file_location("packet", pathlib.Path(__file__).resolve().parent / "packet.py")
+packet = importlib.util.module_from_spec(_packet_spec)
+_packet_spec.loader.exec_module(packet)
 ORDER = ["onepeek-docs", ".github", "onepeek-infra", "onepeek-design-system", "backend-service", "onepeek-web"]
 BASE = {"onepeek-docs": "main", ".github": "main", "marketing-website": "main"}  # every other repo merges into dev
 PIN = check_pins.USES  # every `uses:` naming OnePeek/.github, any letter case, any ref (§8a P2)
@@ -269,18 +272,20 @@ def no_conflicts(prs: list[tuple[str, int]], resolve=None) -> None:
         raise SystemExit(f"STOP: not mergeable {[(p, states[p]) for p in bad]}; resolve conflicts, push, run again")
 
 
-def refresh_docs_pin(repo: str, branch: str, base: str, docs_label: str, docs_head: str, push: bool = True) -> str | None:
+def refresh_docs_pin(repo: str, branch: str, base: str, docs_label: str, docs_head: str, push: bool = True,
+                     source: str | None = None) -> str | None:
     """Merge `base` into the pull request's branch in a temporary worktree and set docs-version.txt to the docs pull
     request's head `docs_head`, committing "Merge <base>; docs-version to <docs_label> head" and pushing it as a
     fast-forward. Returns the pushed commit; "" when nothing needed pushing (or `push` is false and the conflict is
-    only the pin); None when another file conflicts (nothing is changed, the caller stops as for any conflict)."""
+    only the pin); None when another file conflicts (nothing is changed, the caller stops as for any conflict).
+    `source`, when given, is the commit to build on instead of the branch head (the push fails if the branch moved)."""
     refuse_protected(repo, branch, base)
     src = ROOT / repo
     git(src, "fetch", "-q", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
         f"+refs/heads/{base}:refs/remotes/origin/{base}")
     with tempfile.TemporaryDirectory(prefix=f"refresh-{repo}-") as tmp:
         wt = pathlib.Path(tmp) / "wt"
-        git(src, "worktree", "add", "-q", "--detach", str(wt), f"origin/{branch}")
+        git(src, "worktree", "add", "-q", "--detach", str(wt), source or f"origin/{branch}")
         try:
             r = subprocess.run(["git", "-C", str(wt), "merge", "--no-commit", "--no-ff", f"origin/{base}"],
                                capture_output=True, text=True, check=False)
@@ -409,14 +414,15 @@ def wait_tag(sha: str) -> tuple[str, str]:
     raise SystemExit(f"STOP: no tag on .github {sha[:7]} after {TAG_TIMEOUT_S // 60} min (tag-main workflow?)")
 
 
-def bump_pins(repo: str, branch: str, tag: str, sha: str) -> str | None:
-    """Move every OnePeek/.github workflow pin on the branch to the tag, in one ordinary commit (hooks run)."""
+def bump_pins(repo: str, branch: str, tag: str, sha: str, source: str | None = None) -> str | None:
+    """Move every OnePeek/.github workflow pin on the branch to the tag, in one ordinary commit (hooks run), on top of
+    `source` when given (the push fails if the branch moved), else on the branch head."""
     refuse_protected(repo, branch)
     src = ROOT / repo
     git(src, "fetch", "-q", "origin", branch)
     with tempfile.TemporaryDirectory(prefix=f"ship-{repo}-") as tmp:
         wt = pathlib.Path(tmp) / "wt"
-        git(src, "worktree", "add", "-q", "--detach", str(wt), f"origin/{branch}")
+        git(src, "worktree", "add", "-q", "--detach", str(wt), source or f"origin/{branch}")
         try:
             changed, _ = rewrite_pins(wt, tag, sha)
             if not changed:
@@ -756,9 +762,11 @@ def resolve_pin(repo: str, n: int, push: bool = True) -> str | None:
     if pin not in pr_commits(DOCS, DOCS_PR[0]):
         say(f"{repo}#{n}: docs pin {(pin or 'none')[:7]} is not a commit of {DOCS}#{DOCS_PR[0]}; not re-pinning it")
         return None
-    sha = refresh_docs_pin(repo, i["headRefName"], i["baseRefName"], f"{DOCS}#{DOCS_PR[0]}", docs_head(DOCS_PR[0]), push)
+    source = tool_source(repo, n, i["headRefOid"])
+    sha = refresh_docs_pin(repo, i["headRefName"], i["baseRefName"], f"{DOCS}#{DOCS_PR[0]}", docs_head(DOCS_PR[0]), push,
+                           source=source)
     if sha:
-        TOOL_PUSHED.add(sha)
+        TOOL_PUSHED[sha] = source
     return sha
 
 
@@ -768,12 +776,33 @@ def conflict_after(repo: str, n: int, sha: str) -> str:
 
 
 DOCS_PR: list[int] = []
-TOOL_PUSHED: set[str] = set()  # commits this run pushed itself (pin moves, docs-pin refreshes): no new review needed
+TOOL_PUSHED: dict[str, str] = {}  # commit this run pushed (pin moves, docs-pin refreshes) -> the commit it was built on
+GATED: dict[tuple[str, int], str] = {}  # the head each pull request passed the up-front gates at (reviewed or planned)
+
+
+def tool_source(repo: str, n: int, head: str) -> str:
+    """The commit a tool push may build on (ruling T-55): the head that passed the gates, or a commit this run pushed
+    on top of it. Anything else (a commit pushed since the gate, or no gate at all) stops the pull request."""
+    gated = GATED.get((repo, n))
+    if gated and (head == gated or head in TOOL_PUSHED):
+        return head
+    raise SystemExit(f"STOP {repo}#{n}: head {head[:7]} is neither the gated head {(gated or 'none')[:7]} nor a "
+                     "commit this run pushed; not pushing onto it, nothing after it is merged")
+
+
+def hotfix(i: dict) -> bool:
+    """operating-model §3 unblock lane: the body's first line says `Lane: hotfix` (packet.lane_of, ruling T-53 round 3)
+    and it is not a release pull request. Only hotfix skips the review gates: `docs`, `feature`, no lane line or an odd
+    body keep them (fail closed)."""
+    return i.get("baseRefName") != RELEASE_BASE and packet.lane_of(i.get("body")) == "hotfix"
 
 
 def review_gate(repo: str, n: int, i: dict) -> str | None:
     """agent-operations.md §6.6 "Review gates for merging" (F36) for the pull request's head `i["headRefOid"]`, read
-    live; the bot allow-list is the `authors` of ship_watch.yaml (--config). An unreadable record is a problem."""
+    live; the bot allow-list is the `authors` of ship_watch.yaml (--config). An unreadable record is a problem.
+    A hotfix pull request has none: it is reviewed after the merge (operating-model §3)."""
+    if hotfix(i):
+        return None
     try:
         reviews = read_reviews()
     except (OSError, ValueError) as e:
@@ -904,6 +933,9 @@ def main(argv: list[str]) -> int:
     if local and not all((ROOT / r / ".git").exists() for r, _ in prs):
         raise SystemExit(f"run from the workspace root (the folder holding the repos); {ROOT} is not it")
     info = {p: pr_info(*p) for p in prs}
+    GATED.clear()
+    TOOL_PUSHED.clear()
+    GATED.update({p: i["headRefOid"] for p, i in info.items()})
     deps = {p: depends_on.parse(i.get("body")) for p, i in info.items()}
     prs = with_dependencies(prs, deps)
     problems = []
@@ -1011,8 +1043,10 @@ def main(argv: list[str]) -> int:
     for k, (repo, n) in enumerate(prs):
         no_conflicts(prs[k:], resolve_pin)
         if tag and repo not in (DOCS, ".github"):
-            pushed = bump_pins(repo, info[(repo, n)]["headRefName"], *tag)
-            TOOL_PUSHED.add(pushed or "")
+            source = tool_source(repo, n, pr_info(repo, n)["headRefOid"])
+            pushed = bump_pins(repo, info[(repo, n)]["headRefName"], *tag, source=source)
+            if pushed:
+                TOOL_PUSHED[pushed] = source
             moved.add(repo)  # its pins are at the tag inside the set (moved now, or already there)
             if pushed:
                 wait_head(repo, n, pushed)
@@ -1020,8 +1054,9 @@ def main(argv: list[str]) -> int:
         head = green_head(repo, n, may_rerun=merged_any)
         tested = tested_bases(repo, n) if docs_merge and (repo, n) in pinned else set()
         if docs_merge and (repo, n) in pinned:
-            pushed, only_pin = move_docs_pin(repo, info[(repo, n)]["headRefName"], head, docs_merge)
-            TOOL_PUSHED.add(pushed or "")
+            pushed, only_pin = move_docs_pin(repo, info[(repo, n)]["headRefName"], tool_source(repo, n, head), docs_merge)
+            if pushed:
+                TOOL_PUSHED[pushed] = head
             if pushed:
                 wait_head(repo, n, pushed)
                 head = pushed
@@ -1038,11 +1073,17 @@ def main(argv: list[str]) -> int:
             if why:
                 raise SystemExit(f"STOP {repo}#{n}: {why}")
         keep = [] if base_ref == RELEASE_BASE else ["--delete-branch"]  # a release pull request's head is `dev`: never deleted
-        refuse_unresolved(repo, n)  # every review thread read and resolved before the merge (§6.4)
+        live = dict(info[(repo, n)], body=pr_info(repo, n).get("body"))  # the lane, read again now (never cached)
+        lanes = ["hotfix" if hotfix(x) else "feature" for x in (info[(repo, n)], live)]
+        if lanes[0] != lanes[1]:
+            raise SystemExit(f"STOP {repo}#{n}: the lane changed since the plan ({lanes[0]} -> {lanes[1]}); run "
+                             "again; nothing after it is merged")
+        if lanes[1] == "feature":
+            refuse_unresolved(repo, n)  # every review thread read and resolved before the merge (§6.4)
         reviewed = info[(repo, n)]["headRefOid"]  # the review gates, again, right before the merge (F36)
-        why = review_gate(repo, n, info[(repo, n)]) if head == reviewed else (
-            None if head in TOOL_PUSHED - {""} else f"{repo}#{n}: head {head[:7]} is neither the reviewed head "
-                                                     f"{reviewed[:7]} nor a commit this run pushed")
+        why = review_gate(repo, n, live) if lanes[1] == "feature" else None
+        if not why and head != reviewed and head not in TOOL_PUSHED:
+            why = f"{repo}#{n}: head {head[:7]} is neither the reviewed head {reviewed[:7]} nor a commit this run pushed"
         if why:
             raise SystemExit(f"STOP {why}; nothing after it is merged")
         gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, *keep, "--match-head-commit", head)
@@ -1050,6 +1091,8 @@ def main(argv: list[str]) -> int:
         if merged["state"] != "MERGED":
             raise SystemExit(f"STOP {repo}#{n}: merge did not complete ({merged['state']})")
         say(f"{repo}#{n}: merged {merged['mergeCommit']['oid'][:7]}")
+        if hotfix(live):
+            say(f"{repo}#{n}: Lane: hotfix, post-merge review due (operating-model §3)")
         if repo == DOCS:
             docs_merge = merged["mergeCommit"]["oid"]
         if base_ref != RELEASE_BASE:  # never touch the worktrees of `dev`, the head of a release pull request
