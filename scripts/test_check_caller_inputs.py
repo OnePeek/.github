@@ -111,7 +111,7 @@ class FailClosed(Fixture):
         self.assertEqual(out, ["release.yml:4: j0 calls lock.yml@v1.16.0: pin commit not found"])
 
     def test_a_ref_that_is_not_a_commit_sha(self) -> None:
-        for ref in ("v1.16.0", "main", self.sha.upper(), ""):
+        for ref in ("v1.16.0", "main", self.sha.upper(), self.sha[:12], self.sha[:39], self.sha + "0", ""):
             with self.subTest(ref=ref):
                 out = self.caller(self.call(OK_WITH, ref=ref, comment=""))
                 self.assertEqual(len(out), 1)
@@ -151,6 +151,18 @@ class Calls(Fixture):
         (self.repo / ".github/workflows/lock.yml").write_text(CALLEE)
         out = self.caller("    uses: ./.github/workflows/lock.yml\n    with: {scope: a}\n    secrets: inherit\n")
         self.assertEqual(out, ["release.yml:4: j0 calls ./.github/workflows/lock.yml without required input action"])
+
+    def test_a_symlinked_local_callee_is_refused(self) -> None:
+        (self.tmp / "elsewhere.yml").write_text(CALLEE)
+        (self.repo / ".github/workflows/lock.yml").symlink_to(self.tmp / "elsewhere.yml")
+        out = self.caller("    uses: ./.github/workflows/lock.yml\n    with: {scope: a, action: b}\n    secrets: inherit\n")
+        self.assertEqual(out, ["release.yml:4: j0 calls ./.github/workflows/lock.yml: file not found"])
+
+    def test_yaml_callers_are_checked_as_well_as_yml(self) -> None:
+        (self.repo / ".github/workflows/release.yaml").write_text("jobs:\n  y:\n" + self.call("    secrets: inherit\n"))
+        (self.repo / ".github/workflows/notes.txt").write_text("jobs:\n  z:\n" + self.call(""))
+        out = cci.check(self.repo, self.shared)
+        self.assertEqual(out, [f"release.yaml:3: y calls lock.yml@v1.16.0 without required input {k}" for k in ("scope", "action")])
 
     def test_a_local_call_to_a_missing_file(self) -> None:
         out = self.caller("    uses: ./.github/workflows/gone.yml\n")

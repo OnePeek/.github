@@ -3,7 +3,8 @@
 
     python3 check_caller_inputs.py <repo-dir> --shared <.github checkout>
 
-For every job-level `uses: OnePeek/.github/.github/workflows/<file>@<sha>` in the repo's `.github/workflows/*.yml`, the
+For every job-level `uses: OnePeek/.github/.github/workflows/<file>@<sha>` in the repo's `.github/workflows/*.yml` and
+`*.yaml`, the
 called workflow is read at that commit (`git show <sha>:.github/workflows/<file>` in the `.github` checkout), and for
 every `uses: ./.github/workflows/<file>` from the repo's own tree. A call fails when its `with:` lacks an input the
 callee marks `required: true` (even one with a `default:`), passes an input or a secret the callee does not declare, or
@@ -59,7 +60,7 @@ def callee_text(uses: str, repo: pathlib.Path, shared: pathlib.Path, source_line
     if m := LOCAL.fullmatch(uses):
         label = f"./.github/workflows/{m.group(1)}"
         path = repo / ".github/workflows" / m.group(1)
-        if not path.is_file():
+        if path.is_symlink() or not path.is_file():  # a symlinked callee is refused, never followed
             return label, None, "file not found"
         try:
             return label, path.read_text(encoding="utf-8"), None
@@ -115,7 +116,8 @@ def check_call(caller: str, line: int, job_id: str, job: dict, uses: str, source
 
 def check(repo: pathlib.Path, shared: pathlib.Path) -> list[str]:
     failures = []
-    for path in sorted((repo / ".github/workflows").glob("*.yml")):
+    workflows = repo / ".github/workflows"
+    for path in sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")]):  # GitHub accepts both
         try:
             text = path.read_text(encoding="utf-8")
             doc, tree = load(text)
@@ -146,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     if not pathlib.Path(a.repo).is_dir():
         print(f"{a.repo}: not a directory")  # fail closed: a wrong path never passes as "no calls"
         return 1
-    failures =check(pathlib.Path(a.repo), pathlib.Path(a.shared))
+    failures = check(pathlib.Path(a.repo), pathlib.Path(a.shared))
     for f in failures:
         print(f)
     return 1 if failures else 0
