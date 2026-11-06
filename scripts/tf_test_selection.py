@@ -2,7 +2,7 @@
 
 A suite is a directory with a `*.tftest.hcl` file: the folder above its `tests/` folder (any depth under tests/), else
 the folder holding the file. On a pull request into `dev` only the suites whose directory (or whose tests/) changed run,
-plus the stacks/aws suite when the change could reach it: anything under stacks/aws, config/, policy/, scripts/ or
+plus the suite of the AWS stack (stacks/aws) when the change could reach it: anything under stacks/aws, config/, policy/, scripts/ or
 modules/aws (any module may be consumed by the stack, so any module change counts). Release pull requests (base
 `release`), pushes and schedules run every suite.
 
