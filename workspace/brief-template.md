@@ -62,7 +62,7 @@ A BLOCKED hand-back comes before the done-gate: it names what blocks, the done-g
 Report: the `Read:` line first; then files per commit; the last line of each gate; mutations; the DONE CHECK line; gaps; what is left. No narrative.
 ```
 
-A reviewer brief fills the same fields, with the role `reviewer`, the slice as the change to review (the pull request
+A reviewer brief covers **one pull request** (the reviewer is resumed for the next one), tells it to quote the builder's gate lines instead of re-running them, and fills the same fields, with the role `reviewer`, the slice as the change to review (the pull request
 `<repo>#<n>`, or the pushed branch before one exists) and its focus areas, and the authority `edit, commit, push and
 merge: never`. It gives the builder's `Read:` line on its own (agent-operations.md §4.2), and never the builder's summary
 or the rest of its report. The reviewer reviews the pushed head and names it in its verdict.

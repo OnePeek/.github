@@ -70,6 +70,8 @@ Your own docs rulings are never "mechanical". The reviewer reviews the code buil
    - The shipper is always on.
    - **At most 4 background agents**, briefed through the agent types `builder`, `spec-reviewer` and `shipper`.
    - **More than 3 high-risk pull requests waiting for review:** run two reviewers and one builder (the watcher script keeps merging); back to one reviewer at three or fewer (founder, 2026-11-06).
+   - **Brief a reviewer one pull request per run** (it has no `SendMessage`, and its hand-back ends the run): resume the same reviewer with the next pull request, so its context carries over, until it nears 150k tokens. Never batch 5-6 pull requests into one run: the verdict for the head of the chain then waits for all the others (2026-11-06).
+   - **Tell the reviewer not to re-run the builder's gates** (quote the builder's lines) and to keep full high-risk depth for the merge gate, IAM, security, secrets and release paths (review-task §3, §4.5).
    - **Order the reviewer's queue by the merge chain:** the pull request that unblocks the most others first (2026-11-06: #73 placed last held eight pull requests for 20 minutes).
 5. **Idle rule.** A slot with nothing in the unblock or feature queue stays idle. Never invent work. Never start feature work while something blocks merging.
 
