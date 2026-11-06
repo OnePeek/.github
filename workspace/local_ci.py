@@ -720,7 +720,8 @@ def service_argv(name: str, spec) -> list[str]:
     lists = {}
     for key in ("ports", "volumes"):
         lists[key] = none(key, [])
-        if not isinstance(lists[key], list) or not all(isinstance(x, (str, int)) and not isinstance(x, bool) for x in lists[key]):
+        kinds = (str, int) if key == "ports" else (str,)  # a bare port number is valid on CI; a volume is always a string
+        if not isinstance(lists[key], list) or not all(isinstance(x, kinds) and not isinstance(x, bool) for x in lists[key]):
             raise ValueError(f"key {key} is not a list of strings")
     argv = ["docker", "run", "-d", "--name", name, "--label", f"onepeek-local-ci={os.getpid()}"]
     for k, v in env.items():

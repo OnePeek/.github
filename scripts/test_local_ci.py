@@ -925,7 +925,7 @@ class JobServices(unittest.TestCase):
     BAD_SHAPES = {
         "env": [{"env": ["P=1"]}, {"env": ""}, {"env": "P=1"}, {"env": {"P": {"x": 1}}}, {"env": {"P": None}}, {"env": {"A=B": "1"}}],
         "ports": [{"ports": 5432}, {"ports": "5432:5432"}, {"ports": ""}, {"ports": [["5432"]]}, {"ports": ["${{ env.PORT }}:5432"]}],
-        "volumes": [{"volumes": "/a:/b"}, {"volumes": [{"a": "b"}]}, {"volumes": ["${{ runner.temp }}:/x"]}],
+        "volumes": [{"volumes": "/a:/b"}, {"volumes": [5432]}, {"volumes": [{"a": "b"}]}, {"volumes": ["${{ runner.temp }}:/x"]}],
         "image": [{"image": ""}, {"image": ["postgres"]}, {"image": "${{ matrix.image }}"}],
         "options": [{"options": ["--x"]}, {"options": "--health-cmd 'unclosed"}, {"options": "--name ${{ github.sha }}"}],
     }
@@ -959,6 +959,7 @@ class JobServices(unittest.TestCase):
         calls, real = [], subprocess.run
 
         def fake(argv, *args, **kw):
+            assert all(isinstance(x, str) for x in argv), argv  # the real subprocess.run raises TypeError on anything else
             if argv[:2] in (["docker", "run"], ["docker", "inspect"], ["docker", "rm"]):
                 calls.append(argv)
                 return subprocess.CompletedProcess(argv, 0, "healthy\n" if argv[1] == "inspect" else "id\n", "")
@@ -979,6 +980,7 @@ class JobServices(unittest.TestCase):
         calls, real = [], subprocess.run
 
         def fake(argv, *args, **kw):
+            assert all(isinstance(x, str) for x in argv), argv  # the real subprocess.run raises TypeError on anything else
             if argv[:2] in (["docker", "run"], ["docker", "inspect"], ["docker", "rm"]):
                 calls.append(argv)
                 return subprocess.CompletedProcess(argv, 0, health + "\n" if argv[1] == "inspect" else "id\n", "")
