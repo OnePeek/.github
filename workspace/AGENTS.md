@@ -3,6 +3,8 @@
 This folder holds the OnePeek repositories side by side. It is not itself a repository: this file (and `CLAUDE.md`, which loads it) is linked here by `.github/workspace/setup.py`. It applies to people and every AI coding tool alike.
 
 ## Before any task
+**FIRST, every session, every person and agent: read `onepeek-docs/standards/operating-model.md` (decision 174).** It sets the five roles (orchestrator, two builders, reviewer, shipper), the two lanes (unblock: merge on green, review after the merge; feature: docs first, review before the merge), the 10-minute check-in and every edge case. It outranks older rules on roles, lanes and agent counts, including "Running agents" below. Then the coordinator reads its task list (memory `foundation-reset-tasklist.md`) and runs one check-in before starting anything.
+
 0. **Every person and every AI agent working in any OnePeek repo, teammates and the main session (the coordinator) included, reads `onepeek-docs/standards/agent-operations.md` and `.github/workspace/pitfalls.md` first, and follows them strictly** (decision 171). That covers background builders and reviewers, docs drafters, and the session the founder talks to, in every repo.
    - The coordinator reads all of the standard at the start of each session, and runs every agent as its §3 to §7 say: briefs from `workspace/brief-template.md`, gates in proportion to the change, independent review, at most two rounds, three agents.
    - A background agent reads its role's sections and states what it read on its report's first line.
@@ -17,6 +19,8 @@ This folder holds the OnePeek repositories side by side. It is not itself a repo
 4. **For work in one repo,** starting your tool inside that repo loads its rules from the first message. Use this root for work that spans repos.
 
 ## Running agents (AI tools)
+**Superseded where they conflict by `onepeek-docs/standards/operating-model.md` (decision 174)** and the role skills `/orchestrate`, `/build-task`, `/review-task` and `/ship` (agents `builder`, `spec-reviewer`, `shipper`). In short: five roles (the orchestrator plus two builders, one reviewer and one shipper), the unblock lane and the feature lane, and no feature work while anything blocks merging. The rules below still apply inside those roles.
+
 How AI agents are run, so work is fast and token use stays low (founder, 2026-11-01; hardened by decision 171, 2026-11-06). The full rules, gates G0 to G8 and the edge cases are `onepeek-docs/standards/agent-operations.md`; these are the short form.
 1. **Gap check first.** Before a build, a short read-only pass over the task packet lists every gap. All of them are closed on the change set's docs pull request before the builder starts, so the build runs straight through.
 2. **Size by scope.** Each task is one coherent slice that fits in one run: about 400 changed lines at most, generated files and merges aside. A bigger slice is split before it starts (2026-11-06). The time limit (about 25 minutes) is a safety net against a stuck agent, not a way to split work.
