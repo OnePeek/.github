@@ -75,3 +75,4 @@ same pull request as the fix.
 24. **A fresh worktree has no dependencies.** Install them (`pnpm install`, `uv sync`) before committing, so the pre-commit hooks run. Never skip a hook. If a repo's hook needs a tool the repo never installs, that is a bug to report.
 25. **Decision numbers:** check the open docs pull requests, not only `main`, before taking the next number.
 26. **GitHub's API can show the old head for a few seconds after a push.** `done_check.py` re-reads briefly; do not "fix" a failure by pushing again.
+27. **Tests that run `git` clear Git's repository-local variables first** (`git rev-parse --local-env-vars`: `GIT_DIR`, `GIT_INDEX_FILE` and the rest). A hook passes them on, and an inherited `GIT_DIR` made a fixture rewrite another repo's config (.github #60).
