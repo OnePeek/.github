@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run a repo's pull-request CI locally, from its own workflow files, before pushing.
 
-    python3 .github/workspace/local_ci.py <repo dir> [--jobs layout,checks] [--skip-docker] [--list]
+    python3 .github/workspace/local_ci.py <repo dir> [--jobs layout,checks] [--skip-docker] [--list] [--keep-going]
 
 For every workflow that runs on `pull_request`, every job's `run:` steps run in order in the repo directory, with the
 job's and step's `env` (github.* and runner.* values filled in for a pull request into dev here, other expressions left out), stopping at the first failure. `uses:` steps (checkout, setup-*) are
@@ -10,7 +10,8 @@ stand for run here directly (actionlint with shellcheck, the runner-label lint).
 AWS (they read GH_TOKEN, assume a role, or call `gh api`) are skipped and listed, never run.
 
 Exit 0 when every step ran and passed; 1 at the first failure (its output is shown), or at the end when a `terraform test`
-step was not run (no step is reported OK that did not run, T-58); 2 bad input.
+step was not run (no step is reported OK that did not run, T-58); 2 bad input. --keep-going (T-69) runs every step after a
+failure too and ends with one list of every failed step (its reason and last log line) and `LOCAL CI NOT OK: N step(s) failed`.
 """
 from __future__ import annotations
 
@@ -532,7 +533,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--native", action="store_true", help="on macOS, run script tests on the laptop, not in the Linux container (§8c L2)")
     ap.add_argument("--shared", metavar="PATH", default=os.environ.get("ONEPEEK_SHARED_GITHUB") or None,
                     help="read the shared workflows from this .github worktree, not from the caller's pins (§8c L4)")
+    ap.add_argument("--keep-going", action="store_true", help="run every step after a failure too, then list every failed step (T-69)")
     a = ap.parse_args(argv)
+    a.failures = []
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # so a stopped run still removes its checkouts and temp files
     repo = pathlib.Path(a.repo).resolve()
@@ -553,11 +556,13 @@ def main(argv: list[str] | None = None) -> int:
     _DOCKER = None
     if not a.list and (problem := uv_problem()):
         print(f"FAIL  {problem}")
-        return 1
+        if failed(a, "uv", problem):
+            return 1
 
     if not a.list and (marks := conflict_markers(repo)):
         print("FAIL  unresolved merge conflict markers (resolve them first): " + ", ".join(marks[:20]))
-        return 1
+        if failed(a, "conflict markers", ", ".join(marks[:20])):
+            return 1
 
     if a.shared:
         if not pathlib.Path(a.shared).is_dir():
@@ -572,7 +577,8 @@ def main(argv: list[str] | None = None) -> int:
                 lint_root = shared_root(max(set(pins), key=pins.count) if pins else "", a.shared)
         except RuntimeError as e:
             print(f"FAIL  {e}")
-            return 1
+            if failed(a, "shared workflows", str(e)):
+                return 1
     for check, cmd in shared_checks(repo, kind, name, lint_root):
         if a.list:
             print(f"[shared] {check}")
@@ -581,7 +587,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{'PASS' if r.returncode == 0 else 'FAIL'}  [shared] {check}")
         if r.returncode:
             print((r.stdout + r.stderr)[-4000:])
-            return 1
+            if failed(a, f"[shared] {check}", f"exit {r.returncode}", r.stdout + r.stderr):
+                return 1
 
     for path, doc in pr_workflows(repo):
         wf_env = clean_env(doc.get("env"), ctx)
@@ -598,7 +605,9 @@ def main(argv: list[str] | None = None) -> int:
                         local = shared_root(pin, a.shared) / ref.split("OnePeek/.github/", 1)[-1]
                     except RuntimeError as e:
                         print(f"FAIL  {path.name}:{job_id}: {e}")
-                        return 1
+                        if failed(a, f"{path.name}:{job_id}", str(e)):
+                            return 1
+                        continue
                 if not local or not local.exists():
                     skipped.append(f"{path.name}:{job_id} (reusable workflow {ref})")
                     continue
@@ -629,6 +638,12 @@ def main(argv: list[str] | None = None) -> int:
     if a.list:
         return 0
     # A skipped `terraform test` never ends OK (T-58): the run says which suites the laptop did not test.
+    if a.keep_going and (failures := a.failures + [s for s in skipped if s.startswith("terraform test skipped: ")]):
+        print("\nFailed steps:")
+        for f in failures:
+            print(f"  - {f}")
+        print(f"LOCAL CI NOT OK: {len(failures)} step(s) failed")
+        return 1
     if untested := [s for s in skipped if s.startswith("terraform test skipped: ")]:
         print(f"\nLOCAL CI NOT OK: {len(untested)} terraform test step(s) did not run here; run them, or let CI:")
         for s in untested:
@@ -636,6 +651,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"\nLOCAL CI OK ({time.time() - started:.0f}s)")
     return 0
+
+
+def failed(a, label: str, reason: str, out: str = "") -> int:
+    """Records a failed step for the --keep-going summary: 0 (go on) under --keep-going, else 1 (stop here)."""
+    last = next((x.strip() for x in reversed(out.splitlines()) if x.strip()), "")
+    a.failures.append(f"{label} ({reason})" + (f": {last[:200]}" if last else ""))
+    return 0 if a.keep_going else 1
 
 
 def substitute(text: str, inputs: dict[str, str]) -> str:
@@ -694,11 +716,11 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                 tf_test = bool(TERRAFORM_TEST.search(code))
 
                 def skip(reason: str) -> bool:
-                    """Records the skip; True when the run must fail (a skipped `terraform test` under --release)."""
+                    """Records the skip; True when the run must stop (a skipped `terraform test` under --release)."""
                     if tf_test:
                         print(f"{'WARN' if a.list else 'FAIL'}  {label}: terraform test skipped: {reason}")
                         if a.release and not a.list:
-                            return True
+                            return bool(failed(a, label, f"terraform test skipped: {reason}"))
                         skipped.insert(0, f"terraform test skipped: {label} ({reason})")
                     else:
                         skipped.append(f"{label} ({reason})")
@@ -745,7 +767,9 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                 missing = [t for t in OPTIONAL_TOOLS if re.search(rf"(?m)^\s*{t}\b", code) and not shutil.which(t)]
                 if missing and a.release and not a.list:
                     print(f"FAIL  {label}: {missing[0]} is not installed on this laptop (--release does not skip it)")
-                    return 1
+                    if failed(a, label, f"{missing[0]} is not installed"):
+                        return 1
+                    continue
                 if missing:
                     if skip(f"SKIP: {missing[0]} is not installed on this laptop"):
                         return 1
@@ -756,11 +780,15 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                         pure = tflint_commands(cmd, repo, repo / step.get("working-directory", workdir))
                     except ValueError:
                         print(f"FAIL  {label}: a directory is outside the repository")
-                        return 1
+                        if failed(a, label, "a directory is outside the repository"):
+                            return 1
+                        continue
                     if why := tflint_problem(not a.skip_docker):
                         if a.release and not a.list:
                             print(f"FAIL  {label}: {why}")
-                            return 1
+                            if failed(a, label, why):
+                                return 1
+                            continue
                         print(f"WARN  {label}: {why}; CI runs it", file=sys.stderr)
                         if skip(f"SKIP: {why}"):
                             return 1
@@ -768,7 +796,9 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                     tflint_docker = tflint_mode(not a.skip_docker) == "docker"
                     if tflint_docker and pure is None:
                         print(f"FAIL  {label}: this step runs other commands besides tflint, so it needs tflint {TFLINT_VERSION} on PATH (Docker runs only plain tflint commands)")
-                        return 1
+                        if failed(a, label, f"needs tflint {TFLINT_VERSION} on PATH"):
+                            return 1
+                        continue
                 if any(re.search(rf"\bmv\s+{re.escape(c)}\b", code) for c in checkout_paths if not c.startswith("${{")):
                     if skip(f"CI-only: places a checkout the laptop does not make"):
                         return 1
@@ -820,14 +850,18 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                         why = "Docker is not used (--skip-docker)" if a.skip_docker else "Docker is not available"
                         if a.release:
                             print(f"FAIL  {label}: script tests run in a Linux container on macOS and {why} (--native runs them here)")
-                            return 1
+                            if failed(a, label, why):
+                                return 1
+                            continue
                         print(f"WARN  {label}: script tests run here on the laptop, not in CI's Linux: {why}", file=sys.stderr)
                     else:
                         try:
                             linux = (repo, ensure_image(), bool(NEEDS_NETWORK.search(code)))
                         except RuntimeError as e:
                             print(f"FAIL  {label}: {e}")
-                            return 1
+                            if failed(a, label, "cannot build the local CI image", str(e)):
+                                return 1
+                            continue
                 try:
                     rc, out, secs = run_step(cmd, cwd, env, str(step.get("shell") or job.get("shell") or ""), linux)
                 finally:
@@ -843,7 +877,8 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                 print(f"{'PASS' if rc == 0 else 'FAIL'}  {label}  ({secs:.0f}s){'  [linux container]' if linux else ''}")
                 if rc:
                     print(out[-6000:])
-                    return 1
+                    if failed(a, label, f"exit {rc}{', linux container' if linux else ''}", out):
+                        return 1
     return 0
 
 
@@ -927,7 +962,7 @@ def run_build(label0: str, step: dict, inputs: dict, repo: pathlib.Path, workdir
     print(f"{'PASS' if r.returncode == 0 else 'FAIL'}  {label}  ({time.time() - t0:.0f}s)")
     if r.returncode:
         print((r.stdout + r.stderr)[-6000:])
-        return 1
+        return failed(a, label, f"exit {r.returncode}", r.stdout + r.stderr)
     return 0
 
 
