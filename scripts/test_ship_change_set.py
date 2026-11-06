@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import json
 import pathlib
 import shutil
@@ -1766,7 +1767,7 @@ class HeadKeepsMoving(unittest.TestCase):
         self.assertEqual(self.heads(4, True), ("4" * 40, 5))
 
     def test_every_wait_shares_one_deadline(self) -> None:  # T-56 round 2: 5 waits never add up past CHECK_TIMEOUT_S
-        with mock.patch.object(ship.time, "time", return_value=1000.0):
+        with mock.patch.object(ship.time, "time", side_effect=itertools.count(1000.0, 10.0)):  # T-96: a moving clock
             with mock.patch.object(ship, "pr_info", side_effect=[{"headRefOid": h * 40} for h in "0122"]), \
                     mock.patch.object(ship, "wait_green") as wait, mock.patch.object(ship, "say"):
                 ship.green_head("onepeek-web", 3, False)
