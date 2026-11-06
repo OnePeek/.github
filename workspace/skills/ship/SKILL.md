@@ -10,7 +10,7 @@ description: The shipper's procedure. Watch every open pull request, CI run, run
 ## 1. The loop (every 3 to 5 minutes)
 1. Run `python3 "$ONEPEEK_WORKSPACE/.github/workspace/ship_watch.py" --once`. It only reads. Then read `$ONEPEEK_WORKSPACE/.ship/ship-status.json`.
 2. Put each open pull request in one class:
-   - **READY:** the lane's gates are met (§2), the fast checks are green, there are no open real threads, and every dependency has merged.
+   - **READY:** the lane's gates are met (§2), the fast checks are green, and every dependency has merged. CodeRabbit threads are not a gate (founder, 2026-11-07).
    - **BLOCKED:** one named reason.
    - **HOLD:** a release, a draft, another author's pull request, or one that has been replaced.
 3. Merge each READY pull request with `python3 "$ONEPEEK_WORKSPACE/.github/workspace/ship_change_set.py" <repo>#<n> --go`:
@@ -27,7 +27,7 @@ description: The shipper's procedure. Watch every open pull request, CI run, run
 - **Feature lane:**
   - the unblock-lane rule;
   - plus `reviews.json` records the reviewer's `ready` at this exact head;
-  - plus CodeRabbit has finished on that head.
+  - plus CodeRabbit's first review of the pull request has posted (not re-awaited on later heads).
 - **The sandbox** is warn-only until the rehearsal (T-30): a red sandbox run is an alert, not a block.
 - **Never merge:**
   - a release pull request, a draft, or another author's pull request;
@@ -43,9 +43,7 @@ description: The shipper's procedure. Watch every open pull request, CI run, run
 | `depends-on` is red, and its dependency has merged | Re-run it once |
 | A job queued for more than 10 minutes, or no runner online | A capacity alert, with the queue length and the runner counts |
 | A merge conflict | Send the orchestrator the conflicting files. If they are text only (pitfalls, `AGENTS.md`, docs pins), mark it "text-only, no re-review". If code is involved, mark it "delta review" |
-| A real bot thread | Send it to the orchestrator. It becomes a builder task |
-| A bot thread that is wrong, or already fixed | Draft the reply, citing the fixing commit or the line that disproves it, and send it to the orchestrator to post and resolve |
-| A bot nit | Draft the reply "follow-up <task>", and send it to the orchestrator to post and resolve |
+| A CodeRabbit thread | Nothing, unless it is critical or major in its first review and the reviewer has not covered it: then name it to the orchestrator as a builder commit. No reply drafts, no resolving |
 | CodeRabbit is skipping, or out of quota | Not a blocker. Say so in your report |
 | A pull request ready for 30 minutes and not merged | Name the reason to the orchestrator |
 | A replaced pull request, or another author's | List it for the founder. Never close it |

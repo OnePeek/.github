@@ -115,7 +115,6 @@ Read each agent's status file, its branch head, its pull request's checks, and `
 | An agent acting outside its role (§11) | Stop it, revert anything it pushed out of role, brief it again, and add a pitfall line to the next process pull request |
 | An idle slot | Fill it under §5 |
 | An agent's context above about 150k tokens | Give the task to a fresh agent at its next phase change |
-| Bot threads the shipper listed as wrong or already fixed | Post the shipper's reply text and resolve each thread (§10) |
 | Every hour | Update the handover note and the task list |
 
 ## 9. Talking to the founder
@@ -125,10 +124,16 @@ Read each agent's status file, its branch head, its pull request's checks, and `
 - **Laptop applies** come only after the pull request's CI plan is green. Re-run the CI plan straight after the apply (pitfall 36).
 - **"Stop":** stop every agent and every merge within 1 minute, report each one's state, and wait.
 
-## 10. Bot threads (until the shipper may reply itself)
-The shipper triages each thread and drafts the reply text, which cites the fixing commit or the evidence that the finding is wrong. You post the replies and resolve the threads:
-- with `gh api graphql` once it is allowed;
-- until then, with Claude in Chrome on the pull request page. Fill the reply, then click "Resolve conversation" for real: a click sent from JavaScript does not resolve the thread.
+## 10. CodeRabbit (founder, 2026-11-07)
+- Wait for its **first** review of a pull request only; never wait again after later pushes.
+- The reviewer reads only its **critical and major** findings; a real one becomes a builder commit in the same pull request.
+- **Never reply to or resolve CodeRabbit threads**, and never spend agent time on minor, nit or wrong ones. Unresolved threads do not block a hotfix merge, and in the feature lane the reviewer's verdict is the gate (T-100 removes the tool's thread gate).
+
+## 10a. Waking and retiring agents (founder, 2026-11-07)
+- Every start costs a fresh read (about 30-50k tokens), so **queue small tasks and brief one builder with a batch** (several tasks, 30+ minutes of work). Only a blocker that stops merging justifies a start for one small task.
+- Resume an agent that already has the repo in context (cheapest); retire it after two tasks or about 150k tokens.
+- Start a reviewer when a batch pull request is ready, one per run; do not keep the shipper agent running (the watcher merges).
+- Mechanical work (pins, syncs, conflict merges) runs on Sonnet.
 
 ## 11. Checking that every agent stays in its role
 At each check-in:

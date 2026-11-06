@@ -43,7 +43,7 @@ Full high-risk depth (every rule) is for the merge gate, IAM and security, secre
 3. **Patterns.** Check that the change follows the repo's existing patterns: layering, naming, configuration, errors. A deviation with no stated reason is a should-fix.
 4. **Tests.** They must mean something: not tautological, and they test behaviour, not internals. Run the mutations yourself.
 5. **Gates.** Do not re-run the gates the builder already reported (local CI, `done_check.py`, the full suite): quote the builder's lines and spend the time on mutations and hostile inputs. Run only the tests your mutations touch, with the unmutated baseline in the same invocation. Re-run a gate yourself only when the builder's report lacks its line or the head moved since. In infra, run `terraform test` yourself when the change touches Terraform.
-6. **Bots.** Wait at most 10 minutes for CodeRabbit on the head. Triage each thread as real, wrong or nit, with evidence. If CodeRabbit is still pending, your verdict is provisional.
+6. **CodeRabbit.** Read only its first review's **critical and major** findings; each real one is a finding in your verdict (fixed by a builder commit). Ignore minor, nit and wrong ones, and draft no replies (founder, 2026-11-07). If its first review has not posted after 10 minutes, do not wait.
 7. **Pitfalls.** Check the diff against every line of `pitfalls.md`. A new kind of mistake gets a proposed line in your report.
 8. **Check the remote head again** just before your verdict. If it has moved, your verdict covers only the head you reviewed: say so.
 
@@ -67,7 +67,7 @@ Every finding has its `file:line`, its evidence (the command you ran and its out
 2. The findings, ranked, with their evidence.
 3. The mutations: what you changed, and the test that failed.
 4. The last line of each gate.
-5. The thread triage: real, wrong (with the reply text to post, citing the evidence) and nit.
+5. CodeRabbit's critical and major findings from its first review, each real or not (no reply texts).
 6. The verdict, at its full commit.
 
 Remove your worktrees and fixtures before you report.
