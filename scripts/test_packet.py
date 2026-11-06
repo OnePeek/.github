@@ -56,7 +56,12 @@ class Lane(unittest.TestCase):
                      "Lane: hotfix (preprod down)", "Lane: hot fix", "Lane: urgent", "Lane:", "Lane: hotfix.", "\ufeffLane: hotfix",
                      # comments that do not end cleanly before the first line
                      "<!-- x\nLane: hotfix", "<!-- x --> Lane: hotfix", "<!-->\nLane: hotfix\n-->", "<!--->\nLane: hotfix\n-->",
-                     "<!-- x --!>\nLane: hotfix\n-->", " <!-- x -->\nLane: hotfix"):
+                     "<!-- x --!>\nLane: hotfix\n-->", " <!-- x -->\nLane: hotfix",
+                     # each fail-closed comment rule, with a clean lane line after the comment (review of #73)
+                     "<!-- x --> foo\nLane: hotfix", "<!-->\nfoo\n-->\nLane: hotfix", "<!--->\nfoo\n-->\nLane: hotfix",
+                     "<!-- x --!>\nfoo\n-->\nLane: hotfix",
+                     # Unicode case folding must not turn a near-lane into a lane (dotless i, dotted capital I, long s)
+                     "Lane: hotf\u0131x", "Lane: hotf\u0130x", "Lane: doc\u017f"):
             with self.subTest(text=text):
                 self.assertEqual(packet.lane_of(text), "feature")
 
