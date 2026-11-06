@@ -242,31 +242,80 @@ class Retarget(unittest.TestCase):  # F39: a pull request stacked on the merged 
             "mergeable": "MERGEABLE", "body": "", "isCrossRepository": False, "headRepositoryOwner": {"login": "OnePeek"},
             "author": {"login": "Karan-98-Mehta"}}
 
-    def merge(self, listed: str, edit_fails: bool = False) -> list[tuple]:
+    def merge(self, listed: str, edit_fails: bool = False, repo: str = "onepeek-web", base: str = "dev",
+              merge_fails: str = "", head_ref: str = "fix/404-page") -> list[tuple]:
+        """`merge_fails`: "exit" makes `gh pr merge` fail, "state" leaves the pull request open after it."""
         calls: list[tuple] = []
+        start = dict(self.INFO, baseRefName=base, headRefName=head_ref)
 
         def gh(*args):
             calls.append(args)
             if args[:2] == ("pr", "edit") and edit_fails:
                 raise SystemExit("STOP: `gh pr edit 7 ...` failed: HTTP 422")
+            if args[:2] == ("pr", "merge") and merge_fails == "exit":
+                raise SystemExit("STOP: `gh pr merge 3 ...` failed: HTTP 405")
             return listed if args[:2] == ("pr", "list") else ""
 
-        def info(repo, n):
-            merged = any(c[:2] == ("pr", "merge") for c in calls)
-            return dict(self.INFO, state="MERGED", mergeCommit={"oid": "m1"}) if merged else self.INFO
+        def info(r, n):
+            merged = any(c[:2] == ("pr", "merge") for c in calls) and merge_fails != "state"
+            return dict(start, state="MERGED", mergeCommit={"oid": "m1"}) if merged else start
         with mock.patch.object(ship, "pr_info", side_effect=info), mock.patch.object(ship, "say"), \
                 mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "no_conflicts"), \
                 mock.patch.object(ship, "green_head", return_value="h3"), mock.patch.object(ship, "refuse_unresolved"), \
                 mock.patch.object(ship, "remove_worktrees"), mock.patch.object(ship, "gh", side_effect=gh), \
+                mock.patch.object(ship, "wait_tag", return_value=("v9.9.9", "t1")), mock.patch.object(ship, "pin_moves", return_value=[]), \
                 mock.patch.object(ship, "retarget_stacked", REAL_RETARGET):
-            ship.main(["onepeek-web#3", "--go"])
+            ship.main([f"{repo}#3", "--go"])
         return calls
+
+    def test_a_release_merge_keeps_its_branch_and_moves_nothing(self):
+        with mock.patch.object(ship, "release_lock"), mock.patch.object(ship, "lock_problem", return_value=None), \
+                mock.patch.object(ship, "chain_problem", return_value=None):
+            calls = self.merge('[{"number": 7}]', repo="onepeek-web", base=ship.RELEASE_BASE, head_ref="dev")
+        self.assertEqual([c[:2] for c in calls], [("pr", "merge")])
+        self.assertNotIn("--delete-branch", calls[0])
+
+    def test_a_main_based_repo_is_retargeted_to_main(self):
+        for repo in ("onepeek-docs", "marketing-website"):  # through main (.github's merge needs the workspace root)
+            with self.subTest(repo=repo):
+                calls = self.merge('[{"number": 7}]', repo=repo, base="main")
+                self.assertIn(("pr", "edit", "7", "-R", f"OnePeek/{repo}", "--base", "main"), calls)
+        for repo, target in ((".github", "main"), ("onepeek-docs", "main"), ("marketing-website", "main"), ("onepeek-infra", "dev")):
+            with self.subTest(repo=repo), mock.patch.object(ship, "say"), \
+                    mock.patch.object(ship, "gh", side_effect=lambda *a: '[{"number": 7}]' if a[:2] == ("pr", "list") else "") as gh:
+                self.assertEqual(REAL_RETARGET(repo, 3, "b"), [f"{repo}#7"])
+                gh.assert_any_call("pr", "edit", "7", "-R", f"OnePeek/{repo}", "--base", target)
+
+    def test_more_than_the_limit_stops_before_any_edit(self):
+        too_many = json.dumps([{"number": i} for i in range(ship.RETARGET_LIMIT + 1)])
+        with self.assertRaisesRegex(SystemExit, "could not retarget .*may be cut short"):
+            self.merge(too_many)
+        self.assertEqual([c[:2] for c in self.merge(json.dumps([{"number": i} for i in range(ship.RETARGET_LIMIT)]))].count(
+            ("pr", "edit")), ship.RETARGET_LIMIT)
+
+    def test_a_merge_that_fails_after_a_retarget_names_every_moved_pull_request(self):
+        for how in ("exit", "state"):
+            with self.subTest(how=how), self.assertRaisesRegex(
+                    SystemExit, "onepeek-web#7, onepeek-web#9 were retargeted to dev before it: move them back to fix/404-page"):
+                self.merge('[{"number": 9}, {"number": 7}]', merge_fails=how)
+
+    def test_a_retarget_that_fails_part_way_names_the_ones_already_moved(self):
+        calls: list[tuple] = []
+
+        def gh(*args):
+            calls.append(args)
+            if args[:2] == ("pr", "edit") and args[2] == "9":
+                raise SystemExit("HTTP 422")
+            return '[{"number": 9}, {"number": 7}]' if args[:2] == ("pr", "list") else ""
+        with mock.patch.object(ship, "gh", side_effect=gh), mock.patch.object(ship, "say"), \
+                self.assertRaisesRegex(SystemExit, "already retargeted to dev, move back to b: onepeek-web#7;"):
+            REAL_RETARGET("onepeek-web", 3, "b")
 
     def test_a_stacked_pull_request_is_retargeted_before_the_merge(self):
         calls = self.merge('[{"number": 9}, {"number": 7}]')
         verbs = [c[:2] for c in calls]
         self.assertEqual(calls[0], ("pr", "list", "-R", "OnePeek/onepeek-web", "--base", "fix/404-page", "--state", "open",
-                                    "--json", "number", "--limit", "200"))
+                                    "--json", "number", "--limit", "201"))
         self.assertEqual(calls[1:3], [("pr", "edit", "7", "-R", "OnePeek/onepeek-web", "--base", "dev"),
                                       ("pr", "edit", "9", "-R", "OnePeek/onepeek-web", "--base", "dev")])
         self.assertEqual(verbs[3:], [("pr", "merge")])

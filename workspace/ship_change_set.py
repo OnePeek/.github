@@ -911,20 +911,29 @@ def review_problem(label: str, head: str, author: dict | None, all_checks: list[
     return f"no review at {head}"
 
 
-def retarget_stacked(repo: str, n: int, branch: str) -> None:
+RETARGET_LIMIT = 200  # stacked pull requests read per branch; more than this stops (as ship_watch.PR_LIMIT does)
+
+
+def retarget_stacked(repo: str, n: int, branch: str) -> list[str]:
     """Before a merge deletes `branch`, move each open pull request based on it to the repo's merge base: GitHub closes a
-    pull request whose base branch is deleted (F39: .github#76, infra#192). Bodies are left alone. A failure stops the
-    merge."""
+    pull request whose base branch is deleted (F39: .github#76, infra#192). Bodies are left alone. A failure, or a list
+    that may be cut short, stops the merge. Returns the pull requests moved, for the STOP of a merge that then fails."""
     target = BASE.get(repo, "dev")
+    moved: list[str] = []
     try:
         stacked = json.loads(gh("pr", "list", "-R", f"{ORG}/{repo}", "--base", branch, "--state", "open",
-                                "--json", "number", "--limit", "200"))
+                                "--json", "number", "--limit", str(RETARGET_LIMIT + 1)))
+        if len(stacked) > RETARGET_LIMIT:
+            raise ValueError(f"more than {RETARGET_LIMIT} open pull requests are based on it: the list may be cut short")
         for m in sorted(p["number"] for p in stacked):
             gh("pr", "edit", str(m), "-R", f"{ORG}/{repo}", "--base", target)
+            moved.append(f"{repo}#{m}")
             say(f"{repo}#{m}: retargeted from {branch} to {target} before {repo}#{n} merges")
     except (SystemExit, ValueError, KeyError, TypeError) as e:
-        raise SystemExit(f"STOP {repo}#{n}: could not retarget the pull requests based on {branch} ({e}); "
+        undo = f"; already retargeted to {target}, move back to {branch}: {', '.join(moved)}" if moved else ""
+        raise SystemExit(f"STOP {repo}#{n}: could not retarget the pull requests based on {branch} ({e}){undo}; "
                          "not merged, nothing after it is merged") from None
+    return moved
 
 
 def refuse_unresolved(repo: str, n: int) -> None:
@@ -1112,12 +1121,16 @@ def main(argv: list[str]) -> int:
             why = f"{repo}#{n}: head {head[:7]} is neither the reviewed head {reviewed[:7]} nor a commit this run pushed"
         if why:
             raise SystemExit(f"STOP {why}; nothing after it is merged")
-        if keep:  # its branch is deleted on merge (F39)
-            retarget_stacked(repo, n, info[(repo, n)]["headRefName"])
-        gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, *keep, "--match-head-commit", head)
+        retargeted = retarget_stacked(repo, n, info[(repo, n)]["headRefName"]) if keep else []  # its branch is deleted on merge (F39)
+        undo = (f"; {', '.join(retargeted)} were retargeted to {BASE.get(repo, 'dev')} before it: move them back to "
+                f"{info[(repo, n)]['headRefName']}") if retargeted else ""
+        try:
+            gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, *keep, "--match-head-commit", head)
+        except SystemExit as e:
+            raise SystemExit(f"{e}{undo}") from None
         merged = pr_info(repo, n)
         if merged["state"] != "MERGED":
-            raise SystemExit(f"STOP {repo}#{n}: merge did not complete ({merged['state']})")
+            raise SystemExit(f"STOP {repo}#{n}: merge did not complete ({merged['state']}){undo}")
         say(f"{repo}#{n}: merged {merged['mergeCommit']['oid'][:7]}")
         if hotfix(live):
             say(f"{repo}#{n}: Lane: hotfix, post-merge review due (operating-model §3)")
