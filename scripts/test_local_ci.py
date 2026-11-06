@@ -563,7 +563,7 @@ class CommentsL1(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue((d / "ran").exists())
 
-    def test_release_fails_on_a_skipped_terraform_test_and_otherwise_warns_and_lists_it_first(self):
+    def test_release_fails_at_once_on_a_skipped_terraform_test_and_otherwise_the_run_ends_not_ok(self):
         step = "terraform -chdir=. test\naws s3 ls"
         rc, out, err, _ = self.run_main([step, "gh api repos/x"], "--release")
         self.assertEqual(rc, 1)
