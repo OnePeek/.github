@@ -29,31 +29,41 @@ def setUpModule() -> None:
 
 
 class Lane(unittest.TestCase):
-    def test_default_is_feature(self) -> None:
-        self.assertEqual(packet.lane_of(""), "feature")
-        self.assertEqual(packet.lane_of(None), "feature")
-        self.assertEqual(packet.lane_of("Build identity.\nNo lane stated here"), "feature")
-        self.assertEqual(packet.lane_of("Build identity.\nNo lane here, Lane: hotfix mentioned inline"), "feature")
+    """Ruling T-53 round 3 (pitfall 12): the first line after blank lines and leading whole-line HTML comments alone
+    decides, and only when it is exactly `Lane: feature|hotfix|docs`; anything else is feature (fail closed)."""
 
-    def test_a_lane_line_sets_it_in_any_case(self) -> None:
-        self.assertEqual(packet.lane_of("fix it\nLane: hotfix\n"), "hotfix")
-        self.assertEqual(packet.lane_of("  lane: Feature  "), "feature")
+    def test_a_plain_first_line_sets_the_lane(self) -> None:
+        for text in ("Lane: hotfix", "Lane: hotfix\nfix it", "\n \n\t\nLane: hotfix\nx", "<!-- Lane: feature|hotfix -->\nLane: hotfix",
+                     "<!--\nLane: feature\n-->\n\nLane: hotfix", "<!-- a -->  \n<!-- b\n-->\nLane: hotfix",
+                     "Lane: hotfix\r\nfix it\r\n", "\r\nLane: hotfix\r", "lane: HOTFIX", "LANE:hotfix \t",
+                     "Lane: hotfix\nLane: feature", "Lane: hotfix\n\n---"):
+            with self.subTest(text=text):
+                self.assertEqual(packet.lane_of(text), "hotfix")
+        self.assertEqual(packet.lane_of("Lane: docs\nwording"), "docs")
+        self.assertEqual(packet.lane_of("lane: Feature  "), "feature")
 
-    def test_a_bullet_bold_and_trailing_words_are_fine_and_the_first_word_is_the_value(self) -> None:
-        for text in ("- **Lane:** hotfix", "* Lane: hotfix (preprod down)", "Lane: **hotfix**", "x\n  - lane: HOTFIX - restores the release"):
-            self.assertEqual(packet.lane_of(text), "hotfix", text)
-        self.assertEqual(packet.lane_of("- **Lane:** feature (default)"), "feature")
-
-    def test_an_html_comment_is_ignored_also_beside_a_real_line(self) -> None:
-        hint = "<!-- Lane: feature|hotfix -->"
-        self.assertEqual(packet.lane_of(hint), "feature")
-        self.assertEqual(packet.lane_of(f"{hint}\nLane: hotfix"), "hotfix")
-        self.assertEqual(packet.lane_of("<!--\nLane: feature|hotfix\n-->\nLane: hotfix"), "hotfix")
-
-    def test_an_unknown_or_conflicting_lane_is_an_error_never_the_default(self) -> None:
-        for text in ("Lane: urgent", "Lane: hot fix", "Lane:", "Lane: hotfix\nLane: feature"):
-            with self.assertRaises(ValueError):
-                packet.lane_of(text)
+    def test_anything_else_is_feature(self) -> None:
+        for text in ("", None, {"x": 1}, b"Lane: hotfix", "\n\n", "<!-- only a hint -->",
+                     # review round 3: closing fence with trailing text, nested details, setext heading, lazy list line
+                     "```\n```python\nLane: hotfix\n```\n```", "<details>\n<details>\nx\n</details>\nLane: hotfix\n</details>",
+                     "Lane: hotfix\n---", "Lane: hotfix\n===", "Lane: hotfix\n   -", "- item\nLane: hotfix",
+                     # round 2 forms: fence, indent, details, heading, quote, bold, bullet, inline code, prose first
+                     "```markdown\nLane: hotfix\n```", "~~~\nLane: hotfix\n~~~", "    Lane: hotfix", "  Lane: hotfix", "\tLane: hotfix",
+                     "<details><summary>x</summary>\n\nLane: hotfix\n</details>", "## Lane: hotfix", "# Lane: hotfix",
+                     "> Lane: hotfix", "**Lane:** hotfix", "Lane: **hotfix**", "- Lane: hotfix", "* Lane: hotfix", "+ Lane: hotfix",
+                     "`Lane: hotfix`", "We use Lane: hotfix here", "fix it\nLane: hotfix", "Lane\uff1a hotfix", "<p>Lane: hotfix</p>",
+                     # a value that is not exactly a lane
+                     "Lane: hotfix (preprod down)", "Lane: hot fix", "Lane: urgent", "Lane:", "Lane: hotfix.", "\ufeffLane: hotfix",
+                     # comments that do not end cleanly before the first line
+                     "<!-- x\nLane: hotfix", "<!-- x --> Lane: hotfix", "<!-->\nLane: hotfix\n-->", "<!--->\nLane: hotfix\n-->",
+                     "<!-- x --!>\nLane: hotfix\n-->", " <!-- x -->\nLane: hotfix",
+                     # each fail-closed comment rule, with a clean lane line after the comment (review of #73)
+                     "<!-- x --> foo\nLane: hotfix", "<!-->\nfoo\n-->\nLane: hotfix", "<!--->\nfoo\n-->\nLane: hotfix",
+                     "<!-- x --!>\nfoo\n-->\nLane: hotfix",
+                     # Unicode case folding must not turn a near-lane into a lane (dotless i, dotted capital I, long s)
+                     "Lane: hotf\u0131x", "Lane: hotf\u0130x", "Lane: doc\u017f"):
+            with self.subTest(text=text):
+                self.assertEqual(packet.lane_of(text), "feature")
 
 
 def git(cwd: pathlib.Path, *args: str) -> str:
@@ -120,6 +130,18 @@ class DocsClone(unittest.TestCase):
         code, text = self.packet()
         self.assertEqual(code, 0, text)
         self.assertIn("docs newer", text)
+
+    def test_the_task_and_pr_first_line_is_the_packets_first_line(self) -> None:  # ruling T-53 round 3
+        task = self.root / "task.md"
+        for body, want in (("Lane: hotfix\nfix CI", "hotfix"), ("fix CI\nLane: hotfix", "feature"), ("Lane: docs", "docs")):
+            task.write_text(body)
+            code, text = self.packet("--docs", str(self.docs), "--task", str(task))
+            self.assertEqual((code, text.splitlines()[0]), (0, f"lane: {want}"), body)
+        view = subprocess.CompletedProcess([], 0, "<!-- Lane: feature|hotfix -->\nLane: hotfix\n", "")
+        with mock.patch.object(packet, "run", side_effect=lambda a: view if a[0] == "gh" else subprocess.run(
+                a, capture_output=True, text=True, check=False)):
+            code, text = self.packet("--docs", str(self.docs), "--pr", "onepeek-web#3")
+        self.assertEqual((code, text.splitlines()[0]), (0, "lane: hotfix"))
 
     def test_docs_dir_precedence(self) -> None:
         repo = pathlib.Path("/w/repo")

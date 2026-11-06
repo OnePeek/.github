@@ -68,6 +68,9 @@ def _load(name: str):
 
 depends_on = _load("check_depends_on")
 check_pins = _load("check_pins")
+_packet_spec = importlib.util.spec_from_file_location("packet", pathlib.Path(__file__).resolve().parent / "packet.py")
+packet = importlib.util.module_from_spec(_packet_spec)
+_packet_spec.loader.exec_module(packet)
 ORDER = ["onepeek-docs", ".github", "onepeek-infra", "onepeek-design-system", "backend-service", "onepeek-web"]
 BASE = {"onepeek-docs": "main", ".github": "main", "marketing-website": "main"}  # every other repo merges into dev
 PIN = check_pins.USES  # every `uses:` naming OnePeek/.github, any letter case, any ref (§8a P2)
@@ -771,9 +774,19 @@ DOCS_PR: list[int] = []
 TOOL_PUSHED: set[str] = set()  # commits this run pushed itself (pin moves, docs-pin refreshes): no new review needed
 
 
+def hotfix(i: dict) -> bool:
+    """operating-model §3 unblock lane: the body's first line says `Lane: hotfix` (packet.lane_of, ruling T-53 round 3)
+    and it is not a release pull request. Only hotfix skips the review gates: `docs`, `feature`, no lane line or an odd
+    body keep them (fail closed)."""
+    return i.get("baseRefName") != RELEASE_BASE and packet.lane_of(i.get("body")) == "hotfix"
+
+
 def review_gate(repo: str, n: int, i: dict) -> str | None:
     """agent-operations.md §6.6 "Review gates for merging" (F36) for the pull request's head `i["headRefOid"]`, read
-    live; the bot allow-list is the `authors` of ship_watch.yaml (--config). An unreadable record is a problem."""
+    live; the bot allow-list is the `authors` of ship_watch.yaml (--config). An unreadable record is a problem.
+    A hotfix pull request has none: it is reviewed after the merge (operating-model §3)."""
+    if hotfix(i):
+        return None
     try:
         reviews = read_reviews()
     except (OSError, ValueError) as e:
@@ -1038,11 +1051,17 @@ def main(argv: list[str]) -> int:
             if why:
                 raise SystemExit(f"STOP {repo}#{n}: {why}")
         keep = [] if base_ref == RELEASE_BASE else ["--delete-branch"]  # a release pull request's head is `dev`: never deleted
-        refuse_unresolved(repo, n)  # every review thread read and resolved before the merge (§6.4)
+        live = dict(info[(repo, n)], body=pr_info(repo, n).get("body"))  # the lane, read again now (never cached)
+        lanes = ["hotfix" if hotfix(x) else "feature" for x in (info[(repo, n)], live)]
+        if lanes[0] != lanes[1]:
+            raise SystemExit(f"STOP {repo}#{n}: the lane changed since the plan ({lanes[0]} -> {lanes[1]}); run "
+                             "again; nothing after it is merged")
+        if lanes[1] == "feature":
+            refuse_unresolved(repo, n)  # every review thread read and resolved before the merge (§6.4)
         reviewed = info[(repo, n)]["headRefOid"]  # the review gates, again, right before the merge (F36)
-        why = review_gate(repo, n, info[(repo, n)]) if head == reviewed else (
-            None if head in TOOL_PUSHED - {""} else f"{repo}#{n}: head {head[:7]} is neither the reviewed head "
-                                                     f"{reviewed[:7]} nor a commit this run pushed")
+        why = review_gate(repo, n, live) if lanes[1] == "feature" else None
+        if not why and head != reviewed and head not in TOOL_PUSHED - {""}:
+            why = f"{repo}#{n}: head {head[:7]} is neither the reviewed head {reviewed[:7]} nor a commit this run pushed"
         if why:
             raise SystemExit(f"STOP {why}; nothing after it is merged")
         gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, *keep, "--match-head-commit", head)
@@ -1050,6 +1069,8 @@ def main(argv: list[str]) -> int:
         if merged["state"] != "MERGED":
             raise SystemExit(f"STOP {repo}#{n}: merge did not complete ({merged['state']})")
         say(f"{repo}#{n}: merged {merged['mergeCommit']['oid'][:7]}")
+        if hotfix(live):
+            say(f"{repo}#{n}: Lane: hotfix, post-merge review due (operating-model §3)")
         if repo == DOCS:
             docs_merge = merged["mergeCommit"]["oid"]
         if base_ref != RELEASE_BASE:  # never touch the worktrees of `dev`, the head of a release pull request
