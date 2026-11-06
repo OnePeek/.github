@@ -15,6 +15,8 @@ Spec (read in full before anything else):
   - Docs commit: onepeek-docs@<sha> (main, or the change set's open docs PR #<n>)
   - Sections that decide this slice: <file §section>, ...
   - Decisions that bind it: <founder decision numbers>
+  - Gaps ruled: <each gap listed in the gap check or by an earlier round, with the docs commit that rules it> | none listed
+    (agent-operations.md §6.1, F28: every listed gap is ruled before review starts)
 Class: docs only | mechanical | normal code | high risk   (agent-operations.md §5.4a; it sets the done-gate and the review)
 Read first (and state it with the commit as the report's first line):
   onepeek-docs origin/main:standards/agent-operations.md §1, §3, §4 (+ §5 builder, §5.4a and §6 reviewer);

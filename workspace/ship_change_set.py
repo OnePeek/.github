@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -66,7 +67,7 @@ def _load(name: str):
 depends_on = _load("check_depends_on")
 check_pins = _load("check_pins")
 ORDER = ["onepeek-docs", ".github", "onepeek-infra", "onepeek-design-system", "backend-service", "onepeek-web"]
-BASE = {"onepeek-docs": "main", ".github": "main"}  # every other repo merges into dev
+BASE = {"onepeek-docs": "main", ".github": "main", "marketing-website": "main"}  # every other repo merges into dev
 PIN = check_pins.USES  # every `uses:` naming OnePeek/.github, any letter case, any ref (§8a P2)
 VERSION_COMMENT = re.compile(r"[ \t]+#[ \t]*(v\d+\.\d+\.\d+)(.*)")
 DOCS = "onepeek-docs"
@@ -771,6 +772,43 @@ def unresolved_threads(repo: str, n: int) -> list[str]:
             path, at = json.loads(line)
             threads.append(f"{path}:{'?' if at is None else at}")
     return threads
+
+
+REVIEWED_CLASSES = ("mechanical", "docs only")  # §5.4a classes the coordinator's check stands in for G6
+
+
+def reviews_file() -> pathlib.Path:
+    return pathlib.Path(os.environ.get("ONEPEEK_WORKSPACE") or ROOT) / ".ship" / "reviews.json"
+
+
+def read_reviews(path: pathlib.Path | None = None) -> dict:
+    """The coordinator's record of independent-review verdicts (agent-operations.md §6.6 "Review gates for merging"):
+    `{"<repo>#<n>": "<head sha>"}` or `{"<repo>#<n>": {"sha": "<head>", "class": "mechanical"}}`. A missing file is no
+    reviews; one that does not parse or is not an object raises ValueError (fail closed)."""
+    path = path or reviews_file()
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    return data
+
+
+def review_problem(label: str, head: str, author: dict | None, all_checks: list[dict], reviews: dict,
+                   bots: list[str]) -> str | None:
+    """Why the pull request may not merge yet under the review gates (F36, pitfalls.md 30), or None: CodeRabbit has
+    finished on the head (`pass` or `skipping`) and the recorded review is at exactly this head (or the recorded class
+    is mechanical or docs only, at this head). A bot author on the allow-list is exempt."""
+    author = author or {}
+    if author.get("is_bot") is True and author.get("login") in bots:
+        return None
+    bot = [c.get("bucket") for c in all_checks if c.get("name") == "CodeRabbit"]
+    if not bot or any(b not in ("pass", "skipping") for b in bot):
+        return f"no review at {head}: CodeRabbit {'/'.join(map(str, bot)) or 'has not reported'} on the head"
+    r = reviews.get(label)
+    if r == head or (isinstance(r, dict) and r.get("sha") == head and r.get("class") in REVIEWED_CLASSES):
+        return None
+    return f"no review at {head}"
 
 
 def refuse_unresolved(repo: str, n: int) -> None:

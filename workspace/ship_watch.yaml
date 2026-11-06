@@ -1,0 +1,11 @@
+# Settings of ship_watch.py, the watcher and merge queue (onepeek-docs standards/agent-operations.md §6.6).
+# The repos it watches: every OnePeek repo (gh repo list OnePeek, 2026-11-06).
+repos: [onepeek-docs, .github, onepeek-infra, onepeek-design-system, backend-service, onepeek-web,
+        browser-extension, plugin-owl, mcp-athena, marketing-website]
+# Authors whose pull requests it may merge: the founder and the bots that open pin pull requests, as `gh pr list`
+# names them (ship_change_set.py's pin moves are opened as the founder). Any other author is HOLD.
+authors: [Karan-98-Mehta, app/dependabot]
+# Checks re-run once when red, by their exact name as a passing run prints it (pitfalls.md 23). Empty until one is known.
+known_flakes: []
+# The depends-on check's name as passing runs print it (every repo, 2026-11-06).
+depends_on_check: depends-on / depends-on
