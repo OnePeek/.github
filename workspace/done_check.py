@@ -12,13 +12,21 @@ It fails when the work that was reported is not the work that was pushed:
   3. HEAD is not on the remote branch (`--branch`, else the pull request's head branch, else the upstream); a pull
      request from a fork is checked in its head repository, not in `origin`;
   4. with `--pr`: the pull request's head commit is not HEAD, `--branch` is not its head branch, the base cannot be
-     fetched, HEAD does not contain the current base, or the pull request's files are not exactly the files HEAD changes
-     against the base;
+     fetched, or the pull request's files are not exactly the files HEAD changes against the base (HEAD not
+     containing the current base is only a WARN: the merge tool merges a branch that is behind its base);
   5. with `--expect`: the pull request's files are not exactly the files the builder reports;
   6. with `--since <sha>` (needs `--pr` and `--expect`; for a builder that adds commits to a longer pull request): the
      `--expect` files are compared with the files changed by the commits after <sha> instead of with the whole pull
      request's. <sha> is 7 to 40 hex characters, must name a commit that HEAD contains, and merge commits and commits
      already on the base do not count (merging the base in adds none of its files).
+In a batch pull request (operating-model §8: each task on its own branch, merged into the batch branch), run it at the
+batch head after your merge, with the batch head before your merge as <sha>:
+
+    git -C <worktree> fetch origin <batch> && before=$(git -C <worktree> rev-parse origin/<batch>)
+    # merge your task branch into the batch branch, push it, then:
+    python3 "$ONEPEEK_WORKSPACE/.github/workspace/done_check.py" <worktree> --pr <repo>#<batch PR> \
+        --since "$before" --expect <your files>
+
 With `--pr` it always prints the pull request's files, and a WARN when the change is over the slice cap of
 agent-operations.md §4.5 (generated files aside). It prints one line per problem and ends `DONE CHECK OK` or
 `DONE CHECK FAILED`. Exit 0 only when OK.
@@ -233,8 +241,10 @@ def check(worktree: pathlib.Path, pr: str | None, branch: str | None, expect: li
         try:
             run(["git", "merge-base", "--is-ancestor", f"origin/{base_ref}", "HEAD"], worktree)
         except subprocess.CalledProcessError as e:
-            problems.append(f"HEAD does not contain the current origin/{base_ref}: merge it in" if e.returncode == 1
-                            else f"could not compare HEAD with origin/{base_ref}: {(e.stderr or '').strip()}")
+            if e.returncode != 1:
+                problems.append(f"could not compare HEAD with origin/{base_ref}: {(e.stderr or '').strip()}")
+            else:  # a WARN (2026-11-07): the merge tool merges a branch that is behind its base
+                print(f"WARN  HEAD does not contain the current origin/{base_ref}; the comparisons use the merge base")
         if since is not None and expect is not None:
             since_files, why = files_since(since, base_ref, worktree)
             problems += why or compare_since(since_files, expect, since)
@@ -268,7 +278,7 @@ def check(worktree: pathlib.Path, pr: str | None, branch: str | None, expect: li
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("worktree", type=pathlib.Path)
     ap.add_argument("--pr", help="<repo>#<n>, for example onepeek-infra#177")
     ap.add_argument("--branch", help="the remote branch HEAD was pushed to")

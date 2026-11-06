@@ -246,15 +246,22 @@ class Check(unittest.TestCase):
             problems, _ = self.check("x#1", None)
         self.assertTrue(any("could not fetch origin/main" in p for p in problems), problems)
 
-    def test_pr_behind_its_base_fails(self):
+    def test_pr_behind_its_base_warns_and_passes(self):  # 2026-11-07: the merge tool merges a branch behind its base
         head = self.r.commit({"b.txt": "b\n"})
         (self.r.clone / "z.txt").write_text("z\n")
         git(self.r.clone, "add", "z.txt")
         git(self.r.clone, "commit", "-q", "-m", "z")
         git(self.r.clone, "push", "-q", "origin", "main")
         with self.with_gh(FakeGh([head], ["b.txt"])):
-            problems, _ = self.check("x#1", None)
-        self.assertTrue(any("does not contain the current origin/main" in p for p in problems), problems)
+            problems, out = self.check("x#1", None, ["b.txt"])
+        self.assertEqual(problems, [])
+        self.assertIn("WARN  HEAD does not contain the current origin/main", out)
+
+    def test_help_documents_batch_usage(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            dc.main(["--help"])
+        self.assertIn("--since \"$before\" --expect <your files>", out.getvalue())
 
     def test_pr_with_over_100_files_reads_every_page(self):
         names = [f"f{i:03}.txt" for i in range(150)]
