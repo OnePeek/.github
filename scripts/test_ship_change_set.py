@@ -664,7 +664,7 @@ class DocsPin(unittest.TestCase):
         return prs, pr_info, gh, run
 
     def go(self, pins: dict, only_pin: bool = True, bodies: dict | None = None, go: bool = True,
-           base_moved: bool = False) -> int:
+           base_moved: bool = False, on_green=None) -> int:
         prs, pr_info, gh, run = self.harness(pins, bodies)
 
         def move(repo, branch, green, merge_sha):
@@ -673,7 +673,7 @@ class DocsPin(unittest.TestCase):
             return "f" * 40, only_pin
         with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "gh", side_effect=gh), \
                 mock.patch.object(ship.subprocess, "run", side_effect=run), mock.patch.object(ship, "remove_worktrees"), \
-                mock.patch.object(ship, "wait_green", side_effect=lambda r, n, m: self.events.append(("green", r))), \
+                mock.patch.object(ship, "wait_green", side_effect=on_green or (lambda r, n, m: self.events.append(("green", r)))), \
                 mock.patch.object(ship, "tested_bases", return_value={"b" * 40}), \
                 mock.patch.object(ship, "base_head", return_value="c" * 40 if base_moved else "b" * 40), \
                 mock.patch.object(ship, "wait_head"), mock.patch.object(ship, "move_docs_pin", side_effect=move), \
@@ -1024,7 +1024,7 @@ class ConflictFlow(DocsPin):
                 i["isCrossRepository"] = True
             return i
 
-        def refresh(repo, branch, base, label, head, push=True):
+        def refresh(repo, branch, base, label, head, push=True, source=None):
             self.refreshed.append((repo, label, push))
             state[(repo, 2)] = after_refresh
             return "f" * 40 if push else ""
@@ -1114,7 +1114,8 @@ class ConflictFlow(DocsPin):
         with mock.patch.object(ship, "pr_info", side_effect=lambda r, n: info if r == "backend-service" else pr_info(r, n)), \
                 mock.patch.object(ship, "gh", side_effect=gh), mock.patch.object(ship, "branch_pin", return_value=pin), \
                 mock.patch.object(ship, "refresh_docs_pin", return_value="f" * 40) as rf, \
-                mock.patch.object(ship, "say"), mock.patch.object(ship, "DOCS_PR", list(docs_pr)):
+                mock.patch.object(ship, "say"), mock.patch.object(ship, "DOCS_PR", list(docs_pr)), \
+                mock.patch.dict(ship.GATED, {("backend-service", 2): info["headRefOid"]}, clear=True):
             return ship.resolve_pin("backend-service", 2), rf
 
     def test_resolve_pin_refreshes_a_pin_of_the_docs_pull_request(self) -> None:
@@ -1491,3 +1492,141 @@ class HotfixLane(unittest.TestCase):
         rc, merged, _ = self.go(["Lane: hotfix"] * 4 + ["Lane: feature"])
         self.assertIn("unresolved review thread", rc)
         self.assertEqual(merged, [])
+
+
+class ToolPushSource(unittest.TestCase):
+    """Ruling T-55 (the #71 post-merge review): a tool push (docs-pin move, pin bump, docs-pin refresh) builds only on
+    the head that passed the gates, or on a commit this run pushed on it; never on a commit pushed since the gate."""
+
+    GATE, LATER = "1" * 40, "9" * 40
+    setUp, origin, advance_dev = RefreshDocsPin.setUp, RefreshDocsPin.origin, RefreshDocsPin.advance_dev
+
+    def test_the_source_must_be_the_gated_head_or_a_commit_this_run_pushed(self) -> None:
+        with mock.patch.dict(ship.GATED, {("r", 1): self.GATE}, clear=True), \
+                mock.patch.dict(ship.TOOL_PUSHED, {"f" * 40: self.GATE}, clear=True):
+            self.assertEqual(ship.tool_source("r", 1, self.GATE), self.GATE)
+            self.assertEqual(ship.tool_source("r", 1, "f" * 40), "f" * 40)
+            with self.assertRaisesRegex(SystemExit, f"head 9999999 is neither the gated head 1111111"):
+                ship.tool_source("r", 1, self.LATER)
+            with self.assertRaisesRegex(SystemExit, "gated head none"):
+                ship.tool_source("r", 2, self.GATE)
+
+    def builder_pushes_after_the_gate(self) -> tuple[str, str]:
+        """The gated head of feat/x, then an unreviewed commit a builder pushes on top of it."""
+        gated = self.origin("rev-parse", "feat/x").strip()
+        sh("git", "-C", str(self.src), "switch", "-q", "feat/x")
+        (self.src / "unreviewed.txt").write_text("x\n")
+        commit_all(self.src, "unreviewed")
+        sh("git", "-C", str(self.src), "push", "-q", "origin", "feat/x")
+        sh("git", "-C", str(self.src), "switch", "-q", "dev")
+        return gated, self.origin("rev-parse", "feat/x").strip()
+
+    def test_a_refresh_from_the_gated_head_never_lands_on_a_later_commit(self) -> None:
+        gated, later = self.builder_pushes_after_the_gate()
+        self.advance_dev({"docs-version.txt": f"# docs\nonepeek-docs@{DOCS_MERGE}\n"})
+        with self.assertRaisesRegex(SystemExit, " push "):  # the fast-forward push is refused: the branch is past the source
+            ship.refresh_docs_pin("backend-service", "feat/x", "dev", "onepeek-docs#7", "4" * 40, source=gated)
+        self.assertEqual(self.origin("rev-parse", "feat/x").strip(), later)
+
+    def test_a_pin_bump_builds_on_the_source(self) -> None:
+        sh("git", "-C", str(self.src), "switch", "-q", "feat/x")
+        (self.src / ".github/workflows/ci.yml").write_text(
+            "jobs:\n  a:\n    uses: OnePeek/.github/.github/workflows/x.yml@v1.0.0\n")
+        commit_all(self.src, "pinned")
+        sh("git", "-C", str(self.src), "push", "-q", "origin", "feat/x")
+        sh("git", "-C", str(self.src), "switch", "-q", "dev")
+        gated, later = self.builder_pushes_after_the_gate()
+        with self.assertRaisesRegex(SystemExit, " push "):
+            ship.bump_pins("backend-service", "feat/x", "v1.1.0", "a" * 40, source=gated)
+        self.assertEqual(self.origin("rev-parse", "feat/x").strip(), later)
+        new = ship.bump_pins("backend-service", "feat/x", "v1.1.0", "a" * 40, source=later)
+        self.assertEqual(self.origin("rev-parse", f"{new}^").strip(), later)
+
+
+class ToolPushSourceInMain(unittest.TestCase):
+    """The bypass of the #71 review, reproduced: a commit pushed after the gate must not merge under a tool's commit."""
+
+    LATER = "9" * 40
+    setUp, harness, go = DocsPin.setUp, DocsPin.harness, DocsPin.go
+
+    def test_a_docs_pin_move_on_a_commit_pushed_after_the_gate_stops(self) -> None:
+        def later_after_docs(r, n, m):  # the builder pushes while the docs pull request merges
+            self.events.append(("green", r))
+            if r == "onepeek-docs":
+                self.heads["backend-service"] = self.LATER
+        with mock.patch.dict(ship.TOOL_PUSHED, {self.LATER: "x"}), \
+                self.assertRaisesRegex(SystemExit, "head 9999999 is neither the gated head 2222222"):
+            self.go({("backend-service", 2): DOCS_OLDER}, on_green=later_after_docs)  # a stale entry is not kept
+        self.assertNotIn("backend-service", [e[1] for e in self.events if e[0] in ("pin", "merge")])
+
+    def test_a_pin_bump_on_a_commit_pushed_after_the_gate_stops(self) -> None:
+        (self.root / ".github" / ".git").mkdir(parents=True)
+        prs, pr_info, gh, run = self.harness({("backend-service", 2): DOCS_HEAD})
+        bumped = []
+
+        def info(r, n):
+            i = pr_info(r, n)
+            if r == ".github":
+                i["baseRefName"] = "main"
+                i["headRefOid"] = "6" * 40
+                if (r, n) in self.merged:
+                    i["mergeCommit"] = {"oid": "7" * 40}
+            return i
+
+        def gh2(*args):
+            out = gh(*args)
+            if args[:2] == ("pr", "merge") and ".github" in args[4]:
+                self.heads["backend-service"] = self.LATER  # pushed while .github merged and tagged
+            return out
+        with mock.patch.object(ship, "pr_info", side_effect=info), mock.patch.object(ship, "gh", side_effect=gh2), \
+                mock.patch.object(ship.subprocess, "run", side_effect=run), mock.patch.object(ship, "remove_worktrees"), \
+                mock.patch.object(ship, "wait_green"), mock.patch.object(ship, "rerun_failed"), \
+                mock.patch.object(ship, "wait_tag", return_value=("v9.9.9", "7" * 40)), \
+                mock.patch.object(ship, "bump_pins", side_effect=lambda *a, **k: bumped.append(k) or "f" * 40), \
+                mock.patch.object(ship, "move_docs_pin", return_value=(None, True)), \
+                mock.patch.object(ship, "pin_moves", return_value=[]), mock.patch.object(ship, "wait_head"), \
+                mock.patch.object(ship, "docs_pin_problems", return_value=[]), \
+                self.assertRaisesRegex(SystemExit, "head 9999999 is neither the gated head 2222222"):
+            ship.main([".github#5", "backend-service#2", "--go"])
+        self.assertEqual(bumped, [])
+        self.assertNotIn(("merge", "backend-service", "f" * 40), self.events)
+
+    def test_a_pin_bump_on_the_gated_head_is_bound_to_it_and_merges(self) -> None:
+        (self.root / ".github" / ".git").mkdir(parents=True)
+        prs, pr_info, gh, run = self.harness({("backend-service", 2): DOCS_HEAD})
+        bumped = []
+
+        def info(r, n):
+            i = pr_info(r, n)
+            if r == ".github":
+                i.update(baseRefName="main", headRefOid="6" * 40)
+                if (r, n) in self.merged:
+                    i["mergeCommit"] = {"oid": "7" * 40}
+            return i
+
+        def bump(*a, **k):
+            bumped.append(k["source"])
+            self.heads["backend-service"] = "f" * 40
+            return "f" * 40
+        with mock.patch.object(ship, "pr_info", side_effect=info), mock.patch.object(ship, "gh", side_effect=gh), \
+                mock.patch.object(ship.subprocess, "run", side_effect=run), mock.patch.object(ship, "remove_worktrees"), \
+                mock.patch.object(ship, "wait_green"), mock.patch.object(ship, "rerun_failed"), \
+                mock.patch.object(ship, "wait_tag", return_value=("v9.9.9", "7" * 40)), \
+                mock.patch.object(ship, "bump_pins", side_effect=bump), mock.patch.object(ship, "no_conflicts"), \
+                mock.patch.object(ship, "pin_moves", return_value=[]), mock.patch.object(ship, "wait_head"), \
+                mock.patch.object(ship, "docs_pin_problems", return_value=[]):
+            self.assertEqual(ship.main([".github#5", "backend-service#2", "--go"]), 0)
+        self.assertEqual(bumped, ["2" * 40])
+        self.assertEqual(ship.TOOL_PUSHED, {"f" * 40: "2" * 40})
+        self.assertIn(("merge", "backend-service", "f" * 40), self.events)
+
+    def test_a_docs_pin_refresh_on_a_commit_pushed_after_the_gate_stops(self) -> None:
+        prs, pr_info, gh, run = self.harness({("backend-service", 2): DOCS_OLDER})
+        with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "gh", side_effect=gh), \
+                mock.patch.object(ship, "branch_pin", return_value=DOCS_OLDER), mock.patch.object(ship, "say"), \
+                mock.patch.object(ship, "refresh_docs_pin", return_value="f" * 40) as rf, \
+                mock.patch.object(ship, "DOCS_PR", [1]), \
+                mock.patch.dict(ship.GATED, {("backend-service", 2): "1" * 40}, clear=True), \
+                self.assertRaisesRegex(SystemExit, "head 2222222 is neither the gated head 1111111"):
+            ship.resolve_pin("backend-service", 2)
+        rf.assert_not_called()
