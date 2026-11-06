@@ -32,6 +32,14 @@ def needs_of(job: str) -> list[str]:
     return [n] if isinstance(n, str) else n
 
 
+# The stubbed tools read stdin when their arguments say so, as the real ones do: a stub that exits without reading it breaks
+# the pipe under `aws ecr get-login-password | docker login --password-stdin` (or `echo ... | sha256sum -c -`), and the
+# writer then dies of SIGPIPE (141) on a Linux runner that loses the race.
+READS_STDIN = {
+    tool: 'case " $* " in *" --password-stdin "*) cat >/dev/null ;; esac\n' for tool in ("docker", "cosign")
+} | {"sha256sum": 'case " $* " in *" - "*) cat >/dev/null ;; esac\n', "curl": 'case " $* " in *" @- "*) cat >/dev/null ;; esac\n'}
+
+
 def run_step(script: str, aws: str, extra_env: dict[str, str] | None = None, files: dict[str, str] | None = None,
              extra_stubs: dict[str, str] | None = None, with_summary: bool = False):
     """Returns the result, every stub call, and what the step wrote to GITHUB_OUTPUT (and GITHUB_STEP_SUMMARY)."""
@@ -40,7 +48,7 @@ def run_step(script: str, aws: str, extra_env: dict[str, str] | None = None, fil
         stubs = {"aws": aws, "docker": "", "cosign": "", "curl": "", "sha256sum": "", "tar": "", **(extra_stubs or {})}
         for tool, body in stubs.items():
             f = root / tool
-            f.write_text(f'#!/bin/bash\necho "{tool} $*" >> "{root}/calls"\n{body}\n')
+            f.write_text(f'#!/bin/bash\necho "{tool} $*" >> "{root}/calls"\n{READS_STDIN.get(tool, "")}{body}\n')
             f.chmod(f.stat().st_mode | stat.S_IEXEC)
         for name, content in (files or {}).items():
             (root / name).write_text(content)

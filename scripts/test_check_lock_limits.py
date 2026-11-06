@@ -31,7 +31,23 @@ class Limits(unittest.TestCase):
 
     def test_a_limit_below_its_cap_plus_its_other_steps_fails(self):
         problems = self.check(("release-ecs.yml", "    timeout-minutes: 135\n", "    timeout-minutes: 130\n"))
-        self.assertTrue(any("below its wait cap 120 plus its other steps 15" in p for p in problems), problems)
+        self.assertTrue(any("timeout-minutes 130 is below its wait cap and its other steps' limits, 135 in all" in p for p in problems), problems)
+
+    def test_the_other_steps_limits_are_read_from_the_workflow(self):
+        # finish: its unlock step (40) and its deployment record (10) fit in 60; a longer deployment record does not.
+        record = "        timeout-minutes: 10\n        env:\n          GH_TOKEN: ${{ github.token }}\n          COMMIT: ${{ needs.prepare.outputs.commit }}\n"
+        problems = self.check(("release-ecs.yml", record, record.replace("timeout-minutes: 10", "timeout-minutes: 25")))
+        self.assertTrue(any("release-ecs.yml job finish: timeout-minutes 60 is below its wait cap and its other steps' limits, 65 in all" in p
+                            for p in problems), problems)
+
+    def test_the_unlock_step_has_its_own_limit_holding_the_migrate_wait_and_the_put_back(self):
+        for name in ("release-ecs.yml", "operate.yml"):
+            problems = self.check((name, "        timeout-minutes: 40   # its migrate wait 15", "        timeout-minutes: 30   # its migrate wait 15"))
+            self.assertTrue(any("timeout-minutes 30 is below its wait cap 15 plus 20 after it" in p for p in problems), (name, problems))
+        problems = self.check(("operate.yml", "        timeout-minutes: 40   # its migrate wait 15", "        timeout-minutes: 50   # its migrate wait 15"))
+        self.assertEqual(problems, [])
+        problems = self.check(("operate.yml", "        timeout-minutes: 40   # its migrate wait 15", "        timeout-minutes: 61   # its migrate wait 15"))
+        self.assertTrue(any("operate.yml job unlock: timeout-minutes 60 is below" in p for p in problems), problems)
 
     def test_a_limit_above_its_timeout_exceptions_entry_fails(self):
         problems = self.check(("operate.yml", "    timeout-minutes: 135\n", "    timeout-minutes: 140\n"))

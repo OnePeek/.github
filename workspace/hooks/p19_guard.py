@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """P19 hook: the cancel and dispatch rules (onepeek-docs architecture/lld/infra/foundation-playbook.md §1 P19 and §5.4a
-"cancel-release.yml", option A; provisional, 2026-11-05).
+"cancel-release.yml", option A; approved by the founder, decision 167, 2026-11-06).
 
 A Claude Code PreToolUse hook on Bash: it runs only for an agent's tool calls, so every call it sees is an agent session.
 It refuses any way to cancel a run or dispatch a workflow other than the wrapper `.github/workspace/cancel_release.py`

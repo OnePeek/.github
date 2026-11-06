@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The one way agents start a release cancel (onepeek-docs architecture/lld/infra/foundation-playbook.md §5.4a
-"cancel-release.yml", option A; delivery-pipelines.md UC-DEL-009; provisional, 2026-11-05).
+"cancel-release.yml", option A; delivery-pipelines.md UC-DEL-009; approved by the founder, decision 167, 2026-11-06).
 
   python3 .github/workspace/cancel_release.py <repo> <env> --reason <text>
 
