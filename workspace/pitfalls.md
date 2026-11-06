@@ -77,3 +77,4 @@ same pull request as the fix.
 25. **Decision numbers:** check the open docs pull requests, not only `main`, before taking the next number.
 26. **GitHub's API can show the old head for a few seconds after a push.** `done_check.py` re-reads briefly; do not "fix" a failure by pushing again.
 27. **Tests that run `git` clear Git's repository-local variables first** (`git rev-parse --local-env-vars`: `GIT_DIR`, `GIT_INDEX_FILE` and the rest). A hook passes them on, and an inherited `GIT_DIR` made a fixture rewrite another repo's config (.github #60).
+28. **The local CI container must hold every tool CI's steps call.** The Python 3.14 container (#57) lacked `uv`, so `uvx` steps failed locally but not on CI (infra #177). `uv` is baked in at `local_ci.UV_VERSION`, and a test pins it. A new tool in a workflow step is added to the Dockerfile in the same pull request.

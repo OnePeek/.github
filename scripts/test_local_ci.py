@@ -614,6 +614,11 @@ class LinuxContainerL2(unittest.TestCase):
         self.assertRegex(text, r"(?m)^ENV .*\bPATH=\S*:/tmp/\.local/bin\b")
         self.assertRegex(text, r"PATH=/usr/local/bin:")  # the image's own tools stay first
 
+    def test_the_dockerfile_has_uv_at_the_ci_pin(self):
+        # infra #177's local CI failed in the container with `uvx: command not found` (2026-11-06).
+        text = (ROOT / "workspace/local-ci/Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(f"uv=={lc.UV_VERSION}", text)
+
     def run_darwin(self, *args, docker=True):
         d = make_repo_with(job_yaml("python3 -m unittest discover -s scripts", "npx eslint ."))
         seen = []
