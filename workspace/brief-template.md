@@ -28,10 +28,10 @@ Spec (read in full before anything else):
   - Gaps ruled: <each gap listed in the gap check or by an earlier round, with the docs commit that rules it> | none listed
     (agent-operations.md §6.1, F28: every listed gap is ruled before review starts)
 Class: docs only | mechanical | normal code | high risk   (agent-operations.md §5.4a; it sets the done-gate and the review)
-Read first (and state it with the commit as the report's first line):
-  onepeek-docs origin/main:standards/agent-operations.md §1, §3, §4 (+ §5 builder, §5.4a and §6 reviewer);
-  .github origin/main:workspace/pitfalls.md (all of it);
-  the repo's AGENTS.md and docs/guidelines.md if it exists.
+Read first, the start card only (and state it with the commits as the report's first line):
+  the role's skill; operating-model.md §2 (role row) and §3 (this lane's column);
+  pitfalls: <the numbers that fit this task> (all of pitfalls.md only on the agent's first brief of the session);
+  the repo's AGENTS.md "Build kit". A resumed agent does not re-read.
 
 Slice (about 400 changed lines at most, generated files and merges aside):
   - Build: <behaviour 1>, <behaviour 2>, ...

@@ -9,6 +9,8 @@ description: The reviewer's procedure. An independent check, matched to the chan
 
 For a feature-lane change, the checklist in `/review-spec` applies inside step 4.
 
+**Start card** (founder, 2026-11-07): read this skill, `operating-model.md` §2 (reviewer row) and §8 Reviewing, the spec sections the brief names, and the pitfall numbers that fit the change; all of `pitfalls.md` only on your first run of a session. A resumed reviewer does not re-read.
+
 ## 1. Queue order
 1. Post-merge reviews of unblock-lane changes, because they are already live.
 2. The pull request at the head of a dependency chain.

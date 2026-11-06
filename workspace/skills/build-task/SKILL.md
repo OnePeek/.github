@@ -11,10 +11,7 @@ For a feature-lane task, the packet steps in `/build-from-lld` (or `/build-modul
 
 ## 1. Start (about 5 minutes)
 1. Write the first line of your status file: `role builder | task <id> | lane <lane> | class <class> | phase reading`.
-2. Read these, with the commit of each:
-   - `operating-model.md` §1 and §2, and this skill;
-   - `.github/workspace/pitfalls.md`, all of it;
-   - the repo's `AGENTS.md`.
+2. **Read the start card only** (founder, 2026-11-07; it replaces the full read): this skill; `operating-model.md` §2 (your role row) and §3 (your lane's column); the pitfall numbers your brief names; the repo's `AGENTS.md` "Build kit". Read all of `pitfalls.md` only on your **first** brief of a session; a resumed agent never re-reads what it already read. Open other docs sections only when the task needs them. State what you read, with commits.
 3. Make a fresh worktree off the brief's base (`git worktree add <scratchpad>/<name> origin/<base> -b <branch>`). Never work in a shared checkout.
 
 ## 2. Build the context
@@ -69,11 +66,15 @@ Read the real sources. The brief only points to them.
 |---|---|---|
 | Tests | The reproducing test passes, and so do the tests of the area you touched | Every packet test, and the repo's full gates |
 | Mutations | One per changed behaviour, each shown failing a test | One per behaviour, plus hostile inputs for high risk |
-| Platforms | macOS, and Linux for shell, workflow or script changes | The same |
+| Platforms | macOS; add Linux (Docker) only for shell, workflow, Dockerfile or container changes, never for pure Python logic | The same |
 | Local CI | `python3 "$ONEPEEK_WORKSPACE/.github/workspace/local_ci.py" <worktree> --keep-going` ends `LOCAL CI OK`; on NOT OK, report every failure at once (pitfall 43). In infra, also run `terraform test` yourself, because `--native` skips it | The same |
 | Self-review | The diff against your plan, and against every pitfall line | The same |
 | Push | Then check that `git ls-remote origin refs/heads/<branch>` equals `git rev-parse HEAD` | The same |
 | Done check | At the batch head after your merge: `done_check.py <batch worktree> --pr <repo>#<n> --since <batch head before your merge> --expect <your files>` (no pull request yet: `--branch <batch branch>`) ends `DONE CHECK OK` | The same |
+
+**Run the gates once, at the end:** iterate on the touched tests only; run local CI (`--keep-going`) once before the push, not after each fix.
+
+**Script the mutations:** one script per task applies each mutation to a saved copy, runs the touched tests (baseline first, same invocation, `python3 -B`), restores the file, and prints one line per mutation.
 
 **Undo a mutation with the reverse edit,** never `git checkout <file>`, which also throws away your fix.
 

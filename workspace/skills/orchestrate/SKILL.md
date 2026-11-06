@@ -129,11 +129,19 @@ Read each agent's status file, its branch head, its pull request's checks, and `
 - The reviewer reads only its **critical and major** findings; a real one becomes a builder commit in the same pull request.
 - **Never reply to or resolve CodeRabbit threads**, and never spend agent time on minor, nit or wrong ones. Unresolved threads do not block a hotfix merge, and in the feature lane the reviewer's verdict is the gate (T-100 removes the tool's thread gate).
 
-## 10a. Waking and retiring agents (founder, 2026-11-07)
-- Every start costs a fresh read (about 30-50k tokens), so **queue small tasks and brief one builder with a batch** (several tasks, 30+ minutes of work). Only a blocker that stops merging justifies a start for one small task.
-- Resume an agent that already has the repo in context (cheapest); retire it after two tasks or about 150k tokens.
-- Start a reviewer when a batch pull request is ready, one per run; do not keep the shipper agent running (the watcher merges).
-- Mechanical work (pins, syncs, conflict merges) runs on Sonnet.
+## 10a. Waking, keeping warm, retiring and killing agents (founder, 2026-11-07)
+Every fresh start costs a start-card read (about 5 minutes and 20-30k tokens) and a worktree; a resumed agent costs neither. A finished agent costs nothing while idle.
+
+| Situation | Action |
+|---|---|
+| A brief's worth of work is ready (a batch, about 30 minutes or more), or a blocker stops merging | **Invoke**: resume a warm agent that fits (same repo or area), else start a fresh one |
+| A small task (under about 15 minutes) and no blocker | **Queue it** for the next brief; never start an agent for it alone |
+| The next brief is in the same repo or area within about 30 minutes, and the agent has done fewer than two briefs and is under about 100k tokens | **Keep warm**: let it finish its turn; resume it with `SendMessage` |
+| Two briefs done, or about 150k tokens, or the next work is in another area, or nothing is queued for it for 30 minutes | **Retire**: do not resume it again; the next brief goes to a fresh agent |
+| No status for 15 minutes or no commit for 25, acting out of role, its task cancelled, or the founder says stop | **Kill** it (`TaskStop`), then hand its worktree and status file to a fresh agent if the work goes on |
+| A reviewer | Invoke when a batch pull request is ready or a merge-tool change needs its pre-merge review; one pull request per run; keep warm for the next one |
+| The shipper | Not kept running: invoke only for a pass the watcher script cannot do |
+| Mechanical work (pins, syncs, conflict merges) | Sonnet; a fresh agent is fine, its reading is small |
 
 ## 11. Checking that every agent stays in its role
 At each check-in:
