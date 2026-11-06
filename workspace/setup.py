@@ -33,9 +33,11 @@ SHARED_AGENTS = HERE / "agents"
 # Which shared skills and agents each repo carries. backend-service has its own builder (build-module,
 # module-builder); marketing-website has no LLD, so only the docs-first skill applies.
 # Every repo carries preflight (run before every push and release, foundation-playbook §8a P4).
-_ALL = ("review-spec", "fix-docs-gap", "build-from-lld", "spec-reviewer", "builder", "preflight")
+# The role skills of the operating model (decision 174): build-task and review-task go to every code repo; orchestrate
+# and ship live only in the workspace root (the orchestrator and the shipper run there).
+_ALL = ("review-spec", "fix-docs-gap", "build-from-lld", "spec-reviewer", "builder", "preflight", "build-task", "review-task")
 SYNC_REPOS: dict[str, tuple[str, ...]] = {
-    "backend-service": ("review-spec", "fix-docs-gap", "spec-reviewer", "preflight"),
+    "backend-service": ("review-spec", "fix-docs-gap", "spec-reviewer", "preflight", "build-task", "review-task"),
     "onepeek-infra": _ALL,
     "onepeek-web": _ALL,
     "onepeek-design-system": _ALL,
