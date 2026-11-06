@@ -132,9 +132,10 @@ def dependency_check(repo: pathlib.Path, name: str, given: list[str], rep: Repor
 
 
 # 1. Local CI ------------------------------------------------------------------------------------------------------
-def run_local_ci(repo: pathlib.Path, release: bool = False) -> tuple[bool, str]:
+def run_local_ci(repo: pathlib.Path, release: bool = False, shared: str | None = None) -> tuple[bool, str]:
     """Runs local CI with its output shown; ok only when it exits 0 and its last line is `LOCAL CI OK ...`."""
-    r = subprocess.run([sys.executable, str(HERE / "local_ci.py"), str(repo), *(["--release"] if release else [])], capture_output=True, text=True)
+    r = subprocess.run([sys.executable, str(HERE / "local_ci.py"), str(repo), *(["--release"] if release else []),
+                        *(["--shared", shared] if shared else [])], capture_output=True, text=True)
     out = r.stdout + r.stderr
     print(out, end="" if out.endswith("\n") else "\n", flush=True)
     last = next((ln for ln in reversed(out.splitlines()) if ln.strip()), "")
@@ -457,6 +458,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--release", action="store_true", help="also check the prerequisites of release-only steps")
     ap.add_argument("--depends-on", action="append", default=[], metavar="OnePeek/<repo>#<n>",
                     help="a dependency of a branch with no pull request yet (repeatable)")
+    ap.add_argument("--shared", metavar="PATH", default=os.environ.get("ONEPEEK_SHARED_GITHUB") or None,
+                    help="local CI reads the shared workflows from this .github worktree, not the pins (§8c L4); refused with --release")
     ap.add_argument("--live", action="store_true", help="also run live_preflight.py (onepeek-infra, §8a P9)")
     ap.add_argument("--profile", help="--live: the AWS profile for the read-only IAM simulation")
     ap.add_argument("--plan-json", action="append", default=[], help="--live: terraform show -json output (repeatable)")
@@ -472,11 +475,15 @@ def main(argv: list[str] | None = None) -> int:
     if not (repo / ".github/workflows").is_dir():
         print(f"{repo}: no .github/workflows", file=sys.stderr)
         return 2
+    if a.release and a.shared:
+        print(f"PREFLIGHT FAILED (refused: --release with the shared workflows from {a.shared} "
+              "(--shared or ONEPEEK_SHARED_GITHUB), not the pins; a release is checked against the pins)")
+        return 1
     rep = Report()
     if not dependency_check(repo, repo_name(repo), a.depends_on, rep):
         print("PREFLIGHT FAILED (refused: a declared dependency is unmerged)")
         return 1
-    ok, last = run_local_ci(repo, a.release)
+    ok, last = run_local_ci(repo, a.release, a.shared)
     if not ok:
         rep.add("FAIL", f"local CI did not end LOCAL CI OK (last line: {last!r}); fix it first")
         print("PREFLIGHT FAILED (refused: local CI is not OK)")
