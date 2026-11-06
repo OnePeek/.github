@@ -29,18 +29,21 @@ def run(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, capture_output=True, text=True, check=False)
 
 
-LANE = re.compile(r"^[ \t]*(?:[-*+][ \t]+)?(?:#+[ \t]+)?(?:\*\*|__)?Lane:(?:\*\*|__)?[ \t]*(.*)$", re.M | re.I)
-COMMENT = re.compile(r"<!--.*?-->", re.S)  # a template's `<!-- Lane: feature|hotfix -->` hint is not a statement
+LANE = re.compile(r"^(?:[-*] )?Lane:[ \t]*(.*)$", re.M | re.I)  # column 0 only: no indent, heading, quote or bold
+COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.S)  # a template's `<!-- Lane: feature|hotfix -->` hint is not a statement
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,}).*?(?:^ {0,3}\1[^\n]*$|\Z)", re.M | re.S)  # an example, not a statement
+DETAILS = re.compile(r"<details\b.*?(?:</details>|\Z)", re.S | re.I)
 LANES = ("feature", "hotfix")
 
 
 def lane_of(text: str | None) -> str:
-    """The lane a task or pull request states in a line containing `Lane:` (a bullet and bold are fine:
-    `- **Lane:** hotfix`), `feature` or `hotfix` (development-cycle §2b); feature when it says none. The first word after
-    it is the value, so `Lane: hotfix (preprod down)` is hotfix; `hot fix`, an empty value or any other word is an
-    error, never silently the default."""
+    """The lane a task or pull request states (development-cycle §2b), `feature` or `hotfix`; feature when it says
+    none. Only a line at column 0 counts: `Lane: <value>`, `- Lane: <value>` or `* Lane: <value>`, outside HTML
+    comments, fenced code blocks and <details> (an indented, quoted, heading or bold line is not one, ruling T-53 r2).
+    The first word after it is the value, so `Lane: hotfix (preprod down)` is hotfix; `hot fix`, an empty value or any
+    other word is an error, never silently the default."""
     found = []
-    for m in LANE.finditer(COMMENT.sub("", text or "")):
+    for m in LANE.finditer(DETAILS.sub("", FENCE.sub("", COMMENT.sub("", text or "")))):
         words = m.group(1).replace("*", " ").replace("`", " ").split()
         found.append(words[0].lower() if words else "")
     if not found:

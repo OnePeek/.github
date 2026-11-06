@@ -1443,7 +1443,8 @@ class HotfixLane(unittest.TestCase):
     or the thread refusal; the lane is read from the body right before the merge, and anything else is feature."""
 
     def test_only_a_plain_hotfix_line_outside_a_release_is_hotfix(self) -> None:
-        for body, base, want in (("Lane: hotfix", "dev", True), ("- **Lane:** hotfix (CI red)", "main", True),
+        for body, base, want in (("Lane: hotfix", "dev", True), ("- Lane: hotfix (CI red)", "main", True),
+                                 ("```\nLane: hotfix\n```", "dev", False), ("## Lane: hotfix", "dev", False),
                                  ("", "dev", False), (None, "dev", False), ("Lane: feature", "dev", False),
                                  ("Lane: hot fix", "dev", False), ("Lane: hotfix\nLane: feature", "dev", False),
                                  ("<!-- Lane: hotfix -->", "dev", False), ({"x": 1}, "dev", False),
@@ -1488,6 +1489,21 @@ class HotfixLane(unittest.TestCase):
         self.assertIn("backend-service#2: Lane: hotfix, post-merge review due (operating-model §3)", said)
 
     def test_the_lane_is_read_again_before_the_merge(self) -> None:  # hotfix when planned, feature by the merge
-        rc, merged, _ = self.go(["Lane: hotfix"] * 4 + ["Lane: feature"])
-        self.assertIn("unresolved review thread", rc)
+        for bodies in (["Lane: hotfix"] * 4 + ["Lane: feature"], ["Lane: feature"] * 4 + ["Lane: hotfix"]):
+            with self.subTest(bodies=bodies[-1]):
+                rc, merged, _ = self.go(bodies)
+                self.assertIn("the lane changed since the plan", rc)
+                self.assertEqual(merged, [])
+
+    def test_a_feature_head_pushed_by_the_tool_still_needs_the_review(self) -> None:  # review round 2, finding 3
+        with mock.patch.object(ship, "green_head", return_value="f" * 40), \
+                mock.patch.object(ship, "TOOL_PUSHED", {"f" * 40}), \
+                mock.patch.object(ship, "refuse_unresolved"), mock.patch.object(ship, "no_conflicts"), \
+                mock.patch.object(ship, "review_gate", side_effect=[None, "backend-service#2: no review at cccc"]):  # plan, merge
+            rc, merged, _ = self.go(["Lane: feature"])
+        self.assertIn("no review at cccc", rc)
         self.assertEqual(merged, [])
+        with mock.patch.object(ship, "green_head", return_value="f" * 40), \
+                mock.patch.object(ship, "TOOL_PUSHED", {"f" * 40}), mock.patch.object(ship, "no_conflicts"):
+            rc, merged, _ = self.go(["Lane: hotfix"])  # a hotfix on a tool-pushed head merges without one
+        self.assertEqual((rc, len(merged)), (0, 1))
