@@ -20,10 +20,12 @@ import sys
 
 WRAPPER = ".github/workspace/cancel_release.py"
 REFUSED = "P19: agents start a cancel only with `python3 .github/workspace/cancel_release.py <repo> <env> --reason <text>` (foundation-playbook §5.4a)"
-SEPARATORS = re.compile(r"\s*(?:&&|\|\||;|\||\n|\$\(|`)\s*")
+OPERATORS = "&|;\n()`"   # a single & (background, &&), pipes, ;, newline, subshell and command-substitution brackets
 API_PATH = re.compile(r"/(dispatches|runs/[^/\s]+/(force-)?cancel)\b")
 # gh's global flags that take a value, so `gh -R <repo> run cancel 1` is still seen as `run cancel`.
-VALUE_FLAGS = ("-R", "--repo", "--hostname")
+# That includes `gh workflow run`'s own `-F/-f/-r` and their long forms: `gh workflow -F a=b run x.yml` still dispatches.
+VALUE_FLAGS = ("-R", "--repo", "--hostname", "-F", "--field", "-f", "--raw-field", "-r", "--ref")
+LEADERS = ("env", "command", "exec", "sudo", "nohup", "time", "{", "!", "then", "do", "else")
 
 
 def subcommand(words: list[str]) -> list[str]:
@@ -39,10 +41,45 @@ def subcommand(words: list[str]) -> list[str]:
     return out or [""]
 
 
+def split_commands(command: str) -> list[str]:
+    """The text of a shell line cut at every operator that is not inside quotes (a command substitution inside double
+    quotes still starts a command, so it is cut there too); quoted text such as `echo "a & b"` stays whole."""
+    parts, cur, quote, i = [], [], None, 0
+    while i < len(command):
+        ch = command[i]
+        if quote == "'":
+            cur.append(ch)
+            quote = None if ch == "'" else quote
+        elif ch == "\\" and i + 1 < len(command):
+            cur.append(command[i:i + 2])
+            i += 1
+        elif quote == '"':
+            if ch == '"':
+                quote = None
+                cur.append(ch)
+            elif ch == "`" or command.startswith("$(", i):
+                parts.append("".join(cur))
+                cur = []
+                i += 1 if ch == "$" else 0   # skip the "(" of "$("
+            else:
+                cur.append(ch)
+        elif ch in "'\"":
+            quote = ch
+            cur.append(ch)
+        elif ch in OPERATORS:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    parts.append("".join(cur))
+    return parts
+
+
 def segments(command: str) -> list[list[str]]:
     """Each simple command of a shell line, split into words (unparseable text is kept as plain words)."""
     out = []
-    for part in SEPARATORS.split(command):
+    for part in split_commands(command):
         part = part.strip()
         if not part:
             continue
@@ -51,7 +88,7 @@ def segments(command: str) -> list[list[str]]:
         except ValueError:
             words = part.split()
         # Skip leading environment assignments and wrappers such as `env X=1 gh ...`.
-        while words and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]) or words[0] in ("env", "command", "exec", "sudo", "nohup")):
+        while words and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]) or words[0] in LEADERS):
             words = words[1:]
         if words:
             out.append(words)

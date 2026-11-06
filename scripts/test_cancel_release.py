@@ -128,6 +128,18 @@ class Cancel(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(out.keys, {})
 
+    def test_a_rerun_of_this_run_repairs_over_its_own_earlier_claim(self):
+        # The claim of attempt 1 stayed after a failed put-back; the run itself reads as in progress while attempt 2 runs.
+        rec = held("rolling", previous=L.PREV, repair_run=L.RUN + "-1", repair_token="d" * 32)
+        own = gh().replace('*"runs/9 --jq .status"*)', f'*"runs/{L.RUN} --jq .status"*) echo in_progress;;\n*"runs/9 --jq .status"*)')
+        out = cancel({L.BACKEND: rec}, own, GH_TOKEN="gh", GITHUB_RUN_ATTEMPT="2")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("Being repaired by", out.stdout)
+        self.assertEqual(out.keys, {})
+        # another run's claim that is still live is not taken over by the same rule
+        other = held("rolling", previous=L.PREV, repair_run="9-1", repair_token="d" * 32)
+        self.assertEqual(cancel({L.BACKEND: other}, gh(repair="in_progress"), GITHUB_RUN_ATTEMPT="2").returncode, 1)
+
     def test_a_failed_put_back_keeps_the_key_rolling_with_this_claim(self):
         rec = held("rolling", previous=L.PREV)
         out = cancel({L.BACKEND: rec}, gh(), FAIL_UPDATE_SERVICE="ServiceNotFound")
@@ -369,7 +381,12 @@ class P19Hook(unittest.TestCase):
                     "x=$(gh api -X POST repos/o/r/actions/runs/1/cancel)",
                     # a global flag with a value before the subcommand (review of #55, 2026-11-06)
                     "gh -R OnePeek/onepeek-web run cancel 1", "gh --repo OnePeek/x workflow run a.yml",
-                    "gh --hostname github.com run cancel 2"):
+                    "gh --hostname github.com run cancel 2",
+                    # shell operators and subshells (review of #55 on the hook, 2026-11-06)
+                    "sleep 1 & gh run cancel 5", "(gh run cancel 5)", "{ gh run cancel 5; }", "true | gh run cancel 5",
+                    'echo "x" & gh -R OnePeek/x run cancel 5', 'echo "$(gh run cancel 5)"', "sleep 1 &gh run cancel 5",
+                    # a workflow-run flag with a value before the subcommand
+                    "gh workflow -F name=value run a.yml", "gh workflow --field a=b run a.yml", "gh workflow -r main run a.yml"):
             r = self.hook(cmd)
             self.assertEqual(r.returncode, 2, cmd)
             self.assertIn("cancel_release.py", r.stderr)
@@ -377,7 +394,8 @@ class P19Hook(unittest.TestCase):
     def test_the_wrapper_and_reads_pass(self):
         for cmd in ("python3 .github/workspace/cancel_release.py backend-service preprod --reason drill",
                     "gh run list --workflow cancel-release.yml", "gh run view 77", "gh api repos/OnePeek/x/actions/runs/77",
-                    "gh pr view 54", "git log --grep cancel"):
+                    "gh pr view 54", "git log --grep cancel",
+                    'echo "a & b; gh run cancel 5"', "echo '(gh run cancel 5)'", "gh run list -R OnePeek/x --limit 5 2>&1"):
             self.assertEqual(self.hook(cmd).returncode, 0, cmd)
         self.assertEqual(self.hook("gh run cancel 5", tool="Read").returncode, 0)
 

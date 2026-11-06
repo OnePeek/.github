@@ -118,6 +118,18 @@ def wanted() -> dict[pathlib.Path, pathlib.Path]:
     return links
 
 
+SETTINGS_SRC = HERE / "settings.json"
+
+
+def p19_registered(settings: pathlib.Path) -> bool:
+    """True when this settings file runs the P19 guard (hooks/p19_guard.py) before Bash calls."""
+    try:
+        text = settings.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "hooks/p19_guard.py" in text
+
+
 def ours(path: pathlib.Path) -> bool:
     """A link (or copy marker) this script made, so it may replace or remove it."""
     return path.is_symlink() or (path / ".workspace-copy").exists() or path.with_name(path.name + ".workspace-copy").exists()
@@ -224,11 +236,19 @@ def main() -> int:
         else:
             p.unlink()
         print(f"removed {p.relative_to(ROOT)}")
+    unguarded = False
     for dst, src in sorted(want.items()):
-        print(f"{place(dst, src):8} {dst.relative_to(ROOT)} -> {src.relative_to(ROOT)}")
+        result = place(dst, src)
+        print(f"{result:8} {dst.relative_to(ROOT)} -> {src.relative_to(ROOT)}")
+        if result.startswith("skipped") and dst.name == "settings.json" and not p19_registered(dst):
+            unguarded = True
+    if unguarded:
+        print("FAIL  your own .claude/settings.json does not register the P19 hook, so agents here are not blocked from `gh run cancel`, "
+              "`gh workflow run` and dispatch calls. Keep your settings and add the PreToolUse entry of "
+              ".github/workspace/settings.json to them (or move your file aside and run this again).")
     hooks = install_hooks()
     print_hygiene_hints()
-    return 1 if clashes or hooks else 0
+    return 1 if clashes or hooks or unguarded else 0
 
 
 if __name__ == "__main__":

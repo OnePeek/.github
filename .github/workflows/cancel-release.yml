@@ -892,7 +892,7 @@ jobs:
                 echo "The migrate task stopped; exit code $(lock_migrate_exit "${LOCK_CANCEL_TASK}")." | tee -a "${GITHUB_STEP_SUMMARY}"
                 lock_cancel_delete_all "${LOCK_CANCEL_HELD[@]}" || return 1 ;;
               rolling)
-                if [ "${LOCK_CANCEL_REPAIR}" != "-" ] && ! lock_run_finished "${GITHUB_REPOSITORY}" "${LOCK_CANCEL_REPAIR%-*}"; then
+                if [ "${LOCK_CANCEL_REPAIR}" != "-" ] && [ "${LOCK_CANCEL_REPAIR%-*}" != "${GITHUB_RUN_ID}" ] && ! lock_run_finished "${GITHUB_REPOSITORY}" "${LOCK_CANCEL_REPAIR%-*}"; then
                   echo "::error::Being repaired by $(lock_url "${GITHUB_REPOSITORY}" "${LOCK_CANCEL_REPAIR%-*}"); this run writes nothing." | tee -a "${GITHUB_STEP_SUMMARY}"; return 1
                 fi
                 lock_cancel_claim || return 1
