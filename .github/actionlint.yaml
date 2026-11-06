@@ -1,0 +1,9 @@
+# actionlint config (picked up from this path when actionlint runs at the repo root: local_ci.py and workflow-lint.yml).
+# `job.workflow_sha` is documented by GitHub (the commit of the workflow file that defines the job) and contract.yml
+# checks `_shared` out at it, but actionlint 1.7.12, the newest release, does not know the property yet.
+# Ruling: onepeek-docs architecture/lld/infra/delivery-pipelines.md §6.5 "Build rulings" 1. Remove this when actionlint
+# learns it; scripts/test_peer_ref.py fails if this list holds any other pattern.
+paths:
+  .github/workflows/contract.yml:
+    ignore:
+      - 'property "workflow_sha" is not defined in object type'

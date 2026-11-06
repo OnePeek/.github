@@ -1,0 +1,43 @@
+# The other repos' ref for a cross-repo check (onepeek-docs architecture/lld/infra/delivery-pipelines.md §6.5).
+# Callers pin it like a shared workflow: uses: OnePeek/.github/actions/peer-ref@<sha> # vX.Y.Z
+# Outputs one value per repo, keyed by its short name (infra, backend, web, mcp), and writes `peer: <repo>@<ref>` to
+# the job log and summary, always a commit (the merge tool reads the log before a promotion merges).
+name: The other repos' ref
+description: Which version of another repo a pull request is checked against (dev; release for a hotfix; the release candidate for a promotion).
+inputs:
+  base:
+    description: The pull request's base branch, dev or release (github.base_ref).
+    required: true
+  head:
+    description: The pull request's head branch (github.head_ref).
+    required: true
+  repos:
+    description: Comma-separated repo names, from onepeek-infra, backend-service, onepeek-web, mcp-athena.
+    required: true
+  token:
+    description: A token that reads the repos' pull requests.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Resolve the refs
+      shell: bash
+      env:
+        BASE: ${{ inputs.base }}
+        HEAD: ${{ inputs.head }}
+        REPOS: ${{ inputs.repos }}
+        OWNER: ${{ github.repository_owner }}
+        GH_TOKEN: ${{ inputs.token }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        lines=$(python3 "${ACTION_PATH}/../../scripts/peer_ref.py" --base "${BASE}" --head "${HEAD}" --owner "${OWNER}" --repos "${REPOS}" --commits)
+        while IFS='= ' read -r repo ref sha; do
+          [ -n "${repo}" ] || continue
+          case "${repo}" in onepeek-infra) key=infra ;; backend-service) key=backend ;; onepeek-web) key=web ;; mcp-athena) key=mcp ;; esac
+          echo "${repo} is taken at ${ref}"
+          echo "${key}=${ref}" >> "$GITHUB_OUTPUT"
+          # The recorded peer revision: always a commit, in the log (the merge tool reads it there) and the summary.
+          echo "peer: ${repo}@${sha}"
+          echo "peer: ${repo}@${sha}" >> "$GITHUB_STEP_SUMMARY"
+        done <<< "${lines}"
