@@ -21,7 +21,7 @@ description: The shipper's procedure. Watch every open pull request, CI run, run
 ## 2. When a pull request may merge
 `ship_change_set.py` enforces these rules. Check them yourself too.
 
-- **Unblock lane** (`Lane: hotfix`):
+- **Unblock lane** (`Lane: hotfix` as the body's first line; a `Lane:` line anywhere else does not count, `development-cycle.md` §2b):
   - Rule: the fast checks are green and there are no open real threads.
   - After it merges: add it to the reviewer's post-merge queue in your report.
 - **Feature lane:**
