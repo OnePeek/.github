@@ -4,10 +4,20 @@ The coordinator writes every builder or reviewer brief in this shape (AGENTS.md 
 comes from the packet and the files named here, never from the coordinator's summary of them. A brief that cannot fill
 a field is not ready, so close the gap first.
 
+The brief's first line, outside the block below, is the lane: exactly `Lane: feature`, `Lane: hotfix` or `Lane: docs`.
+`packet.py --task` and the merge tools read only the first non-empty line of a brief or pull request body
+(`development-cycle.md` §2b), so a task file copied from this template starts with that line, unfenced.
+
 ```
-Lane: feature | hotfix
 Role: builder | reviewer | docs drafter        Model: opus | sonnet (rule in AGENTS.md "Running agents" 3)
 Repo: OnePeek/<repo>   Base: origin/<dev|main>   Branch: <type>/<topic> (existing PR: #<n>, or "new")
+
+Env: shell state does not persist between commands; prefix every command that needs it with
+  `export ONEPEEK_WORKSPACE=<the folder holding the repos> &&` (pitfalls.md 37). Read docs from origin/main or the docs
+  commit named below (`git -C "$ONEPEEK_WORKSPACE/onepeek-docs" show <ref>:<path>`), never from a shared checkout that may be stale.
+
+Symptom (unblock lane only; a feature brief leaves it out): the failing run's link, the log line, and the behaviour the docs expect (file §section).
+  Never a guessed cause: the builder reproduces first and reports the cause it finds (2026-11-06, T-58).
 
 Spec (read in full before anything else):
   - Packet: python3 "$ONEPEEK_WORKSPACE/.github/workspace/packet.py" <unit> --out .context/<unit>.md, from the worktree
@@ -27,8 +37,12 @@ Slice (about 400 changed lines at most, generated files and merges aside):
   - Build: <behaviour 1>, <behaviour 2>, ...
   - Files expected to change: <paths>
   - Do NOT touch: <paths other open PRs own>
+  - Files an open unblock-lane PR of this lane already changes: add the fix there as a commit (PR #<n>), never a new stacked PR
+  - Base: the trunk (dev or main) with `Depends on: OnePeek/<repo>#<n>` for any order; never another PR's branch (F39)
 
 Known traps for this slice: <pitfalls.md numbers, or new ones>
+Hostile inputs (when the slice adds or changes a pattern that decides a privilege or a gate: network, credentials,
+  AWS, lane, review): the real inputs to derive cases from, and the near-misses to test (pitfalls.md 40).
 
 Status: write <worktree>/.context/status.md at every phase change (at least every 10 min); never wait > 5 min on CI,
   a review or a dependency: push if the authority below allows it and local CI is green (else keep the worktree path),
@@ -48,7 +62,7 @@ A BLOCKED hand-back comes before the done-gate: it names what blocks, the done-g
 Report: the `Read:` line first; then files per commit; the last line of each gate; mutations; the DONE CHECK line; gaps; what is left. No narrative.
 ```
 
-A reviewer brief fills the same fields, with the role `reviewer`, the slice as the change to review (the pull request
+A reviewer brief covers **one pull request** (the reviewer is resumed for the next one), tells it to quote the builder's gate lines instead of re-running them, and fills the same fields, with the role `reviewer`, the slice as the change to review (the pull request
 `<repo>#<n>`, or the pushed branch before one exists) and its focus areas, and the authority `edit, commit, push and
 merge: never`. It gives the builder's `Read:` line on its own (agent-operations.md §4.2), and never the builder's summary
 or the rest of its report. The reviewer reviews the pushed head and names it in its verdict.
