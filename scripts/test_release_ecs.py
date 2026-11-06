@@ -40,11 +40,16 @@ def run_step(script: str, aws: str, extra_env: dict[str, str] | None = None, fil
         stubs = {"aws": aws, "docker": "", "cosign": "", "curl": "", "sha256sum": "", "tar": "", **(extra_stubs or {})}
         for tool, body in stubs.items():
             f = root / tool
-            f.write_text(f'#!/bin/bash\necho "{tool} $*" >> "{root}/calls"\n{body}\n')
+            # docker and cosign take a password on stdin (`aws ecr get-login-password | docker login --password-stdin`),
+            # as the real tools do: a stand-in that exits without reading it gives the writer SIGPIPE (exit 141 under
+            # pipefail), which raced on Linux (pitfall 11; .github #64 and #65 local CI, 2026-11-06). Only these two
+            # drain it: a stub called inside a `while read` loop must not swallow the loop's input.
+            drain = "if [ -p /dev/stdin ]; then cat >/dev/null; fi\n" if tool in ("docker", "cosign") else ""
+            f.write_text(f'#!/bin/bash\n{drain}echo "{tool} $*" >> "{root}/calls"\n{body}\n')
             f.chmod(f.stat().st_mode | stat.S_IEXEC)
         for name, content in (files or {}).items():
             (root / name).write_text(content)
-        out = subprocess.run(["bash", "-eo", "pipefail", "-c", script], cwd=root, capture_output=True, text=True, env={
+        out = subprocess.run(["bash", "-eo", "pipefail", "-c", script], cwd=root, capture_output=True, text=True, stdin=subprocess.DEVNULL, env={
             **os.environ, **ENV, **(extra_env or {}), "PATH": f"{root}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(root / "output"), "GITHUB_STEP_SUMMARY": str(root / "summary"),
         })  # fmt: skip
         read = lambda n: (root / n).read_text() if (root / n).exists() else ""
