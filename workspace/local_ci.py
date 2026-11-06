@@ -708,7 +708,8 @@ def service_argv(name: str, spec) -> list[str]:
         raise ValueError(f"key {unknown[0]} is not supported here")
     if bad := next((str(k) for k, v in spec.items() if has_expression(k) or has_expression(v)), None):
         raise ValueError(f"key {bad} holds an expression (${{{{ }}}}) the laptop cannot fill")
-    image, options, env = spec.get("image"), spec.get("options", ""), spec.get("env") or {}
+    none = lambda key, empty: empty if spec.get(key) is None else spec[key]  # `options:` with no value is empty, as on CI
+    image, options, env = spec.get("image"), none("options", ""), none("env", {})
     if not isinstance(image, str) or not image.strip():
         raise ValueError("key image is not a non-empty string")
     if not isinstance(options, str):
@@ -718,7 +719,7 @@ def service_argv(name: str, spec) -> list[str]:
         raise ValueError("key env is not a mapping of names to scalar values")
     lists = {}
     for key in ("ports", "volumes"):
-        lists[key] = spec.get(key) or []
+        lists[key] = none(key, [])
         if not isinstance(lists[key], list) or not all(isinstance(x, (str, int)) and not isinstance(x, bool) for x in lists[key]):
             raise ValueError(f"key {key} is not a list of strings")
     argv = ["docker", "run", "-d", "--name", name, "--label", f"onepeek-local-ci={os.getpid()}"]

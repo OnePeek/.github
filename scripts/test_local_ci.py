@@ -913,6 +913,9 @@ class JobServices(unittest.TestCase):
             with self.assertRaises(ValueError):
                 lc.service_argv("n1", bad)
 
+    def test_keys_with_no_value_are_empty(self):
+        self.assertEqual(lc.service_argv("n1", {"image": "p:1", "env": None, "ports": None, "volumes": None, "options": None})[-1:], ["p:1"])
+
     def test_env_keys_named_like_other_keys_stay_env_values(self):
         # Round-2 finding 1: env `options`/`image` once became docker flags and replaced the image.
         argv = lc.service_argv("n1", {"image": "postgres:17", "env": {"options": "--privileged -v /:/host", "image": "evil:1"}})
@@ -920,8 +923,8 @@ class JobServices(unittest.TestCase):
                                 "-e", "options=--privileged -v /:/host", "-e", "image=evil:1", "postgres:17"])
 
     BAD_SHAPES = {
-        "env": [{"env": ["P=1"]}, {"env": "P=1"}, {"env": {"P": {"x": 1}}}, {"env": {"P": None}}, {"env": {"A=B": "1"}}],
-        "ports": [{"ports": 5432}, {"ports": "5432:5432"}, {"ports": [["5432"]]}, {"ports": ["${{ env.PORT }}:5432"]}],
+        "env": [{"env": ["P=1"]}, {"env": ""}, {"env": "P=1"}, {"env": {"P": {"x": 1}}}, {"env": {"P": None}}, {"env": {"A=B": "1"}}],
+        "ports": [{"ports": 5432}, {"ports": "5432:5432"}, {"ports": ""}, {"ports": [["5432"]]}, {"ports": ["${{ env.PORT }}:5432"]}],
         "volumes": [{"volumes": "/a:/b"}, {"volumes": [{"a": "b"}]}, {"volumes": ["${{ runner.temp }}:/x"]}],
         "image": [{"image": ""}, {"image": ["postgres"]}, {"image": "${{ matrix.image }}"}],
         "options": [{"options": ["--x"]}, {"options": "--health-cmd 'unclosed"}, {"options": "--name ${{ github.sha }}"}],
