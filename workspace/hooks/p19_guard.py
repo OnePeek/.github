@@ -22,6 +22,21 @@ WRAPPER = ".github/workspace/cancel_release.py"
 REFUSED = "P19: agents start a cancel only with `python3 .github/workspace/cancel_release.py <repo> <env> --reason <text>` (foundation-playbook §5.4a)"
 SEPARATORS = re.compile(r"\s*(?:&&|\|\||;|\||\n|\$\(|`)\s*")
 API_PATH = re.compile(r"/(dispatches|runs/[^/\s]+/(force-)?cancel)\b")
+# gh's global flags that take a value, so `gh -R <repo> run cancel 1` is still seen as `run cancel`.
+VALUE_FLAGS = ("-R", "--repo", "--hostname")
+
+
+def subcommand(words: list[str]) -> list[str]:
+    """gh's words after the program name, without flags and the values of the flags that take one."""
+    out, skip = [], False
+    for w in words[1:]:
+        if skip:
+            skip = False
+        elif w in VALUE_FLAGS:
+            skip = True
+        elif not w.startswith("-"):
+            out.append(w)
+    return out or [""]
 
 
 def segments(command: str) -> list[list[str]]:
@@ -53,7 +68,7 @@ def refusal(command: str) -> str | None:
                 return inner
         if name != "gh":
             continue
-        rest = [w for w in words[1:] if not w.startswith("-")] or [""]
+        rest = subcommand(words)
         if rest[:2] == ["workflow", "run"]:
             return f"{REFUSED}; `gh workflow run` dispatches a workflow."
         if rest[:2] == ["run", "cancel"]:

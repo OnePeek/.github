@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.env == "prod" and agent_session():
         print("REFUSED: a prod cancel is the founder's only (foundation-playbook §5.4a). Ask the founder to run cancel-release.yml "
-              f"in {ORG}/{args.repo} himself; an agent session may cancel preprod only.")
+              f"in {ORG}/{args.repo} in person; an agent session may cancel preprod only.")
         return 2
     rc, said = dispatch(args.repo, args.env, args.reason)
     print(said)

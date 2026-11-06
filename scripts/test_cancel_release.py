@@ -366,7 +366,10 @@ class P19Hook(unittest.TestCase):
                     "gh api --method POST /repos/OnePeek/backend-service/actions/runs/77/force-cancel",
                     "gh api repos/OnePeek/backend-service/actions/workflows/cancel-release.yml/dispatches -f ref=release",
                     "cd /x && GH_TOKEN=t gh run cancel 5", "echo ok; env A=1 gh workflow run x.yml", "bash -c 'gh run cancel 5'",
-                    "x=$(gh api -X POST repos/o/r/actions/runs/1/cancel)"):
+                    "x=$(gh api -X POST repos/o/r/actions/runs/1/cancel)",
+                    # a global flag with a value before the subcommand (review of #55, 2026-11-06)
+                    "gh -R OnePeek/onepeek-web run cancel 1", "gh --repo OnePeek/x workflow run a.yml",
+                    "gh --hostname github.com run cancel 2"):
             r = self.hook(cmd)
             self.assertEqual(r.returncode, 2, cmd)
             self.assertIn("cancel_release.py", r.stderr)
