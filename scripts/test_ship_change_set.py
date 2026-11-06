@@ -1493,7 +1493,8 @@ class PeerRecheck(unittest.TestCase):
                 mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "release_lock", side_effect=lambda *a: self.events.append("lock")), \
                 mock.patch.object(ship, "green_head", return_value="c" * 40), mock.patch.object(ship, "refuse_protected"), \
                 mock.patch.object(ship, "own_branch_problem", return_value=None), mock.patch.object(ship, "say"), \
-                mock.patch.object(ship, "recheck_peers", side_effect=lambda r, n: calls.append((r, n)) or self.events.append("recheck")):
+                mock.patch.object(ship, "recheck_peers", side_effect=lambda r, n: calls.append((r, n)) or self.events.append("recheck")), \
+                mock.patch.object(ship, "refuse_unresolved", side_effect=lambda r, n: self.events.append("unresolved")):
             rc = ship.main(["backend-service#5", "--go", "--no-chain", "test"])
         return rc, calls, state["merged"]
 
@@ -1501,9 +1502,9 @@ class PeerRecheck(unittest.TestCase):
         rc, calls, merged = self.merge_flow("dev")
         self.assertEqual((rc, calls, merged), (0, [("backend-service", 5)], True))
 
-    def test_the_lock_read_stays_the_last_gate_before_the_merge(self):  # §6.5 Build rulings 2 "Order"
+    def test_the_lock_read_stays_the_last_gate_before_the_merge(self):  # §6.5 Build rulings 2 "Order"; threads §6.4
         self.merge_flow("dev")
-        self.assertEqual(self.events[-3:], ["recheck", "lock", "merge"], self.events)
+        self.assertEqual(self.events[-4:], ["recheck", "lock", "unresolved", "merge"], self.events)
 
     def test_a_hotfix_is_not_re_checked(self):  # it ships against release, not against a release candidate
         rc, calls, merged = self.merge_flow("hotfix/x")
