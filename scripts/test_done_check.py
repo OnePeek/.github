@@ -5,6 +5,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -16,6 +17,18 @@ _SPEC = importlib.util.spec_from_file_location(
     "done_check", pathlib.Path(__file__).resolve().parents[1] / "workspace" / "done_check.py")
 dc = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(dc)
+
+
+def setUpModule() -> None:
+    """Clear Git's repository-local variables (`git rev-parse --local-env-vars`: GIT_DIR, GIT_INDEX_FILE and the rest),
+    as a hook passes them on, so the fixtures and the code under test touch only the fixture repos (CodeRabbit on #60:
+    an inherited GIT_DIR had the fixture rewrite another repo's config)."""
+    names = subprocess.run(["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True, check=True).stdout.split()
+    patcher = mock.patch.dict(os.environ)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    for name in names:
+        os.environ.pop(name, None)
 
 
 def git(cwd, *args):
@@ -63,8 +76,9 @@ class Repo:
 class FakeGh:
     """Stands in for `gh` only; every git command runs for real. `files` are what the API's jq would print."""
 
-    def __init__(self, heads, files, branch="feat", base="main", fail_fetch=False):
+    def __init__(self, heads, files, branch="feat", base="main", fail_fetch=False, fork=None):
         self.heads, self.files, self.branch, self.base, self.fail_fetch = list(heads), files, branch, base, fail_fetch
+        self.fork = fork  # (owner, name, {branch: sha}) for a pull request from a fork
         self.calls = []
         self.real = dc.run
 
@@ -72,7 +86,14 @@ class FakeGh:
         self.calls.append(cmd)
         if cmd[:3] == ["gh", "pr", "view"]:
             head = self.heads.pop(0) if len(self.heads) > 1 else self.heads[0]
-            return json.dumps({"headRefName": self.branch, "headRefOid": head, "baseRefName": self.base})
+            info = {"headRefName": self.branch, "headRefOid": head, "baseRefName": self.base,
+                    "isCrossRepository": bool(self.fork)}
+            if self.fork:
+                info |= {"headRepositoryOwner": {"login": self.fork[0]}, "headRepository": {"name": self.fork[1]}}
+            return json.dumps(info)
+        if self.fork and cmd[:2] == ["git", "ls-remote"] and cmd[2] == f"https://github.com/{self.fork[0]}/{self.fork[1]}.git":
+            ref = cmd[3].removeprefix("refs/heads/")
+            return f"{self.fork[2][ref]}\t{cmd[3]}\n" if ref in self.fork[2] else ""
         if cmd[:2] == ["gh", "api"]:
             return "".join(json.dumps(f) + "\n" for f in self.files)
         if cmd[:2] == ["git", "fetch"] and self.fail_fetch:
@@ -277,6 +298,39 @@ class Check(unittest.TestCase):
             problems, _ = self.check("x#1", None)
         self.assertTrue(any(".context/status.md" in p for p in problems), problems)
 
+    def test_a_committed_context_file_fails_without_a_pull_request_too(self):
+        # CodeRabbit on #60: the --branch and upstream modes never looked for a committed .context/ file.
+        self.r.commit({".context/status.md": "phase: done\n"})
+        for branch in (None, "feat"):
+            with self.subTest(branch=branch):
+                problems = self.check(None, branch)[0]
+                self.assertTrue(any("HEAD commits .context/ files" in p and ".context/status.md" in p for p in problems),
+                                problems)
+
+    def test_a_pull_request_deleting_an_old_context_file_passes(self):
+        # CodeRabbit on #60: the removal of a file committed by mistake must be able to pass.
+        self.r.commit({".context/old.md": "x\n"})
+        git(self.r.work, "push", "-q", "origin", "HEAD:main")
+        git(self.r.work, "rm", "-q", ".context/old.md")
+        git(self.r.work, "commit", "-q", "-m", "rm")
+        git(self.r.work, "push", "-q", "origin", "HEAD:feat")
+        with self.with_gh(FakeGh([self.r.head()], [".context/old.md"])):
+            problems, _ = self.check("x#1", None)
+        self.assertEqual(problems, [])
+
+    def test_a_fork_pull_request_is_checked_in_the_fork_not_in_origin(self):
+        # CodeRabbit on #60: a fork's head branch is not in origin, so origin alone reported it unpushed.
+        head = self.r.commit({"b.txt": "b\n"})
+        with self.with_gh(FakeGh([head], ["b.txt"], branch="fork-only", fork=("someone", "x", {"fork-only": head}))):
+            self.assertEqual(self.check("x#1", None)[0], [])
+        with self.with_gh(FakeGh([head], ["b.txt"], branch="fork-only", fork=("someone", "x", {"fork-only": "1" * 40}))):
+            problems = self.check("x#1", None)[0]
+        self.assertTrue(any(p.startswith("https://github.com/someone/x.git fork-only is 1111111") for p in problems),
+                        problems)
+        with self.with_gh(FakeGh([head], ["b.txt"], branch="fork-only", fork=("someone", "x", {}))):
+            problems = self.check("x#1", None)[0]
+        self.assertIn("branch fork-only is not on https://github.com/someone/x.git: push it", problems)
+
     def test_expect_without_pr_fails(self):
         self.assertTrue(any("--expect needs --pr" in p for p in self.check(None, None, ["a.txt"])[0]))
 
@@ -316,6 +370,17 @@ class Main(unittest.TestCase):
         with mock.patch.object(dc, "run", side_effect=fake), mock.patch.object(dc, "PR_READ_WAIT", 0):
             self.assertEqual(self.main(str(self.r.work), "--pr", "x#1"), (1, "DONE CHECK FAILED"))
 
+    def test_a_fork_that_was_deleted_fails_closed(self):  # TypeError: GitHub gives a null head repository
+        real = dc.run
+
+        def fake(cmd, cwd):
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return json.dumps({"headRefName": "feat", "headRefOid": self.r.head(), "baseRefName": "main",
+                                   "isCrossRepository": True, "headRepositoryOwner": None, "headRepository": None})
+            return "" if cmd[:2] == ["gh", "api"] else real(cmd, cwd)
+        with mock.patch.object(dc, "run", side_effect=fake):
+            self.assertEqual(self.main(str(self.r.work), "--pr", "x#1"), (1, "DONE CHECK FAILED"))
+
     def test_the_script_is_executable(self):
         self.assertTrue(pathlib.Path(dc.__file__).stat().st_mode & 0o111)
 
@@ -336,7 +401,8 @@ class PrFilesJq(unittest.TestCase):
 
 
 class ContextNeverCommitted(unittest.TestCase):
-    """Review round 2 of #60: a committed .context/status.md slipped through, because done_check skips only untracked ones."""
+    """Review round 2 of #60: a committed .context/status.md slipped through, because done_check skips only untracked ones.
+    `context_paths` gets every path HEAD tracks (`git ls-tree -r HEAD`)."""
 
     def test_a_committed_context_file_fails(self):
         problems = dc.context_paths(["workspace/x.py", ".context/status.md"])

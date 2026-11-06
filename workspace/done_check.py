@@ -6,8 +6,10 @@
 It fails when the work that was reported is not the work that was pushed:
   1. the worktree is not a linked worktree (`git worktree add`, agent-operations.md §4.3);
   2. the worktree has uncommitted or untracked files (only untracked files under a top-level `.context/` are ignored:
-     packets and status files are never committed; a tracked file there that changed still fails);
-  3. HEAD is not on the remote branch (`--branch`, else the pull request's head branch, else the upstream);
+     packets and status files are never committed; a tracked file there that changed still fails), or HEAD tracks any
+     file under `.context/`, in every mode (deleting one that was committed earlier passes);
+  3. HEAD is not on the remote branch (`--branch`, else the pull request's head branch, else the upstream); a pull
+     request from a fork is checked in its head repository, not in `origin`;
   4. with `--pr`: the pull request's head commit is not HEAD, `--branch` is not its head branch, the base cannot be
      fetched, HEAD does not contain the current base, or the pull request's files are not exactly the files HEAD changes
      against the base;
@@ -70,10 +72,11 @@ def compare_files(pr_files: list[str], changed: list[str]) -> list[str]:
     return problems
 
 
-def context_paths(pr_files: list[str]) -> list[str]:
-    """Problems when the pull request commits a `.context/` file: packets and status files are never committed (agent-operations.md §5.5)."""
-    found = sorted(f for f in pr_files if f.split("/", 1)[0] == ".context")
-    return ["the pull request commits .context/ files, which are never committed: " + ", ".join(found)] if found else []
+def context_paths(tracked: list[str]) -> list[str]:
+    """Problems when HEAD tracks a `.context/` file: packets and status files are never committed (agent-operations.md §5.5).
+    `tracked` is every path in HEAD's tree, so a branch without a pull request is checked too, and a deleted one passes."""
+    found = sorted(f for f in tracked if f.split("/", 1)[0] == CONTEXT_DIR)
+    return ["HEAD commits .context/ files, which are never committed: " + ", ".join(found)] if found else []
 
 
 def compare_expected(pr_files: list[str], expected: list[str]) -> list[str]:
@@ -101,7 +104,8 @@ PR_READ_TRIES, PR_READ_WAIT = 4, 5  # GitHub's API can show the old head for a f
 def read_pr(repo: str, number: str, head: str, worktree: pathlib.Path, sleep=time.sleep) -> dict:
     """The pull request as GitHub reports it, re-read briefly while its head still lags a fresh push."""
     for attempt in range(PR_READ_TRIES):
-        info = json.loads(run(["gh", "pr", "view", number, "-R", repo, "--json", "headRefName,headRefOid,baseRefName"],
+        info = json.loads(run(["gh", "pr", "view", number, "-R", repo, "--json",
+                               "headRefName,headRefOid,baseRefName,isCrossRepository,headRepository,headRepositoryOwner"],
                               worktree))
         if info.get("headRefOid") == head or attempt == PR_READ_TRIES - 1:
             return info
@@ -151,6 +155,8 @@ def check(worktree: pathlib.Path, pr: str | None, branch: str | None, expect: li
     if dirty:
         problems.append("uncommitted or untracked: " + ", ".join(dirty))
     head = run(["git", "rev-parse", "HEAD"], worktree).strip()
+    problems += context_paths(nul_fields(run(["git", "ls-tree", "-r", "-z", "--name-only", "HEAD"], worktree)))
+    remote_repo = "origin"
     if expect is not None and not pr:
         problems.append("--expect needs --pr: the expected files are compared with the pull request's")
     if pr:
@@ -160,13 +166,14 @@ def check(worktree: pathlib.Path, pr: str | None, branch: str | None, expect: li
             problems.append(f"--branch {branch} is not the pull request's head branch {info['headRefName']}")
         branch = branch or info["headRefName"]
         base_ref = info["baseRefName"]
+        if info.get("isCrossRepository"):  # a fork: its head branch lives in the fork, not in origin
+            remote_repo = f"https://github.com/{info['headRepositoryOwner']['login']}/{info['headRepository']['name']}.git"
         if info["headRefOid"] != head:
             problems.append(f"the pull request's head is {info['headRefOid'][:7]}, not HEAD {head[:7]}: push HEAD")
         files = pr_files(repo, number, worktree)
         print(f"pull request files ({len(files)}):")
         for f in files:
             print(f"  {f}")
-        problems += context_paths(files)
         if expect is not None:
             problems += compare_expected(files, expect)
         try:
@@ -187,11 +194,12 @@ def check(worktree: pathlib.Path, pr: str | None, branch: str | None, expect: li
             print(f"WARN  {lines} changed lines (generated files aside), over the slice cap of {SLICE_CAP} "
                   "(agent-operations.md §4.5): split the slice")
     if branch:
-        remote = run(["git", "ls-remote", "origin", f"refs/heads/{branch}"], worktree).split()
+        remote = run(["git", "ls-remote", remote_repo, f"refs/heads/{branch}"], worktree).split()
         if not remote:
-            problems.append(f"branch {branch} is not on origin: push it")
+            problems.append(f"branch {branch} is not on {remote_repo}: push it")
         elif remote[0] != head:
-            problems.append(f"origin/{branch} is {remote[0][:7]}, not HEAD {head[:7]}: push HEAD")
+            where = f"origin/{branch}" if remote_repo == "origin" else f"{remote_repo} {branch}"
+            problems.append(f"{where} is {remote[0][:7]}, not HEAD {head[:7]}: push HEAD")
     else:
         try:
             upstream = run(["git", "rev-parse", "@{u}"], worktree).strip()

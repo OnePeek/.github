@@ -16,6 +16,18 @@ packet = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(packet)
 
 
+def setUpModule() -> None:
+    """Clear Git's repository-local variables (`git rev-parse --local-env-vars`: GIT_DIR, GIT_INDEX_FILE and the rest),
+    as a hook passes them on, so the fixtures and the code under test touch only the fixture repos (CodeRabbit on #60:
+    an inherited GIT_DIR had the fixture rewrite another repo's config)."""
+    names = subprocess.run(["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True, check=True).stdout.split()
+    patcher = mock.patch.dict(os.environ)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    for name in names:
+        os.environ.pop(name, None)
+
+
 class Lane(unittest.TestCase):
     def test_default_is_feature(self) -> None:
         self.assertEqual(packet.lane_of(""), "feature")
