@@ -56,3 +56,27 @@ class SettingsWithoutTheGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class P19RegisteredParsesTheSettings(unittest.TestCase):
+    """Review of #55: the hook counts only as a real PreToolUse entry on Bash, never as text anywhere in the file."""
+
+    def check(self, text):
+        import json  # noqa: F401
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "settings.json"
+            f.write_text(text)
+            return s.p19_registered(f)
+
+    def test_a_real_entry_counts(self):
+        entry = {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 x/.github/workspace/hooks/p19_guard.py"}]}]}}
+        import json
+        self.assertTrue(self.check(json.dumps(entry)))
+
+    def test_the_name_elsewhere_does_not_count(self):
+        import json
+        for text in ('{"note": "hooks/p19_guard.py"}',
+                     json.dumps({"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [{"type": "command", "command": "hooks/p19_guard.py"}]}]}}),
+                     json.dumps({"hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "hooks/p19_guard.py"}]}]}}),
+                     "not json hooks/p19_guard.py"):
+            self.assertFalse(self.check(text), text)

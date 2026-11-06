@@ -22,6 +22,7 @@ Docker build-cache prune and the shared Terraform provider cache (TF_PLUGIN_CACH
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import shutil
 import subprocess
@@ -124,10 +125,18 @@ SETTINGS_SRC = HERE / "settings.json"
 def p19_registered(settings: pathlib.Path) -> bool:
     """True when this settings file runs the P19 guard (hooks/p19_guard.py) before Bash calls."""
     try:
-        text = settings.read_text(encoding="utf-8")
-    except OSError:
+        data = json.loads(settings.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return False
-    return "hooks/p19_guard.py" in text
+    # A real PreToolUse entry on Bash whose command runs the guard; a comment or another key never counts.
+    entries = (data.get("hooks") or {}).get("PreToolUse") or [] if isinstance(data, dict) else []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict) or entry.get("matcher") != "Bash":
+            continue
+        for hook in entry.get("hooks") or []:
+            if isinstance(hook, dict) and hook.get("type") == "command" and "hooks/p19_guard.py" in str(hook.get("command", "")):
+                return True
+    return False
 
 
 def ours(path: pathlib.Path) -> bool:
