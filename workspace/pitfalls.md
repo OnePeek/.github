@@ -66,3 +66,10 @@ same pull request as the fix.
 21. **Do not wait on CI, a review or a dependency.** On 2026-11-06 an agent sat about 70 minutes waiting on its own
     background work. Write the status file, push, and hand back `BLOCKED` within about 5 minutes; the coordinator
     watches and resumes you (`agent-operations.md` §5.6).
+
+## Added 2026-11-06 (watch until holding, agent-operations.md §8a)
+22. **`.context/` is never committed.** A builder committed its status file. It is in `.gitignore` now, and `done_check.py` fails on it.
+23. **Prove platform behaviour before a design depends on it.** `journalctl --follow` on systemd 252 writes no cursor when stopped; only a container test showed it. Test it in a container or the sandbox, and cite the result.
+24. **A fresh worktree has no dependencies.** Install them (`pnpm install`, `uv sync`) before committing, so the pre-commit hooks run. Never skip a hook. If a repo's hook needs a tool the repo never installs, that is a bug to report.
+25. **Decision numbers:** check the open docs pull requests, not only `main`, before taking the next number.
+26. **GitHub's API can show the old head for a few seconds after a push.** `done_check.py` re-reads briefly; do not "fix" a failure by pushing again.

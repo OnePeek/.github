@@ -12,3 +12,4 @@
   - status files and `BLOCKED` hand-backs, never silent waiting;
   - short reports.
 - Ship each unit as one change set merged together (`onepeek-docs/standards/development-cycle.md` §2a).
+- **The learning loop is not optional** (founder, 2026-11-06; `agent-operations.md` §8a). On any failure in development, mine included: pause that slice, record it in the same pull request as the fix (a §2 row, a `pitfalls.md` line, and an automated check where possible), then watch the next passes until it is `holding`. A lesson that lives only in memory or chat does not count.
