@@ -1558,7 +1558,25 @@ class HotfixLane(unittest.TestCase):
                                  ("Lane: hot fix", "dev", False), ("<!-- Lane: hotfix -->", "dev", False),
                                  ({"x": 1}, "dev", False), ("Lane: hotfix", "release", False)):
             with self.subTest(body=body, base=base):
-                self.assertIs(ship.hotfix({"body": body, "baseRefName": base}), want)
+                self.assertIs(ship.hotfix_lane({"body": body, "baseRefName": base}), want)
+                with mock.patch.object(ship, "pr_files", return_value=["scripts/x.py"]):
+                    self.assertIs(ship.hotfix({"body": body, "baseRefName": base, "repo": "x", "number": 1}), want)
+
+    def test_hotfix_itself_applies_review_required_paths_for_the_watcher_too(self) -> None:  # F43, one copy
+        i = {"body": "Lane: hotfix", "baseRefName": "dev"}
+        with mock.patch.object(ship, "say") as said:
+            with mock.patch.object(ship, "pr_files", return_value=["scripts/x.py"]):
+                self.assertTrue(ship.hotfix(dict(i, repo="x", number=1)))  # as ship_watch passes it
+                self.assertTrue(ship.hotfix(i, "x", 1))
+                self.assertFalse(ship.hotfix(i))  # not named: cannot be checked, fail closed
+            with mock.patch.object(ship, "pr_files", return_value=["scripts/x.py", "infra/iam.tf"]):
+                self.assertFalse(ship.hotfix(dict(i, repo="x", number=1)))
+            with mock.patch.object(ship, "pr_files", side_effect=SystemExit("HTTP 502")):
+                self.assertFalse(ship.hotfix(i, "x", 1))
+        lines = [c.args[0] for c in said.call_args_list]
+        self.assertIn("x#1: Lane: hotfix, but it changes infra/iam.tf (review_required_paths): it needs the review "
+                      "record at its head (ruling F43)", lines)
+        self.assertTrue(any("could not be checked (HTTP 502)" in x for x in lines), lines)
 
     def test_the_review_gate_passes_a_hotfix_without_a_review_or_coderabbit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(ship.os.environ, {"ONEPEEK_WORKSPACE": tmp}), \
@@ -1905,8 +1923,7 @@ class ReviewRequiredPaths(unittest.TestCase):
     def test_a_hotfix_changing_a_required_path_needs_the_record_at_its_head(self) -> None:
         self.assertIsNone(self.gate(["scripts/check_pins.py", "README.md"]))
         why = self.gate(["README.md", "workspace/ship_change_set.py"])
-        self.assertIn("no review at h3 (a hotfix that needs a review: it changes workspace/ship_change_set.py "
-                      "(review_required_paths))", why)
+        self.assertIn("no review at h3 (a hotfix that needs a review: ruling F43)", why)
         self.assertIn("no review at h3", self.gate(["infra/iam.tf"], {"onepeek-web#3": "h2"}))
         self.assertIsNone(self.gate(["infra/iam.tf"], {"onepeek-web#3": "h3"}))
 
@@ -1915,7 +1932,7 @@ class ReviewRequiredPaths(unittest.TestCase):
             raise SystemExit("STOP: `gh api --paginate ...` failed: HTTP 502")
         for files in (broken, []):
             with self.subTest(files=files):
-                self.assertIn("could not be checked", self.gate(files))
+                self.assertIn("no review at h3 (a hotfix that needs a review", self.gate(files))
         self.assertIsNone(self.gate(broken, {"onepeek-web#3": "h3"}))
 
     def test_the_plan_stops_a_hotfix_changing_the_merge_tool(self) -> None:
@@ -1933,8 +1950,9 @@ class ReviewRequiredPaths(unittest.TestCase):
         self.assertIn("backend-service#2: Lane: hotfix, post-merge review due (operating-model §3)", said)
 
     def test_a_file_read_error_right_before_the_merge_needs_the_record(self) -> None:  # fail closed at the merge too
-        rc, merged, _ = go_once(lambda k: feature_info(), files=[["scripts/x.py"], SystemExit("HTTP 502")])
-        self.assertIn("could not be checked", rc)
+        rc, merged, said = go_once(lambda k: feature_info(), files=[["scripts/x.py"], SystemExit("HTTP 502")])
+        self.assertIn("no review at", rc)
+        self.assertTrue(any("could not be checked (HTTP 502)" in x for x in said), said)
         self.assertEqual(merged, [])
 
     def test_a_reviewed_hotfix_on_a_required_path_merges_with_no_review_due_line(self) -> None:
@@ -2058,10 +2076,8 @@ class DirectPinPush(unittest.TestCase):
                 self.assertEqual(text.count(f"@{NEW} # v1.8.2"), 2)
                 self.assertEqual(sh("git", "--git-dir", self.bare(repo), "for-each-ref", "--format=%(refname)").split(),
                                  [f"refs/heads/{base}"])
-                row = self.records()[-1]
-                self.assertEqual({k: row[k] for k in ("repo", "branch", "sha", "parent", "tag")},
-                                 {"repo": repo, "branch": base, "sha": new, "parent": before, "tag": "v1.8.2"})
-                self.assertRegex(row["verify_after"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+                self.assertEqual(self.records()[-1], {"repo": repo, "branch": base, "sha": new})  # exactly, for the watcher
+                self.assertRegex(new, r"^[0-9a-f]{40}$")
 
     def test_anything_but_pinned_uses_lines_falls_back_to_a_pull_request(self) -> None:
         for name, workflow in (("untagged", "    uses: OnePeek/.github/.github/workflows/x.yml@main\n"),
@@ -2140,6 +2156,12 @@ class DirectPinPush(unittest.TestCase):
         with mock.patch.object(ship, "git", side_effect=git), self.assertRaises(SystemExit):
             ship.push_pin_move("onepeek-web", "v1.8.2", NEW)
         self.assertEqual(self.rev("onepeek-web", "dev"), theirs[0])
+        self.assertEqual(self.records(), [])
+
+    def test_only_a_trunk_and_a_full_commit_are_recorded(self) -> None:
+        for branch, sha in (("release", "a" * 40), ("main", "a" * 40), ("dev", "A" * 40), ("dev", "a" * 39)):
+            with self.subTest(branch=branch, sha=sha), self.assertRaisesRegex(SystemExit, "not recording"):
+                ship.record_direct_push("backend-service", branch, sha, "p", "v1")
         self.assertEqual(self.records(), [])
 
     def test_a_push_the_remote_does_not_show_is_a_failure_and_not_recorded(self) -> None:

@@ -23,7 +23,7 @@ request's `OnePeek/.github` workflow pins move to the new tag in one commit, so 
 or unmerged workflow; every caller repo whose pins were not moved inside the set (one outside it, or one merged
 before .github, such as onepeek-docs) then gets the move to the same tag (foundation-playbook §8a P2): pushed straight
 to its trunk (dev; main for onepeek-docs and marketing-website; never release) when the commit changes only pinned
-`uses: OnePeek/.github/...@<sha> # vX.Y.Z` lines (ruling T-86), the push read back from the remote and recorded in
+`uses: OnePeek/.github/...@<sha> # vX.Y.Z` lines (ruling T-86), the push read back from the remote and recorded ({repo, branch, sha}) in
 $ONEPEEK_WORKSPACE/.ship/direct-pushes.jsonl for the watcher, which checks the trunk's CI on it and reverts it when red;
 anything else gets a pin-move pull request, with a note when it was more than one minor version behind. Every repo of
 ship_watch.yaml's `repos` that is not checked out, or whose trunk cannot be read, is listed and fails the run (T-61).
@@ -717,13 +717,15 @@ def direct_pushes_file() -> pathlib.Path:
 
 
 def record_direct_push(repo: str, branch: str, sha: str, parent: str, tag: str) -> None:
-    """One JSON line per direct push (ruling T-86) for ship_watch.py: it checks the trunk's CI on `sha` from
-    `verify_after` on, and reverts the commit when it is red."""
+    """One JSON line per direct push (ruling T-86) for ship_watch.py, exactly {"repo", "branch", "sha"} (the shape the
+    watcher accepts; anything else alerts): it checks the trunk's CI on `sha` and reverts the commit when it is red.
+    `parent` and `tag` are only said."""
+    if branch != trunk(repo) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise SystemExit(f"STOP {repo}: not recording {branch}@{sha}: not the trunk or not a 40-hex commit")
     path = direct_pushes_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    row = {"repo": repo, "branch": branch, "sha": sha, "parent": parent, "tag": tag, "pushed_at": now,
-           "verify_after": now, "by": "ship_change_set.py pin move"}
+    say(f"{repo}: direct push {parent[:7]} -> {sha[:7]} ({tag}) recorded in {path}")
+    row = {"repo": repo, "branch": branch, "sha": sha}
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, sort_keys=True) + "\n")
 
@@ -937,11 +939,34 @@ def tool_source(repo: str, n: int, head: str) -> str:
                      "commit this run pushed; not pushing onto it, nothing after it is merged")
 
 
-def hotfix(i: dict) -> bool:
+def hotfix_lane(i: dict) -> bool:
     """operating-model §3 unblock lane: the body's first line says `Lane: hotfix` (packet.lane_of, ruling T-53 round 3)
-    and it is not a release pull request. Only hotfix skips the review gates: `docs`, `feature`, no lane line or an odd
-    body keep them (fail closed)."""
+    and it is not a release pull request. `docs`, `feature`, no lane line or an odd body are not (fail closed)."""
     return i.get("baseRefName") != RELEASE_BASE and packet.lane_of(i.get("body")) == "hotfix"
+
+
+def hotfix(i: dict, repo: str | None = None, n: int | None = None) -> bool:
+    """Whether the pull request skips the review gates as a hotfix (reviewed after the merge): it is in the hotfix lane
+    (hotfix_lane) and changes no path of `review_required_paths` (ruling F43), its files read live. The one copy of the
+    rule, for this tool and ship_watch.py alike. `repo` and `n` default to `i["repo"]` and `i["number"]`; without
+    them, or when the files cannot be read, it is not a hotfix (fail closed), and the reason is said."""
+    if not hotfix_lane(i):
+        return False
+    repo, n = repo or i.get("repo"), n or i.get("number")
+    if not repo or not n:
+        say("Lane: hotfix, but the pull request is not named, so its paths cannot be checked: it needs the review record")
+        return False
+    try:
+        hits = review_required(repo, n)
+    except SystemExit as e:
+        say(f"{repo}#{n}: Lane: hotfix, but its changed paths could not be checked ({e}): it needs the review record "
+            "at its head (ruling F43)")
+        return False
+    if hits:
+        say(f"{repo}#{n}: Lane: hotfix, but it changes {', '.join(hits)} (review_required_paths): it needs the review "
+            "record at its head (ruling F43)")
+        return False
+    return True
 
 
 def review_required_paths(path: pathlib.Path | None = None) -> list[str] | None:
@@ -994,17 +1019,9 @@ def review_gate(repo: str, n: int, i: dict) -> str | None:
     A hotfix pull request has none (it is reviewed after the merge, operating-model §3), unless it changes a path of
     `review_required_paths` (ruling F43: merge-tool and security changes are reviewed before the merge in every lane)
     or its changed paths cannot be read; then it needs the record at its head like a feature pull request."""
-    why_review = ""
-    if hotfix(i):
-        try:
-            hits = review_required(repo, n)
-        except SystemExit as e:
-            hits, why_review = [], f"its changed paths could not be checked ({e})"
-        if not hits and not why_review:
-            return None
-        why_review = why_review or f"it changes {', '.join(hits)} (review_required_paths)"
-        say(f"{repo}#{n}: Lane: hotfix, but {why_review}: it needs the review record at its head (ruling F43)")
-        why_review = f" (a hotfix that needs a review: {why_review})"
+    if hotfix(i, repo, n):
+        return None
+    why_review = " (a hotfix that needs a review: ruling F43)" if hotfix_lane(i) else ""
     try:
         reviews = read_reviews()
     except (OSError, ValueError) as e:
@@ -1014,16 +1031,6 @@ def review_gate(repo: str, n: int, i: dict) -> str | None:
                          authors if isinstance(authors, list) else [])
     return f"{repo}#{n}: {why}{why_review}" if why else None
 
-
-def review_exempt(repo: str, n: int, i: dict) -> bool:
-    """True when the pull request merges without a review before the merge: a hotfix (operating-model §3) that changes
-    no path of `review_required_paths` (ruling F43). Any read error means not exempt."""
-    if not hotfix(i):
-        return False
-    try:
-        return not review_required(repo, n)
-    except SystemExit:
-        return False
 
 
 def refresh_one(repo: str, n: int) -> int:
@@ -1318,14 +1325,14 @@ def main(argv: list[str]) -> int:
             raise SystemExit(f"STOP {repo}#{n}: the base changed since the plan ({base_ref} -> "
                              f"{fresh.get('baseRefName')}); run again; nothing after it is merged")
         live = dict(info[(repo, n)], body=fresh.get("body"))
-        lanes = ["hotfix" if hotfix(x) else "feature" for x in (info[(repo, n)], live)]
+        lanes = ["hotfix" if hotfix_lane(x) else "feature" for x in (info[(repo, n)], live)]
         if lanes[0] != lanes[1]:
             raise SystemExit(f"STOP {repo}#{n}: the lane changed since the plan ({lanes[0]} -> {lanes[1]}); run "
                              "again; nothing after it is merged")
         # Review threads never block a merge (ruling T-100). The review gates, again, right before the merge (F36); a
         # hotfix skips them only when it changes no review_required_paths path, read live again (ruling F43).
         reviewed = info[(repo, n)]["headRefOid"]
-        exempt = review_exempt(repo, n, live)
+        exempt = hotfix(live, repo, n)
         why = None if exempt else review_gate(repo, n, live)
         if not why and head != reviewed and head not in TOOL_PUSHED:
             why = f"{repo}#{n}: head {head[:7]} is neither the reviewed head {reviewed[:7]} nor a commit this run pushed"
