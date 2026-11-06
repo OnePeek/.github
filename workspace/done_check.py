@@ -114,11 +114,13 @@ def files_since(since: str, base_ref: str, worktree: pathlib.Path) -> tuple[list
     except subprocess.CalledProcessError as e:
         return [], [f"--since {since} is not an ancestor of HEAD" if e.returncode == 1
                     else f"could not compare --since {since} with HEAD: {(e.stderr or '').strip()}"]
-    commits = run(["git", "rev-list", "--no-merges", f"{full}..HEAD", "--not", f"origin/{base_ref}"], worktree).split()
+    commits = run(["git", "rev-list", f"{full}..HEAD", "--not", f"origin/{base_ref}"], worktree).split()
     files: set[str] = set()
     for c in commits:
-        files.update(nul_fields(run(["git", "diff-tree", "-r", "-z", "--no-commit-id", "--name-only", "--no-renames", c],
-                                    worktree)))
+        # --cc: a plain commit lists its files; a merge lists only what it changed against every parent (a conflict
+        # fix or a file added during the merge), never the base's files it brings in (review of .github #64).
+        files.update(nul_fields(run(["git", "diff-tree", "-r", "-z", "--cc", "--no-commit-id", "--name-only",
+                                     "--no-renames", c], worktree)))
     return sorted(files), []
 
 

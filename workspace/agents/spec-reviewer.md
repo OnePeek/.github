@@ -37,7 +37,9 @@ Check, with `file:line` evidence:
    Record its `git rev-parse HEAD` as the reviewed head. Read the diff from that worktree (`git diff origin/<base>...HEAD`), not from a diff handed to you; if the two differ, review the worktree's and say so. Run every gate in this repo's `AGENTS.md` there, and remove the worktree afterwards.
 7. **The pushed change is the whole change.** Run `python3 "$ONEPEEK_WORKSPACE/.github/workspace/done_check.py" <worktree> --pr <repo>#<n>` on your throwaway worktree, or `--branch <branch>` before a pull request exists, and check that the changed files are the ones the packet needs.
 8. **Mutations.** Break at least one behaviour per area yourself and confirm a test fails. A test that cannot fail is blocking.
-9. **Pitfalls.** List each `pitfalls.md` line the change breaks. If you find a new kind of mistake, propose its one-line addition.
+9. **One review stream with CodeRabbit (`agent-operations.md` §6.2, F27).** With a pull request, start only after CodeRabbit's check on the head has finished (wait at most 10 minutes; past that, say so and go on). Read every unresolved CodeRabbit thread in the same round. List each real defect as a finding, and list each wrong one with its evidence, so the thread can be answered and resolved. Never fix code. A branch review before a pull request exists may start at once, but its verdict is final only after the pull request opens and you have triaged CodeRabbit's threads on that head. The same reviewer does this, in the same round.
+10. **Gaps ruled (F28).** The brief's `Gaps ruled:` line lists the gaps the coordinator ruled before the build. Check that the code follows each ruling. A ruling the code ignores is blocking.
+11. **Pitfalls.** List each `pitfalls.md` line the change breaks. If you find a new kind of mistake, propose its one-line addition.
 
 Never edit the real working tree, commit, push or merge.
 

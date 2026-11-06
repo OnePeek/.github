@@ -367,6 +367,24 @@ class Check(unittest.TestCase):
         with self.with_gh(FakeGh([head], ["b.txt", "c.txt"])):
             self.assertEqual(self.check("x#1", None, ["c.txt"], first)[0], [])
 
+    def test_since_sees_a_file_changed_inside_a_merge(self):
+        # Review of .github #64: rev-list --no-merges hid a file added while merging the base.
+        first = self.r.commit({"b.txt": "b\n"})
+        (self.r.clone / "z.txt").write_text("z\n")
+        git(self.r.clone, "add", "z.txt")
+        git(self.r.clone, "commit", "-q", "-m", "z")
+        git(self.r.clone, "push", "-q", "origin", "main")
+        git(self.r.work, "fetch", "-q", "origin")
+        git(self.r.work, "merge", "-q", "--no-ff", "--no-commit", "origin/main")
+        (self.r.work / "hidden.txt").write_text("h\n")
+        git(self.r.work, "add", "hidden.txt")
+        git(self.r.work, "commit", "-q", "-m", "merge main")
+        head = self.r.commit({"c.txt": "c\n"})
+        with self.with_gh(FakeGh([head], ["b.txt", "c.txt", "hidden.txt"])):
+            problems, _ = self.check("x#1", None, ["c.txt"], first)
+            self.assertIn(f"changed after {first} but not reported: hidden.txt", problems)
+            self.assertEqual(self.check("x#1", None, ["c.txt", "hidden.txt"], first)[0], [])
+
     def test_since_lists_both_paths_of_a_rename(self):
         first = self.r.head()
         git(self.r.work, "mv", "a.txt", "moved.txt")

@@ -2,9 +2,9 @@
 
 Run from inside a repo (the backend has the same thing as `uv run app context`):
 
-    python3 ../.github/workspace/packet.py clients/onepeek-web --out .context/onepeek-web.md
-    python3 ../.github/workspace/packet.py infra/aws-stack --out .context/aws-stack.md
-    python3 ../.github/workspace/packet.py mcp-gateway --refine
+    python3 "$ONEPEEK_WORKSPACE/.github/workspace/packet.py" clients/onepeek-web --out .context/onepeek-web.md
+    python3 "$ONEPEEK_WORKSPACE/.github/workspace/packet.py" infra/aws-stack --out .context/aws-stack.md
+    python3 "$ONEPEEK_WORKSPACE/.github/workspace/packet.py" mcp-gateway --refine
 
 The docs clone is `--docs <path>`, else `$ONEPEEK_WORKSPACE/onepeek-docs`, else `../onepeek-docs` next to the repo, so a
 repo worktree under a session scratchpad works too. It makes a temporary detached worktree of that clone at the commit

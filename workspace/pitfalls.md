@@ -69,7 +69,7 @@ same pull request as the fix.
 21. **Do not wait on CI, a review or a dependency.** On 2026-11-06 an agent sat about 70 minutes waiting on its own
     background work. Write the status file, push if you have push authority and local CI is green (otherwise keep the worktree path), and
     hand back `BLOCKED` within about 5 minutes; the coordinator
-    watches and resumes you (`agent-operations.md` §5.6).
+    watches and resumes you (`agent-operations.md` §5.5).
 
 ## Added 2026-11-06 (watch until holding, agent-operations.md §8a)
 22. **`.context/` is never committed.** A builder committed its status file. It is in `.gitignore` now, and `done_check.py` fails on it.
