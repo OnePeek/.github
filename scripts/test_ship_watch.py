@@ -41,8 +41,9 @@ class FakeGh:
     """Stands in for `gh`: answers each read from the given world, records every call, fails the ones in `fail`."""
 
     def __init__(self, prs, checks=None, threads=None, states=None, online=1, queued=0, sandbox=None, fail=(),
-                 bot=BOT_DONE, pins=None, docs_commits=None):
+                 bot=BOT_DONE, pins=None, docs_commits=None, commits=None, raise_on=()):
         self.prs, self.checks, self.threads, self.states = prs, checks or {}, threads or {}, states or {}
+        self.commits, self.raise_on = commits or {}, raise_on  # sha -> [(name, status, conclusion, workflow)]
         self.bot, self.pins, self.docs_commits, self.required = bot, pins or {}, docs_commits or {}, None
         self.online, self.queued, self.sandbox, self.fail, self.calls = online, queued, sandbox, fail, []
 
@@ -50,7 +51,16 @@ class FakeGh:
         self.calls.append(args)
         if any(f in " ".join(args) for f in self.fail):
             return subprocess.CompletedProcess(args, 1, "", "HTTP 502")
+        if any(f in " ".join(args) for f in self.raise_on):
+            raise sw.ReadError(f"gh {' '.join(args[:3])} timed out after 120 s")  # as _gh_process does on a timeout
         a = args
+        if a[:2] == ["run", "list"] and "--commit" in a:
+            runs = self.commits.get(a[a.index("--commit") + 1], [])
+            return done([{"databaseId": 900 + i, "workflowName": c[3]} for i, c in enumerate(runs)])
+        if a[:1] == ["api"] and "/check-runs" in a[2]:
+            runs = self.commits.get(a[2].split("/")[4], [])
+            return done("".join(json.dumps([c[0], c[1], c[2], f"https://x/actions/runs/{900 + i}/job/1"]) + "\n"
+                                for i, c in enumerate(runs)))
         if a[:2] == ["pr", "list"]:
             return done([p for p in self.prs if p["_repo"] == a[3].split("/")[1]])
         if a[:2] == ["pr", "checks"]:
@@ -149,11 +159,14 @@ class Classify(unittest.TestCase):
             ("BLOCKED", "pending: x", {"checks": [{"name": "x", "bucket": "pending"}]}),
             ("READY", "", {"checks": [{"name": "s", "bucket": "skipping"}] + GREEN}),
             ("BLOCKED", "no checks", {"checks": []}),
-            ("BLOCKED", "1 unresolved review thread(s): a.py:3", {"threads": ["a.py:3"]}),
+            # T-100 (founder 2026-11-07): unresolved threads and CodeRabbit's state never block, in any lane
+            ("READY", "", {"threads": ["a.py:3"]}),
+            ("READY", "", {"all_checks": [{"name": "CodeRabbit", "bucket": "pending"}]}),
+            ("READY", "", {"all_checks": GREEN}),
+            ("READY", "", {"all_checks": [{"name": "CodeRabbit", "bucket": "fail"}], "threads": ["a.py:3"]}),
             ("BLOCKED", "no review at h5", {"reviews": {"onepeek-web#5": "h4"}}),
             ("BLOCKED", "no review at h5", {"reviews": {}}),
-            ("BLOCKED", "no review at h5: CodeRabbit pending", {"all_checks": [{"name": "CodeRabbit", "bucket": "pending"}]}),
-            ("BLOCKED", "CodeRabbit has not reported", {"all_checks": GREEN}),
+            ("BLOCKED", "no review at h5", {"all_checks": [{"name": "CodeRabbit", "bucket": "pending"}], "reviews": {}}),
             ("READY", "", {"reviews": {"onepeek-web#5": {"sha": "h5", "class": "mechanical"}}}),
             ("READY", "", {"reviews": {"onepeek-web#5": {"sha": "h5", "class": "docs only"}}}),
             ("BLOCKED", "no review at h5", {"reviews": {"onepeek-web#5": {"sha": "h4", "class": "docs only"}}}),
@@ -169,10 +182,10 @@ class Classify(unittest.TestCase):
             ("BLOCKED", "CONFLICTING", {**HOT, "mergeable": "CONFLICTING"}),
             ("HOLD", "not in ship_watch.yaml", {**HOT, "author": {"login": "someone"}}),
             ("HOLD", "release", {**HOT, "baseRefName": "release"}),
-            ("BLOCKED", "1 unresolved review thread(s)", {"body": "Lane: hot fix", "threads": ["a.py:3"]}),
+            ("BLOCKED", "no review at h5", {"body": "Lane: hot fix", "threads": ["a.py:3"], "reviews": {}}),
             ("BLOCKED", "no review at h5", {"body": "fix it\nLane: hotfix", "reviews": {}}),  # ruling T-53 round 3
             ("BLOCKED", "no review at h5", {"body": "Lane: hotfix\n---", "reviews": {}}),
-            ("BLOCKED", "1 unresolved review thread(s)", {"body": "Lane: docs", "threads": ["a.py:3"]}),
+            ("READY", "", {"body": "Lane: docs", "threads": ["a.py:3"]}),
             ("BLOCKED", "no review at h5", {"body": "Lane: docs", "reviews": {}}),
             ("READY", "post-merge review due", {"body": "<!-- hint -->\nLane: hotfix\nLane: feature", "reviews": {}}),
         ]
@@ -207,18 +220,20 @@ class Queue(Base):
         self.run_pass(FakeGh(world(("onepeek-web", pr("onepeek-web", 4)))), cfg=dict(CFG, path="/x/other.yaml"))
         self.assertEqual(self.merge_cmds[0][3:], ["--go", "--config", "/x/other.yaml"])
 
-    def test_never_merges_release_draft_hold_or_unresolved_threads(self):
+    def test_never_merges_release_draft_or_hold_but_merges_past_threads_and_coderabbit(self):  # T-100
         fake = FakeGh(world(("onepeek-web", pr("onepeek-web", 1, baseRefName="release")),
                             ("onepeek-web", pr("onepeek-web", 2, isDraft=True)),
                             ("onepeek-web", pr("onepeek-web", 3, author={"login": "app/other"})),
                             ("onepeek-web", pr("onepeek-web", 4)), ("onepeek-web", pr("onepeek-web", 5))),
-                      threads={"onepeek-web#4": ["a.py"]})
-        self.run_pass(fake)
-        self.assertEqual(self.merged, ["onepeek-web#5"])
+                      threads={"onepeek-web#4": ["a.py"]}, bot={"name": "CodeRabbit", "bucket": "pending"})
+        s = self.run_pass(fake)
+        self.assertEqual(self.merged, ["onepeek-web#4", "onepeek-web#5"])
+        self.assertFalse([a for a in s["alerts"] if "thread" in a or "CodeRabbit" in a], s["alerts"])
+        self.assertFalse([c for c in fake.calls if c[:2] == ["api", "graphql"]])  # threads are not even read
         self.merged.clear()
         with mock.patch.object(sw, "classify", lambda p, cfg: ("READY", "")):  # the guard before the merge holds alone
             self.run_pass(fake)
-        self.assertEqual(self.merged, ["onepeek-web#3", "onepeek-web#5"])
+        self.assertEqual(self.merged, ["onepeek-web#3", "onepeek-web#4", "onepeek-web#5"])
         self.merged.clear()
         fake.prs[1]["isDraft"] = None  # not exactly false: the guard holds too
         with mock.patch.object(sw, "classify", lambda p, cfg: ("READY", "")):
@@ -590,7 +605,7 @@ class Alerts(Base):
 
 class FailClosed(Base):
     def test_a_read_error_merges_and_reruns_nothing(self):
-        for broken in ("actions/runners", "pr checks", "api graphql", "pr list -R OnePeek/onepeek-infra"):
+        for broken in ("actions/runners", "pr checks", "pr list -R OnePeek/onepeek-infra"):
             with self.subTest(broken):
                 self.merged.clear()
                 red = [{"name": "flaky / job", "bucket": "fail", "link": "https://x/runs/9/job/1"}]
@@ -601,7 +616,7 @@ class FailClosed(Base):
                 self.assertTrue([a for a in s["alerts"] if a.startswith("read failed")], s["alerts"])
 
     def test_a_read_error_is_an_alert(self):
-        for broken in ("actions/runners", "pr checks", "api graphql", "pr list -R OnePeek/onepeek-infra"):
+        for broken in ("actions/runners", "pr checks", "pr list -R OnePeek/onepeek-infra"):
             with self.subTest(broken):
                 s = self.run_pass(FakeGh(world(("onepeek-web", pr("onepeek-web", 1))), fail=(broken,)))
                 self.assertTrue([a for a in s["alerts"] if a.startswith("read failed")], s["alerts"])
@@ -756,6 +771,436 @@ class Main(Base):
         with self.assertRaises(SystemExit):
             sw.out_dir(str(repo / "out"))
         self.assertEqual(sw.out_dir(str(pathlib.Path(self.tmp.name) / "o")).name, "o")
+
+
+def setUpModule() -> None:
+    """Clear Git's repository-local variables (a hook passes them on, pitfalls.md 27) so the git fixtures touch only
+    their own repos."""
+    names = subprocess.run(["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True, check=True).stdout.split()
+    patcher = mock.patch.dict(os.environ)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    for name in names:
+        os.environ.pop(name, None)
+
+
+def git(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@x", "-c",
+                           "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],
+                          capture_output=True, text=True, check=True).stdout
+
+
+def origin_and_clone(root: pathlib.Path, name: str, branch: str, files: dict) -> pathlib.Path:
+    """A bare origin with `files` on `branch`, and a clone of it at root/name on that branch."""
+    bare, clone = root / f"{name}.git", root / name
+    subprocess.run(["git", "init", "-q", "--bare", "-b", branch, str(bare)], check=True)
+    subprocess.run(["git", "clone", "-q", str(bare), str(clone)], check=True, capture_output=True)
+    git(clone, "checkout", "-q", "-b", branch)
+    commit(clone, files, "first")
+    git(clone, "push", "-q", "origin", branch)
+    git(clone, "config", "user.name", "t")
+    git(clone, "config", "user.email", "t@x")
+    git(clone, "config", "commit.gpgsign", "false")
+    git(clone, "config", "core.hooksPath", "/dev/null")
+    return clone
+
+
+def commit(clone: pathlib.Path, files: dict, msg: str) -> str:
+    for rel, text in files.items():
+        (clone / rel).parent.mkdir(parents=True, exist_ok=True)
+        (clone / rel).write_text(text)
+    git(clone, "add", "-A")
+    git(clone, "commit", "-q", "-m", msg)
+    return git(clone, "rev-parse", "HEAD").strip()
+
+
+SHA_A, SHA_B = "a" * 40, "b" * 40
+YAML = str(sw.HERE / "ship_watch.yaml")
+
+
+class DirectPush(Base):
+    """T-86 partner (founder 2026-11-07): every direct push in direct-pushes.jsonl is verified on its trunk's CI, or
+    reverted when red; never anything not in the file; a read error is an alert and no revert."""
+
+    def setUp(self):
+        super().setUp()
+        self.reverts = []
+        self.revert_error = None
+
+        def revert(repo, branch, sha, ws):
+            self.reverts.append((repo, branch, sha, ws))
+            if self.revert_error:
+                raise sw.ReadError(self.revert_error)
+            return "reverted by c0ffee"
+        p = mock.patch.object(sw, "REVERT", revert)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def pushes(self, *entries, raw=None):
+        self.out.mkdir(parents=True, exist_ok=True)
+        (self.out / "direct-pushes.jsonl").write_text(raw if raw is not None else
+                                                      "".join(json.dumps(e) + "\n" for e in entries))
+
+    def test_green_is_verified_once(self):
+        self.pushes({"repo": "onepeek-web", "branch": "dev", "sha": SHA_A})
+        fake = FakeGh([], commits={SHA_A: [("tests", "completed", "success", "checks"),
+                                           ("lint", "completed", "skipped", "checks")]})
+        s = self.run_pass(fake)
+        self.assertIn(f"verified direct push onepeek-web@{SHA_A[:12]} on dev", s["actions"])
+        self.assertEqual(json.loads((self.out / "state.json").read_text())["direct_pushes"][f"onepeek-web@{SHA_A}"]["status"],
+                         "verified")
+        fake.calls.clear()
+        self.run_pass(fake, now=NOW + 60)
+        self.assertFalse([c for c in fake.calls if SHA_A in " ".join(c)])  # settled: never read again
+        self.assertEqual(self.reverts, [])
+
+    def test_red_is_reverted_once_with_an_alert_naming_repo_and_sha(self):
+        self.pushes({"repo": "onepeek-docs", "branch": "main", "sha": SHA_A})
+        fake = FakeGh([], commits={SHA_A: [("tests", "completed", "success", "checks"),
+                                           ("lint", "completed", "failure", "checks")]})
+        s = self.run_pass(fake)
+        self.assertEqual(self.reverts, [("onepeek-docs", "main", SHA_A, pathlib.Path(self.tmp.name))])
+        self.assertIn(f"direct push onepeek-docs@{SHA_A[:12]} on main red (lint): reverted by c0ffee", s["alerts"])
+        s = self.run_pass(fake, now=NOW + 60)
+        self.assertEqual(len(self.reverts), 1)
+        self.assertFalse([a for a in s["alerts"] if "direct push" in a], s["alerts"])
+
+    def test_pending_alerts_after_45_minutes_and_cancelled_is_never_reverted(self):
+        self.pushes({"repo": "onepeek-web", "branch": "dev", "sha": SHA_A})
+        for runs in ([("tests", "in_progress", None, "checks")], [("tests", "completed", "cancelled", "checks")], []):
+            with self.subTest(runs=runs):
+                (self.out / "state.json").unlink(missing_ok=True)
+                fake = FakeGh([], commits={SHA_A: runs})
+                s = self.run_pass(fake)
+                self.assertFalse([a for a in s["alerts"] if "direct push" in a], s["alerts"])
+                s = self.run_pass(fake, now=NOW + 45 * 60 - 1)
+                self.assertFalse([a for a in s["alerts"] if "direct push" in a], s["alerts"])
+                s = self.run_pass(fake, now=NOW + 45 * 60)
+                self.assertIn(f"direct push onepeek-web@{SHA_A[:12]} on dev: CI not settled after 45 min", s["alerts"])
+        self.assertEqual(self.reverts, [])
+
+    def test_warn_checks_and_coderabbit_never_revert(self):
+        self.pushes({"repo": "onepeek-infra", "branch": "dev", "sha": SHA_A})
+        fake = FakeGh([], commits={SHA_A: [("apply-test", "completed", "failure", "sandbox"),
+                                           ("CodeRabbit", "completed", "failure", None),
+                                           ("tests", "completed", "success", "checks")]})
+        s = self.run_pass(fake)
+        self.assertEqual(self.reverts, [])
+        self.assertIn(f"verified direct push onepeek-infra@{SHA_A[:12]} on dev", s["actions"])
+
+    def test_a_read_error_is_an_alert_and_no_revert(self):
+        self.pushes({"repo": "onepeek-web", "branch": "dev", "sha": SHA_A})
+        for how in ({"fail": ("check-runs",)}, {"raise_on": ("--commit",)}):
+            with self.subTest(how):
+                fake = FakeGh([], commits={SHA_A: [("t", "completed", "failure", "checks")]}, **how)
+                s = self.run_pass(fake)
+                self.assertTrue([a for a in s["alerts"] if a.startswith(f"direct push onepeek-web@{SHA_A[:12]} on dev: "
+                                                                       "CI unreadable, not reverted")], s["alerts"])
+        self.assertEqual(self.reverts, [])
+
+    def test_odd_lines_are_alerts_never_reverted_or_read(self):
+        lines = ["{not json", json.dumps([SHA_A]), json.dumps({"repo": "onepeek-web", "branch": "main", "sha": SHA_A}),
+                 json.dumps({"repo": "onepeek-web", "branch": "dev", "sha": SHA_A[:12]}),
+                 json.dumps({"repo": "someone/else", "branch": "dev", "sha": SHA_A}),
+                 json.dumps({"repo": "onepeek-web", "branch": "dev", "sha": SHA_A.upper()}),
+                 json.dumps({"repo": "onepeek-web", "sha": SHA_A})]
+        self.pushes(raw="\n".join(lines) + "\n")
+        fake = FakeGh([], commits={SHA_A: [("t", "completed", "failure", "checks")]})
+        s = self.run_pass(fake)
+        self.assertEqual(len([a for a in s["alerts"] if a.startswith("direct pushes line")]), len(lines), s["alerts"])
+        self.assertEqual(self.reverts, [])
+        self.assertFalse([c for c in fake.calls if SHA_A in " ".join(c)])
+
+    def test_only_entries_in_the_file_are_read_or_reverted(self):
+        self.pushes({"repo": "onepeek-web", "branch": "dev", "sha": SHA_A})
+        fake = FakeGh([], commits={SHA_A: [("t", "completed", "failure", "checks")],
+                                   SHA_B: [("t", "completed", "failure", "checks")]})
+        self.run_pass(fake, state={"direct_pushes": {f"onepeek-web@{SHA_B}": {"status": "pending", "since": NOW}}})
+        self.assertEqual([r[2] for r in self.reverts], [SHA_A])
+        self.assertEqual(set(json.loads((self.out / "state.json").read_text())["direct_pushes"]), {f"onepeek-web@{SHA_A}"})
+
+    def test_dry_run_and_a_failed_revert(self):
+        self.pushes({"repo": "onepeek-web", "branch": "dev", "sha": SHA_A})
+        fake = FakeGh([], commits={SHA_A: [("t", "completed", "failure", "checks")]})
+        s = self.run_pass(fake, dry=True)
+        self.assertEqual((self.reverts, s["actions"]), ([], [f"would revert direct push onepeek-web@{SHA_A[:12]} on dev: red t"]))
+        self.revert_error = "push rejected"
+        s = self.run_pass(fake)
+        self.assertTrue([a for a in s["alerts"] if "the revert FAILED" in a and "push rejected" in a], s["alerts"])
+        self.revert_error = None
+        self.run_pass(fake, now=NOW + 60)  # not marked, so the next pass tries again
+        self.assertEqual(len(self.reverts), 2)
+
+
+class RevertPush(unittest.TestCase):
+    """The real revert: a temporary worktree, `git revert --no-edit`, a plain push, the remote read back."""
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.ws = pathlib.Path(d.name)
+        self.repo = origin_and_clone(self.ws, "onepeek-web", "dev", {"a.txt": "good\n"})
+
+    def remote_head(self):
+        return git(self.repo, "ls-remote", "origin", "refs/heads/dev").split()[0]
+
+    def test_a_red_push_is_reverted_on_the_trunk(self):
+        bad = commit(self.repo, {"a.txt": "bad\n"}, "pin move")
+        git(self.repo, "push", "-q", "origin", "dev")
+        git(self.repo, "checkout", "-q", "--detach")  # the shared checkout may be anywhere
+        did = sw._revert_push("onepeek-web", "dev", bad, self.ws)
+        head = self.remote_head()
+        self.assertEqual(did, f"reverted by {head[:12]}")
+        self.assertEqual(git(self.repo, "show", f"{head}:a.txt"), "good\n")
+        self.assertIn(f"This reverts commit {bad}", git(self.repo, "log", "-1", "--format=%B", head))
+        self.assertEqual(git(self.repo, "worktree", "list", "--porcelain").count("worktree "), 1)  # cleaned up
+        self.assertEqual(sw._revert_push("onepeek-web", "dev", bad, self.ws), f"already reverted by {head[:12]}")
+        self.assertEqual(self.remote_head(), head)
+
+    def test_a_sha_not_on_the_trunk_is_refused(self):
+        git(self.repo, "checkout", "-q", "-b", "side")
+        side = commit(self.repo, {"a.txt": "side\n"}, "side")
+        before = self.remote_head()
+        with self.assertRaises(sw.ReadError):
+            sw._revert_push("onepeek-web", "dev", side, self.ws)
+        self.assertEqual(self.remote_head(), before)
+
+
+class ReviewsDue(Base):
+    """S2: ship-status.md lists every pull request merged as a hotfix that post-reviews.json does not name."""
+
+    def test_the_section_lists_hotfixes_not_yet_reviewed(self):
+        self.out.mkdir(parents=True)
+        rows = [{"pr": "onepeek-web#1", "post_merge_review_due": True}, {"pr": "onepeek-web#2", "post_merge_review_due": False},
+                {"pr": ".github#3", "post_merge_review_due": True}, {"pr": "onepeek-infra#4", "post_merge_review_due": True,
+                                                                    "merged": False},
+                {"pr": "onepeek-infra#5", "post_merge_review_due": True, "merged": None}]
+        (self.out / "measures.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        (self.out / "post-reviews.json").write_text(json.dumps({".github#3": "verdict ready at abc"}))
+        s = self.run_pass(FakeGh([]))
+        self.assertEqual(s["post_merge_reviews_due"], ["onepeek-web#1", "onepeek-infra#5"])
+        md = (self.out / "ship-status.md").read_text()
+        self.assertIn("## Post-merge reviews due\n- onepeek-web#1\n- onepeek-infra#5\n", md)
+        (self.out / "post-reviews.json").write_text("[]")  # unreadable: an alert, and every one is listed
+        s = self.run_pass(FakeGh([]))
+        self.assertEqual(s["post_merge_reviews_due"], ["onepeek-web#1", ".github#3", "onepeek-infra#5"])
+        self.assertTrue([a for a in s["alerts"] if "post-reviews.json unreadable" in a], s["alerts"])
+
+    def test_a_hotfix_merged_in_this_pass_is_due(self):
+        s = self.run_pass(FakeGh(world(("onepeek-web", pr("onepeek-web", 1, **HOT)))), reviews={})
+        self.assertEqual(s["post_merge_reviews_due"], ["onepeek-web#1"])
+        self.assertIn("## Post-merge reviews due\n- onepeek-web#1", (self.out / "ship-status.md").read_text())
+
+
+class SelfUpdate(unittest.TestCase):
+    """T-92: the watcher re-executes itself when its code changes on the shared .github checkout's main."""
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.root = pathlib.Path(d.name)
+        files = {f"workspace/{n}": f"{n} v1\n" for n in sw.CODE}
+        self.gh_dir = origin_and_clone(self.root, ".github", "main", files)
+        self.pusher = self.root / "pusher"
+        subprocess.run(["git", "clone", "-q", str(self.root / ".github.git"), str(self.pusher)], check=True,
+                       capture_output=True)
+        for name, value in (("HERE", self.gh_dir / "workspace"),
+                            ("LOADED", {n: sw.blob(f"{n} v1\n".encode()) for n in sw.CODE})):
+            p = mock.patch.object(sw, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def push_change(self, name):
+        commit(self.pusher, {f"workspace/{name}": f"{name} v2\n"}, "change")
+        git(self.pusher, "push", "-q", "origin", "main")
+
+    def test_no_change_no_reload(self):
+        self.assertEqual(sw.reload_check(self.gh_dir), (False, None))
+
+    def test_a_change_to_any_code_file_on_main_reloads(self):
+        for name in sw.CODE:
+            with self.subTest(name):
+                self.push_change(name)
+                self.assertEqual(sw.reload_check(self.gh_dir), (True, None))
+                self.assertEqual((self.gh_dir / "workspace" / name).read_text(), f"{name} v2\n")  # pulled
+                sw.LOADED[name] = sw.blob(f"{name} v2\n".encode())
+
+    def test_running_from_another_folder_alerts_instead_of_looping(self):
+        self.push_change("ship_watch.py")
+        with mock.patch.object(sw, "HERE", self.pusher.parent / "elsewhere"):
+            (self.pusher.parent / "elsewhere").mkdir()
+            (self.pusher.parent / "elsewhere" / "ship_watch.py").write_text("ship_watch.py v1\n")
+            go, why = sw.reload_check(self.gh_dir)
+        self.assertFalse(go)
+        self.assertIn("restart the watcher", why)
+
+    def test_off_main_or_a_failed_pull_is_an_alert(self):
+        git(self.gh_dir, "checkout", "-q", "-b", "other")
+        self.push_change("ship_watch.py")
+        go, why = sw.reload_check(self.gh_dir)
+        self.assertEqual((go, why), (False, f"self-update: {self.gh_dir} is on other, not main; running the loaded code"))
+        self.assertEqual((self.gh_dir / "workspace" / "ship_watch.py").read_text(), "ship_watch.py v1\n")  # no pull
+        git(self.gh_dir, "checkout", "-q", "main")
+        (self.gh_dir / "workspace" / "ship_watch.py").write_text("local edit\n")  # the pull cannot go on
+        go, why = sw.reload_check(self.gh_dir)
+        self.assertFalse(go)
+        self.assertIn("self-update check failed", why)
+
+    def test_the_loop_reexecutes_with_the_same_argv_before_the_pass(self):
+        ws = self.root
+        (ws / ".ship").mkdir()
+
+        class Exec(Exception):
+            pass
+
+        def execv(path, args):
+            raise Exec(path, args)
+        with mock.patch.object(sw, "RELOAD", lambda d: (True, None)), mock.patch.object(sw, "EXEC", execv), \
+                mock.patch.object(sw, "one_pass") as one, mock.patch.object(sw, "exit_on_signals"), \
+                mock.patch.dict(sw.os.environ, {"ONEPEEK_WORKSPACE": str(ws)}), mock.patch("builtins.print"), \
+                self.assertRaises(Exec) as e:
+            sw.main(["--go", "--out", str(ws / ".ship"), "--config", YAML])
+        self.assertEqual(e.exception.args, (sys.executable, [sys.executable, str(sw.HERE / "ship_watch.py"), "--go", "--out",
+                                                             str(ws / ".ship"), "--config", YAML]))
+        one.assert_not_called()
+
+    def test_an_alert_from_the_check_reaches_the_status(self):
+        ws = self.root
+        (ws / ".ship").mkdir()
+        with mock.patch.object(sw, "RELOAD", lambda d: (False, "self-update check failed: x")), \
+                mock.patch.object(sw, "GH_RUN", FakeGh([])), mock.patch.object(sw, "exit_on_signals"), \
+                mock.patch.dict(sw.os.environ, {"ONEPEEK_WORKSPACE": str(ws)}), mock.patch("builtins.print"):
+            self.assertEqual(sw.main(["--once", "--dry-run", "--out", str(ws / ".ship"), "--config", YAML]), 0)
+        self.assertIn("self-update check failed: x", json.loads((ws / ".ship" / "ship-status.json").read_text())["alerts"])
+
+
+class Timeouts(unittest.TestCase):
+    """T-97: every gh and git call is bounded; a timeout is a read error."""
+
+    def fake_bin(self, name):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        f = pathlib.Path(d.name) / name
+        f.write_text("#!/bin/sh\nexec sleep 5\n")
+        f.chmod(0o755)
+        return mock.patch.dict(os.environ, {"PATH": f"{d.name}:{os.environ['PATH']}"})
+
+    def test_a_hung_gh_is_a_read_error(self):
+        start = time.monotonic()
+        with self.fake_bin("gh"), mock.patch.object(sw, "READ_TIMEOUT_S", 0.3), self.assertRaises(sw.ReadError) as e:
+            sw._gh_process(["pr", "list"])
+        self.assertIn("timed out", str(e.exception))
+        self.assertLess(time.monotonic() - start, 4)
+
+    def test_a_hung_git_is_a_read_error(self):
+        start = time.monotonic()
+        with self.fake_bin("git"), mock.patch.object(sw, "READ_TIMEOUT_S", 0.3), self.assertRaises(sw.ReadError) as e:
+            sw.git(pathlib.Path("."), "fetch")
+        self.assertIn("timed out", str(e.exception))
+        self.assertLess(time.monotonic() - start, 4)
+
+
+class TimedOutReads(Base):
+    def test_a_timed_out_read_fails_the_pass_closed(self):
+        for broken in ("actions/runners", "pr checks", "pr list -R OnePeek/onepeek-infra"):
+            with self.subTest(broken):
+                self.merged.clear()
+                fake = FakeGh(world(("onepeek-web", pr("onepeek-web", 1))), raise_on=(broken,))
+                s = self.run_pass(fake)
+                self.assertEqual(self.merged, [])
+                self.assertTrue([a for a in s["alerts"] if a.startswith("read failed") and "timed out" in a], s["alerts"])
+
+
+class StopWindows(Base):
+    """T-97: SIGTERM/SIGHUP are blocked from before the merge run starts until the try that kills it is armed, and in
+    the cleanup until the group is killed; the run itself starts with the signals unblocked."""
+
+    def setUp(self):
+        super().setUp()
+        for sig in (sw.signal.SIGTERM, sw.signal.SIGHUP):
+            self.addCleanup(sw.signal.signal, sig, sw.signal.getsignal(sig))
+        sw.exit_on_signals()
+        self.merged_file = pathlib.Path(self.tmp.name) / "merged"
+        self.cmd = ["sh", "-c", 'sleep 1.5; touch "$0"', str(self.merged_file)]
+
+    def test_a_stop_right_after_the_run_starts_kills_it(self):
+        real = sw.subprocess.Popen
+
+        def popen(*a, **k):
+            child = real(*a, **k)
+            os.kill(os.getpid(), sw.signal.SIGTERM)  # lands before _merge_process enters its try
+            return child
+        with mock.patch.object(sw.subprocess, "Popen", popen), self.assertRaises(sw.Stop):
+            sw._merge_process(self.cmd, pathlib.Path(self.tmp.name))
+        time.sleep(2)
+        self.assertFalse(self.merged_file.exists())
+
+    def test_a_stop_during_the_cleanup_still_kills_the_group(self):
+        real = sw.os.killpg
+
+        def killpg(pid, sig):
+            os.kill(os.getpid(), sw.signal.SIGTERM)  # lands before the kill
+            return real(pid, sig)
+        with mock.patch.object(sw, "MERGE_TIMEOUT_S", 0.3), mock.patch.object(sw.os, "killpg", killpg), \
+                self.assertRaises(sw.Stop):
+            sw._merge_process(self.cmd, pathlib.Path(self.tmp.name))
+        time.sleep(2)
+        self.assertFalse(self.merged_file.exists())
+
+    def test_the_run_starts_with_stop_signals_unblocked(self):
+        r = sw._merge_process(["sh", "-c", "kill -TERM $$; echo alive"], pathlib.Path(self.tmp.name))
+        self.assertEqual((r.returncode, r.stdout), (-sw.signal.SIGTERM, ""))
+        self.assertFalse(sw.signal.pthread_sigmask(sw.signal.SIG_BLOCK, []) & sw.STOP_SIGNALS)  # restored here too
+
+
+class StopKeepsState(Base):
+    """T-97: a Stop in the middle of a pass still writes state.json, so timed-out runs and re-runs survive."""
+
+    def test_timed_out_and_reruns_survive_a_stop(self):
+        red = [{"name": "flaky / job", "bucket": "fail", "link": "https://x/runs/9/job/1"}]
+        fake = FakeGh(world(("onepeek-web", pr("onepeek-web", 1)), ("onepeek-web", pr("onepeek-web", 2)),
+                            ("onepeek-web", pr("onepeek-web", 3))),
+                      checks={"onepeek-web#3": red}, states={"onepeek-web#1": "OPEN"})
+
+        def merge(cmd, cwd):
+            if cmd[2] == "onepeek-web#1":
+                raise sw.MergeTimeout(3600)
+            raise sw.Stop(sw.signal.SIGTERM)
+        with mock.patch.object(sw, "MERGE_RUN", merge), self.assertRaises(sw.Stop):
+            self.run_pass(fake, state={"prs": {"x#1": {"fp": [], "since": 5}}})
+        state = json.loads((self.out / "state.json").read_text())
+        self.assertEqual(state["timed_out"], {"onepeek-web#1": "h1"})
+        self.assertIn("onepeek-web#3@h3:flaky / job", state["reruns"])
+        self.assertEqual(state["prs"], {"x#1": {"fp": [], "since": 5}})  # the rest of the old state is kept
+
+    def test_an_unreadable_state_is_never_overwritten_by_a_stop(self):
+        fake = FakeGh(world(("onepeek-web", pr("onepeek-web", 1))))
+        with mock.patch.object(sw, "read_ci", side_effect=sw.Stop(sw.signal.SIGTERM)), self.assertRaises(sw.Stop):
+            self.run_pass(fake, state="{corrupt")
+        self.assertEqual((self.out / "state.json").read_text(), "{corrupt")
+
+
+class StopInTheLoop(Base):
+    """T-96/T-97: a Stop ends the normal loop (no --once), never caught by its `except Exception`."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(sw, "exit_on_signals")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_stop_passes_through_the_loop(self):
+        calls = []
+
+        def one_pass(*a):
+            calls.append(1)
+            if len(calls) == 1:
+                raise sw.Stop(sw.signal.SIGTERM)
+            raise KeyboardInterrupt  # a second pass means the loop swallowed the Stop
+        with mock.patch.object(sw, "one_pass", one_pass), mock.patch.object(sw.time, "sleep"), \
+                mock.patch.dict(sw.os.environ, {"ONEPEEK_WORKSPACE": self.tmp.name}), mock.patch("builtins.print"):
+            self.assertEqual(sw.main(["--dry-run", "--out", str(self.out)]), 128 + sw.signal.SIGTERM)
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":
