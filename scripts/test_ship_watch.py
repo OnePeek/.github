@@ -167,7 +167,11 @@ class Classify(unittest.TestCase):
             ("HOLD", "not in ship_watch.yaml", {**HOT, "author": {"login": "someone"}}),
             ("HOLD", "release", {**HOT, "baseRefName": "release"}),
             ("BLOCKED", "1 unresolved review thread(s)", {"body": "Lane: hot fix", "threads": ["a.py:3"]}),
-            ("BLOCKED", "no review at h5", {"body": "Lane: hotfix\nLane: feature", "reviews": {}}),
+            ("BLOCKED", "no review at h5", {"body": "fix it\nLane: hotfix", "reviews": {}}),  # ruling T-53 round 3
+            ("BLOCKED", "no review at h5", {"body": "Lane: hotfix\n---", "reviews": {}}),
+            ("BLOCKED", "1 unresolved review thread(s)", {"body": "Lane: docs", "threads": ["a.py:3"]}),
+            ("BLOCKED", "no review at h5", {"body": "Lane: docs", "reviews": {}}),
+            ("READY", "post-merge review due", {"body": "<!-- hint -->\nLane: hotfix\nLane: feature", "reviews": {}}),
         ]
         for want, why_part, change in cases:
             with self.subTest(want=want, change=change):

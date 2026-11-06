@@ -9,9 +9,9 @@ lines, unresolved review threads, mergeable, draft, release or not), the org's r
 onepeek-infra sandbox.yml run and the open release workflow runs. Each pull request is READY, BLOCKED (one reason) or
 HOLD (a release, a draft, or an author not in the allow-list). READY also needs the review gates (§6.6, F36):
 CodeRabbit finished on the head and the coordinator's $ONEPEEK_WORKSPACE/.ship/reviews.json naming that head (bots on
-the list exempt), except for a `Lane: hotfix` pull request (operating-model §3): green checks merge it, and its review
-is due after the merge (`post_merge_review_due` in ship-status and measures.jsonl). A check is green only when it is
-`pass` or `skipping`. Every GitHub call goes through one layer that allows reads only. Any read failure, or an odd
+the list exempt), except for a pull request whose body's first line is `Lane: hotfix` (operating-model §3,
+packet.lane_of; `Lane: docs` keeps the gates): green checks merge it, and its review is due after the merge
+(`post_merge_review_due` in ship-status and measures.jsonl). A check is green only when it is `pass` or `skipping`. Every GitHub call goes through one layer that allows reads only. Any read failure, or an odd
 shape (a missing field, a non-list, a corrupt state or reviews file), fails the pass closed: an alert says why, nothing
 is merged or re-run, and `--once` exits 1; the loop keeps running.
 

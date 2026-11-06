@@ -791,12 +791,10 @@ def tool_source(repo: str, n: int, head: str) -> str:
 
 
 def hotfix(i: dict) -> bool:
-    """operating-model §3 unblock lane: the body's `Lane:` line (development-cycle §2b, packet.lane_of) says hotfix and
-    it is not a release pull request. No line, an unknown value, two values or an odd body are feature (fail closed)."""
-    try:
-        return i.get("baseRefName") != RELEASE_BASE and packet.lane_of(i.get("body")) == "hotfix"
-    except (ValueError, TypeError):
-        return False
+    """operating-model §3 unblock lane: the body's first line says `Lane: hotfix` (packet.lane_of, ruling T-53 round 3)
+    and it is not a release pull request. Only hotfix skips the review gates: `docs`, `feature`, no lane line or an odd
+    body keep them (fail closed)."""
+    return i.get("baseRefName") != RELEASE_BASE and packet.lane_of(i.get("body")) == "hotfix"
 
 
 def review_gate(repo: str, n: int, i: dict) -> str | None:
