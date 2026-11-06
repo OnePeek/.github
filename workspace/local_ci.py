@@ -62,11 +62,14 @@ def strip_comments(cmd: str) -> str:
         while i < len(line):
             ch = line[i]
             if quote:
-                if ch == "\\" and quote == '"':
+                if ch == "\\" and quote in ('"', "$'"):   # a backslash escapes inside double quotes and ANSI-C quotes
                     i += 1
-                elif ch == quote:
+                elif ch == quote[-1]:
                     quote = ""
             elif ch == "\\":
+                i += 1
+            elif ch == "$" and line[i + 1:i + 2] == "'":   # $'...' (ANSI-C quoting), where \' is an escaped quote
+                quote = "$'"
                 i += 1
             elif ch in "'\"":
                 quote = ch
@@ -533,6 +536,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if a.shared:
+        if not pathlib.Path(a.shared).is_dir():
+            print(f"FAIL  --shared {a.shared} is not a directory (check --shared and ONEPEEK_SHARED_GITHUB)")
+            return 1
         print("NOTE  " + shared_notice(a.shared), flush=True)
     lint_root = None
     if name != ".github":

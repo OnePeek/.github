@@ -530,6 +530,14 @@ class CommentsL1(unittest.TestCase):
             rc = lc.main([str(d), "--jobs", "a", *args])
         return rc, out.getvalue(), err.getvalue(), d
 
+    def test_strip_comments_keeps_ansi_c_quoted_text_whole(self):
+        # $'it\'s # note' is one word: its escaped quote does not end it (review of #57, 2026-11-06)
+        self.assertEqual(lc.strip_comments("echo $'it\\'s # note'; git push"), "echo $'it\\'s # note'; git push")
+        self.assertEqual(lc.strip_comments("echo $'a\\\\' # real comment"), "echo $'a\\\\' ")
+        # an escaped dollar sign before an ordinary single-quoted string is not ANSI-C quoting
+        self.assertEqual(lc.strip_comments("echo \\$'x # y'"), "echo \\$'x # y'")
+        self.assertEqual(lc.strip_comments("echo \\$'x' # y"), "echo \\$'x' ")
+
     def test_strip_comments_cases(self):
         self.assertEqual(lc.strip_comments("# aws s3 ls\nls"), "\nls")
         self.assertEqual(lc.strip_comments("ls # aws s3 ls"), "ls ")
@@ -598,6 +606,13 @@ class LinuxContainerL2(unittest.TestCase):
     def test_the_dockerfile_base_is_the_ci_python_pinned_by_digest(self):
         text = (ROOT / "workspace/local-ci/Dockerfile").read_text(encoding="utf-8")
         self.assertRegex(text, rf"(?m)^FROM public\.ecr\.aws/docker/library/python:{re.escape(lc.CI_PYTHON)}-slim@sha256:[0-9a-f]{{64}}$")
+
+    def test_the_dockerfile_has_pytest_at_the_workflow_pin_and_the_user_install_dir_on_path(self):
+        text = (ROOT / "workspace/local-ci/Dockerfile").read_text(encoding="utf-8")
+        pin = re.search(r"PYTEST_VERSION: (\S+)", (ROOT / ".github/workflows/python-checks.yml").read_text(encoding="utf-8")).group(1)
+        self.assertIn(f"pytest=={pin}", text)
+        self.assertRegex(text, r"(?m)^ENV .*\bPATH=\S*:/tmp/\.local/bin\b")
+        self.assertRegex(text, r"PATH=/usr/local/bin:")  # the image's own tools stay first
 
     def run_darwin(self, *args, docker=True):
         d = make_repo_with(job_yaml("python3 -m unittest discover -s scripts", "npx eslint ."))
@@ -780,6 +795,17 @@ class SharedPinL4(unittest.TestCase):
         rc, out = self.run_main(d, "--shared", str(self.shared))
         self.assertEqual(rc, 1)
         self.assertIn(f"shared workflows from {self.shared.resolve()} (main {self.B[:7]}), not the pin", out)
+
+    def test_a_shared_path_that_does_not_exist_fails_without_a_traceback(self):
+        d = self.caller(self.A)
+        missing = str(self.tmp / "no-such-folder")
+        rc, out = self.run_main(d, "--shared", missing)
+        self.assertEqual(rc, 1)
+        self.assertIn(f"FAIL  --shared {missing} is not a directory", out)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), mock.patch.dict(os.environ, {"ONEPEEK_SHARED_GITHUB": missing}):
+            self.assertEqual(lc.main([str(d)]), 1)
+        self.assertIn("is not a directory", buf.getvalue())
 
     def test_the_environment_variable_does_the_same(self):
         out = io.StringIO()

@@ -6,5 +6,7 @@ FROM public.ecr.aws/docker/library/python:3.14-slim@sha256:af8a5aa14780025dbfbcf
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bash ca-certificates curl git jq shellcheck \
  && rm -rf /var/lib/apt/lists/* \
- && pip install --no-cache-dir pyyaml==6.0.3
-ENV PIP_ROOT_USER_ACTION=ignore PIP_DISABLE_PIP_VERSION_CHECK=1
+ && pip install --no-cache-dir pyyaml==6.0.3 pytest==9.1.1
+# local_ci.py runs the container as the laptop user with HOME=/tmp, so `pip install` in a step puts commands in
+# /tmp/.local/bin; pytest is baked in at the version python-checks.yml pins (PYTEST_VERSION).
+ENV PIP_ROOT_USER_ACTION=ignore PIP_DISABLE_PIP_VERSION_CHECK=1 PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin:/tmp/.local/bin
