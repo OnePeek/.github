@@ -504,14 +504,17 @@ def job_yaml(*steps: str) -> str:
 class CommentsL1(unittest.TestCase):
     """L1: skip patterns are matched with shell comments removed; a skipped `terraform test` is never silent."""
 
-    def bin_with_terraform(self, marker: pathlib.Path) -> str:
+    def bin_with_terraform(self, marker: pathlib.Path, version: str = "1.16.6") -> str:
         b = pathlib.Path(tempfile.mkdtemp())
-        (b / "terraform").write_text(f"#!/bin/sh\necho \"$@\" >> {marker}\n", encoding="utf-8")
+        (b / "terraform").write_text(f'#!/bin/sh\n[ "$1" = --version ] && {{ echo "Terraform v{version}"; exit 0; }}\n'
+                                     f'echo "$@" >> {marker}\n', encoding="utf-8")
         (b / "terraform").chmod(0o755)
         return f"{b}:{os.environ['PATH']}"
 
-    def run_main(self, steps, *args, path=None):
+    def run_main(self, steps, *args, path=None, pin="1.16.6"):
         d = make_repo_with(job_yaml(*steps))
+        if pin is not None:
+            (d / ".terraform-version").write_text(pin + "\n", encoding="utf-8")
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, {"PATH": path or os.environ["PATH"]}), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -560,17 +563,46 @@ class CommentsL1(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue((d / "ran").exists())
 
-    def test_release_fails_on_a_skipped_terraform_test_and_otherwise_warns_and_lists_it_first(self):
+    def test_release_fails_at_once_on_a_skipped_terraform_test_and_otherwise_the_run_ends_not_ok(self):
         step = "terraform -chdir=. test\naws s3 ls"
         rc, out, err, _ = self.run_main([step, "gh api repos/x"], "--release")
         self.assertEqual(rc, 1)
         self.assertIn("terraform test skipped", out)
-        rc, out, err, _ = self.run_main(["gh api repos/x", step])
-        self.assertEqual(rc, 0)
-        self.assertIn("WARN", err + out)
-        self.assertIn("terraform test skipped", err + out)
+        # Without --release the other steps still run, but the run ends NOT OK naming the step (T-58), never OK.
+        rc, out, err, d = self.run_main(["gh api repos/x", step, "touch after"])
+        self.assertEqual(rc, 1)
+        self.assertTrue((d / "after").exists())
+        self.assertIn("FAIL", out)
         listed = out.split("Skipped (CI runs these):")[1].splitlines()
         self.assertIn("terraform test skipped", listed[1])
+        self.assertNotIn("LOCAL CI OK", out)
+        self.assertIn("LOCAL CI NOT OK: 1 terraform test step(s) did not run here", out)
+        self.assertIn("(needs GitHub or AWS)", out.split("LOCAL CI NOT OK")[1])
+
+    def test_terraform_test_runs_only_with_the_pinned_terraform_and_otherwise_ends_not_ok(self):
+        # T-58: a gate never prints OK for a step it did not run. The pin is the repository's .terraform-version.
+        step = "terraform -chdir=. test"
+        for version, pin, ok, why in (("1.16.6", "1.16.6", True, ""),
+                                      ("1.17.0", "1.16.6", False, "the laptop's terraform is 1.17.0, the repository pins 1.16.6"),
+                                      ("1.16.6", None, False, "no readable .terraform-version"),
+                                      ("1.16.6", "", False, ".terraform-version is empty")):
+            marker = pathlib.Path(tempfile.mkdtemp()) / "calls"
+            rc, out, _, _ = self.run_main([step], path=self.bin_with_terraform(marker, version), pin=pin)
+            self.assertEqual(rc, 0 if ok else 1, out)
+            self.assertEqual(marker.exists(), ok, out)
+            self.assertEqual("LOCAL CI OK" in out, ok, out)
+            self.assertIn(why, out)
+        rc, out, _, _ = self.run_main([step], path="/usr/bin:/bin")  # git, but no terraform
+        self.assertEqual(rc, 1, out)
+        self.assertIn("terraform is not on PATH (the repository pins 1.16.6)", out)
+
+    def test_the_shared_terraform_test_step_is_not_classed_as_remote(self):
+        # T-58: prose in its embedded script ("the stacks/aws suite") matched `aws ` and skipped every infra suite locally.
+        doc = yaml.safe_load((ROOT / ".github/workflows/terraform-checks.yml").read_text(encoding="utf-8"))
+        steps = [st["run"] for job in doc["jobs"].values() for st in job["steps"] if lc.TERRAFORM_TEST.search(str(st.get("run") or ""))]
+        self.assertEqual(len(steps), 1)
+        code = lc.strip_comments(steps[0])
+        self.assertIsNone(lc.REMOTE.search(code), lc.REMOTE.search(code) and lc.REMOTE.search(code).group(0))
 
 
 class LinuxContainerL2(unittest.TestCase):
