@@ -334,6 +334,73 @@ class Check(unittest.TestCase):
     def test_expect_without_pr_fails(self):
         self.assertTrue(any("--expect needs --pr" in p for p in self.check(None, None, ["a.txt"])[0]))
 
+    # --since: a builder adding commits to a longer pull request reports only its own files (kit v2, CodeRabbit on the
+    # rollout pull requests: --expect compared the whole pull request, so a later slice could never pass).
+    def test_since_compares_expect_with_the_commits_after_it_only(self):
+        first = self.r.commit({"b.txt": "b\n"})
+        head = self.r.commit({"c.txt": "c\n", "d e é.txt": "d\n"})
+        with self.with_gh(FakeGh([head], ["b.txt", "c.txt", "d e é.txt"])):
+            problems, out = self.check("x#1", None, ["c.txt", "d e é.txt"], first)
+            self.assertEqual(problems, [])
+            self.assertIn(f"files changed after {first} (2):", out)
+            self.assertIn("pull request files (3):", out)  # the whole pull request is still printed and compared
+            problems, _ = self.check("x#1", None, ["b.txt", "c.txt"], first[:7])
+        self.assertIn(f"reported but not changed after {first[:7]}: b.txt", problems)
+        self.assertIn(f"changed after {first[:7]} but not reported: d e é.txt", problems)
+
+    def test_since_still_checks_the_whole_pull_request_against_head(self):
+        first = self.r.commit({"b.txt": "b\n"})
+        head = self.r.commit({"c.txt": "c\n"})
+        with self.with_gh(FakeGh([head], ["c.txt"])):  # b.txt left out of the pull request
+            problems, _ = self.check("x#1", None, ["c.txt"], first)
+        self.assertTrue(any("not in the pull request: b.txt" in p for p in problems), problems)
+
+    def test_since_ignores_a_merge_of_the_base_and_its_files(self):
+        first = self.r.commit({"b.txt": "b\n"})
+        (self.r.clone / "z.txt").write_text("z\n")
+        git(self.r.clone, "add", "z.txt")
+        git(self.r.clone, "commit", "-q", "-m", "z")
+        git(self.r.clone, "push", "-q", "origin", "main")
+        git(self.r.work, "fetch", "-q", "origin")
+        git(self.r.work, "merge", "-q", "--no-ff", "-m", "merge main", "origin/main")
+        head = self.r.commit({"c.txt": "c\n"})
+        with self.with_gh(FakeGh([head], ["b.txt", "c.txt"])):
+            self.assertEqual(self.check("x#1", None, ["c.txt"], first)[0], [])
+
+    def test_since_lists_both_paths_of_a_rename(self):
+        first = self.r.head()
+        git(self.r.work, "mv", "a.txt", "moved.txt")
+        git(self.r.work, "commit", "-q", "-m", "mv")
+        git(self.r.work, "push", "-q", "origin", "HEAD:feat")
+        with self.with_gh(FakeGh([self.r.head()], ["moved.txt", "a.txt"])):
+            self.assertEqual(self.check("x#1", None, ["a.txt", "moved.txt"], first)[0], [])
+
+    def test_since_refuses_anything_but_a_commit_that_head_contains(self):
+        head = self.r.commit({"b.txt": "b\n"})
+        (self.r.clone / "z.txt").write_text("z\n")
+        git(self.r.clone, "add", "z.txt")
+        git(self.r.clone, "commit", "-q", "-m", "z")
+        git(self.r.clone, "push", "-q", "origin", "HEAD:other")
+        git(self.r.work, "fetch", "-q", "origin", "other")
+        not_ancestor = git(self.r.work, "rev-parse", "FETCH_HEAD")
+        blob = git(self.r.work, "rev-parse", "HEAD:b.txt")
+        cases = {"HEAD~1": "must be a commit SHA", "abc12": "must be a commit SHA", "--all": "must be a commit SHA",
+                 "x" * 40: "must be a commit SHA", "ABCDEF0": "must be a commit SHA", head + "0": "must be a commit SHA",
+                 f"{head[:7]};id": "must be a commit SHA", "deadbee": "is not a commit in this worktree",
+                 blob: "is not a commit in this worktree", not_ancestor: "is not an ancestor of HEAD"}
+        for since, why in cases.items():
+            with self.subTest(since=since), self.with_gh(FakeGh([head], ["b.txt"])):
+                problems, _ = self.check("x#1", None, ["b.txt"], since)
+                self.assertTrue(any(why in p for p in problems), problems)
+                self.assertFalse(any("changed after" in p for p in problems), problems)  # never compared after a refusal
+
+    def test_since_needs_pr_and_expect(self):
+        first = self.r.commit({"b.txt": "b\n"})
+        self.assertTrue(any("--since needs --pr and --expect" in p for p in self.check(None, "feat", None, first)[0]))
+        self.assertTrue(any("--since needs --pr and --expect" in p for p in self.check(None, None, ["b.txt"], first)[0]))
+        with self.with_gh(FakeGh([first], ["b.txt"])):
+            self.assertTrue(any("--since needs --pr and --expect" in p for p in self.check("x#1", None, None, first)[0]))
+
     def test_over_the_slice_cap_warns_and_generated_files_do_not_count(self):
         head = self.r.commit({"uv.lock": "x\n" * 900, "rendered/p.html": "x\n" * 900, "b.txt": "x\n" * dc.SLICE_CAP})
         with self.with_gh(FakeGh([head], ["uv.lock", "rendered/p.html", "b.txt"])):
@@ -361,6 +428,15 @@ class Main(unittest.TestCase):
     def test_ok_and_failed_lines(self):
         self.assertEqual(self.main(str(self.r.work)), (0, "DONE CHECK OK"))
         self.assertEqual(self.main(str(self.r.work), "--pr", "not-a-pr"), (1, "DONE CHECK FAILED"))
+
+    def test_since_reaches_check_from_the_command_line(self):
+        first = self.r.commit({"b.txt": "b\n"})
+        head = self.r.commit({"c.txt": "c\n"})
+        with mock.patch.object(dc, "run", side_effect=FakeGh([head], ["b.txt", "c.txt"])):
+            self.assertEqual(self.main(str(self.r.work), "--pr", "x#1", "--expect", "c.txt", "--since", first),
+                             (0, "DONE CHECK OK"))
+            self.assertEqual(self.main(str(self.r.work), "--pr", "x#1", "--expect", "b.txt", "--since", first),
+                             (1, "DONE CHECK FAILED"))
 
     def test_a_missing_worktree_fails_closed(self):  # OSError
         self.assertEqual(self.main(str(self.r.work / "gone")), (1, "DONE CHECK FAILED"))
