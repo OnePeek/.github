@@ -1,0 +1,91 @@
+# Shared: the release gate (onepeek-docs architecture/lld/infra/delivery-pipelines.md §8.1, decision 168 point 2).
+# A dev -> release pull request (a promotion) skips the tree-only checks; this required check makes that safe. It
+# passes only when the tree the promotion's merge commit will hold (git merge-tree --write-tree origin/release H)
+# equals H^{tree}, and a first-parent dev commit with that tree is certified: every file in `workflows` has its newest
+# push or workflow_dispatch run on dev for that commit completed with success, and for checks.yml its `certified` job
+# too. A hotfix/* head from this repo passes as "not a promotion: every check runs"; any other head, a fork or a base
+# other than release is refused. The logic is scripts/release_gate.py at the caller's pin of this workflow.
+#
+# Callers (each repo with a release branch), in checks.yml:
+#   release-gate:
+#     needs: depends-on
+#     if: ${{ github.event_name == 'pull_request' && github.base_ref == 'release' }}
+#     uses: OnePeek/.github/.github/workflows/release-gate.yml@<sha> # <tag>
+#     permissions: { contents: read, actions: read, pull-requests: read }
+#     with:
+#       workflows: checks.yml image-smoke.yml   # web: checks.yml image.yml
+#       runner: ${{ vars.RUNNER || 'github' }}
+#
+# The `certified` rule for callers (§8.1 "Certification"; the gate reads it by name, build ruling G3):
+#   - checks.yml has a final job with the id `certified` and no `name:` of its own (the jobs API reports the name, and
+#     the gate matches exactly `certified`; a missing job or one under another name is refused);
+#   - `needs:` lists every tree-only job, and never `certified` itself;
+#   - if: ${{ always() && github.ref == 'refs/heads/dev' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+#   - its step fails unless every needed job's result is `success` (a skipped tree-only job fails certification).
+#
+# Token: the job's own GITHUB_TOKEN, read-only on the calling repo (no App token). git fetches only `release` and H,
+# authenticated by the `!gh auth git-credential` helper set through GIT_CONFIG_* (it answers from GH_TOKEN), so the
+# token is never written to disk.
+name: release-gate
+
+on:
+  workflow_call:
+    inputs:
+      workflows:
+        description: "The certifying workflow files, separated by spaces: checks.yml plus image-smoke.yml (backend) or image.yml (web)."
+        type: string
+        required: true
+      runner:
+        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
+        type: string
+        default: github
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+jobs:
+  release-gate:
+    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows
+            scripts
+
+      - name: This workflow's version (the caller's pin of release-gate.yml)
+        id: version
+        run: |
+          sha=$(grep -rhoiE 'OnePeek/\.github/\.github/workflows/release-gate\.yml@[0-9a-f]{40}' .github/workflows | head -n 1 | cut -d@ -f2 || true)
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "release-gate.yml runs at ${sha:-this repo (a local call)}"
+
+      - name: OnePeek/.github at that version
+        if: ${{ steps.version.outputs.sha != '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OnePeek/.github
+          ref: ${{ steps.version.outputs.sha }}
+          path: _shared
+          persist-credentials: false
+
+      - name: The tree ships what dev certified
+        env:
+          SHA: ${{ steps.version.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          WORKFLOWS: ${{ inputs.workflows }}
+          GIT_CONFIG_COUNT: "2"
+          GIT_CONFIG_KEY_0: credential.helper
+          GIT_CONFIG_VALUE_0: ""
+          GIT_CONFIG_KEY_1: credential.helper
+          GIT_CONFIG_VALUE_1: "!gh auth git-credential"
+        run: |
+          script=scripts/release_gate.py
+          [ -n "${SHA}" ] && script=_shared/scripts/release_gate.py
+          python3 "${script}" --repo "${REPO}" --pr "${NUMBER}" --workflows "${WORKFLOWS}" --git-dir "${RUNNER_TEMP}/release-gate"
