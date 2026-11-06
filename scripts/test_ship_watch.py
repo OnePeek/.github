@@ -958,8 +958,11 @@ class RevertPush(unittest.TestCase):
         self.assertEqual(self.remote_head(), head)
 
     def test_a_sha_not_on_the_trunk_is_refused(self):
-        git(self.repo, "checkout", "-q", "-b", "side")
-        side = commit(self.repo, {"a.txt": "side\n"}, "side")
+        base = git(self.repo, "rev-parse", "HEAD").strip()
+        commit(self.repo, {"c.txt": "c\n"}, "on dev")
+        git(self.repo, "push", "-q", "origin", "dev")
+        git(self.repo, "checkout", "-q", "-b", "side", base)  # the same change on another branch: its revert would
+        side = commit(self.repo, {"c.txt": "c\n"}, "on side")  # apply cleanly to dev, so only the ancestry check stops it
         before = self.remote_head()
         with self.assertRaises(sw.ReadError):
             sw._revert_push("onepeek-web", "dev", side, self.ws)
@@ -1057,6 +1060,7 @@ class SelfUpdate(unittest.TestCase):
             raise Exec(path, args)
         with mock.patch.object(sw, "RELOAD", lambda d: (True, None)), mock.patch.object(sw, "EXEC", execv), \
                 mock.patch.object(sw, "one_pass") as one, mock.patch.object(sw, "exit_on_signals"), \
+                mock.patch.object(sw.time, "sleep", side_effect=KeyboardInterrupt), \
                 mock.patch.dict(sw.os.environ, {"ONEPEEK_WORKSPACE": str(ws)}), mock.patch("builtins.print"), \
                 self.assertRaises(Exec) as e:
             sw.main(["--go", "--out", str(ws / ".ship"), "--config", YAML])
