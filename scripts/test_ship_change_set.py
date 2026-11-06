@@ -54,6 +54,12 @@ class Pin(unittest.TestCase):
         self.assertIn(f"contract.yml@{new_sha} # v1.1.3", out)
         self.assertIn(f"actions/checkout@{old_sha} # v7", out)
 
+    def test_a_composite_action_pin_moves_with_the_workflow_pins(self) -> None:
+        old, new = "a" * 40, "b" * 40
+        text = f"      - uses: OnePeek/.github/actions/peer-ref@{old} # v1.1.2\n"
+        out = ship.PIN.sub(lambda m: ship.moved_pin(m, "v1.1.3", new), text)
+        self.assertEqual(out, f"      - uses: OnePeek/.github/actions/peer-ref@{new} # v1.1.3\n")
+
     def test_only_the_sha_and_the_tag_change_and_trailing_comment_text_is_kept(self) -> None:
         new = "b" * 40
         cases = {
@@ -1182,6 +1188,7 @@ class ReleaseMergeMethod(unittest.TestCase):
                 mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "release_lock", side_effect=locks), \
                 mock.patch.object(ship, "release_run", return_value=(ReleaseGates.OK, HEAD)), \
                 mock.patch.object(ship, "green_head", return_value="c" * 40), mock.patch.object(ship, "no_conflicts"), \
+                mock.patch.object(ship, "recheck_peers"), \
                 mock.patch.object(ship, "remove_worktrees", side_effect=lambda r, b: removed.append(b)), \
                 mock.patch.object(ship, "say", side_effect=say.append):
             code = ship.main(["backend-service#5", "--go"])
@@ -1236,3 +1243,118 @@ class OpenDependencyNeedsADraft(unittest.TestCase):
                 mock.patch.object(ship, "say", side_effect=lines.append):
             self.assertEqual(ship.main(["onepeek-infra#3"]), 1)
         self.assertTrue(any("as a draft" in l for l in lines), lines)
+
+
+A, B, C, D = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+
+
+class PeerRecheck(unittest.TestCase):
+    """Before a promotion merges, the peer each check recorded is compared with the peer's release candidate now
+    (delivery-pipelines §6.5, Build rulings 2)."""
+
+    def run_recheck(self, recorded, candidates, merge_of=False):
+        """recorded: the peer lines each read of the checks returns (one list per read); candidates: the candidate per read."""
+        reads, cands, reruns, said = list(recorded), list(candidates), [], []
+        rec = lambda repo, n: reads.pop(0) if len(reads) > 1 else reads[0]  # noqa: E731
+        cand = lambda peer: cands.pop(0) if len(cands) > 1 else cands[0]  # noqa: E731
+        with mock.patch.object(ship, "peer_records", side_effect=rec), mock.patch.object(ship, "peer_candidate", side_effect=cand), \
+                mock.patch.object(ship, "promotion_merge_of", return_value=merge_of), \
+                mock.patch.object(ship, "gh", side_effect=lambda *a: reruns.append(a) or ""), mock.patch.object(ship, "green_head") as green, \
+                mock.patch.object(ship.time, "sleep"), mock.patch.object(ship, "say", side_effect=said.append):
+            try:
+                ship.recheck_peers("onepeek-web", 9)
+                err = None
+            except SystemExit as e:
+                err = str(e)
+        return err, reruns, green.call_count, said
+
+    LINE = [{"job": "77", "name": "e2e", "peer": "backend-service", "sha": A}]
+
+    def test_an_equal_candidate_passes_with_no_rerun(self):
+        err, reruns, green, _ = self.run_recheck([self.LINE], [A])
+        self.assertEqual((err, reruns, green), (None, [], 0))
+
+    def test_only_the_peers_promotion_merge_commit_with_an_equal_tree_passes(self):
+        err, reruns, _, _ = self.run_recheck([self.LINE], [B], merge_of=True)
+        self.assertEqual((err, reruns), (None, []))
+
+    def test_a_different_candidate_re_runs_that_check_once_and_passes_when_it_now_matches(self):
+        moved = [{**self.LINE[0], "sha": B}]
+        err, reruns, green, said = self.run_recheck([self.LINE, moved], [B])
+        self.assertIsNone(err)
+        self.assertEqual(reruns, [("run", "rerun", "-R", "OnePeek/onepeek-web", "--job", "77")])
+        self.assertEqual(green, 1)
+        self.assertTrue(any("re-running it once" in s for s in said), said)
+
+    def test_a_candidate_that_still_differs_after_the_one_re_run_refuses(self):
+        err, reruns, _, _ = self.run_recheck([self.LINE, self.LINE], [B])
+        self.assertEqual(len(reruns), 1)  # once, never twice
+        self.assertIn("STOP onepeek-web#9", err)
+        self.assertIn("e2e tested backend-service@aaaaaaa", err)
+
+    def test_the_candidate_moving_again_after_the_re_run_refuses(self):
+        moved = [{**self.LINE[0], "sha": B}]
+        err, reruns, _, _ = self.run_recheck([self.LINE, moved], [B, C])
+        self.assertEqual(len(reruns), 1)
+        self.assertIn("STOP", err)
+
+    def test_a_merge_commit_of_another_tree_is_not_the_promotion_merge(self):
+        c = {"parents": [{"sha": A}, {"sha": D}], "commit": {"tree": {"sha": "t1"}}}
+        r = {"parents": [], "commit": {"tree": {"sha": "t2"}}}
+        for current, recorded, want in ((c, r, False), ({**c, "commit": {"tree": {"sha": "t2"}}}, r, True),
+                                        ({"parents": [{"sha": A}], "commit": {"tree": {"sha": "t2"}}}, r, False),   # not a merge commit
+                                        ({"parents": [{"sha": D}, {"sha": C}], "commit": {"tree": {"sha": "t2"}}}, r, False)):  # recorded is no parent
+            import json as _j
+            with mock.patch.object(ship, "gh", side_effect=lambda *a: _j.dumps(current if a[1].endswith(B) else recorded)):
+                self.assertIs(ship.promotion_merge_of("backend-service", A, B), want)
+
+    def test_the_recorded_peers_are_read_from_the_passing_jobs_logs(self):
+        checks = [{"name": "e2e", "bucket": "pass", "link": "https://github.com/OnePeek/onepeek-web/actions/runs/5/job/77"},
+                  {"name": "node", "bucket": "pass", "link": "https://github.com/OnePeek/onepeek-web/actions/runs/5/job/78"},
+                  {"name": "skipped", "bucket": "skipping", "link": "https://github.com/OnePeek/onepeek-web/actions/runs/5/job/79"}]
+        logs = {"77": f"2026-11-06T10:00:00.1Z peer: backend-service@{A}\n2026-11-06T10:00:01Z other\n", "78": "nothing\n"}
+        asked = []
+        gh = lambda *a: asked.append(a[1]) or logs[a[1].split("/")[-2]]  # noqa: E731
+        with mock.patch.object(ship, "read_checks", return_value=checks), mock.patch.object(ship, "gh", side_effect=gh):
+            got = ship.peer_records("onepeek-web", 9)
+        self.assertEqual(got, [{"job": "77", "name": "e2e", "peer": "backend-service", "sha": A}])
+        self.assertEqual(asked, ["repos/OnePeek/onepeek-web/actions/jobs/77/logs", "repos/OnePeek/onepeek-web/actions/jobs/78/logs"])
+
+    def test_a_line_that_is_not_a_full_commit_is_not_a_record(self):
+        self.assertEqual(ship.PEER_LINE.findall("peer: backend-service@dev\npeer: backend-service@abc123\n"), [])
+
+    def test_the_candidate_is_the_open_promotions_head_resolved_to_a_commit(self):
+        with mock.patch.object(ship.peer_ref, "candidate", return_value="release"), \
+                mock.patch.object(ship.peer_ref, "commit", side_effect=lambda o, r, ref: {"release": B}[ref]):
+            self.assertEqual(ship.peer_candidate("backend-service"), B)
+
+    def merge_flow(self, head):
+        """main() merging one release pull request; returns the recheck_peers calls."""
+        root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        calls, state = [], {"merged": False}
+
+        def info(r, n):
+            return {"state": "MERGED" if state["merged"] else "OPEN", "baseRefName": "release", "headRefName": head, "isDraft": False,
+                    "mergeable": "MERGEABLE", "headRefOid": "c" * 40, "body": "", "isCrossRepository": False,
+                    "headRepositoryOwner": {"login": "OnePeek"}, "mergeCommit": {"oid": "d" * 40}}
+
+        def gh(*a):
+            if a[:2] == ("pr", "merge"):
+                state["merged"] = True
+            return ""
+        with mock.patch.object(ship, "pr_info", side_effect=info), mock.patch.object(ship, "gh", side_effect=gh), \
+                mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "release_lock", return_value=None), \
+                mock.patch.object(ship, "green_head", return_value="c" * 40), mock.patch.object(ship, "refuse_protected"), \
+                mock.patch.object(ship, "own_branch_problem", return_value=None), mock.patch.object(ship, "say"), \
+                mock.patch.object(ship, "recheck_peers", side_effect=lambda r, n: calls.append((r, n))):
+            rc = ship.main(["backend-service#5", "--go", "--no-chain", "test"])
+        return rc, calls, state["merged"]
+
+    def test_a_promotion_is_re_checked_right_before_it_merges(self):
+        rc, calls, merged = self.merge_flow("dev")
+        self.assertEqual((rc, calls, merged), (0, [("backend-service", 5)], True))
+
+    def test_a_hotfix_is_not_re_checked(self):  # it ships against release, not against a release candidate
+        rc, calls, merged = self.merge_flow("hotfix/x")
+        self.assertEqual((rc, calls, merged), (0, [], True))

@@ -65,6 +65,7 @@ def _load(name: str):
 
 depends_on = _load("check_depends_on")
 check_pins = _load("check_pins")
+peer_ref = _load("peer_ref")
 ORDER = ["onepeek-docs", ".github", "onepeek-infra", "onepeek-design-system", "backend-service", "onepeek-web"]
 BASE = {"onepeek-docs": "main", ".github": "main"}  # every other repo merges into dev
 PIN = check_pins.USES  # every `uses:` naming OnePeek/.github, any letter case, any ref (§8a P2)
@@ -526,6 +527,64 @@ def rerun_failed(repo: str, n: int) -> None:
         time.sleep(POLL_S)  # let the re-runs register before the checks are read again
 
 
+PEER_LINE = re.compile(r"peer: ([a-z][a-z-]*)@([0-9a-f]{40})\s*$", re.M)
+
+
+def peer_records(repo: str, n: int) -> list[dict]:
+    """The `peer: <repo>@<sha>` lines the passing checks of a pull request wrote to their job logs (peer_ref.py,
+    delivery-pipelines §6.5): [{job, name, peer, sha}]. A job's log is read with the person's own `gh` login."""
+    out = []
+    for c in read_checks(repo, n, False):
+        m = re.search(r"/job/(\d+)", c.get("link") or "")
+        if c["bucket"] != "pass" or not m:
+            continue
+        log = gh("api", f"repos/{ORG}/{repo}/actions/jobs/{m.group(1)}/logs")
+        out += [{"job": m.group(1), "name": c["name"], "peer": p, "sha": sha} for p, sha in PEER_LINE.findall(log)]
+    return out
+
+
+def peer_candidate(peer: str) -> str:
+    """The peer's release candidate now, as a commit: the head of its one open dev -> release pull request, else release."""
+    return peer_ref.commit(ORG, peer, peer_ref.candidate(ORG, peer))
+
+
+def promotion_merge_of(peer: str, recorded: str, current: str) -> bool:
+    """True when `current` is the peer's own promotion merge commit of `recorded`: a merge commit with `recorded` as a
+    parent whose tree equals the tree of `recorded`."""
+    c = json.loads(gh("api", f"repos/{ORG}/{peer}/commits/{current}"))
+    r = json.loads(gh("api", f"repos/{ORG}/{peer}/commits/{recorded}"))
+    return recorded in [p["sha"] for p in c["parents"]] and len(c["parents"]) > 1 and c["commit"]["tree"]["sha"] == r["commit"]["tree"]["sha"]
+
+
+def stale_peers(repo: str, n: int) -> list[dict]:
+    """The recorded peers whose release candidate has changed since the check ran (a promotion merge commit with an
+    equal tree does not count)."""
+    stale, now = [], {}
+    for rec in peer_records(repo, n):
+        cur = now.setdefault(rec["peer"], peer_candidate(rec["peer"]))
+        if cur != rec["sha"] and not promotion_merge_of(rec["peer"], rec["sha"], cur):
+            stale.append({**rec, "now": cur})
+    return stale
+
+
+def recheck_peers(repo: str, n: int) -> None:
+    """Right before a promotion merges (§6.5 Build rulings 2): every check that read a peer is still about the peer's
+    current release candidate. When not, re-run that check once; refuse if it is still behind."""
+    stale = stale_peers(repo, n)
+    if not stale:
+        return
+    for rec in stale:
+        say(f"{repo}#{n}: {rec['name']} tested {rec['peer']}@{rec['sha'][:7]}, its release candidate is now {rec['now'][:7]}; re-running it once")
+        gh("run", "rerun", "-R", f"{ORG}/{repo}", "--job", rec["job"])
+    time.sleep(POLL_S)  # let the re-runs register before the checks are read again
+    green_head(repo, n, may_rerun=False)
+    stale = stale_peers(repo, n)
+    if stale:
+        raise SystemExit(f"STOP {repo}#{n}: " + "; ".join(
+            f"{r['name']} tested {r['peer']}@{r['sha'][:7]} but its release candidate is {r['now'][:7]}" for r in stale)
+            + " even after one re-run; nothing is merged")
+
+
 def minor_behind(old_tags: set[str], new: str) -> bool:
     """True when any old pin is more than one minor version behind the new tag (or a major, or untagged)."""
     want = re.fullmatch(r"v(\d+)\.(\d+)\.\d+", new)
@@ -900,6 +959,8 @@ def main(argv: list[str]) -> int:
             why = lock_problem(RELEASE_ENV, release_lock(RELEASE_ENV, a.aws_profile))
             if why:
                 raise SystemExit(f"STOP {repo}#{n}: {why}")
+        if base_ref == RELEASE_BASE and repo in CHAIN and not info[(repo, n)]["headRefName"].startswith("hotfix/"):
+            recheck_peers(repo, n)  # a promotion: the peers it was checked against are still their release candidates
         keep = [] if base_ref == RELEASE_BASE else ["--delete-branch"]  # a release pull request's head is `dev`: never deleted
         gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, *keep, "--match-head-commit", head)
         merged = pr_info(repo, n)
