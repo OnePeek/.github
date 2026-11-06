@@ -43,6 +43,7 @@ OPTIONAL_TOOLS = ("trivy",)
 # The versions CI pins (foundation-playbook §8a P3; scripts/test_local_ci.py keeps the shared workflows at these).
 # A different uv on the laptop fails the run with the fix; tflint runs natively at CI's version, else in CI's Docker image, else it is skipped (WARN), or FAILS under --release.
 UV_VERSION = "0.12.0"
+CI_PYTHON = "3.14"  # the runner image's Python minor version; workspace/local-ci/Dockerfile's base must be python:<this>
 TFLINT_VERSION = "0.65.0"
 TFLINT_IMAGE = "ghcr.io/terraform-linters/tflint"
 # One provider cache for every local run and worktree (§8a P6), unless the laptop sets TF_PLUGIN_CACHE_DIR itself.

@@ -595,9 +595,9 @@ class LinuxContainerL2(unittest.TestCase):
         self.assertNotEqual(lc.image_tag(f), first)
         self.assertRegex(lc.image_tag(), r"^onepeek-local-ci:[0-9a-f]{16}$")
 
-    def test_the_dockerfile_pins_its_base_by_digest(self):
+    def test_the_dockerfile_base_is_the_ci_python_pinned_by_digest(self):
         text = (ROOT / "workspace/local-ci/Dockerfile").read_text(encoding="utf-8")
-        self.assertRegex(text, r"(?m)^FROM public\.ecr\.aws/ubuntu/ubuntu@sha256:[0-9a-f]{64}$")
+        self.assertRegex(text, rf"(?m)^FROM public\.ecr\.aws/docker/library/python:{re.escape(lc.CI_PYTHON)}-slim@sha256:[0-9a-f]{{64}}$")
 
     def run_darwin(self, *args, docker=True):
         d = make_repo_with(job_yaml("python3 -m unittest discover -s scripts", "npx eslint ."))
