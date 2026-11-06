@@ -361,8 +361,9 @@ def is_warn(c: dict, warn: list[tuple[str, str, str]], repo: str) -> bool:
 GREEN = ("pass", "skipping")  # any other bucket, or none, is red or pending (§6.6 fail closed on every shape)
 
 
-def wait_green(repo: str, n: int, may_rerun: bool) -> None:
-    deadline, reran = time.time() + CHECK_TIMEOUT_S, False
+def wait_green(repo: str, n: int, may_rerun: bool, deadline: float | None = None) -> None:
+    """deadline: an end shared by several waits (green_head's), else CHECK_TIMEOUT_S from now."""
+    deadline, reran = deadline or time.time() + CHECK_TIMEOUT_S, False
     warn, until = warn_checks()
     told = False
     while time.time() < deadline:
@@ -541,10 +542,11 @@ HEAD_MOVES_MAX = 5  # a head that keeps moving stops the pull request instead of
 
 def green_head(repo: str, n: int, may_rerun: bool) -> str:
     """Wait for the required checks to be green and return the head they were green on (asked again if it moved).
-    After HEAD_MOVES_MAX moves in one wait it STOPs, naming the heads."""
-    heads = [pr_info(repo, n)["headRefOid"]]
+    After HEAD_MOVES_MAX moves in one wait it STOPs, naming the heads. All its waits share one CHECK_TIMEOUT_S deadline,
+    so a merge run stays inside the watcher's MERGE_TIMEOUT_S (T-56 round 2)."""
+    heads, deadline = [pr_info(repo, n)["headRefOid"]], time.time() + CHECK_TIMEOUT_S
     while True:
-        wait_green(repo, n, may_rerun)
+        wait_green(repo, n, may_rerun, deadline)
         heads.append(pr_info(repo, n)["headRefOid"])
         if heads[-1] == heads[-2]:
             return heads[-1]

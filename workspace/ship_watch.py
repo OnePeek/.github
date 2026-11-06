@@ -71,19 +71,24 @@ class MergeTimeout(Exception):
 
 def _merge_process(cmd: list[str], cwd: pathlib.Path) -> subprocess.CompletedProcess:
     """One merge run, in its own session: past MERGE_TIMEOUT_S its whole process group (gh, git, their children) is
-    killed and MergeTimeout raised (ruling T-56). Its pipes are never read after the kill, so a stray child holding
-    them cannot hang the watcher."""
+    killed and MergeTimeout raised (ruling T-56). Its own session keeps it out of the terminal's group, so Ctrl-C or any
+    other exception in the wait kills the group too, then goes on up: a run never outlives the watcher (T-56 round 2).
+    Its pipes are never read after the kill, so a stray child holding them cannot hang the watcher."""
     child = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                              start_new_session=True)
     try:
         out, err = child.communicate(timeout=MERGE_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
+    except BaseException as e:
         try:
             os.killpg(child.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         child.wait()
-        raise MergeTimeout(MERGE_TIMEOUT_S) from None
+        for pipe in (child.stdout, child.stderr):
+            pipe.close()
+        if isinstance(e, subprocess.TimeoutExpired):
+            raise MergeTimeout(MERGE_TIMEOUT_S) from None
+        raise
     return subprocess.CompletedProcess(cmd, child.returncode, out, err)
 
 
@@ -374,11 +379,14 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
         cfg = dict(cfg, reviews={})
     seen = state.get("prs") if isinstance(state.get("prs"), dict) else {}
     done = dict(state["reruns"]) if isinstance(state.get("reruns"), dict) else {}
+    timed_out = dict(state["timed_out"]) if isinstance(state.get("timed_out"), dict) else {}
     prs = read_prs(cfg, errors)
     ci = read_ci(cfg, errors)
     progress, todo, due = {}, [], []
     for p in prs:
         p["class"], p["reason"] = classify(p, cfg)
+        if p["class"] != "HOLD" and timed_out.get(p["label"]) == p.get("headRefOid"):  # not retried every pass (T-56 r2)
+            p["class"], p["reason"] = "BLOCKED", f"merge run timed out at {p['headRefOid']}; waits a new head"
         fp = [p["headRefOid"], p["class"], p["reason"]]
         old = seen.get(p["label"]) if isinstance(seen.get(p["label"]), dict) else {}
         since = old["since"] if old.get("fp") == fp and isinstance(old.get("since"), (int, float)) else now
@@ -444,7 +452,16 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
                                "--config", cfg.get("path") or str(HERE / "ship_watch.yaml")], root)
             except MergeTimeout as e:  # killed; the queue goes on with the next pull request
                 alerts.append(f"merge run for {p['label']} timed out after {e.args[0]} s")
-                r, row = None, {"pr": p["label"], "merge_timed_out_after_s": e.args[0]}
+                timed_out[p["label"]] = p["headRefOid"]
+                r, row = None, {"pr": p["label"], "merge_timed_out_after_s": e.args[0],
+                                "post_merge_review_due": scs.hotfix(p), "merged": None}
+                try:  # it may have merged before it hung (T-56 r2)
+                    row["merged"] = json.loads(gh("pr", "view", str(n), "-R", f"{ORG}/{repo}", "--json", "state"))[
+                        "state"] == "MERGED"
+                except (ReadError, ValueError, KeyError, TypeError) as err:
+                    alerts.append(f"{p['label']}: state after the timed-out run unreadable, check it by hand: {err}")
+                if row["merged"] and scs.hotfix(p):
+                    due.append(p["label"])
             if r is not None and r.returncode != 0:
                 last = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-1:] or ["no output"]
                 actions.append(f"skipped {p['label']}: {last[0][:300]}")
@@ -465,7 +482,8 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
               "prs": [{k: p.get(k) for k in ("label", "title", "url", "class", "reason", "headRefOid", "baseRefName",
                                               "isDraft", "mergeable", "checks", "threads", "dep_states")} for p in prs]}
     new_state = {"prs": progress, "no_runner_since": no_runner, "reds": reds,
-                 "reruns": {k: v for k, v in done.items() if k.split("@", 1)[0] in open_labels}}
+                 "reruns": {k: v for k, v in done.items() if k.split("@", 1)[0] in open_labels},
+                 "timed_out": {k: v for k, v in timed_out.items() if k in open_labels}}
     write(out, status, new_state)
     return status
 

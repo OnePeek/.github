@@ -133,6 +133,43 @@ class LocalCi(unittest.TestCase):
         d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 3\n")
         self.assertEqual(lc.main([str(d), "--jobs", "a"]), 1)
 
+    @mock.patch.object(lc, "uv_problem", return_value="")  # never the laptop's own uv, as in the other main() tests
+    def test_keep_going_runs_every_step_and_lists_every_failure(self, _uv_problem):
+        # T-69: the default stops at the first failure, so faults surfaced one per run; --keep-going shows them all at once.
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+                      "      - name: first\n        run: 'echo noise >&2; echo boom-a; exit 3'\n      - run: touch after-a\n"
+                      "  b:\n    runs-on: ubuntu-latest\n    steps:\n      - name: second\n        run: 'echo boom-b >&2; exit 4'\n"
+                      "  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: touch ran-c\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(lc.main([str(d)]), 1)
+        self.assertFalse((d / "after-a").exists())  # the default is unchanged: it stops at the first failure
+        self.assertFalse((d / "ran-c").exists())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(lc.main([str(d), "--keep-going"]), 1)
+        out = out.getvalue()
+        self.assertTrue((d / "after-a").exists() and (d / "ran-c").exists(), out)
+        summary = out.split("Failed steps:")[1]
+        self.assertIn("checks.yml:a: first (exit 3): boom-a", summary)
+        self.assertIn("checks.yml:b: second (exit 4): boom-b", summary)
+        self.assertEqual(summary.rstrip().splitlines()[-1], "LOCAL CI NOT OK: 2 step(s) failed")
+        self.assertNotIn("LOCAL CI OK", out)
+        # A skipped terraform test is a failure in the summary too, and a clean run still ends OK.
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+                      "      - run: terraform test\n      - run: 'true'\n")
+        (d / ".terraform-version").write_text("0.0.1\n", encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(lc.main([str(d), "--keep-going"]), 1)
+        self.assertIn("terraform test skipped", out.getvalue().split("Failed steps:")[1])
+        self.assertIn("LOCAL CI NOT OK: 1 step(s) failed", out.getvalue())
+        d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(lc.main([str(d), "--keep-going"]), 0)
+        self.assertIn("LOCAL CI OK", out.getvalue())
+
     def test_runner_contexts_are_filled_in_and_unknown_expressions_dropped(self):
         d = self.repo("on: [pull_request]\njobs: {}\n")
         ctx = lc.contexts(d, "onepeek-infra")
@@ -685,6 +722,31 @@ class LinuxContainerL2(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual([(c, bool(l)) for c, l in seen], [("python3", True), ("npx", False)])
         self.assertEqual(seen[0][1][1], "img:1")
+
+    # infra checks.yml, job collector-config, verbatim: it ran in the container and failed with `docker: command not found` (T-67).
+    INFRA_COLLECTOR_STEP = ("docker version --format 'Docker {{.Server.Version}}'\n"
+                            "uvx --with pyyaml==6.0.3 python -m unittest scripts/test_collector_config.py\n")
+
+    def test_a_step_that_calls_docker_stays_on_the_host(self):
+        infra = pathlib.Path(os.environ.get("ONEPEEK_WORKSPACE") or ROOT.parent) / "onepeek-infra/.github/workflows/checks.yml"
+        if infra.is_file():  # the fixture is the real step while infra's checkout is beside this repo
+            steps = yaml.safe_load(infra.read_text(encoding="utf-8"))["jobs"]["collector-config"]["steps"]
+            self.assertIn(self.INFRA_COLLECTOR_STEP, [st.get("run") for st in steps])
+        d = make_repo_with(job_yaml())
+        (d / "scripts").mkdir()
+        (d / "scripts/boot.sh").write_text("docker run --rm x\n", encoding="utf-8")
+        (d / ".github/workflows/checks.yml").write_text(job_yaml(self.INFRA_COLLECTOR_STEP, "scripts/boot.sh --x",
+                                                                 "python3 -m unittest discover -s scripts"), encoding="utf-8")
+        seen = []
+
+        def fake_step(cmd, cwd, env, shell, linux=None):
+            seen.append(linux is not None)
+            return 0, "", 0.0
+        with mock.patch.object(lc.platform, "system", return_value="Darwin"), mock.patch.object(lc, "docker_ready", return_value=True), \
+                mock.patch.object(lc, "ensure_image", return_value="img:1"), mock.patch.object(lc, "run_step", fake_step), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+        self.assertEqual(seen, [False, False, True])  # both docker steps on the host, the plain script tests in the container
 
     def test_native_turns_it_off(self):
         _, seen, _ = self.run_darwin("--native")

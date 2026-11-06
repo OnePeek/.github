@@ -722,7 +722,7 @@ class DocsPin(unittest.TestCase):
             return "f" * 40, only_pin
         with mock.patch.object(ship, "pr_info", side_effect=pr_info), mock.patch.object(ship, "gh", side_effect=gh), \
                 mock.patch.object(ship.subprocess, "run", side_effect=run), mock.patch.object(ship, "remove_worktrees"), \
-                mock.patch.object(ship, "wait_green", side_effect=on_green or (lambda r, n, m: self.events.append(("green", r)))), \
+                mock.patch.object(ship, "wait_green", side_effect=on_green or (lambda r, n, m, *_: self.events.append(("green", r)))), \
                 mock.patch.object(ship, "tested_bases", return_value={"b" * 40}), \
                 mock.patch.object(ship, "base_head", return_value="c" * 40 if base_moved else "b" * 40), \
                 mock.patch.object(ship, "wait_head"), mock.patch.object(ship, "move_docs_pin", side_effect=move), \
@@ -1622,7 +1622,7 @@ class ToolPushSourceInMain(unittest.TestCase):
     setUp, harness, go = DocsPin.setUp, DocsPin.harness, DocsPin.go
 
     def test_a_docs_pin_move_on_a_commit_pushed_after_the_gate_stops(self) -> None:
-        def later_after_docs(r, n, m):  # the builder pushes while the docs pull request merges
+        def later_after_docs(r, n, m, *_):  # the builder pushes while the docs pull request merges
             self.events.append(("green", r))
             if r == "onepeek-docs":
                 self.heads["backend-service"] = self.LATER
@@ -1715,6 +1715,21 @@ class HeadKeepsMoving(unittest.TestCase):
 
     def test_four_moves_then_still_returns_the_last_head(self) -> None:
         self.assertEqual(self.heads(4, True), ("4" * 40, 5))
+
+    def test_every_wait_shares_one_deadline(self) -> None:  # T-56 round 2: 5 waits never add up past CHECK_TIMEOUT_S
+        with mock.patch.object(ship.time, "time", return_value=1000.0):
+            with mock.patch.object(ship, "pr_info", side_effect=[{"headRefOid": h * 40} for h in "0122"]), \
+                    mock.patch.object(ship, "wait_green") as wait, mock.patch.object(ship, "say"):
+                ship.green_head("onepeek-web", 3, False)
+        self.assertEqual([c.args[3] for c in wait.call_args_list], [1000.0 + ship.CHECK_TIMEOUT_S] * 3)
+
+    def test_wait_green_stops_at_the_given_deadline(self) -> None:
+        pending = [{"name": "a", "bucket": "pending", "workflow": "w"}]
+        with mock.patch.object(ship, "checks", return_value=pending) as cs, mock.patch.object(ship, "say"), \
+                mock.patch.object(ship, "warn_checks", return_value=([], "")), mock.patch.object(ship, "POLL_S", 0.01), \
+                mock.patch.object(ship, "CHECK_TIMEOUT_S", 0.2), self.assertRaises(SystemExit):
+            ship.wait_green("onepeek-web", 3, False, ship.time.time() - 1)
+        cs.assert_not_called()
 
     def test_five_or_six_moves_stop_naming_the_heads(self) -> None:
         for moves in (5, 6):

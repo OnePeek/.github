@@ -278,7 +278,8 @@ class MergeTimeout(Base):
             if cmd[2] == "onepeek-docs#1":
                 raise sw.MergeTimeout(3600)
             return subprocess.CompletedProcess(cmd, 0, "", "")
-        fake = FakeGh(world(("onepeek-docs", pr("onepeek-docs", 1)), ("onepeek-web", pr("onepeek-web", 4))))
+        fake = FakeGh(world(("onepeek-docs", pr("onepeek-docs", 1)), ("onepeek-web", pr("onepeek-web", 4))),
+                      states={"onepeek-docs#1": "OPEN"})
         with mock.patch.object(sw, "MERGE_RUN", merge):
             s = self.run_pass(fake)
         self.assertEqual(self.merged, ["onepeek-docs#1", "onepeek-web#4"])
@@ -286,7 +287,72 @@ class MergeTimeout(Base):
         self.assertIn("merged onepeek-web#4", s["actions"])
         rows = [json.loads(x) for x in (self.out / "measures.jsonl").read_text().splitlines()]
         self.assertEqual([r["pr"] for r in rows], ["onepeek-docs#1", "onepeek-web#4"])
-        self.assertEqual(rows[0], {"pr": "onepeek-docs#1", "merge_timed_out_after_s": 3600})
+        self.assertEqual(rows[0], {"pr": "onepeek-docs#1", "merge_timed_out_after_s": 3600, "post_merge_review_due": False,
+                                   "merged": False})
+
+    def interrupted(self, exc):
+        """A merge run whose wait is broken by `exc` (Ctrl-C is KeyboardInterrupt) half a second in."""
+        ticks = pathlib.Path(self.tmp.name) / "ticks"
+        cmd = ["sh", "-c", f'(for i in $(seq 50); do echo x >> "{ticks}"; sleep 0.1; done) & wait']
+
+        def fire(*_):
+            raise exc
+        old = sw.signal.signal(sw.signal.SIGALRM, fire)
+        self.addCleanup(sw.signal.signal, sw.signal.SIGALRM, old)
+        sw.signal.setitimer(sw.signal.ITIMER_REAL, 0.5)
+        try:
+            with self.assertRaises(type(exc)):
+                sw._merge_process(cmd, pathlib.Path(self.tmp.name))
+        finally:
+            sw.signal.setitimer(sw.signal.ITIMER_REAL, 0)
+        size = ticks.stat().st_size
+        time.sleep(0.6)
+        return size, ticks.stat().st_size
+
+    def test_ctrl_c_or_any_error_in_the_wait_kills_the_group_and_goes_on_up(self):  # T-56 round 2
+        for exc in (KeyboardInterrupt(), RuntimeError("boom")):
+            with self.subTest(exc=type(exc).__name__):
+                before, after = self.interrupted(exc)
+                self.assertEqual(before, after)  # the grandchild stopped too
+
+    def test_a_timed_out_hotfix_records_the_review_due_and_whether_it_merged(self):
+        def merge(cmd, cwd):
+            self.merged.append(cmd[2])
+            raise sw.MergeTimeout(3600)
+        for state, merged, due in (("MERGED", True, ["onepeek-web#4"]), ("OPEN", False, [])):
+            with self.subTest(state=state):
+                (self.out / "measures.jsonl").unlink(missing_ok=True)
+                fake = FakeGh(world(("onepeek-web", pr("onepeek-web", 4, **HOT))), states={"onepeek-web#4": state})
+                with mock.patch.object(sw, "MERGE_RUN", merge):
+                    s = self.run_pass(fake, state={})
+                row = json.loads((self.out / "measures.jsonl").read_text())
+                self.assertEqual((row["post_merge_review_due"], row["merged"]), (True, merged))
+                self.assertEqual(s["post_merge_review_due"], due)
+
+    def test_an_unreadable_state_after_a_timeout_is_an_alert(self):
+        def merge(cmd, cwd):
+            raise sw.MergeTimeout(3600)
+        fake = FakeGh(world(("onepeek-web", pr("onepeek-web", 4, **HOT))), fail=("--json state",))
+        with mock.patch.object(sw, "MERGE_RUN", merge):
+            s = self.run_pass(fake)
+        self.assertTrue(any("state after the timed-out run unreadable" in a for a in s["alerts"]), s["alerts"])
+        self.assertIsNone(json.loads((self.out / "measures.jsonl").read_text())["merged"])
+        self.assertEqual(s["post_merge_review_due"], [])
+
+    def test_a_timed_out_head_waits_for_a_new_head(self):
+        def merge(cmd, cwd):
+            self.merged.append(cmd[2])
+            raise sw.MergeTimeout(3600)
+        fake = FakeGh(world(("onepeek-web", pr("onepeek-web", 4))), states={"onepeek-web#4": "OPEN"})
+        with mock.patch.object(sw, "MERGE_RUN", merge):
+            self.run_pass(fake)
+            s = self.run_pass(fake, now=NOW + 60)
+        self.assertEqual(self.merged, ["onepeek-web#4"])
+        self.assertEqual((s["prs"][0]["class"], s["prs"][0]["reason"]),
+                         ("BLOCKED", "merge run timed out at h4; waits a new head"))
+        fake.prs[0]["headRefOid"] = "h5"
+        s = self.run_pass(fake, reviews={"onepeek-web#4": "h5"}, now=NOW + 120)
+        self.assertEqual(self.merged, ["onepeek-web#4", "onepeek-web#4"])
 
     def test_the_merge_timeout_covers_the_checks_wait(self):
         self.assertEqual(sw.MERGE_TIMEOUT_S, sw.scs.CHECK_TIMEOUT_S + 15 * 60)
