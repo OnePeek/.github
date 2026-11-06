@@ -1436,3 +1436,81 @@ class OpenDependencyNeedsADraft(unittest.TestCase):
                 mock.patch.object(ship, "say", side_effect=lines.append):
             self.assertEqual(ship.main(["onepeek-infra#3"]), 1)
         self.assertTrue(any("as a draft" in l for l in lines), lines)
+
+
+class HotfixLane(unittest.TestCase):
+    """operating-model §3, ruling T-53: a `Lane: hotfix` pull request merges on green checks, without the review record
+    or the thread refusal; the lane is read from the body right before the merge, and anything else is feature."""
+
+    def test_only_a_plain_hotfix_line_outside_a_release_is_hotfix(self) -> None:
+        for body, base, want in (("Lane: hotfix", "dev", True), ("<!-- hint -->\nLane: hotfix\nLane: feature", "main", True),
+                                 ("- Lane: hotfix", "dev", False), ("```\nLane: hotfix\n```", "dev", False),
+                                 ("## Lane: hotfix", "dev", False), ("Lane: hotfix\n---", "dev", False),
+                                 ("fix it\nLane: hotfix", "dev", False), ("", "dev", False), (None, "dev", False),
+                                 ("Lane: feature", "dev", False), ("Lane: docs", "main", False),
+                                 ("Lane: hot fix", "dev", False), ("<!-- Lane: hotfix -->", "dev", False),
+                                 ({"x": 1}, "dev", False), ("Lane: hotfix", "release", False)):
+            with self.subTest(body=body, base=base):
+                self.assertIs(ship.hotfix({"body": body, "baseRefName": base}), want)
+
+    def test_the_review_gate_passes_a_hotfix_without_a_review_or_coderabbit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(ship.os.environ, {"ONEPEEK_WORKSPACE": tmp}), \
+                mock.patch.object(ship, "read_checks", return_value=[{"name": "CodeRabbit", "bucket": "pending"}]):
+            i = {"headRefOid": "h3", "baseRefName": "dev", "author": {"login": "Karan-98-Mehta"}}
+            self.assertIsNone(REAL_GATE("onepeek-web", 3, dict(i, body="Lane: hotfix")))
+            for body in ("", "Lane: docs"):  # only hotfix skips the review gates
+                self.assertIn("no review at h3", REAL_GATE("onepeek-web", 3, dict(i, body=body)))
+
+    def go(self, bodies: list[str]):
+        """main --go on one pull request with an unresolved thread; `bodies` are the bodies successive reads return."""
+        state = {"state": "OPEN", "baseRefName": "dev", "isDraft": False, "mergeable": "MERGEABLE", "headRefName": "b",
+                 "headRefOid": "c" * 40, "mergeCommit": {"oid": "d" * 40}, "isCrossRepository": False,
+                 "headRepositoryOwner": {"login": "OnePeek"}, "author": {"login": "Karan-98-Mehta"}}
+        merged = []
+
+        def pr_info(repo, n):
+            return dict(state, body=bodies.pop(0) if len(bodies) > 1 else bodies[0])
+
+        def gh(*args):
+            if args[:2] == ("pr", "merge"):
+                merged.append(args)
+                state["state"] = "MERGED"
+            return '["app/x.py",4]\n' if args[:2] == ("api", "graphql") else ""
+        with mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "pr_info", pr_info), \
+                mock.patch.object(ship, "gh", side_effect=gh), mock.patch.object(ship, "wait_green"), \
+                mock.patch.object(ship, "remove_worktrees"), mock.patch.object(ship, "say") as say:
+            try:
+                rc = ship.main(["backend-service#2", "--go"])
+            except SystemExit as e:
+                rc = str(e)
+        return rc, merged, [c.args[0] for c in say.call_args_list]
+
+    def test_a_hotfix_merges_past_an_unresolved_thread_and_a_review_is_due(self) -> None:
+        rc, merged, said = self.go(["Lane: hotfix"])
+        self.assertEqual((rc, len(merged)), (0, 1))
+        self.assertIn("backend-service#2: Lane: hotfix, post-merge review due (operating-model §3)", said)
+
+    def test_a_docs_lane_still_refuses_an_unresolved_thread(self) -> None:  # ruling T-53 round 3: docs keeps the gates
+        rc, merged, _ = self.go(["Lane: docs"])
+        self.assertIn("unresolved review thread", rc)
+        self.assertEqual(merged, [])
+
+    def test_the_lane_is_read_again_before_the_merge(self) -> None:  # hotfix when planned, feature by the merge
+        for bodies in (["Lane: hotfix"] * 4 + ["Lane: feature"], ["Lane: feature"] * 4 + ["Lane: hotfix"]):
+            with self.subTest(bodies=bodies[-1]):
+                rc, merged, _ = self.go(bodies)
+                self.assertIn("the lane changed since the plan", rc)
+                self.assertEqual(merged, [])
+
+    def test_a_feature_head_pushed_by_the_tool_still_needs_the_review(self) -> None:  # review round 2, finding 3
+        with mock.patch.object(ship, "green_head", return_value="f" * 40), \
+                mock.patch.object(ship, "TOOL_PUSHED", {"f" * 40}), \
+                mock.patch.object(ship, "refuse_unresolved"), mock.patch.object(ship, "no_conflicts"), \
+                mock.patch.object(ship, "review_gate", side_effect=[None, "backend-service#2: no review at cccc"]):  # plan, merge
+            rc, merged, _ = self.go(["Lane: feature"])
+        self.assertIn("no review at cccc", rc)
+        self.assertEqual(merged, [])
+        with mock.patch.object(ship, "green_head", return_value="f" * 40), \
+                mock.patch.object(ship, "TOOL_PUSHED", {"f" * 40}), mock.patch.object(ship, "no_conflicts"):
+            rc, merged, _ = self.go(["Lane: hotfix"])  # a hotfix on a tool-pushed head merges without one
+        self.assertEqual((rc, len(merged)), (0, 1))
