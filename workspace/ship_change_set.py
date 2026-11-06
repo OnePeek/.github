@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -68,7 +69,7 @@ def _load(name: str):
 depends_on = _load("check_depends_on")
 check_pins = _load("check_pins")
 ORDER = ["onepeek-docs", ".github", "onepeek-infra", "onepeek-design-system", "backend-service", "onepeek-web"]
-BASE = {"onepeek-docs": "main", ".github": "main"}  # every other repo merges into dev
+BASE = {"onepeek-docs": "main", ".github": "main", "marketing-website": "main"}  # every other repo merges into dev
 PIN = check_pins.USES  # every `uses:` naming OnePeek/.github, any letter case, any ref (§8a P2)
 VERSION_COMMENT = re.compile(r"[ \t]+#[ \t]*(v\d+\.\d+\.\d+)(.*)")
 DOCS = "onepeek-docs"
@@ -214,7 +215,8 @@ def parse(item: str) -> tuple[str, int]:
 
 def pr_info(repo: str, n: int) -> dict:
     return json.loads(gh("pr", "view", str(n), "-R", f"{ORG}/{repo}", "--json",
-                         "state,baseRefName,headRefName,headRefOid,mergeCommit,isDraft,mergeable,body,isCrossRepository,headRepositoryOwner"))
+                         "state,baseRefName,headRefName,headRefOid,mergeCommit,isDraft,mergeable,body,isCrossRepository,headRepositoryOwner,"
+                         "author"))
 
 
 def read_checks(repo: str, n: int, required: bool) -> list[dict]:
@@ -320,29 +322,38 @@ def refresh_docs_pin(repo: str, branch: str, base: str, docs_label: str, docs_he
             git(src, "worktree", "remove", "--force", str(wt))
 
 
-WARN_FILE = pathlib.Path(__file__).resolve().parent / "ship_watch.yaml"
+CONFIG = [pathlib.Path(__file__).resolve().parent / "ship_watch.yaml"]  # --config (the watcher passes its own)
 
 
-def warn_checks(path: pathlib.Path = WARN_FILE) -> tuple[list[tuple[str, str]], str]:
-    """Decision 173: the checks that warn but never block a merge, as (workflow, check-name prefix) from
-    ship_watch.yaml's `warn_checks`, and its end condition `warn_until`. Deleting the list ends it. A file that is
-    missing, unreadable or malformed gives no warn checks, so every check blocks (fail closed)."""
+def read_config(path: pathlib.Path | None = None) -> dict:
+    """ship_watch.yaml (or --config): {} when it is missing, unreadable or not a mapping, so nothing is exempted."""
     try:
         import yaml  # only here: the rest of this tool needs no third-party package
-    except ImportError:
-        return [], ""
-    try:
-        cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
-        warn = [(r["workflow"], r["prefix"]) for r in cfg.get("warn_checks") or []]
-    except (OSError, yaml.YAMLError, AttributeError, KeyError, TypeError):
-        return [], ""
-    if not all(isinstance(w, str) and w and isinstance(p, str) and p for w, p in warn):
-        return [], ""
-    return warn, str(cfg.get("warn_until") or "")
+        cfg = yaml.safe_load((path or CONFIG[0]).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - any failure reads as no settings (fail closed)
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
 
 
-def is_warn(c: dict, warn: list[tuple[str, str]]) -> bool:
-    return any(c.get("workflow") == w and c["name"].startswith(p) for w, p in warn)
+def warn_checks(path: pathlib.Path | None = None) -> tuple[list[tuple[str, str, str]], str]:
+    """Decision 173 (§6.6 build rulings): the checks that warn but never block a merge, as (repo, workflow, exact check
+    name) from `warn_checks`, and the end condition `warn_until`. No `warn_until`, an empty list, or any malformed
+    entry gives no warn checks, so every check blocks (fail closed). Deleting the list ends it."""
+    cfg = read_config(path)
+    rows, until = cfg.get("warn_checks"), cfg.get("warn_until")
+    if not isinstance(until, str) or not until.strip() or not isinstance(rows, list) or not rows:
+        return [], ""
+    keys = ("repo", "workflow", "name")
+    if not all(isinstance(r, dict) and all(isinstance(r.get(k), str) and r[k] for k in keys) for r in rows):
+        return [], ""
+    return [(r["repo"], r["workflow"], r["name"]) for r in rows], until
+
+
+def is_warn(c: dict, warn: list[tuple[str, str, str]], repo: str) -> bool:
+    return (repo, c.get("workflow"), c.get("name")) in warn
+
+
+GREEN = ("pass", "skipping")  # any other bucket, or none, is red or pending (§6.6 fail closed on every shape)
 
 
 def wait_green(repo: str, n: int, may_rerun: bool) -> None:
@@ -351,13 +362,13 @@ def wait_green(repo: str, n: int, may_rerun: bool) -> None:
     told = False
     while time.time() < deadline:
         cs = checks(repo, n)
-        skipped = sorted({c["name"] for c in cs if is_warn(c, warn)})
+        skipped = sorted({c["name"] for c in cs if is_warn(c, warn, repo)})
         if skipped and not told:  # decision 173: they still run and report; the watcher alerts when one is red
-            say(f"{repo}#{n}: not waiting on warn-only check(s) {skipped} (until {until or 'the list is removed'})")
+            say(f"{repo}#{n}: not waiting on warn-only check(s) {skipped} (until {until})")
             told = True
-        cs = [c for c in cs if not is_warn(c, warn)]
-        pending = [c["name"] for c in cs if c["bucket"] == "pending"]
-        failed = [c for c in cs if c["bucket"] == "fail" or c["bucket"] == "cancel"]
+        cs = [c for c in cs if not is_warn(c, warn, repo)]
+        pending = [c["name"] for c in cs if c.get("bucket") == "pending"]
+        failed = [c for c in cs if c.get("bucket") not in (*GREEN, "pending")]
         if cs and not pending and not failed:
             say(f"{repo}#{n}: required checks green ({len(cs)})")
             return
@@ -745,7 +756,10 @@ def resolve_pin(repo: str, n: int, push: bool = True) -> str | None:
     if pin not in pr_commits(DOCS, DOCS_PR[0]):
         say(f"{repo}#{n}: docs pin {(pin or 'none')[:7]} is not a commit of {DOCS}#{DOCS_PR[0]}; not re-pinning it")
         return None
-    return refresh_docs_pin(repo, i["headRefName"], i["baseRefName"], f"{DOCS}#{DOCS_PR[0]}", docs_head(DOCS_PR[0]), push)
+    sha = refresh_docs_pin(repo, i["headRefName"], i["baseRefName"], f"{DOCS}#{DOCS_PR[0]}", docs_head(DOCS_PR[0]), push)
+    if sha:
+        TOOL_PUSHED.add(sha)
+    return sha
 
 
 def conflict_after(repo: str, n: int, sha: str) -> str:
@@ -754,6 +768,20 @@ def conflict_after(repo: str, n: int, sha: str) -> str:
 
 
 DOCS_PR: list[int] = []
+TOOL_PUSHED: set[str] = set()  # commits this run pushed itself (pin moves, docs-pin refreshes): no new review needed
+
+
+def review_gate(repo: str, n: int, i: dict) -> str | None:
+    """agent-operations.md §6.6 "Review gates for merging" (F36) for the pull request's head `i["headRefOid"]`, read
+    live; the bot allow-list is the `authors` of ship_watch.yaml (--config). An unreadable record is a problem."""
+    try:
+        reviews = read_reviews()
+    except (OSError, ValueError) as e:
+        return f"{repo}#{n}: cannot read the review record: {e}"
+    authors = read_config().get("authors")
+    why = review_problem(f"{repo}#{n}", i["headRefOid"], i.get("author"), read_checks(repo, n, False), reviews,
+                         authors if isinstance(authors, list) else [])
+    return f"{repo}#{n}: {why}" if why else None
 
 
 def refresh_one(repo: str, n: int) -> int:
@@ -807,6 +835,43 @@ def unresolved_threads(repo: str, n: int) -> list[str]:
     return threads
 
 
+REVIEWED_CLASSES = ("mechanical", "docs only")  # §5.4a classes the coordinator's check stands in for G6
+
+
+def reviews_file() -> pathlib.Path:
+    return pathlib.Path(os.environ.get("ONEPEEK_WORKSPACE") or ROOT) / ".ship" / "reviews.json"
+
+
+def read_reviews(path: pathlib.Path | None = None) -> dict:
+    """The coordinator's record of independent-review verdicts (agent-operations.md §6.6 "Review gates for merging"):
+    `{"<repo>#<n>": "<head sha>"}` or `{"<repo>#<n>": {"sha": "<head>", "class": "mechanical"}}`. A missing file is no
+    reviews; one that does not parse or is not an object raises ValueError (fail closed)."""
+    path = path or reviews_file()
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    return data
+
+
+def review_problem(label: str, head: str, author: dict | None, all_checks: list[dict], reviews: dict,
+                   bots: list[str]) -> str | None:
+    """Why the pull request may not merge yet under the review gates (F36, pitfalls.md 30), or None: CodeRabbit has
+    finished on the head (`pass` or `skipping`) and the recorded review is at exactly this head (or the recorded class
+    is mechanical or docs only, at this head). A bot author on the allow-list is exempt."""
+    author = author or {}
+    if author.get("is_bot") is True and author.get("login") in bots:
+        return None
+    bot = [c.get("bucket") for c in all_checks if c.get("name") == "CodeRabbit"]
+    if not bot or any(b not in ("pass", "skipping") for b in bot):
+        return f"no review at {head}: CodeRabbit {'/'.join(map(str, bot)) or 'has not reported'} on the head"
+    r = reviews.get(label)
+    if r == head or (isinstance(r, dict) and r.get("sha") == head and r.get("class") in REVIEWED_CLASSES):
+        return None
+    return f"no review at {head}"
+
+
 def refuse_unresolved(repo: str, n: int) -> None:
     """Right before a merge: stop while the pull request has any unresolved review thread, naming each one."""
     threads = unresolved_threads(repo, n)
@@ -826,7 +891,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--order", default="", help="repoA,repoB,...: merge in this order instead of the fixed one (§8a P1)")
     ap.add_argument("--aws-profile", default="", help="AWS profile that can read s3://onepeek-<env>-deploy (release pull requests)")
     ap.add_argument("--no-chain", metavar="REASON", default="", help="release pull requests: skip the chain check (never the lock), with the reason")
+    ap.add_argument("--config", default=str(CONFIG[0]), help="ship_watch.yaml to read: warn-only checks, bot authors")
     a = ap.parse_args(argv)
+    CONFIG[:] = [pathlib.Path(a.config)]
     if a.refresh:
         return refresh_one(*parse(a.refresh))
     if not a.prs:
@@ -876,6 +943,9 @@ def main(argv: list[str]) -> int:
         why = own_branch_problem(repo, n, i)
         if why:
             problems.append(why)
+        gate = review_gate(repo, n, i) if i["state"] == "OPEN" else None
+        if gate:
+            problems.append(gate)
         state = mergeable(repo, n) if i["mergeable"] == "UNKNOWN" else i["mergeable"]
         if state == "CONFLICTING" and docs and repo not in (DOCS, ".github") and not why:
             conflicting.append((repo, n))  # maybe only docs-version.txt: refreshed below, once nothing else is wrong
@@ -942,6 +1012,7 @@ def main(argv: list[str]) -> int:
         no_conflicts(prs[k:], resolve_pin)
         if tag and repo not in (DOCS, ".github"):
             pushed = bump_pins(repo, info[(repo, n)]["headRefName"], *tag)
+            TOOL_PUSHED.add(pushed or "")
             moved.add(repo)  # its pins are at the tag inside the set (moved now, or already there)
             if pushed:
                 wait_head(repo, n, pushed)
@@ -950,6 +1021,7 @@ def main(argv: list[str]) -> int:
         tested = tested_bases(repo, n) if docs_merge and (repo, n) in pinned else set()
         if docs_merge and (repo, n) in pinned:
             pushed, only_pin = move_docs_pin(repo, info[(repo, n)]["headRefName"], head, docs_merge)
+            TOOL_PUSHED.add(pushed or "")
             if pushed:
                 wait_head(repo, n, pushed)
                 head = pushed
@@ -967,6 +1039,12 @@ def main(argv: list[str]) -> int:
                 raise SystemExit(f"STOP {repo}#{n}: {why}")
         keep = [] if base_ref == RELEASE_BASE else ["--delete-branch"]  # a release pull request's head is `dev`: never deleted
         refuse_unresolved(repo, n)  # every review thread read and resolved before the merge (§6.4)
+        reviewed = info[(repo, n)]["headRefOid"]  # the review gates, again, right before the merge (F36)
+        why = review_gate(repo, n, info[(repo, n)]) if head == reviewed else (
+            None if head in TOOL_PUSHED - {""} else f"{repo}#{n}: head {head[:7]} is neither the reviewed head "
+                                                     f"{reviewed[:7]} nor a commit this run pushed")
+        if why:
+            raise SystemExit(f"STOP {why}; nothing after it is merged")
         gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, *keep, "--match-head-commit", head)
         merged = pr_info(repo, n)
         if merged["state"] != "MERGED":

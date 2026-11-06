@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
 import shutil
 import subprocess
@@ -14,6 +15,16 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 ship = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(ship)
+
+
+REAL_GATE = ship.review_gate
+
+
+def setUpModule() -> None:
+    """The review gates (F36) pass for every test except ReviewGate's, which calls the real one (REAL_GATE)."""
+    p = mock.patch.object(ship, "review_gate", return_value=None)
+    p.start()
+    unittest.addModuleCleanup(p.stop)
 
 
 class Order(unittest.TestCase):
@@ -104,44 +115,123 @@ class Checks(unittest.TestCase):
 class WarnOnly(unittest.TestCase):
     """Decision 173: wait_green does not wait on the warn-only checks ship_watch.yaml lists; every other check blocks."""
 
-    def wait(self, sandbox, other="pass", warn=(("sandbox", "apply-"),)):
+    WARN = (("onepeek-infra", "sandbox", "apply-test"),)
+
+    def wait(self, sandbox, other="pass", warn=WARN, repo="onepeek-infra"):
         cs = [{"name": "tests", "bucket": other, "workflow": "checks", "link": ""},
               {"name": "apply-test", "bucket": sandbox, "workflow": "sandbox", "link": ""}]
         with mock.patch.object(ship, "checks", return_value=cs), mock.patch.object(ship, "say"), \
                 mock.patch.object(ship, "warn_checks", return_value=(list(warn), "T-30")), \
                 mock.patch.object(ship, "CHECK_TIMEOUT_S", 0.05), mock.patch.object(ship, "POLL_S", 0.01):
-            ship.wait_green("onepeek-infra", 5, False)
+            ship.wait_green(repo, 5, False)
 
     def test_pending_or_red_warn_check_does_not_block(self):
         self.wait("pending")
         self.wait("fail")
 
     def test_every_other_red_check_blocks(self):
-        with self.assertRaisesRegex(SystemExit, "failed \\['tests'\\]"):
-            self.wait("pass", other="fail")
+        for bucket in ("fail", "cancel", "neutral", None):
+            with self.subTest(bucket), self.assertRaisesRegex(SystemExit, "failed \\['tests'\\]"):
+                self.wait("pass", other=bucket)
+        self.wait("pass", other="skipping")
 
-    def test_an_empty_list_blocks_on_the_warn_check_again(self):
+    def test_an_empty_list_or_another_repo_blocks_on_the_warn_check_again(self):
         with self.assertRaisesRegex(SystemExit, "still pending"):
             self.wait("pending", warn=())
         with self.assertRaisesRegex(SystemExit, "apply-test"):
             self.wait("fail", warn=())
+        with self.assertRaisesRegex(SystemExit, "apply-test"):
+            self.wait("fail", repo="backend-service")
 
-    def test_same_workflow_and_prefix_only(self):
-        self.assertTrue(ship.is_warn({"name": "apply-test", "workflow": "sandbox"}, [("sandbox", "apply-")]))
-        self.assertFalse(ship.is_warn({"name": "apply-test", "workflow": "checks"}, [("sandbox", "apply-")]))
-        self.assertFalse(ship.is_warn({"name": "tests", "workflow": "sandbox"}, [("sandbox", "apply-")]))
+    def test_exact_repo_workflow_and_name(self):
+        c = {"name": "apply-test", "workflow": "sandbox"}
+        self.assertTrue(ship.is_warn(c, list(self.WARN), "onepeek-infra"))
+        self.assertFalse(ship.is_warn(c, list(self.WARN), "backend-service"))
+        self.assertFalse(ship.is_warn(dict(c, workflow="checks"), list(self.WARN), "onepeek-infra"))
+        self.assertFalse(ship.is_warn(dict(c, name="apply-test-2"), list(self.WARN), "onepeek-infra"))
+        self.assertFalse(ship.is_warn(dict(c, name="apply-"), list(self.WARN), "onepeek-infra"))
 
     def test_the_file_is_read_and_a_bad_one_gives_no_warn_checks(self):
         warn, until = ship.warn_checks()
-        self.assertIn(("sandbox", "apply-test"), warn)
+        self.assertIn(("onepeek-infra", "sandbox", "apply-test"), warn)
         self.assertEqual(until, "T-30")
+        row = "{repo: onepeek-infra, workflow: sandbox, name: apply-test}"
         with tempfile.TemporaryDirectory() as d:
             f = pathlib.Path(d) / "w.yaml"
-            for text in ("warn_checks: [{workflow: sandbox}]", "warn_checks: [{workflow: sandbox, prefix: ''}]",
-                         "warn_checks: x", "[1, 2]", "a: [", "warn_checks: [{workflow: 3, prefix: a}]"):
+            f.write_text(f"warn_until: T-30\nwarn_checks: [{row}]")
+            self.assertEqual(ship.warn_checks(f), ([("onepeek-infra", "sandbox", "apply-test")], "T-30"))
+            for text in (f"warn_checks: [{row}]", f"warn_until: ''\nwarn_checks: [{row}]", "warn_until: T-30\nwarn_checks: []",
+                         "warn_until: T-30\nwarn_checks: [{repo: onepeek-infra, workflow: sandbox}]",
+                         "warn_until: T-30\nwarn_checks: [{repo: onepeek-infra, workflow: sandbox, name: ''}]",
+                         "warn_until: T-30\nwarn_checks: [{repo: onepeek-infra, workflow: sandbox, prefix: apply-}]",
+                         "warn_until: T-30\nwarn_checks: x", "[1, 2]", "a: [", f"warn_until: 30\nwarn_checks: [{row}]"):
                 f.write_text(text)
                 self.assertEqual(ship.warn_checks(f), ([], ""), text)
             self.assertEqual(ship.warn_checks(f.with_name("missing.yaml")), ([], ""))
+
+    def test_config_is_passed_on_the_command_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "c.yaml"
+            f.write_text("warn_until: T-30\nwarn_checks: [{repo: r, workflow: w, name: n}]\n")
+            with mock.patch.object(ship, "CONFIG", [ship.CONFIG[0]]), mock.patch.object(ship, "refresh_one", return_value=0):
+                ship.main(["--refresh", "r#1", "--config", str(f)])
+                self.assertEqual(ship.warn_checks(), ([("r", "w", "n")], "T-30"))
+
+
+class ReviewGate(unittest.TestCase):
+    """agent-operations.md §6.6 review gates (F36): CodeRabbit finished on the head and a review recorded at it."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        env = mock.patch.dict(ship.os.environ, {"ONEPEEK_WORKSPACE": self.tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
+        (pathlib.Path(self.tmp.name) / ".ship").mkdir()
+
+    def gate(self, reviews, bot="pass", author=None):
+        (pathlib.Path(self.tmp.name) / ".ship" / "reviews.json").write_text(json.dumps(reviews))
+        cs = [{"name": "ci", "bucket": "pass"}] + ([{"name": "CodeRabbit", "bucket": bot}] if bot else [])
+        with mock.patch.object(ship, "read_checks", return_value=cs):
+            return REAL_GATE("onepeek-web", 3, {"headRefOid": "h3", "author": author or {"login": "Karan-98-Mehta"}})
+
+    def test_review_at_the_head_and_coderabbit_finished(self):
+        self.assertIsNone(self.gate({"onepeek-web#3": "h3"}))
+        self.assertIsNone(self.gate({"onepeek-web#3": "h3"}, bot="skipping"))
+        self.assertIsNone(self.gate({"onepeek-web#3": {"sha": "h3", "class": "mechanical"}}))
+
+    def test_blocked_without_it(self):
+        for reviews, bot in (({}, "pass"), ({"onepeek-web#3": "h2"}, "pass"), ({"onepeek-web#3": "h3"}, "pending"),
+                             ({"onepeek-web#3": "h3"}, None), ({"onepeek-web#3": {"sha": "h3", "class": "normal code"}}, "pass")):
+            with self.subTest(reviews=reviews, bot=bot):
+                self.assertIn("no review at h3", self.gate(reviews, bot))
+
+    def test_a_listed_bot_is_exempt_and_a_bad_record_is_a_problem(self):
+        self.assertIsNone(self.gate({}, bot=None, author={"login": "app/dependabot", "is_bot": True}))
+        (pathlib.Path(self.tmp.name) / ".ship" / "reviews.json").write_text("{")
+        self.assertIn("cannot read the review record", REAL_GATE("onepeek-web", 3, {"headRefOid": "h3"}))
+
+    def test_main_stops_before_merging_an_unreviewed_head(self):
+        info = {"state": "OPEN", "baseRefName": "dev", "headRefName": "feat/x", "headRefOid": "h3", "isDraft": False,
+                "mergeable": "MERGEABLE", "body": "", "isCrossRepository": False, "headRepositoryOwner": {"login": "OnePeek"},
+                "author": {"login": "Karan-98-Mehta"}}
+        with mock.patch.object(ship, "pr_info", return_value=info), mock.patch.object(ship, "say") as say, \
+                mock.patch.object(ship, "review_gate", side_effect=lambda r, n, i: "onepeek-web#3: no review at h3"), \
+                mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "gh") as gh:
+            self.assertEqual(ship.main(["onepeek-web#3", "--go"]), 1)
+        self.assertIn("problem: onepeek-web#3: no review at h3", [c.args[0] for c in say.call_args_list])
+        gh.assert_not_called()
+
+    def test_a_head_that_moved_after_the_review_is_not_merged(self):
+        info = {"state": "OPEN", "baseRefName": "dev", "headRefName": "feat/x", "headRefOid": "h3", "isDraft": False,
+                "mergeable": "MERGEABLE", "body": "", "isCrossRepository": False, "headRepositoryOwner": {"login": "OnePeek"},
+                "author": {"login": "Karan-98-Mehta"}}
+        with mock.patch.object(ship, "pr_info", return_value=info), mock.patch.object(ship, "say"), \
+                mock.patch.object(ship, "docs_pin_problems", return_value=[]), mock.patch.object(ship, "no_conflicts"), \
+                mock.patch.object(ship, "green_head", return_value="h4"), mock.patch.object(ship, "refuse_unresolved"), \
+                mock.patch.object(ship, "gh") as gh, self.assertRaisesRegex(SystemExit, "neither the reviewed head"):
+            ship.main(["onepeek-web#3", "--go"])
+        gh.assert_not_called()
 
 
 class Conflicts(unittest.TestCase):

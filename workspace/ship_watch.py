@@ -7,17 +7,22 @@
 Each pass reads every open pull request of the repos in ship_watch.yaml (its required checks on the head, `Depends on:`
 lines, unresolved review threads, mergeable, draft, release or not), the org's runners against queued runs, the latest
 onepeek-infra sandbox.yml run and the open release workflow runs. Each pull request is READY, BLOCKED (one reason) or
-HOLD (a release, a draft, or an author not in the allow-list). READY ones merge one per `ship_change_set.py --go` run
-(so one docs pull request per run), docs first, then in the fixed order; a run that fails is recorded and the queue
-goes on (F32). A red check is re-run once only when it is the depends-on check and every pull request its `Depends on:`
-lines name has merged, or when it is a known flake. The only write this script makes itself is `gh run rerun`: it never
-merges a release, closes a pull request, pushes, or touches a review thread. Any read failure fails the pass closed:
-nothing is merged or re-run, and an alert says why. While ship_watch.yaml lists `warn_checks` (decision 173: the sandbox
-workflow's, until `warn_until`), those checks never block READY; a red one is an alert ("sandbox red on ..."). Without --go or --dry-run, the first run (no state.json yet) is a
-dry run and later runs merge.
+HOLD (a release, a draft, or an author not in the allow-list). READY also needs the review gates (§6.6, F36):
+CodeRabbit finished on the head and the coordinator's $ONEPEEK_WORKSPACE/.ship/reviews.json naming that head (bots on
+the list exempt). A check is green only when it is `pass` or `skipping`. Every GitHub call goes through one layer that
+allows reads only. Any read failure, or an odd shape (a missing field, a non-list, a corrupt state or reviews file),
+fails the pass closed: an alert says why, nothing is merged or re-run, and `--once` exits 1; the loop keeps running.
 
-It writes ship-status.json, ship-status.md, state.json and measures.jsonl (one line per pull request it merged) to
---out, default $ONEPEEK_WORKSPACE/.ship/, never inside a repo.
+READY ones merge one per `ship_change_set.py --go` run (so one docs pull request per run), docs first, then in the
+fixed order; a run that fails is recorded and the queue goes on (F32). A red check is re-run once only when it is the
+depends-on check and every pull request its `Depends on:` lines name has merged, or when it is a known flake. The only
+writes are those merge-tool runs and `gh run rerun`: it never merges a release, closes a pull request, pushes, or
+touches a review thread. While ship_watch.yaml lists `warn_checks` (decision 173), those checks never block READY; a
+red one is an alert ("sandbox red on ..."). Without --go or --dry-run, the first run (no state.json yet) is a dry run
+and later runs merge; measures.jsonl gets one line per pull request it merged.
+
+It writes ship-status.json, ship-status.md and state.json to --out, default $ONEPEEK_WORKSPACE/.ship/, never inside a
+repo.
 """
 from __future__ import annotations
 
@@ -45,6 +50,8 @@ PR_LIMIT = 200
 PR_FIELDS = ("number,title,url,author,isDraft,mergeable,headRefOid,headRefName,baseRefName,body,createdAt,"
              "isCrossRepository,headRepositoryOwner")
 READS = (["pr", "list"], ["pr", "view"], ["pr", "checks"], ["run", "list"])
+VALUE_FLAGS = {"--jq", "-q", "--template", "-t", "--header", "-H", "--cache", "--preview", "-p", "--hostname"}
+GREEN = ("pass", "skipping")  # any other bucket, or none, is red or pending (§6.6 fail closed on every shape)
 
 
 class ReadError(Exception):
@@ -63,17 +70,49 @@ GH_RUN = _gh_process  # the one GitHub call layer (tests replace it)
 MERGE_RUN = _merge_process  # ship_change_set.py runs (tests replace it)
 
 
+def api_fields(args: list[str]) -> list[str] | None:
+    """The `-f`/`-F`/`--field`/`--raw-field` values of a `gh api` call, joined or separate, or None when the call is
+    not a read: `--input` in any form, or `-X`/`--method` other than GET."""
+    fields, toks = [], list(args[1:])
+    while toks:
+        a = toks.pop(0)
+        name, eq, val = a.partition("=") if a.startswith("--") else (a, "", "")
+        if name in ("--field", "--raw-field"):
+            fields.append(val if eq else (toks.pop(0) if toks else ""))
+        elif name == "--method":
+            if (val if eq else (toks.pop(0) if toks else "")).upper() != "GET":
+                return None
+        elif name == "--input":
+            return None
+        elif name in VALUE_FLAGS:
+            if not eq and toks:
+                toks.pop(0)
+        elif a.startswith("-") and not a.startswith("--") and len(a) > 1:  # a short flag, or a cluster of them
+            for k, ch in enumerate(a[1:]):
+                rest = a[k + 2:] or (toks.pop(0) if toks and ch in "fFXqtHp" else "")
+                if ch in "fF":
+                    fields.append(rest)
+                elif ch == "X" and rest.upper() != "GET":
+                    return None
+                if ch in "fFXqtHp":
+                    break
+    return fields
+
+
 def allowed(args: list[str]) -> bool:
-    """Reads, plus `run rerun`; never a merge, a close, a push, a thread or any other write."""
+    """Reads, plus `run rerun`: never a merge, a close, a push, a thread or any other write. `gh api` takes fields only
+    for a GraphQL query (one `query=query ...`, no `mutation`, no `operationName`)."""
     if args[:2] in READS or args[:2] == ["run", "rerun"]:
         return True
-    if args[:1] != ["api"] or any(a in ("-X", "--input") or a.startswith(("-X", "--method")) for a in args):
+    fields = api_fields(args) if args[:1] == ["api"] else None
+    if fields is None:
         return False
-    fields = [args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-f", "-F", "--field", "--raw-field")]
-    if not fields:
+    if not fields and args[1:2] != ["graphql"]:
         return True  # a GET
-    queries = [f[len("query="):].lstrip() for f in fields if f.startswith("query=")]
-    return args[1:2] == ["graphql"] and len(queries) == 1 and queries[0].startswith("query")
+    keys = [f.partition("=")[0] for f in fields]
+    query = [f.partition("=")[2].lstrip() for f in fields if f.startswith("query=")]
+    return (args[1:2] == ["graphql"] and len(query) == 1 and query[0].startswith("query")
+            and "mutation" not in query[0] and "operationName" not in keys)
 
 
 def gh(*args: str) -> str:
@@ -104,6 +143,7 @@ def load_config(path: pathlib.Path) -> dict:
     if not isinstance(cfg, dict) or any(not isinstance(cfg.get(k), t) for k, t in keys.items()):
         raise SystemExit(f"{path}: needs {', '.join(f'{k} ({t.__name__})' for k, t in keys.items())}")
     cfg["warn"] = scs.warn_checks(path)[0]  # decision 173: one reader, shared with ship_change_set's wait
+    cfg["path"] = str(path)
     return cfg
 
 
@@ -117,12 +157,19 @@ def out_dir(arg: str) -> pathlib.Path:
     return p
 
 
+def listed(value, what: str, keys: tuple[str, ...] = ()) -> list:
+    """A list of objects that each hold `keys`, or a ReadError (fail closed on every shape)."""
+    if not isinstance(value, list) or any(not isinstance(i, dict) or any(k not in i for k in keys) for i in value):
+        raise ReadError(f"{what}: not a list of objects with {', '.join(keys) or 'fields'}")
+    return value
+
+
 def read_prs(cfg: dict, errors: list[str]) -> list[dict]:
     prs, states = [], {}
     for repo in cfg["repos"]:
         try:
-            items = json.loads(gh("pr", "list", "-R", f"{ORG}/{repo}", "--state", "open", "--limit", str(PR_LIMIT),
-                                  "--json", PR_FIELDS))
+            items = listed(json.loads(gh("pr", "list", "-R", f"{ORG}/{repo}", "--state", "open", "--limit",
+                                         str(PR_LIMIT), "--json", PR_FIELDS)), "pull requests", tuple(PR_FIELDS.split(",")))
             if len(items) >= PR_LIMIT:
                 raise ReadError(f"{PR_LIMIT} or more open pull requests: the list may be cut short")
         except (ReadError, ValueError) as e:
@@ -131,11 +178,21 @@ def read_prs(cfg: dict, errors: list[str]) -> list[dict]:
         for i in items:
             prs.append(dict(i, repo=repo, label=f"{repo}#{i['number']}"))
             states[(repo, i["number"])] = "OPEN"
+    docs_commits: dict[int, set[str]] = {}
     for p in prs:
         p["deps"] = scs.depends_on.parse(p.get("body"))
         try:
-            p["checks"] = scs.checks(p["repo"], p["number"])
+            p["checks"] = listed(scs.checks(p["repo"], p["number"]), "checks", ("name", "bucket"))
+            p["all_checks"] = listed(scs.read_checks(p["repo"], p["number"], False), "checks", ("name", "bucket"))
             p["threads"] = scs.unresolved_threads(p["repo"], p["number"])
+            p["docs_pr"] = None  # N2: a code pull request pinned to an open docs pull request waits a pass
+            if p["repo"] not in (scs.DOCS, ".github"):
+                pin = scs.branch_pin(p["repo"], p["headRefName"])
+                for d in (q for q in prs if q["repo"] == scs.DOCS) if pin else ():
+                    if d["number"] not in docs_commits:
+                        docs_commits[d["number"]] = scs.pr_commits(scs.DOCS, d["number"])
+                    if pin in docs_commits[d["number"]]:
+                        p["docs_pr"] = d["label"]
             for d in p["deps"]:
                 if d not in states:
                     view = gh("pr", "view", str(d[1]), "-R", f"{ORG}/{d[0]}", "--json", "state")
@@ -151,8 +208,8 @@ def classify(p: dict, cfg: dict) -> tuple[str, str]:
     login = (p.get("author") or {}).get("login")
     if p["baseRefName"] == scs.RELEASE_BASE:
         return "HOLD", "a release pull request: it needs the founder's go"
-    if p["isDraft"]:
-        return "HOLD", "a draft"
+    if p["isDraft"] is not False:
+        return "HOLD", "a draft (isDraft is not false)"
     if login not in cfg["authors"]:
         return "HOLD", f"author {login} is not in ship_watch.yaml"
     if p.get("error"):
@@ -168,37 +225,42 @@ def classify(p: dict, cfg: dict) -> tuple[str, str]:
     waiting = [d for d, s in p["dep_states"].items() if s != "MERGED"]
     if waiting:
         return "BLOCKED", f"waiting for {', '.join(waiting)}"
-    hard = [c for c in p["checks"] if not scs.is_warn(c, cfg["warn"])]  # warn-only checks never block (decision 173)
-    red = [c["name"] for c in hard if c["bucket"] in ("fail", "cancel")]
+    if p["docs_pr"]:
+        return "BLOCKED", f"docs pin is a commit of open {p['docs_pr']}: waits for the pass after it merges"
+    hard = [c for c in p["checks"] if not scs.is_warn(c, cfg["warn"], p["repo"])]  # never block (decision 173)
+    red = [c["name"] for c in hard if c.get("bucket") not in (*GREEN, "pending")]
     if red:
         return "BLOCKED", f"red: {', '.join(red)}"
-    pending = [c["name"] for c in hard if c["bucket"] == "pending"]
+    pending = [c["name"] for c in hard if c.get("bucket") == "pending"]
     if pending:
         return "BLOCKED", f"pending: {', '.join(pending)}"
     if not hard:
         return "BLOCKED", "no checks reported"
     if p["threads"]:
         return "BLOCKED", f"{len(p['threads'])} unresolved review thread(s): {', '.join(p['threads'])}"
+    why = scs.review_problem(p["label"], p["headRefOid"], p.get("author"), p["all_checks"], cfg["reviews"],
+                             cfg["authors"])
+    if why:
+        return "BLOCKED", why
     return "READY", ""
 
 
-def reruns(p: dict, cfg: dict, done: dict) -> tuple[list[tuple[str, str]], list[str]]:
-    """(key, run id) of each red check to re-run once, and the alerts for checks red again after their re-run."""
+def reruns(p: dict, cfg: dict, done: dict) -> list[tuple[str, str]]:
+    """(key, run id) of each red check to re-run once: the depends-on check once every pull request its `Depends on:`
+    lines name has merged, or a known flake; never twice on the same head (`done`), never a warn-only check."""
     if p["class"] == "HOLD" or p.get("error"):
-        return [], []
-    out, alerts = [], []
+        return []
+    out = []
     deps_merged = bool(p["deps"]) and all(s == "MERGED" for s in p["dep_states"].values())
     for c in p["checks"]:
-        if c["bucket"] not in ("fail", "cancel"):
+        if c.get("bucket") in (*GREEN, "pending") or scs.is_warn(c, cfg["warn"], p["repo"]):
             continue
         key = f"{p['label']}@{p['headRefOid']}:{c['name']}"
-        if key in done:
-            alerts.append(f"{p['label']}: required check {c['name']} red twice")
-            continue
         m = re.search(r"/runs/(\d+)", c.get("link") or "")
-        if m and ((c["name"] == cfg["depends_on_check"] and deps_merged) or c["name"] in cfg["known_flakes"]):
+        if key not in done and m and ((c["name"] == cfg["depends_on_check"] and deps_merged)
+                                      or c["name"] in cfg["known_flakes"]):
             out.append((key, m.group(1)))
-    return out, alerts
+    return out
 
 
 def read_ci(cfg: dict, errors: list[str]) -> dict:
@@ -229,6 +291,28 @@ def iso(ts: float) -> str:
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def red_twice(prs: list[dict], reds: dict, warn: list) -> tuple[dict, list[str]]:
+    """Each required check red a second time on the same head: red, then not red (or a new job link), then red again.
+    Keyed by pull request, head, check name and run, so checks of the same name in other workflows stay apart."""
+    out, alerts = {}, []
+    for p in prs:
+        for c in [] if p.get("error") else [c for c in p["checks"] if not scs.is_warn(c, warn, p["repo"])]:
+            run = re.search(r"/runs/(\d+)", c.get("link") or "")
+            key = f"{p['label']}@{p['headRefOid']}:{c['name']}:{run.group(1) if run else ''}"
+            prev = reds.get(key) if isinstance(reds.get(key), dict) else None
+            if c.get("bucket") in (*GREEN, "pending"):
+                if prev:
+                    out[key] = dict(prev, last="other")
+                continue
+            count = (prev or {}).get("count", 0)
+            if not prev or prev.get("last") != "red" or prev.get("link") != c.get("link"):
+                count += 1
+            out[key] = {"count": count, "last": "red", "link": c.get("link")}
+            if count >= 2:
+                alerts.append(f"{p['label']}: required check {c['name']} red twice on {p['headRefOid']}")
+    return out, alerts
+
+
 def hours_between(a: str, b: str) -> float:
     t = [datetime.datetime.fromisoformat(x.replace("Z", "+00:00")) for x in (a, b)]
     return round((t[1] - t[0]).total_seconds() / 3600, 2)
@@ -247,32 +331,45 @@ def measure(repo: str, n: int, done: dict) -> dict:
 
 def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.Path | None) -> dict:
     out.mkdir(parents=True, exist_ok=True)
-    state_file = out / "state.json"
-    state = json.loads(state_file.read_text()) if state_file.exists() else {}
-    done, seen = dict(state.get("reruns") or {}), state.get("prs") or {}
     errors: list[str] = []
     alerts: list[str] = []
     actions: list[str] = []
     warned: list[dict] = []
+    state_file = out / "state.json"
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
+        if not isinstance(state, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as e:
+        errors.append(f"{state_file} unreadable: {e}")
+        state = {}
+    try:
+        cfg = dict(cfg, reviews=scs.read_reviews())
+    except (OSError, ValueError) as e:
+        errors.append(f"{scs.reviews_file()} unreadable: {e}")
+        cfg = dict(cfg, reviews={})
+    seen = state.get("prs") if isinstance(state.get("prs"), dict) else {}
+    done = dict(state["reruns"]) if isinstance(state.get("reruns"), dict) else {}
     prs = read_prs(cfg, errors)
     ci = read_ci(cfg, errors)
     progress, todo = {}, []
     for p in prs:
         p["class"], p["reason"] = classify(p, cfg)
         fp = [p["headRefOid"], p["class"], p["reason"]]
-        since = seen[p["label"]]["since"] if seen.get(p["label"], {}).get("fp") == fp else now
+        old = seen.get(p["label"]) if isinstance(seen.get(p["label"]), dict) else {}
+        since = old["since"] if old.get("fp") == fp and isinstance(old.get("since"), (int, float)) else now
         progress[p["label"]] = {"fp": fp, "since": since}
-        if now - since >= NO_PROGRESS_S:
+        if p["class"] != "HOLD" and now - since >= NO_PROGRESS_S:  # HOLD items never raise it (§6.6 rulings)
             alerts.append(f"{p['label']}: no progress for {(now - since) / 3600:.1f} h ({p['class']} {p['reason']})".rstrip())
-        for c in p.get("checks") or []:
-            if c["bucket"] in ("fail", "cancel") and scs.is_warn(c, cfg["warn"]):
+        for c in [] if p.get("error") else p["checks"]:
+            if c.get("bucket") not in (*GREEN, "pending") and scs.is_warn(c, cfg["warn"], p["repo"]):
                 run = re.match(r".*/runs/\d+", c.get("link") or "")
                 alerts.append(f"sandbox red on {p['label']}: {run.group(0) if run else c.get('link')}")
                 warned.append({"pr": p["label"], "check": c["name"], "link": c.get("link")})
-        more, red = reruns(p, cfg, done)
-        todo += more
-        alerts += red
-    no_runner = state.get("no_runner_since")
+        todo += reruns(p, cfg, done)
+    reds, twice = red_twice(prs, state.get("reds") if isinstance(state.get("reds"), dict) else {}, cfg["warn"])
+    alerts += twice
+    no_runner = state.get("no_runner_since") if isinstance(state.get("no_runner_since"), (int, float)) else None
     if ci["online"] is not None:
         no_runner = (no_runner or now) if ci["online"] == 0 and ci["queued"] else None
         if no_runner is not None and now - no_runner >= NO_RUNNER_S:
@@ -307,12 +404,13 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
             alerts.append(f"merge queue not ordered, nothing merged: {e}")
         for repo, n in queue:
             p = by_key[(repo, n)]
-            if p["baseRefName"] == scs.RELEASE_BASE or p["isDraft"] or p["threads"]:  # defence in depth
+            if p["baseRefName"] == scs.RELEASE_BASE or p["isDraft"] is not False or p["threads"]:  # defence in depth
                 continue
             if dry:
                 actions.append(f"would merge {p['label']}")
                 continue
-            r = MERGE_RUN([sys.executable, str(HERE / "ship_change_set.py"), p["label"], "--go"], root)
+            r = MERGE_RUN([sys.executable, str(HERE / "ship_change_set.py"), p["label"], "--go",
+                           "--config", cfg.get("path") or str(HERE / "ship_watch.yaml")], root)
             if r.returncode != 0:
                 last = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-1:] or ["no output"]
                 actions.append(f"skipped {p['label']}: {last[0][:300]}")
@@ -324,10 +422,11 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
             except (ReadError, ValueError, KeyError, TypeError) as e:
                 alerts.append(f"{p['label']}: measures unreadable: {e}")
     open_labels = {p["label"] for p in prs}
-    status = {"at": iso(now), "mode": "dry-run" if dry else "go", "alerts": alerts, "actions": actions, "warned": warned, "ci": ci,
+    status = {"at": iso(now), "mode": "dry-run" if dry else "go", "alerts": alerts, "actions": actions,
+              "warned": warned, "ci": ci,
               "prs": [{k: p.get(k) for k in ("label", "title", "url", "class", "reason", "headRefOid", "baseRefName",
                                               "isDraft", "mergeable", "checks", "threads", "dep_states")} for p in prs]}
-    new_state = {"prs": progress, "no_runner_since": no_runner,
+    new_state = {"prs": progress, "no_runner_since": no_runner, "reds": reds,
                  "reruns": {k: v for k, v in done.items() if k.split("@", 1)[0] in open_labels}}
     write(out, status, new_state)
     return status
@@ -370,7 +469,14 @@ def main(argv: list[str]) -> int:
     if not dry and not (ws and (pathlib.Path(ws) / ".github" / ".git").exists()):
         raise SystemExit("merging needs ONEPEEK_WORKSPACE, the folder holding the repos (ship_change_set.py runs there)")
     while True:
-        s = one_pass(cfg, out, dry, time.time(), pathlib.Path(ws) if ws else None)
+        try:
+            s = one_pass(cfg, out, dry, time.time(), pathlib.Path(ws) if ws else None)
+        except Exception as e:  # noqa: BLE001 - a pass that breaks merges nothing; the loop keeps running
+            if a.once:
+                raise
+            print(f"{time.strftime('%H:%M:%S')} pass failed, nothing merged: {e!r}", flush=True)
+            time.sleep(INTERVAL_S)
+            continue
         print(markdown(s), end="", flush=True)
         if a.once:
             return 1 if any(x.startswith("read failed") for x in s["alerts"]) else 0
