@@ -442,6 +442,11 @@ def shared_checks(repo: pathlib.Path, kind: str, name: str, shared: pathlib.Path
     if lint.exists():
         checks.append(("runner-label lint", [sys.executable, str(lint), "--kind", kind,
                                              "--repo", f"OnePeek/{name}", str(repo / ".github/workflows")]))
+    # Every call passes the called workflow's required inputs and secrets (delivery-pipelines §6.4a): pins.yml's step
+    # needs the CI-only pin SHA, so the laptop runs it here, reading the pinned commits from the workspace's .github.
+    caller_inputs = lint.parent / "check_caller_inputs.py"
+    if caller_inputs.exists():
+        checks.append(("caller inputs", [sys.executable, str(caller_inputs), str(repo), "--shared", str(WORKSPACE / ".github")]))
     return checks
 
 

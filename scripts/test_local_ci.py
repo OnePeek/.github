@@ -742,6 +742,44 @@ class BuildImageL3(unittest.TestCase):
         self.assertFalse((d / "ran").exists())
 
 
+class CallerInputsCheck(unittest.TestCase):
+    """delivery-pipelines §6.4a: the laptop runs check_caller_inputs.py in shared_checks(), with --shared the workspace's .github."""
+
+    def test_it_runs_against_the_workspace_github_and_fails_a_missing_required_input(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        shared = tmp / ".github"
+        (shared / "scripts").mkdir(parents=True)
+        (shared / ".github/workflows").mkdir(parents=True)
+        shutil.copy(ROOT / "scripts/check_caller_inputs.py", shared / "scripts")
+        (shared / ".github/workflows/lock.yml").write_text("on:\n  workflow_call:\n    inputs:\n      scope: {required: true}\njobs: {}\n")
+        local = subprocess.run(["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True).stdout.split()
+        env = {k: v for k, v in os.environ.items() if k not in local}  # pitfall 27
+        for args in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "a"]):
+            subprocess.run(["git", *args], cwd=shared, env=env, check=True, capture_output=True)
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=shared, env=env, capture_output=True, text=True).stdout.strip()
+        call = f"on: [pull_request]\njobs:\n  c:\n    uses: OnePeek/.github/.github/workflows/lock.yml@{sha} # v1.18.0\n"
+        repo = make_repo_with(call)
+        self.addCleanup(shutil.rmtree, repo, True)
+        with mock.patch.object(lc, "WORKSPACE", tmp):
+            checks = dict(lc.shared_checks(repo, "public", "onepeek-infra"))
+        cmd = checks["caller inputs"]
+        self.assertEqual(cmd[1:], [str(shared / "scripts/check_caller_inputs.py"), str(repo), "--shared", str(shared)])
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("checks.yml:4: c calls lock.yml@v1.18.0 without required input scope", r.stdout)
+        (repo / ".github/workflows/checks.yml").write_text(call + "    with: {scope: infra}\n")
+        self.assertEqual(subprocess.run(cmd, capture_output=True, text=True, env=env).returncode, 0)
+
+    def test_github_itself_uses_its_own_script(self):
+        repo = make_repo_with("on: [pull_request]\njobs: {}\n")
+        self.addCleanup(shutil.rmtree, repo, True)
+        (repo / "scripts").mkdir()
+        (repo / "scripts/check_caller_inputs.py").write_text("")
+        cmd = dict(lc.shared_checks(repo, "public", ".github"))["caller inputs"]
+        self.assertEqual(cmd[1], str(repo / "scripts/check_caller_inputs.py"))
+
+
 class SharedPinL4(unittest.TestCase):
     """L4: the shared workflows are read at the caller's pin, not from whatever the shared checkout is on."""
 
