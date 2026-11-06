@@ -9,6 +9,13 @@ Lane: feature | hotfix
 Role: builder | reviewer | docs drafter        Model: opus | sonnet (rule in AGENTS.md "Running agents" 3)
 Repo: OnePeek/<repo>   Base: origin/<dev|main>   Branch: <type>/<topic> (existing PR: #<n>, or "new")
 
+Env: shell state does not persist between commands; prefix every command that needs it with
+  `export ONEPEEK_WORKSPACE=<the folder holding the repos> &&` (pitfalls.md 37). Read docs from origin/main
+  (`git -C "$ONEPEEK_WORKSPACE/onepeek-docs" show origin/main:<path>`), never from a shared checkout that may be stale.
+
+Symptom (unblock lane): the failing run's link, the log line, and the behaviour the docs expect (file §section).
+  Never a guessed cause: the builder reproduces first and reports the cause it finds (2026-11-06, T-58).
+
 Spec (read in full before anything else):
   - Packet: python3 "$ONEPEEK_WORKSPACE/.github/workspace/packet.py" <unit> --out .context/<unit>.md, from the worktree
     (backend: uv run app context <unit>); ONEPEEK_WORKSPACE is the folder holding all the repos (agent-operations.md §4.3)
@@ -29,6 +36,8 @@ Slice (about 400 changed lines at most, generated files and merges aside):
   - Do NOT touch: <paths other open PRs own>
 
 Known traps for this slice: <pitfalls.md numbers, or new ones>
+Hostile inputs (when the slice adds or changes a pattern that decides a privilege or a gate: network, credentials,
+  AWS, lane, review): the real inputs to derive cases from, and the near-misses to test (pitfalls.md 40).
 
 Status: write <worktree>/.context/status.md at every phase change (at least every 10 min); never wait > 5 min on CI,
   a review or a dependency: push if the authority below allows it and local CI is green (else keep the worktree path),

@@ -15,6 +15,7 @@ description: The orchestrator's procedure (the main session in the OnePeek works
    - the runner status;
    - the latest `ship-status.md`;
    - `git worktree list` in each repo, to find agent worktrees left behind.
+   - `git pull --ff-only` on the shared `main` checkouts of `.github` and `onepeek-docs`, so the tools and docs agents read are current (F38: a 79-commit-stale docs checkout lacked `operating-model.md`).
 4. Write the session plan into the task list: the 3 to 6 items you will finish, in order, each with its lane and its owner.
 5. Send the founder one line: what is done, what is next, and what you need from them, if anything.
 
@@ -55,7 +56,7 @@ The class sets the builder's model and how deep the review goes.
 Your own docs rulings are never "mechanical". The reviewer reviews the code built from them, not the rulings themselves.
 
 ## 5. Choosing the agent
-1. **Continuity first.** If a builder already has this repo or area in context and is under about 150k tokens, resume it with `SendMessage`. Resuming is cheaper, and the agent keeps its context.
+1. **Continuity first.** If a builder already has this repo or area in context and is under about 150k tokens (read the token count in its completion notice, never the agent's own estimate: one reported "under 150k" at 217k), resume it with `SendMessage`. Resuming is cheaper, and the agent keeps its context.
 2. **Otherwise, a fresh agent:**
    - Builder A takes the `onepeek-infra` and `.github` work.
    - Builder B takes `backend-service`, `onepeek-web` and the other repos.
