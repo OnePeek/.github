@@ -9,6 +9,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -145,7 +146,7 @@ LIB = re.search(r"# --- release-lock begin.*?# --- release-lock end ---\n", TAKE
 
 def run(script: str, keys: dict | None = None, gh: str = "echo in_progress", frozen_by: str | None = None, files: dict | None = None,
         git: str | None = None, stubs: dict | None = None, **extra: str):
-    """Returns the result with .keys (every key left in S3), .calls, .puts, .output, .summary and .frozen."""
+    """Returns the result with .keys (every key left in S3), .calls, .puts, .output, .summary, .frozen and .elapsed (wall-clock seconds)."""
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         tools = {"aws": FAKE_AWS, "gh": f'#!/bin/bash\necho "gh token=$GH_TOKEN $*" >> "{root}/calls"\n{gh}\n', **(stubs or {})}
@@ -163,10 +164,12 @@ def run(script: str, keys: dict | None = None, gh: str = "echo in_progress", fro
             (root / "etag_locks_frozen.json").write_text('"frozen-etag"')
         for name, content in (files or {}).items():
             (root / name).write_text(content)
+        began = time.monotonic()
         out = subprocess.run(["bash", "-eo", "pipefail", "-c", script], cwd=root, capture_output=True, text=True, timeout=60, env={
             **os.environ, **ENV, **extra, "FAKE_S3": str(root), "PATH": f"{root}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(root / "output"),
             "GITHUB_STEP_SUMMARY": str(root / "summary"),
         })  # fmt: skip
+        out.elapsed = time.monotonic() - began  # type: ignore[attr-defined]
         read = lambda n: (root / n).read_text() if (root / n).exists() else None
         out.keys = {p.name[3:].replace("locks_", "locks/"): p.read_text() for p in root.glob("s3_locks_*") if p.name != "s3_locks_frozen.json"}  # type: ignore[attr-defined]
         out.frozen = read("s3_locks_frozen.json")  # type: ignore[attr-defined]
@@ -227,11 +230,17 @@ class Take(unittest.TestCase):
         held = record(INFRA, "77", scope="infra")
         out = run(TAKE, keys={BACKEND: held}, LOCK_WAIT_SECONDS="1", LOCK_WAIT_CAP_SECONDS="6")
         self.assertEqual(out.returncode, 1)
-        self.assertGreaterEqual(out.stdout.count("Waiting for the preprod release lock"), 3)
+        # The cap is wall-clock time (bash SECONDS), so it is asserted as time: the step ends only once SECONDS has
+        # moved 6 past its start, more than 5 real seconds. The 1-second own-scope limit would end it after one wait.
+        # A count of waits inside the cap shrinks on a loaded machine, to none when one try takes the whole cap (pitfall 33).
+        self.assertGreaterEqual(out.elapsed, 5)
         self.assertIn("::error::waiting for OnePeek/onepeek-infra (infra, run 77); re-run", out.stdout)
 
     def test_try_or_release_gives_back_every_key_taken_on_the_etag_of_its_own_write_before_it_waits(self):
-        out = run(TAKE, keys={BACKEND: record(INFRA, "77", scope="infra")}, LOCK_WAIT_CAP_SECONDS="3")
+        # Held by a live run of its own scope, so the step stops after exactly two tries by the counted own-scope limit
+        # (LOCK_WAIT_SECONDS 1, one poll per wait), never by the wall-clock cap, which a loaded machine could reach
+        # after the first try (pitfall 33).
+        out = run(TAKE, keys={BACKEND: record(REPO, "77", scope="backend")}, LOCK_WAIT_SECONDS="1", LOCK_WAIT_CAP_SECONDS="60")
         self.assertEqual(out.returncode, 1)
         written = re.search(r'locks/release.json \{.*', out.puts).group(0)
         self.assertIn(REPO, written)
@@ -977,13 +986,15 @@ class EdgeLimits(unittest.TestCase):
         self.assertEqual(out.returncode, 1)
         self.assertIn("::error::waiting for OnePeek/onepeek-infra (infra, run 77); re-run", out.stdout)
         self.assertNotIn("put-object", out.calls)
-        return out.stdout.count("Waiting for the preprod release lock")
+        return out
 
     def test_a_live_infra_run_that_holds_infra_json_is_waited_for_up_to_the_cap(self):
-        self.assertGreaterEqual(self.waits({INFRA_KEY: record(INFRA, "77", scope="infra")}), 4)
+        # The cap is wall-clock time (bash SECONDS), so it is asserted as time: more than 5 real seconds of the 6 s cap.
+        # The 1-second queued limit would end it after one wait. A count of waits shrinks on a loaded machine (pitfall 33).
+        self.assertGreaterEqual(self.waits({INFRA_KEY: record(INFRA, "77", scope="infra")}).elapsed, 5)
 
     def test_a_queued_infra_run_or_one_that_holds_no_key_gets_the_60_minutes(self):
-        self.assertLessEqual(self.waits({}), 2)
+        self.assertLessEqual(self.waits({}).stdout.count("Waiting for the preprod release lock"), 2)
 
 
 class InfraOwnScope(unittest.TestCase):
@@ -993,7 +1004,9 @@ class InfraOwnScope(unittest.TestCase):
                   LOCK_WAIT_SECONDS="1", LOCK_WAIT_CAP_SECONDS="6")
         self.assertEqual(out.returncode, 1)
         self.assertIn("::error::waiting for OnePeek/onepeek-infra (infra, run 77); re-run", out.stdout)
-        self.assertGreaterEqual(out.stdout.count("Waiting for the preprod release lock"), 4)
+        # Asserted as time, not as a count of waits (pitfall 33): more than 5 real seconds of the 6 s cap, where the
+        # 1-second app limit would end it after one wait.
+        self.assertGreaterEqual(out.elapsed, 5)
         self.assertEqual(out.keys, {INFRA_KEY: held})
 
 
