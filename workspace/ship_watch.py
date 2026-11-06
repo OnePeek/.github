@@ -73,7 +73,8 @@ def _merge_process(cmd: list[str], cwd: pathlib.Path) -> subprocess.CompletedPro
     """One merge run, in its own session: past MERGE_TIMEOUT_S its whole process group (gh, git, their children) is
     killed and MergeTimeout raised (ruling T-56). Its own session keeps it out of the terminal's group, so Ctrl-C or any
     other exception in the wait kills the group too, then goes on up: a run never outlives the watcher (T-56 round 2).
-    Its pipes are never read after the kill, so a stray child holding them cannot hang the watcher."""
+    SIGTERM and SIGHUP reach this path as SystemExit (exit_on_signals). A group holding only the exited child's zombie
+    refuses the kill on macOS (PermissionError); it has nothing left to kill. Its pipes are never read after the kill, so a stray child holding them cannot hang the watcher."""
     child = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                              start_new_session=True)
     try:
@@ -81,7 +82,7 @@ def _merge_process(cmd: list[str], cwd: pathlib.Path) -> subprocess.CompletedPro
     except BaseException as e:
         try:
             os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         child.wait()
         for pipe in (child.stdout, child.stderr):
@@ -90,6 +91,15 @@ def _merge_process(cmd: list[str], cwd: pathlib.Path) -> subprocess.CompletedPro
             raise MergeTimeout(MERGE_TIMEOUT_S) from None
         raise
     return subprocess.CompletedProcess(cmd, child.returncode, out, err)
+
+
+def exit_on_signals() -> None:
+    """SIGTERM and SIGHUP raise SystemExit(128 + signal), so a running merge run's group is killed on the way out
+    (#82 round 2 review); by default they end the watcher at once and leave the run free to merge."""
+    def leave(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, leave)
 
 
 GH_RUN = _gh_process  # the one GitHub call layer (tests replace it)
@@ -191,7 +201,8 @@ def listed(value, what: str, keys: tuple[str, ...] = ()) -> list:
     return value
 
 
-def read_prs(cfg: dict, errors: list[str]) -> list[dict]:
+def read_prs(cfg: dict, errors: list[str], unread: set[str] | None = None) -> list[dict]:
+    """unread: gets each repo whose open pull requests could not be listed."""
     prs, states = [], {}
     for repo in cfg["repos"]:
         try:
@@ -201,6 +212,8 @@ def read_prs(cfg: dict, errors: list[str]) -> list[dict]:
                 raise ReadError(f"{PR_LIMIT} or more open pull requests: the list may be cut short")
         except (ReadError, ValueError) as e:
             errors.append(f"{repo}: open pull requests unreadable: {e}")
+            if unread is not None:
+                unread.add(repo)
             continue
         for i in items:
             prs.append(dict(i, repo=repo, label=f"{repo}#{i['number']}"))
@@ -380,7 +393,8 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
     seen = state.get("prs") if isinstance(state.get("prs"), dict) else {}
     done = dict(state["reruns"]) if isinstance(state.get("reruns"), dict) else {}
     timed_out = dict(state["timed_out"]) if isinstance(state.get("timed_out"), dict) else {}
-    prs = read_prs(cfg, errors)
+    unread: set[str] = set()
+    prs = read_prs(cfg, errors, unread)
     ci = read_ci(cfg, errors)
     progress, todo, due = {}, [], []
     for p in prs:
@@ -483,7 +497,8 @@ def one_pass(cfg: dict, out: pathlib.Path, dry: bool, now: float, root: pathlib.
                                               "isDraft", "mergeable", "checks", "threads", "dep_states")} for p in prs]}
     new_state = {"prs": progress, "no_runner_since": no_runner, "reds": reds,
                  "reruns": {k: v for k, v in done.items() if k.split("@", 1)[0] in open_labels},
-                 "timed_out": {k: v for k, v in timed_out.items() if k in open_labels}}
+                 "timed_out": {k: v for k, v in timed_out.items()  # kept while its repo is unreadable
+                               if k in open_labels or k.rsplit("#", 1)[0] in unread}}
     write(out, status, new_state)
     return status
 
@@ -524,6 +539,7 @@ def main(argv: list[str]) -> int:
     ws = os.environ.get("ONEPEEK_WORKSPACE", "")
     if not dry and not (ws and (pathlib.Path(ws) / ".github" / ".git").exists()):
         raise SystemExit("merging needs ONEPEEK_WORKSPACE, the folder holding the repos (ship_change_set.py runs there)")
+    exit_on_signals()
     while True:
         try:
             s = one_pass(cfg, out, dry, time.time(), pathlib.Path(ws) if ws else None)

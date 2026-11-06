@@ -291,15 +291,19 @@ class MergeTimeout(Base):
                                    "merged": False})
 
     def interrupted(self, exc):
-        """A merge run whose wait is broken by `exc` (Ctrl-C is KeyboardInterrupt) half a second in."""
-        ticks = pathlib.Path(self.tmp.name) / "ticks"
+        """A merge run whose wait is broken by `exc` (Ctrl-C is KeyboardInterrupt) once the grandchild has ticked."""
+        ticks = pathlib.Path(self.tmp.name) / f"ticks-{type(exc).__name__}"  # fresh for each subtest
         cmd = ["sh", "-c", f'(for i in $(seq 50); do echo x >> "{ticks}"; sleep 0.1; done) & wait']
+        tries = [0]
 
-        def fire(*_):
-            raise exc
+        def fire(*_):  # every 50 ms; raises once the first tick is written, or after 200 tries (counted, pitfall 33)
+            tries[0] += 1
+            if (ticks.exists() and ticks.stat().st_size) or tries[0] >= 200:
+                sw.signal.setitimer(sw.signal.ITIMER_REAL, 0)
+                raise exc
         old = sw.signal.signal(sw.signal.SIGALRM, fire)
         self.addCleanup(sw.signal.signal, sw.signal.SIGALRM, old)
-        sw.signal.setitimer(sw.signal.ITIMER_REAL, 0.5)
+        sw.signal.setitimer(sw.signal.ITIMER_REAL, 0.05, 0.05)
         try:
             with self.assertRaises(type(exc)):
                 sw._merge_process(cmd, pathlib.Path(self.tmp.name))
@@ -314,6 +318,52 @@ class MergeTimeout(Base):
             with self.subTest(exc=type(exc).__name__):
                 before, after = self.interrupted(exc)
                 self.assertEqual(before, after)  # the grandchild stopped too
+
+    def test_sigterm_or_sighup_kills_the_group_before_it_merges(self):  # #82 round 2 review, finding 1
+        here = pathlib.Path(self.tmp.name)
+        for sig in (sw.signal.SIGTERM, sw.signal.SIGHUP):
+            with self.subTest(sig=sig.name):
+                started, merged = here / f"started-{sig.name}", here / f"merged-{sig.name}"
+                code = ("import importlib.util, pathlib, sys\n"
+                        "spec = importlib.util.spec_from_file_location('ship_watch', sys.argv[1])\n"
+                        "sw = importlib.util.module_from_spec(spec); spec.loader.exec_module(sw)\n"
+                        "sw.exit_on_signals()\n"
+                        "sw._merge_process(['sh', '-c', 'touch \"$0\"; sleep 1.5; touch \"$1\"', sys.argv[2], sys.argv[3]],"
+                        " pathlib.Path('.'))\n")
+                watcher = subprocess.Popen([sys.executable, "-c", code, sw.__file__, str(started), str(merged)],
+                                           cwd=here, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for _ in range(200):  # counted, never a wall-clock cap on turns (pitfall 33)
+                    if started.exists():
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(started.exists())
+                watcher.send_signal(sig)
+                self.assertEqual(watcher.wait(timeout=10), 128 + sig)
+                time.sleep(2.5)  # past the run's own merge at 1.5 s
+                self.assertFalse(merged.exists())
+
+    def test_a_group_holding_only_a_zombie_still_times_out(self):  # #82 round 2 review, finding 2 (macOS EPERM)
+        class Exited(subprocess.Popen):
+            def communicate(self, *a, **k):
+                os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOWAIT)  # it exited and is not reaped: a zombie
+                raise subprocess.TimeoutExpired(self.args, 0)
+        with mock.patch.object(sw.subprocess, "Popen", Exited), self.assertRaises(sw.MergeTimeout):
+            sw._merge_process(["true"], pathlib.Path(self.tmp.name))
+
+    def test_a_timed_out_record_survives_a_pass_that_cannot_list_its_repo(self):  # #82 round 2 review, finding 3
+        def merge(cmd, cwd):
+            self.merged.append(cmd[2])
+            raise sw.MergeTimeout(3600)
+        fake = FakeGh(world(("onepeek-web", pr("onepeek-web", 4))), states={"onepeek-web#4": "OPEN"})
+        with mock.patch.object(sw, "MERGE_RUN", merge):
+            self.run_pass(fake)
+            fake.fail = ("pr list -R OnePeek/onepeek-web",)
+            self.run_pass(fake, now=NOW + 60)
+            self.assertEqual(json.loads((self.out / "state.json").read_text())["timed_out"], {"onepeek-web#4": "h4"})
+            fake.fail = ()
+            s = self.run_pass(fake, now=NOW + 120)
+        self.assertEqual(self.merged, ["onepeek-web#4"])
+        self.assertEqual(s["prs"][0]["class"], "BLOCKED")
 
     def test_a_timed_out_hotfix_records_the_review_due_and_whether_it_merged(self):
         def merge(cmd, cwd):
@@ -615,6 +665,19 @@ class FailClosed(Base):
 
 
 class Main(Base):
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(sw, "exit_on_signals")
+        self.signals = p.start()
+        self.addCleanup(p.stop)
+
+    def test_main_turns_sigterm_and_sighup_into_an_exit(self):  # #82 round 2 review, finding 1
+        ws = pathlib.Path(self.tmp.name)
+        with mock.patch.object(sw, "one_pass", side_effect=KeyboardInterrupt), \
+                mock.patch.dict(sw.os.environ, {"ONEPEEK_WORKSPACE": str(ws)}), self.assertRaises(KeyboardInterrupt):
+            sw.main(["--once", "--dry-run", "--out", str(ws / "o")])
+        self.signals.assert_called_once_with()
+
     def test_first_run_is_dry_then_merges(self):
         ws = pathlib.Path(self.tmp.name)
         (ws / ".github" / ".git").mkdir(parents=True)
