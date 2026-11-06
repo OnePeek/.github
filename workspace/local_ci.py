@@ -637,9 +637,10 @@ def main(argv: list[str] | None = None) -> int:
             if rc:
                 return rc
 
-    if skipped:
+    # A skipped terraform test is listed once, with the failures below (not also here), except under --list.
+    if shown := [s for s in skipped if a.list or not s.startswith("terraform test skipped: ")]:
         print("\nSkipped (CI runs these):")
-        for s in skipped:
+        for s in shown:
             print(f"  - {s}")
     if a.list:
         return 0
@@ -682,15 +683,113 @@ def calls_docker_script(cmd: str, cwd: pathlib.Path) -> bool:
     return bool(first) and not first.startswith("/") and path.is_file() and bool(re.search(r"\bdocker\b", path.read_text(encoding="utf-8", errors="ignore")))
 
 
+SERVICE_TIMEOUT = 120  # seconds a job's services get to report healthy (T-73)
+
+
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def has_expression(value) -> bool:
+    """True when any key or value anywhere in a parsed YAML value holds `${{`."""
+    if isinstance(value, dict):
+        return any(has_expression(k) or has_expression(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(has_expression(v) for v in value)
+    return "${{" in str(value)
+
+
+def service_argv(name: str, spec) -> list[str]:
+    """`docker run -d` for one entry of a job's `services:`, as declared: each value only from its own key (env only as
+    `-e KEY=VALUE`). ValueError naming the key when the definition has a shape CI would not take, an expression the
+    laptop cannot fill, credentials, or an unknown key; it fails closed (pitfall 14)."""
+    if not isinstance(spec, dict):
+        raise ValueError("its definition is not a mapping")
+    if unknown := sorted(set(map(str, spec)) - {"image", "env", "ports", "volumes", "options"}):
+        raise ValueError(f"key {unknown[0]} is not supported here")
+    if bad := next((str(k) for k, v in spec.items() if has_expression(k) or has_expression(v)), None):
+        raise ValueError(f"key {bad} holds an expression (${{{{ }}}}) the laptop cannot fill")
+    none = lambda key, empty: empty if spec.get(key) is None else spec[key]  # `options:` with no value is empty, as on CI
+    image, options, env = spec.get("image"), none("options", ""), none("env", {})
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError("key image is not a non-empty string")
+    if not isinstance(options, str):
+        raise ValueError("key options is not a string")
+    if not isinstance(env, dict) or not all(isinstance(k, str) and ENV_NAME.fullmatch(k) and isinstance(v, (str, int, float))
+                                            for k, v in env.items()):
+        raise ValueError("key env is not a mapping of names to scalar values")
+    lists = {}
+    for key in ("ports", "volumes"):
+        lists[key] = none(key, [])
+        kinds = (str, int) if key == "ports" else (str,)  # a bare port number is valid on CI; a volume is always a string
+        if not isinstance(lists[key], list) or not all(isinstance(x, kinds) and not isinstance(x, bool) for x in lists[key]):
+            raise ValueError(f"key {key} is not a list of strings")
+    argv = ["docker", "run", "-d", "--name", name, "--label", f"onepeek-local-ci={os.getpid()}"]
+    for k, v in env.items():
+        argv += ["-e", f"{k}={str(v).lower() if isinstance(v, bool) else v}"]
+    for port in lists["ports"]:
+        argv += ["-p", str(port)]
+    for vol in lists["volumes"]:
+        argv += ["-v", vol]
+    try:
+        return argv + shlex.split(options) + [image]
+    except ValueError as e:
+        raise ValueError(f"key options does not parse: {e}") from None
+
+
+@contextlib.contextmanager
+def job_services(label0: str, job: dict, a):
+    """Start the job's `services:` containers as CI does, wait until each is healthy (or running, without a health
+    check), and always remove them, by their own names only (pitfall 35). Yields "" or why the job cannot run here."""
+    names: list[str] = []
+    try:
+        services = job.get("services") or {}
+        if not services or a.list:
+            yield ""
+            return
+        if a.skip_docker or not docker_ready():
+            yield "its services need Docker, which " + ("--skip-docker turns off" if a.skip_docker else "is not available")
+            return
+        if not isinstance(services, dict):
+            yield "its services: is not a mapping of names to definitions"
+            return
+        try:
+            for svc, spec in services.items():
+                name = re.sub(r"[^A-Za-z0-9_.-]", "-", f"local-ci-{os.getpid()}-{label0}-{svc}")
+                argv = service_argv(name, spec)
+                names.append(name)
+                if (r := subprocess.run(argv, capture_output=True, text=True)).returncode:
+                    raise ValueError(f"exit {r.returncode}: {(r.stdout + r.stderr).strip()[-300:]}")
+        except ValueError as e:
+            yield f"service {svc} did not start: {e}"
+            return
+        deadline = time.monotonic() + SERVICE_TIMEOUT
+        for svc, name in zip(services, names):
+            fmt = "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}"
+            while (state := subprocess.run(["docker", "inspect", "-f", fmt, name], capture_output=True, text=True).stdout.strip()) \
+                    not in ("healthy", "running"):
+                if state not in ("starting", "created") or time.monotonic() > deadline:
+                    yield f"service {svc} is {state or 'gone'}, not healthy, after {SERVICE_TIMEOUT}s at most"
+                    return
+                time.sleep(1)
+        yield ""
+    finally:
+        for name in names:
+            subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True)
+
+
 def run_job(label0: str, job: dict, wf_env: dict, inputs: dict, repo: pathlib.Path, a, skipped: list) -> int:
-    runs = "\n".join(str(st.get("run") or "") + " " + str(st.get("working-directory") or "") for st in job.get("steps") or [])
-    if not a.list and USES_SIBLINGS.search(runs):
-        with sibling_checkouts(repo, a.own) as (ok, reason):
-            if not ok:
-                skipped.append(f"{label0} (SKIP: needs the other repos checked out as _backend/_web/_infra: {reason})")
-                return 0
-            return run_job_steps(label0, job, wf_env, inputs, repo, a, skipped)
-    return run_job_steps(label0, job, wf_env, inputs, repo, a, skipped)
+    with job_services(label0, job, a) as problem:
+        if problem:  # a job CI runs with its databases never passes here without them (T-73)
+            print(f"FAIL  {label0}: {problem}")
+            return failed(a, label0, problem)
+        runs = "\n".join(str(st.get("run") or "") + " " + str(st.get("working-directory") or "") for st in job.get("steps") or [])
+        if not a.list and USES_SIBLINGS.search(runs):
+            with sibling_checkouts(repo, a.own) as (ok, reason):
+                if not ok:
+                    skipped.append(f"{label0} (SKIP: needs the other repos checked out as _backend/_web/_infra: {reason})")
+                    return 0
+                return run_job_steps(label0, job, wf_env, inputs, repo, a, skipped)
+        return run_job_steps(label0, job, wf_env, inputs, repo, a, skipped)
 
 
 def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: pathlib.Path, a, skipped: list) -> int:
@@ -888,7 +987,8 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
     return 0
 
 
-BUILD_INPUTS = {"context", "file", "platforms", "tags", "build-args", "secrets", "load", "push", "target", "cache-from", "cache-to"}
+BUILD_INPUTS = {"context", "file", "platforms", "tags", "build-args", "secrets", "load", "push", "target", "cache-from", "cache-to",
+                "provenance"}
 
 
 def build_command(step: dict, inputs: dict, ctx: dict, repo: pathlib.Path, workdir: str) -> tuple[list[str], dict[str, str], list[str]]:
@@ -915,6 +1015,8 @@ def build_command(step: dict, inputs: dict, ctx: dict, repo: pathlib.Path, workd
         argv += ["--platform", w["platforms"]]
     if w.get("target"):
         argv += ["--target", w["target"]]
+    if w.get("provenance"):  # backend image-smoke.yml builds with `provenance: false`, as release-ecs.yml does (T-74)
+        argv.append(f"--provenance={w['provenance'].lower()}")
     for line in filter(None, (x.strip() for x in w.get("build-args", "").splitlines())):
         argv += ["--build-arg", line]
     env: dict[str, str] = {}

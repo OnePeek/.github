@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import unittest
 from unittest import mock
 
@@ -164,6 +165,8 @@ class LocalCi(unittest.TestCase):
             self.assertEqual(lc.main([str(d), "--keep-going"]), 1)
         self.assertIn("terraform test skipped", out.getvalue().split("Failed steps:")[1])
         self.assertIn("LOCAL CI NOT OK: 1 step(s) failed", out.getvalue())
+        listed = [ln for ln in out.getvalue().splitlines() if ln.startswith("  - ") and "terraform test skipped" in ln]
+        self.assertEqual(len(listed), 1, out.getvalue())  # once, in the failures, not also under "Skipped" (T-73)
         d = self.repo("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -610,8 +613,8 @@ class CommentsL1(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertTrue((d / "after").exists())
         self.assertIn("FAIL", out)
-        listed = out.split("Skipped (CI runs these):")[1].splitlines()
-        self.assertIn("terraform test skipped", listed[1])
+        listed = out.split("Skipped (CI runs these):")[1].split("LOCAL CI NOT OK")[0]
+        self.assertNotIn("terraform test skipped", listed)  # listed once, below, with what did not run (T-73)
         self.assertNotIn("LOCAL CI OK", out)
         self.assertIn("LOCAL CI NOT OK: 1 terraform test step(s) did not run here", out)
         self.assertIn("(needs GitHub or AWS)", out.split("LOCAL CI NOT OK")[1])
@@ -821,6 +824,11 @@ class BuildImageL3(unittest.TestCase):
         return {"uses": "docker/build-push-action@abc # v6", "with": {"context": ".", "load": True, "push": False,
                                                                       "tags": "lci-test:boot", **with_}}
 
+    def test_provenance_is_passed_to_buildx(self):
+        # backend image-smoke.yml builds with `provenance: false`; it was refused as unknown, so Smoke and Boot were skipped (T-74).
+        argv, _, _ = lc.build_command(self.build_step(provenance=False), {}, {}, pathlib.Path("."), ".")
+        self.assertIn("--provenance=false", argv)
+
     def test_a_load_build_is_translated(self):
         step = self.build_step(file="images/Dockerfile", platforms="linux/arm64", **{"build-args": "A=1\nB=${{ github.sha }}"})
         argv, env, tags = lc.build_command(step, {}, {"github.sha": "abc123"}, pathlib.Path("."), ".")
@@ -890,6 +898,133 @@ class BuildImageL3(unittest.TestCase):
         rc, calls, out = self.run_main(d, "--skip-docker")
         self.assertEqual(calls, [["docker", "image", "rm", "lci-test:boot"]])
         self.assertFalse((d / "ran").exists())
+
+
+class JobServices(unittest.TestCase):
+    """A job's `services:` start as CI starts them, and are always removed (T-73)."""
+    SPEC = {"image": "public.ecr.aws/docker/library/postgres:17@sha256:" + "a" * 64, "env": {"POSTGRES_DB": "onepeek"},
+            "ports": ["127.0.0.1:55432:5432"], "options": '--health-cmd "pg_isready -U postgres" --health-retries 30'}
+
+    def test_a_service_runs_as_declared(self):
+        argv = lc.service_argv("n1", self.SPEC)
+        self.assertEqual(argv, ["docker", "run", "-d", "--name", "n1", "--label", f"onepeek-local-ci={os.getpid()}",
+                                "-e", "POSTGRES_DB=onepeek", "-p", "127.0.0.1:55432:5432", "--health-cmd", "pg_isready -U postgres",
+                                "--health-retries", "30", self.SPEC["image"]])
+        for bad in ({**self.SPEC, "credentials": {"username": "u"}}, {**self.SPEC, "env": {"P": "${{ secrets.P }}"}}, {"ports": [1]}):
+            with self.assertRaises(ValueError):
+                lc.service_argv("n1", bad)
+
+    def test_keys_with_no_value_are_empty(self):
+        self.assertEqual(lc.service_argv("n1", {"image": "p:1", "env": None, "ports": None, "volumes": None, "options": None})[-1:], ["p:1"])
+
+    def test_env_keys_named_like_other_keys_stay_env_values(self):
+        # Round-2 finding 1: env `options`/`image` once became docker flags and replaced the image.
+        argv = lc.service_argv("n1", {"image": "postgres:17", "env": {"options": "--privileged -v /:/host", "image": "evil:1"}})
+        self.assertEqual(argv, ["docker", "run", "-d", "--name", "n1", "--label", f"onepeek-local-ci={os.getpid()}",
+                                "-e", "options=--privileged -v /:/host", "-e", "image=evil:1", "postgres:17"])
+
+    BAD_SHAPES = {
+        "env": [{"env": ["P=1"]}, {"env": ""}, {"env": "P=1"}, {"env": {"P": {"x": 1}}}, {"env": {"P": None}}, {"env": {"A=B": "1"}}],
+        "ports": [{"ports": 5432}, {"ports": "5432:5432"}, {"ports": ""}, {"ports": [["5432"]]}, {"ports": ["${{ env.PORT }}:5432"]}],
+        "volumes": [{"volumes": "/a:/b"}, {"volumes": [5432]}, {"volumes": [{"a": "b"}]}, {"volumes": ["${{ runner.temp }}:/x"]}],
+        "image": [{"image": ""}, {"image": ["postgres"]}, {"image": "${{ matrix.image }}"}],
+        "options": [{"options": ["--x"]}, {"options": "--health-cmd 'unclosed"}, {"options": "--name ${{ github.sha }}"}],
+    }
+
+    def test_each_bad_shape_raises_naming_its_key(self):
+        for key, specs in self.BAD_SHAPES.items():
+            for extra in specs:
+                with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, rf"\bkey {key}\b"):
+                    lc.service_argv("n1", {"image": "postgres:17", **extra})
+        for bad in ("postgres:17", ["postgres:17"], None):
+            with self.subTest(spec=bad), self.assertRaisesRegex(ValueError, "not a mapping"):
+                lc.service_argv("n1", bad)
+
+    def test_a_bad_shape_fails_the_job_by_service_and_key_without_a_traceback(self):
+        for services, expect in (("      pg:\n        image: postgres:17\n        ports: 5432\n", "service pg did not start: key ports"),
+                                 ("      pg:\n        image: postgres:17\n        env: [P=1]\n", "service pg did not start: key env"),
+                                 ("      pg:\n        image: postgres:17\n        volumes: ['${{ runner.temp }}:/x']\n",
+                                  "service pg did not start: key volumes"),
+                                 ("      - pg\n", "is not a mapping")):
+            with self.subTest(services=services):
+                rc, calls, out, err = self.run_services(services)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(expect, out)
+                self.assertIn("LOCAL CI NOT OK", out)
+                self.assertNotIn("Traceback", out + err)
+                self.assertEqual([c for c in calls if c[:2] == ["docker", "run"]], [])
+
+    def run_services(self, services: str):
+        d = make_repo_with("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    services:\n" + services
+                           + "    steps:\n      - run: 'true'\n")
+        calls, real = [], subprocess.run
+
+        def fake(argv, *args, **kw):
+            assert all(isinstance(x, str) for x in argv), argv  # the real subprocess.run raises TypeError on anything else
+            if argv[:2] in (["docker", "run"], ["docker", "inspect"], ["docker", "rm"]):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, "healthy\n" if argv[1] == "inspect" else "id\n", "")
+            return real(argv, *args, **kw)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(lc, "docker_ready", return_value=True), mock.patch.object(lc.subprocess, "run", fake), \
+                mock.patch.object(lc.time, "sleep"), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = lc.main([str(d), "--jobs", "a", "--keep-going"])
+            except Exception:  # a crash is the failure this test guards against; show it as output, not as an error
+                return -1, calls, out.getvalue(), traceback.format_exc()
+        return rc, calls, out.getvalue(), err.getvalue()
+
+    def run_job(self, step: str, health: str = "healthy", docker: bool = True, timeout: int = 120):
+        d = make_repo_with("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    services:\n      pg:\n"
+                           f"        image: {self.SPEC['image']} # 17\n        ports: ['127.0.0.1:55432:5432']\n"
+                           f"        env:\n          POSTGRES_DB: onepeek\n    steps:\n      - run: {step}\n")
+        calls, real = [], subprocess.run
+
+        def fake(argv, *args, **kw):
+            assert all(isinstance(x, str) for x in argv), argv  # the real subprocess.run raises TypeError on anything else
+            if argv[:2] in (["docker", "run"], ["docker", "inspect"], ["docker", "rm"]):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, health + "\n" if argv[1] == "inspect" else "id\n", "")
+            return real(argv, *args, **kw)
+        out = io.StringIO()
+        with mock.patch.object(lc, "docker_ready", return_value=docker), mock.patch.object(lc.subprocess, "run", fake), \
+                mock.patch.object(lc, "SERVICE_TIMEOUT", timeout), mock.patch.object(lc.time, "sleep"), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = lc.main([str(d), "--jobs", "a", "--keep-going"])
+        return rc, calls, out.getvalue()
+
+    def removed(self, calls) -> list[str]:
+        return [c[-1] for c in calls if c[:2] == ["docker", "rm"]]
+
+    def test_services_start_before_the_steps_and_are_removed_after_a_pass_and_a_failure(self):
+        rc, calls, out = self.run_job("'true'")
+        self.assertEqual(rc, 0, out)
+        started = [c for c in calls if c[:2] == ["docker", "run"]]
+        self.assertEqual(len(started), 1)
+        name = started[0][started[0].index("--name") + 1]
+        self.assertTrue(name.startswith(f"local-ci-{os.getpid()}-"), name)
+        self.assertIn("127.0.0.1:55432:5432", started[0])
+        self.assertIn("POSTGRES_DB=onepeek", started[0])
+        self.assertEqual(self.removed(calls), [name])
+        rc, calls, out = self.run_job("'false'")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(len(self.removed(calls)), 1)
+
+    def test_a_service_that_never_turns_healthy_fails_the_job_and_is_removed(self):
+        rc, calls, out = self.run_job("'true'", health="starting", timeout=0)
+        self.assertEqual(rc, 1)
+        self.assertIn("service pg is starting, not healthy", out)
+        self.assertEqual(len(self.removed(calls)), 1)
+        rc, calls, out = self.run_job("'true'", health="unhealthy")
+        self.assertEqual(rc, 1)
+        self.assertIn("service pg is unhealthy", out)
+
+    def test_no_docker_means_not_ok_not_a_silent_skip(self):
+        rc, calls, out = self.run_job("'true'", docker=False)
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, [])
+        self.assertIn("its services need Docker", out)
+        self.assertIn("LOCAL CI NOT OK", out)
 
 
 class CallerInputsCheck(unittest.TestCase):
