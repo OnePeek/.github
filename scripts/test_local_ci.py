@@ -686,6 +686,31 @@ class LinuxContainerL2(unittest.TestCase):
         self.assertEqual([(c, bool(l)) for c, l in seen], [("python3", True), ("npx", False)])
         self.assertEqual(seen[0][1][1], "img:1")
 
+    # infra checks.yml, job collector-config, verbatim: it ran in the container and failed with `docker: command not found` (T-67).
+    INFRA_COLLECTOR_STEP = ("docker version --format 'Docker {{.Server.Version}}'\n"
+                            "uvx --with pyyaml==6.0.3 python -m unittest scripts/test_collector_config.py\n")
+
+    def test_a_step_that_calls_docker_stays_on_the_host(self):
+        infra = pathlib.Path(os.environ.get("ONEPEEK_WORKSPACE") or ROOT.parent) / "onepeek-infra/.github/workflows/checks.yml"
+        if infra.is_file():  # the fixture is the real step while infra's checkout is beside this repo
+            steps = yaml.safe_load(infra.read_text(encoding="utf-8"))["jobs"]["collector-config"]["steps"]
+            self.assertIn(self.INFRA_COLLECTOR_STEP, [st.get("run") for st in steps])
+        d = make_repo_with(job_yaml())
+        (d / "scripts").mkdir()
+        (d / "scripts/boot.sh").write_text("docker run --rm x\n", encoding="utf-8")
+        (d / ".github/workflows/checks.yml").write_text(job_yaml(self.INFRA_COLLECTOR_STEP, "scripts/boot.sh --x",
+                                                                 "python3 -m unittest discover -s scripts"), encoding="utf-8")
+        seen = []
+
+        def fake_step(cmd, cwd, env, shell, linux=None):
+            seen.append(linux is not None)
+            return 0, "", 0.0
+        with mock.patch.object(lc.platform, "system", return_value="Darwin"), mock.patch.object(lc, "docker_ready", return_value=True), \
+                mock.patch.object(lc, "ensure_image", return_value="img:1"), mock.patch.object(lc, "run_step", fake_step), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(lc.main([str(d), "--jobs", "a"]), 0)
+        self.assertEqual(seen, [False, False, True])  # both docker steps on the host, the plain script tests in the container
+
     def test_native_turns_it_off(self):
         _, seen, _ = self.run_darwin("--native")
         self.assertEqual([bool(l) for _, l in seen], [False, False])

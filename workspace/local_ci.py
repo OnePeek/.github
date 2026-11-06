@@ -642,6 +642,11 @@ def substitute(text: str, inputs: dict[str, str]) -> str:
     return re.sub(r"\$\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*\}\}", lambda m: inputs.get(m.group(1), m.group(0)), text)
 
 
+def calls_docker(code: str, cmd: str, cwd: pathlib.Path) -> bool:
+    """True when the step (comments removed) calls docker, itself or through a repo script it runs."""
+    return bool(re.search(r"\bdocker\b", code)) or calls_docker_script(cmd, cwd)
+
+
 def calls_docker_script(cmd: str, cwd: pathlib.Path) -> bool:
     """True when the step runs a script in the repo (`scripts/x.sh args`) whose text calls docker."""
     first = (cmd.strip().split() or [""])[0]
@@ -780,7 +785,8 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                     if skip(f"SKIP: needs {unknown[0]}, a value only a CI run has"):
                         return 1
                     continue
-                if a.skip_docker and (re.search(r"\bdocker\b", code) or calls_docker_script(cmd, repo / step.get("working-directory", workdir))):
+                docker_step = calls_docker(code, cmd, repo / step.get("working-directory", workdir))
+                if a.skip_docker and docker_step:
                     if skip(f"docker"):
                         return 1
                     docker_skipped = True
@@ -807,7 +813,9 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                 pkg = cwd / "package.json"
                 keep = pkg.read_bytes() if re.search(r"\bnpm pkg (set|delete|fix)\b", cmd) and pkg.is_file() else None
                 linux = None
-                if platform.system() == "Darwin" and not a.native and wants_linux(code):
+                # A step that calls docker stays on the host: the container has no Docker (never Docker-in-Docker, F31);
+                # infra's collector-config step ran there and failed with `docker: command not found` (T-67).
+                if platform.system() == "Darwin" and not a.native and wants_linux(code) and not docker_step:
                     if a.skip_docker or not docker_ready():
                         why = "Docker is not used (--skip-docker)" if a.skip_docker else "Docker is not available"
                         if a.release:
