@@ -8,6 +8,7 @@ import os
 import pathlib
 import tempfile
 import unittest
+import urllib.parse
 from unittest import mock
 
 import yaml
@@ -25,9 +26,18 @@ SHUTDOWN_REAL = ("The runner has received a shutdown signal. This can happen whe
 CANCELED = "The operation was canceled."
 
 
+T0 = "2026-11-06T10:00:10Z"
+NEWER = "2026-11-06T10:05:00Z"
+OLDER = "2026-11-06T09:00:00Z"
+
+
 class FakeGh:
-    def __init__(self, attempt=1, conclusion="failure", jobs=None, logs=None, notes=None):
+    def __init__(self, attempt=1, conclusion="failure", jobs=None, logs=None, notes=None, event="pull_request",
+                 others=None, head="aaaaaaa1111", runs_error=False, branch_error=None, on_logs=None, branch="feat/x"):
+        self.branch = branch
         self.attempt, self.conclusion = attempt, conclusion
+        self.event, self.others, self.head = event, others if others is not None else [], head
+        self.runs_error, self.branch_error, self.on_logs = runs_error, branch_error, on_logs
         self.jobs = jobs if jobs is not None else [(1, "tests", "failure"), (2, "lint", "success")]
         self.logs = logs or {}
         self.notes = notes or {}
@@ -38,6 +48,17 @@ class FakeGh:
         path = next((a for a in args[1:] if not a.startswith("--")), "") if args[0] == "api" else ""
         if args[0] == "run":
             return ""
+        if "/actions/workflows/" in path:
+            if self.runs_error:
+                raise sr.GhError("500")
+            self.runs_query = urllib.parse.parse_qs(path.split("?", 1)[1])
+            return "".join(json.dumps({"id": i, "created_at": c, "html_url": f"https://github.com/OnePeek/x/actions/runs/{i}"}) + "\n"
+                           for i, c in self.others)
+        if "/branches/" in path:
+            if self.branch_error:
+                # branch_error is the HTTP status gh ends its error with; the message carries the branch name like the real one
+                raise sr.GhError(f"gh api repos/OnePeek/x/branches/{self.branch} failed: gh: error (HTTP {self.branch_error})", self.branch_error)
+            return self.head + "\n"
         if path.startswith("repos/") and "/check-runs/" in path:
             job = int(path.split("/check-runs/")[1].split("/")[0])
             if job not in self.notes:
@@ -45,6 +66,8 @@ class FakeGh:
             return "".join(m + "\n" for m in self.notes[job])
         if path.endswith("/logs") and getattr(self, "old_gh", False) and "--allow-escape-sequences" in args:
             raise sr.GhError("gh api failed: unknown flag: --allow-escape-sequences")
+        if path.endswith("/logs") and self.on_logs:
+            self.on_logs(self)
         if path.endswith("/logs"):
             job = int(path.split("/")[-2])
             if job not in self.logs:
@@ -52,7 +75,9 @@ class FakeGh:
             return self.logs[job]
         if "/jobs" in path:
             return "".join(json.dumps({"id": i, "name": n, "conclusion": c}) + "\n" for i, n, c in self.jobs)
-        return json.dumps({"run_attempt": self.attempt, "conclusion": self.conclusion})
+        return json.dumps({"run_attempt": self.attempt, "conclusion": self.conclusion, "workflow_id": 7,
+                           "name": "checks", "event": self.event, "head_branch": self.branch, "head_sha": "aaaaaaa1111",
+                           "created_at": T0})
 
     def reruns(self) -> list[tuple]:
         return [c for c in self.calls if c[0] == "run"]
@@ -198,6 +223,132 @@ class Decision(unittest.TestCase):
         _, out = go(fake)
         self.assertNotIn("`", out)
         self.assertEqual(len(out.strip().splitlines()), 1)
+
+
+class Superseded(unittest.TestCase):
+    """ci-runners.md section 4.1: a superseded run is never re-run (a re-run would cancel the current run)."""
+
+    def check(self, fake: FakeGh, expect_rerun: bool, text: str = "", **kw) -> str:
+        fake.logs = fake.logs or {1: SHUTDOWN}
+        code, out = go(fake, **kw)
+        self.assertEqual(len(fake.reruns()), 1 if expect_rerun else 0, out)
+        self.assertEqual(code, 0)
+        self.assertIn(text, out)
+        return out
+
+    def test_a_newer_run_of_the_same_workflow_and_branch_supersedes_it(self) -> None:
+        fake = FakeGh(others=[(41, OLDER), (43, NEWER)])
+        self.check(fake, False, "superseded by https://github.com/OnePeek/x/actions/runs/43 (newer run of checks on feat/x)")
+        self.assertEqual(fake.runs_query["branch"], ["feat/x"])
+        self.assertEqual(fake.runs_query["event"], ["pull_request"])
+        self.assertEqual(fake.runs_query["created"], [">=" + T0])
+
+    def test_a_tie_on_created_at_counts_as_newer(self) -> None:
+        self.check(FakeGh(others=[(42, T0), (99, T0)]), False, "superseded by https://github.com/OnePeek/x/actions/runs/99")
+
+    def test_the_run_itself_does_not_supersede_it(self) -> None:
+        self.check(FakeGh(others=[(42, T0)]), True)
+
+    def test_an_older_run_does_not_supersede_it(self) -> None:
+        self.check(FakeGh(others=[(41, OLDER)]), True)
+
+    def test_a_superseded_run_costs_no_log_read(self) -> None:
+        fake = FakeGh(others=[(43, NEWER)])
+        self.check(fake, False)
+        self.assertFalse([c for c in fake.calls if any(str(a).endswith("/logs") for a in c)])
+
+    def test_a_moved_branch_head_supersedes_push_and_pull_request(self) -> None:
+        for event in ("push", "pull_request"):
+            self.check(FakeGh(event=event, head="bbbbbbb2222"), False,
+                       "head of feat/x is now bbbbbbb, not aaaaaaa")
+
+    def test_the_head_still_the_run_head_is_rerun(self) -> None:
+        self.check(FakeGh(event="push", head="aaaaaaa1111"), True)
+
+    def test_a_deleted_branch_supersedes(self) -> None:
+        self.check(FakeGh(branch_error=404), False, "no longer exists")
+
+    def test_schedule_and_dispatch_use_the_newer_run_rule_only(self) -> None:
+        for event in ("schedule", "workflow_dispatch"):
+            self.check(FakeGh(event=event, head="bbbbbbb2222", branch_error=404), True)
+            self.check(FakeGh(event=event, others=[(43, NEWER)]), False)
+
+    def test_a_push_during_the_log_wait_is_caught_by_the_second_check(self) -> None:
+        def push_lands(fake: FakeGh) -> None:
+            fake.head = "bbbbbbb2222"
+        fake = FakeGh(on_logs=push_lands)
+        self.check(fake, False, "head of feat/x is now bbbbbbb")
+
+    def test_a_newer_run_during_the_log_wait_is_caught_by_the_second_check(self) -> None:
+        def run_starts(fake: FakeGh) -> None:
+            fake.others = [(43, NEWER)]
+        self.check(FakeGh(on_logs=run_starts), False, "superseded by https://github.com/OnePeek/x/actions/runs/43")
+
+    def test_runs_are_matched_by_workflow_id_in_the_path(self) -> None:
+        fake = FakeGh()
+        self.check(fake, True)
+        self.assertTrue(any("/actions/workflows/7/runs" in str(a) for c in fake.calls for a in c))
+
+    def test_a_failed_runs_read_re_runs_nothing_and_exits_1(self) -> None:
+        fake = FakeGh(runs_error=True)
+        err = io.StringIO()
+        with mock.patch.object(sr, "gh", fake), mock.patch.dict(os.environ, {"RUN_ID": "42", "REPO": "OnePeek/x"}), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(sr.main(), 1)
+        self.assertEqual(fake.reruns(), [])
+        self.assertIn("::warning::", err.getvalue())
+        self.assertIn("runs of workflow 7", err.getvalue())
+
+    def test_a_branch_named_with_404_and_a_server_error_is_not_a_deleted_branch(self) -> None:
+        fake = FakeGh(event="push", branch="fix/404-page", branch_error=500)
+        err = io.StringIO()
+        with mock.patch.object(sr, "gh", fake), mock.patch.dict(os.environ, {"RUN_ID": "42", "REPO": "OnePeek/x"}), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(err):
+            self.assertEqual(sr.main(), 1)
+        self.assertEqual(fake.reruns(), [])
+        self.assertNotIn("no longer exists", out.getvalue())
+        self.assertIn("head of branch fix/404-page could not be read", err.getvalue())
+        # a real 404 on that same branch name is still a deleted branch
+        self.check(FakeGh(event="push", branch="fix/404-page", branch_error=404), False, "no longer exists")
+
+    def test_gh_reports_the_http_status_it_prints(self) -> None:
+        def done(stderr: str) -> mock.Mock:
+            return mock.Mock(returncode=1, stdout="", stderr=stderr)
+        for stderr, status in (("gh: Not Found (HTTP 404)", 404), ("gh: Internal Server Error (HTTP 500)", 500),
+                               ("could not connect to api.github.com", 0)):
+            with mock.patch.object(sr.subprocess, "run", return_value=done(stderr)):
+                with self.assertRaises(sr.GhError) as ctx:
+                    sr.gh("api", "repos/o/fix/404-page")
+            self.assertEqual(ctx.exception.status, status, stderr)
+
+    def test_a_failed_branch_read_re_runs_nothing_and_exits_1(self) -> None:
+        fake = FakeGh(branch_error=500)
+        err = io.StringIO()
+        with mock.patch.object(sr, "gh", fake), mock.patch.dict(os.environ, {"RUN_ID": "42", "REPO": "OnePeek/x"}), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(sr.main(), 1)
+        self.assertEqual(fake.reruns(), [])
+        self.assertIn("head of branch feat/x could not be read", err.getvalue())
+
+    def test_a_run_without_comparable_fields_re_runs_nothing(self) -> None:
+        fake = FakeGh()
+        real = fake.__call__
+
+        def bare(*args: str) -> str:
+            out = real(*args)
+            return json.dumps({"run_attempt": 1, "conclusion": "failure"}) if "--jq" in args and "run_attempt" in args[-1] else out
+        with self.assertRaises(sr.GhError), contextlib.redirect_stderr(io.StringIO()), mock.patch.object(sr, "gh", bare):
+            sr.run("42", "OnePeek/x")
+        self.assertEqual(fake.reruns(), [])
+
+    def test_rerun_all_workflows_follow_the_same_rules(self) -> None:
+        fake = FakeGh(others=[(43, NEWER)])
+        self.check(fake, False, workflow="sandbox", rerun_all="sandbox")
+        self.check(FakeGh(), True, workflow="sandbox", rerun_all="sandbox")
+
+    def test_a_different_workflow_or_branch_is_not_in_the_list_the_api_returns(self) -> None:
+        # The query names the workflow id, branch and event, so the API returns no such run: re-run.
+        self.check(FakeGh(others=[]), True)
 
 
 class Inputs(unittest.TestCase):
