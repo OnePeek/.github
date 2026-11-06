@@ -17,7 +17,8 @@ same pull request as the fix.
 
 ## Match the real environment
 5. **CI runs Linux, not macOS.** macOS has bash 3.2, CI has bash 5, and pipes behave differently. Run script tests in a
-   Linux container. `local_ci.py` does this from L2 on; until then, use `docker run python:3.14-slim`.
+   Linux container. `local_ci.py` does this from L2 on; until then, mount the worktree and run the changed tests:
+   `docker run --rm -v "<worktree>:/w" -w /w python:3.14-slim sh -c 'apt-get update -qq && apt-get install -qq -y git >/dev/null && python3 -m unittest <test files>'`.
 6. **Use the tool versions CI really uses.** Read them from the one constant that CI uses, never from your laptop. On
    2026-11-06 a local CI container ran Python 3.12 while CI ran 3.14.
 7. **Verify platform behaviour in the official docs before you rely on it** (GitHub contexts, AWS IAM, Terraform, ECS).
@@ -64,7 +65,8 @@ same pull request as the fix.
 
 ## Never wait silently
 21. **Do not wait on CI, a review or a dependency.** On 2026-11-06 an agent sat about 70 minutes waiting on its own
-    background work. Write the status file, push, and hand back `BLOCKED` within about 5 minutes; the coordinator
+    background work. Write the status file, push if you have push authority and local CI is green (otherwise keep the worktree path), and
+    hand back `BLOCKED` within about 5 minutes; the coordinator
     watches and resumes you (`agent-operations.md` §5.6).
 
 ## Added 2026-11-06 (watch until holding, agent-operations.md §8a)

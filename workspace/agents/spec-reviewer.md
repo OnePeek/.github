@@ -29,7 +29,7 @@ Check, with `file:line` evidence:
    - Each testing-plan level is covered.
    - No test is tautological.
 5. **Bypasses.** Try to get past each rule the change relies on, using throwaway fixtures under `/private/tmp` only.
-6. **Gates.** Run every gate in this repo's `AGENTS.md` in a throwaway worktree (`git worktree add /private/tmp/<dir> <branch>`), and remove the worktree afterwards.
+6. **Gates.** Run every gate in this repo's `AGENTS.md` in a throwaway worktree of the pull request's fetched head (`git fetch origin && git worktree add --detach /private/tmp/<dir> origin/<branch>`, never a local branch, which may be stale; `agent-operations.md` §4.3), and remove the worktree afterwards.
 7. **The pushed change is the whole change.** Run `python3 .github/workspace/done_check.py <worktree> --pr <repo>#<n>` on your throwaway worktree, and check that the pull request's files are the ones the packet needs.
 8. **Mutations.** Break at least one behaviour per area yourself and confirm a test fails. A test that cannot fail is blocking.
 9. **Pitfalls.** List each `pitfalls.md` line the change breaks. If you find a new kind of mistake, propose its one-line addition.
