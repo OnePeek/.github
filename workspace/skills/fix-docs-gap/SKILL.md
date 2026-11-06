@@ -16,7 +16,7 @@ Code never merges ahead of its docs (`onepeek-docs/standards/spec-to-code.md` §
 3. **Propose the smallest fix and its reason,** in plain words.
    - If it is a product or architecture choice, ask the founder and record the answer in `decisions/`.
    - Otherwise use the recommended default and mark it provisional in the doc.
-4. **Commit the fix on the change set's one docs pull request** in `../onepeek-docs` (branch `docs/<unit>`; open it only if the unit has none yet, never a second one). Run every gate listed in that repo's `AGENTS.md`, including `python3 tools/context.py --check-all`, and push (`standards/development-cycle.md` §2a).
+4. **Commit the fix on the change set's one docs pull request** in your own worktree of `"$ONEPEEK_WORKSPACE/onepeek-docs"` (`agent-operations.md` §4.3; branch `docs/<unit>`; open it only if the unit has none yet, never a second one). Run every gate listed in that repo's `AGENTS.md`, including `python3 tools/context.py --check-all`, and push (`standards/development-cycle.md` §2a).
 5. **Then, without waiting for a merge:**
    - move this repo's `docs-version.txt` to that new docs commit;
    - regenerate the packet;

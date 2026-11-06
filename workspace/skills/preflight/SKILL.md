@@ -8,10 +8,10 @@ description: Run the preflight check before every push and before every release 
 A check that runs only in CI, or only on a release pull request, costs a CI round each time it fails (onepeek-docs `architecture/lld/infra/foundation-playbook.md` §8a P4, lesson L21). Preflight runs those checks on the laptop first.
 
 ## Steps
-1. **From the workspace root** (the folder holding the repos side by side), on the worktree you are about to push:
-   - before a push: `python3 .github/workspace/preflight.py <repo or worktree dir>`
+1. **On the worktree you are about to push**, never the repo name, which reads the shared checkout (`ONEPEEK_WORKSPACE` is the folder holding the repos side by side):
+   - before a push: `python3 "$ONEPEEK_WORKSPACE/.github/workspace/preflight.py" <worktree>`
    - before opening, updating or merging a `dev` -> `release` pull request: add `--release`.
-   - onepeek-infra, opt-in: add `--live [--profile <read-only profile>] [--plan-json <terraform show -json output>] [--apply-role <role>]` (also `--plan`, `--plan-dir`, `--env`, `--base`, `--memory <image>=<MB>`, `--seconds`, passed through) to run `live_preflight.py` (§8a P9: IAM simulation of the plan, changed images under their task memory limit, the edge's answer to the smoke User-Agent; read-only on AWS; SCPs are not evaluated); it must end `LIVE PREFLIGHT OK`, and any skipped check turns the line WARN.
+   - onepeek-infra, opt-in: add `--live [--profile <read-only profile>] [--plan-json <file>] [--apply-role <role>]` (also `--plan`, `--plan-dir`, `--env`, `--base`, `--memory <image>=<MB>`, `--seconds`, passed through) to run `live_preflight.py` (§8a P9: IAM simulation of the plan, changed images under their task memory limit, the edge's answer to the smoke User-Agent; read-only on AWS; SCPs are not evaluated); it must end `LIVE PREFLIGHT OK`, and any skipped check turns the line WARN. `--plan-json` takes the path of a file holding `terraform show -json <plan>` output, never the JSON itself (save it first: `terraform show -json tfplan > plan.json`), and may be repeated.
 2. **It runs, in order:**
    1. Declared dependencies (§8a P1): the `Depends on: OnePeek/<repo>#<n>` lines of the branch's open pull request, or, before it has one, each `--depends-on OnePeek/<repo>#<n>` you pass. While one is unmerged, preflight refuses: keep the branch local, or open its pull request as a draft (a draft's push is only a warning; its CI waits in the `depends-on` job). When your change needs another repo's unmerged pull request, write that line in your pull request body.
    2. local CI (`local_ci.py`). If local CI does not end `LOCAL CI OK`, preflight refuses: it stops there and runs nothing else.
@@ -19,7 +19,7 @@ A check that runs only in CI, or only on a release pull request, costs a CI roun
    4. The tool versions:
       - Terraform, Python and Node must match every tracked `.terraform-version`, `.python-version` and `.node-version`;
       - uv must be CI's pinned version;
-      - tflint is CI's version, or runs in CI's Docker image, or a warning (a failure under `--release`).
+      - tflint is CI's version, or runs in CI's Docker image, or a warning (a failure under `--release`). Docker covers only a step made of plain tflint commands: a step that runs tflint with other commands needs CI's tflint version on `PATH`, and local CI fails it otherwise, with or without `--release` (foundation-playbook §8a P3).
    5. With `--release`:
       - `docs-version.txt` is on onepeek-docs `main`;
       - the agents' App grants every permission the workflows ask it for and is installed on the repos they name;
