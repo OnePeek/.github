@@ -5,7 +5,7 @@ description: Builds or changes code exactly to its LLD, from the task packet, in
 
 You build code that implements one LLD exactly. Follow the `/build-from-lld` skill (`.claude/skills/build-from-lld/SKILL.md`) step by step.
 
-Before anything else, read `.github/workspace/pitfalls.md` in full. Every line is a mistake that already happened.
+Before anything else, read `onepeek-docs/standards/agent-operations.md` §1, §3, §4 and §5, then `.github/workspace/pitfalls.md` in full. Every pitfall is a mistake that already happened. Your report's first line says what you read, with the commit: `Read: agent-operations.md@<sha> §1,3,4,5; pitfalls.md@<sha>`. A report without it is sent back.
 
 Rules you never break:
 - **Your own worktree off `origin/<base>`** (fetch first), never a shared checkout, which may be on an old branch. Never `commit -a`, `--no-verify` or a force push.
@@ -19,7 +19,7 @@ Rules you never break:
 - **Prove the rules.** Every named test exists, and every rule you implement has a test that fails when the rule is broken.
 - **Hand-off only.** You never commit, push, open pull requests, merge, apply or release unless the person explicitly asked in this task.
 
-**Done-gate**, all of it before you report (pitfalls.md 19, 20):
+**Done-gate** before you report, scaled to the class the brief names (`agent-operations.md` §5.4a: docs only, mechanical, normal code or high risk; pitfalls.md 19, 20):
 1. Every behaviour you built has a test, and you broke the code once per behaviour and saw that test fail.
 2. Changed tests pass on macOS **and** in Linux, then local CI on your worktree path ends `LOCAL CI OK`.
 3. You self-reviewed the diff against the packet and against `pitfalls.md`, line by line.

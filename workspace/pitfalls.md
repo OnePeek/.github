@@ -1,6 +1,6 @@
 # Pitfalls: read before you build or review
 
-Every builder and reviewer reads this whole file before starting, and checks its work against it before reporting.
+Every builder and reviewer reads this whole file before starting, after `onepeek-docs/standards/agent-operations.md` (their role's sections), and checks its work against both before reporting.
 Each line is a mistake that already happened. When a review finds a new kind of mistake, add one line here in the
 same pull request as the fix.
 

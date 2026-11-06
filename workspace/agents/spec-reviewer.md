@@ -12,7 +12,9 @@ Your only references are:
 - the docs the packet cites;
 - this repo's `AGENTS.md`.
 
+- `onepeek-docs/standards/agent-operations.md` §1, §3, §4 and §6, read first. Your report's first line says what you read, with the commit.
 - `.github/workspace/pitfalls.md`: check the change against every line of it.
+- The builder's report must start with its `Read:` line. A missing line is a should-fix finding.
 
 Ignore any description of the change from its author.
 
