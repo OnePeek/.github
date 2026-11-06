@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import unittest
 from unittest import mock
 
@@ -904,13 +905,69 @@ class JobServices(unittest.TestCase):
             "ports": ["127.0.0.1:55432:5432"], "options": '--health-cmd "pg_isready -U postgres" --health-retries 30'}
 
     def test_a_service_runs_as_declared(self):
-        argv = lc.service_argv("n1", self.SPEC, {})
+        argv = lc.service_argv("n1", self.SPEC)
         self.assertEqual(argv, ["docker", "run", "-d", "--name", "n1", "--label", f"onepeek-local-ci={os.getpid()}",
                                 "-e", "POSTGRES_DB=onepeek", "-p", "127.0.0.1:55432:5432", "--health-cmd", "pg_isready -U postgres",
                                 "--health-retries", "30", self.SPEC["image"]])
         for bad in ({**self.SPEC, "credentials": {"username": "u"}}, {**self.SPEC, "env": {"P": "${{ secrets.P }}"}}, {"ports": [1]}):
             with self.assertRaises(ValueError):
-                lc.service_argv("n1", bad, {})
+                lc.service_argv("n1", bad)
+
+    def test_env_keys_named_like_other_keys_stay_env_values(self):
+        # Round-2 finding 1: env `options`/`image` once became docker flags and replaced the image.
+        argv = lc.service_argv("n1", {"image": "postgres:17", "env": {"options": "--privileged -v /:/host", "image": "evil:1"}})
+        self.assertEqual(argv, ["docker", "run", "-d", "--name", "n1", "--label", f"onepeek-local-ci={os.getpid()}",
+                                "-e", "options=--privileged -v /:/host", "-e", "image=evil:1", "postgres:17"])
+
+    BAD_SHAPES = {
+        "env": [{"env": ["P=1"]}, {"env": "P=1"}, {"env": {"P": {"x": 1}}}, {"env": {"P": None}}, {"env": {"A=B": "1"}}],
+        "ports": [{"ports": 5432}, {"ports": "5432:5432"}, {"ports": [["5432"]]}, {"ports": ["${{ env.PORT }}:5432"]}],
+        "volumes": [{"volumes": "/a:/b"}, {"volumes": [{"a": "b"}]}, {"volumes": ["${{ runner.temp }}:/x"]}],
+        "image": [{"image": ""}, {"image": ["postgres"]}, {"image": "${{ matrix.image }}"}],
+        "options": [{"options": ["--x"]}, {"options": "--health-cmd 'unclosed"}, {"options": "--name ${{ github.sha }}"}],
+    }
+
+    def test_each_bad_shape_raises_naming_its_key(self):
+        for key, specs in self.BAD_SHAPES.items():
+            for extra in specs:
+                with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, rf"\bkey {key}\b"):
+                    lc.service_argv("n1", {"image": "postgres:17", **extra})
+        for bad in ("postgres:17", ["postgres:17"], None):
+            with self.subTest(spec=bad), self.assertRaisesRegex(ValueError, "not a mapping"):
+                lc.service_argv("n1", bad)
+
+    def test_a_bad_shape_fails_the_job_by_service_and_key_without_a_traceback(self):
+        for services, expect in (("      pg:\n        image: postgres:17\n        ports: 5432\n", "service pg did not start: key ports"),
+                                 ("      pg:\n        image: postgres:17\n        env: [P=1]\n", "service pg did not start: key env"),
+                                 ("      pg:\n        image: postgres:17\n        volumes: ['${{ runner.temp }}:/x']\n",
+                                  "service pg did not start: key volumes"),
+                                 ("      - pg\n", "is not a mapping")):
+            with self.subTest(services=services):
+                rc, calls, out, err = self.run_services(services)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(expect, out)
+                self.assertIn("LOCAL CI NOT OK", out)
+                self.assertNotIn("Traceback", out + err)
+                self.assertEqual([c for c in calls if c[:2] == ["docker", "run"]], [])
+
+    def run_services(self, services: str):
+        d = make_repo_with("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    services:\n" + services
+                           + "    steps:\n      - run: 'true'\n")
+        calls, real = [], subprocess.run
+
+        def fake(argv, *args, **kw):
+            if argv[:2] in (["docker", "run"], ["docker", "inspect"], ["docker", "rm"]):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, "healthy\n" if argv[1] == "inspect" else "id\n", "")
+            return real(argv, *args, **kw)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(lc, "docker_ready", return_value=True), mock.patch.object(lc.subprocess, "run", fake), \
+                mock.patch.object(lc.time, "sleep"), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = lc.main([str(d), "--jobs", "a", "--keep-going"])
+            except Exception:  # a crash is the failure this test guards against; show it as output, not as an error
+                return -1, calls, out.getvalue(), traceback.format_exc()
+        return rc, calls, out.getvalue(), err.getvalue()
 
     def run_job(self, step: str, health: str = "healthy", docker: bool = True, timeout: int = 120):
         d = make_repo_with("on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    services:\n      pg:\n"

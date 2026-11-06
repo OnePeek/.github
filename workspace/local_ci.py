@@ -686,25 +686,52 @@ def calls_docker_script(cmd: str, cwd: pathlib.Path) -> bool:
 SERVICE_TIMEOUT = 120  # seconds a job's services get to report healthy (T-73)
 
 
-def service_argv(name: str, spec: dict, ctx: dict) -> list[str]:
-    """`docker run -d` for one entry of a job's `services:`, as declared: image, env, ports, volumes, options.
-    ValueError when a value cannot be used here (an expression the laptop cannot fill, credentials, an unknown key)."""
-    if unknown := sorted(set(spec) - {"image", "env", "ports", "volumes", "options"}):
-        raise ValueError(f"service key {unknown[0]} is not supported here")
-    vals = {k: expand(str(v), ctx) for k, v in {"image": spec.get("image", ""), "options": spec.get("options") or "",
-                                               **(spec.get("env") or {})}.items()}
-    if bad := next((k for k, v in vals.items() if EXPR.search(v)), None):
-        raise ValueError(f"{bad} holds an expression the laptop cannot fill")
-    if not vals["image"]:
-        raise ValueError("no image")
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def has_expression(value) -> bool:
+    """True when any key or value anywhere in a parsed YAML value holds `${{`."""
+    if isinstance(value, dict):
+        return any(has_expression(k) or has_expression(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(has_expression(v) for v in value)
+    return "${{" in str(value)
+
+
+def service_argv(name: str, spec) -> list[str]:
+    """`docker run -d` for one entry of a job's `services:`, as declared: each value only from its own key (env only as
+    `-e KEY=VALUE`). ValueError naming the key when the definition has a shape CI would not take, an expression the
+    laptop cannot fill, credentials, or an unknown key; it fails closed (pitfall 14)."""
+    if not isinstance(spec, dict):
+        raise ValueError("its definition is not a mapping")
+    if unknown := sorted(set(map(str, spec)) - {"image", "env", "ports", "volumes", "options"}):
+        raise ValueError(f"key {unknown[0]} is not supported here")
+    if bad := next((str(k) for k, v in spec.items() if has_expression(k) or has_expression(v)), None):
+        raise ValueError(f"key {bad} holds an expression (${{{{ }}}}) the laptop cannot fill")
+    image, options, env = spec.get("image"), spec.get("options", ""), spec.get("env") or {}
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError("key image is not a non-empty string")
+    if not isinstance(options, str):
+        raise ValueError("key options is not a string")
+    if not isinstance(env, dict) or not all(isinstance(k, str) and ENV_NAME.fullmatch(k) and isinstance(v, (str, int, float))
+                                            for k, v in env.items()):
+        raise ValueError("key env is not a mapping of names to scalar values")
+    lists = {}
+    for key in ("ports", "volumes"):
+        lists[key] = spec.get(key) or []
+        if not isinstance(lists[key], list) or not all(isinstance(x, (str, int)) and not isinstance(x, bool) for x in lists[key]):
+            raise ValueError(f"key {key} is not a list of strings")
     argv = ["docker", "run", "-d", "--name", name, "--label", f"onepeek-local-ci={os.getpid()}"]
-    for k in spec.get("env") or {}:
-        argv += ["-e", f"{k}={vals[k]}"]
-    for port in spec.get("ports") or []:
+    for k, v in env.items():
+        argv += ["-e", f"{k}={str(v).lower() if isinstance(v, bool) else v}"]
+    for port in lists["ports"]:
         argv += ["-p", str(port)]
-    for vol in spec.get("volumes") or []:
-        argv += ["-v", str(vol)]
-    return argv + shlex.split(vals["options"]) + [vals["image"]]
+    for vol in lists["volumes"]:
+        argv += ["-v", vol]
+    try:
+        return argv + shlex.split(options) + [image]
+    except ValueError as e:
+        raise ValueError(f"key options does not parse: {e}") from None
 
 
 @contextlib.contextmanager
@@ -720,10 +747,13 @@ def job_services(label0: str, job: dict, a):
         if a.skip_docker or not docker_ready():
             yield "its services need Docker, which " + ("--skip-docker turns off" if a.skip_docker else "is not available")
             return
+        if not isinstance(services, dict):
+            yield "its services: is not a mapping of names to definitions"
+            return
         try:
             for svc, spec in services.items():
                 name = re.sub(r"[^A-Za-z0-9_.-]", "-", f"local-ci-{os.getpid()}-{label0}-{svc}")
-                argv = service_argv(name, spec or {}, a.ctx)
+                argv = service_argv(name, spec)
                 names.append(name)
                 if (r := subprocess.run(argv, capture_output=True, text=True)).returncode:
                     raise ValueError(f"exit {r.returncode}: {(r.stdout + r.stderr).strip()[-300:]}")
