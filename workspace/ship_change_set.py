@@ -1076,12 +1076,16 @@ def main(argv: list[str]) -> int:
                 raise SystemExit(f"STOP {repo}#{n}: {why}")
         keep = [] if base_ref == RELEASE_BASE else ["--delete-branch"]  # a release pull request's head is `dev`: never deleted
         live = dict(info[(repo, n)], body=pr_info(repo, n).get("body"))  # the lane, read again now (never cached)
-        if not hotfix(live):
+        lanes = ["hotfix" if hotfix(x) else "feature" for x in (info[(repo, n)], live)]
+        if lanes[0] != lanes[1]:
+            raise SystemExit(f"STOP {repo}#{n}: the lane changed since the plan ({lanes[0]} -> {lanes[1]}); run "
+                             "again; nothing after it is merged")
+        if lanes[1] == "feature":
             refuse_unresolved(repo, n)  # every review thread read and resolved before the merge (§6.4)
         reviewed = info[(repo, n)]["headRefOid"]  # the review gates, again, right before the merge (F36)
-        why = review_gate(repo, n, live) if head == reviewed else (
-            None if head in TOOL_PUSHED else f"{repo}#{n}: head {head[:7]} is neither the reviewed head "
-                                                     f"{reviewed[:7]} nor a commit this run pushed")
+        why = review_gate(repo, n, live) if lanes[1] == "feature" else None
+        if not why and head != reviewed and head not in TOOL_PUSHED:
+            why = f"{repo}#{n}: head {head[:7]} is neither the reviewed head {reviewed[:7]} nor a commit this run pushed"
         if why:
             raise SystemExit(f"STOP {why}; nothing after it is merged")
         gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, *keep, "--match-head-commit", head)

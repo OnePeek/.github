@@ -37,12 +37,25 @@ class Lane(unittest.TestCase):
 
     def test_a_lane_line_sets_it_in_any_case(self) -> None:
         self.assertEqual(packet.lane_of("fix it\nLane: hotfix\n"), "hotfix")
-        self.assertEqual(packet.lane_of("  lane: Feature  "), "feature")
+        self.assertEqual(packet.lane_of("fix it\r\nlane: HOTFIX\r\n"), "hotfix")
+        self.assertEqual(packet.lane_of("lane: Feature  "), "feature")
 
-    def test_a_bullet_bold_and_trailing_words_are_fine_and_the_first_word_is_the_value(self) -> None:
-        for text in ("- **Lane:** hotfix", "* Lane: hotfix (preprod down)", "Lane: **hotfix**", "x\n  - lane: HOTFIX - restores the release"):
+    def test_a_bullet_and_trailing_words_are_fine_and_the_first_word_is_the_value(self) -> None:
+        for text in ("- Lane: hotfix", "* Lane: hotfix (preprod down)", "Lane: **hotfix**", "x\n- lane: HOTFIX - restores it"):
             self.assertEqual(packet.lane_of(text), "hotfix", text)
-        self.assertEqual(packet.lane_of("- **Lane:** feature (default)"), "feature")
+        self.assertEqual(packet.lane_of("- Lane: feature (default)"), "feature")
+
+    def test_only_a_column_0_line_outside_code_and_details_counts(self) -> None:  # ruling T-53 round 2, pitfall 12
+        for text in ("```markdown\nLane: hotfix\n```", "~~~\nLane: hotfix\n~~~", "  ```\nLane: hotfix\n  ```",
+                     "````\n```\nLane: hotfix\n````", "```\nLane: hotfix", "    Lane: hotfix", "  Lane: hotfix",
+                     "  - Lane: hotfix", "<details><summary>x</summary>\n\nLane: hotfix\n</details>",
+                     "<DETAILS>\nLane: hotfix", "## Lane: hotfix", "# Lane: hotfix", "> Lane: hotfix",
+                     "`Lane: hotfix`", "We use Lane: hotfix here", "Lane\uff1a hotfix", "<p>Lane: hotfix</p>",
+                     "- **Lane:** hotfix", "**Lane:** hotfix", "+ Lane: hotfix", "<!-- x\nLane: hotfix"):
+            with self.subTest(text=text):
+                self.assertEqual(packet.lane_of(text), "feature")
+        self.assertEqual(packet.lane_of("```\nLane: feature\n```\nLane: hotfix"), "hotfix")
+        self.assertEqual(packet.lane_of("<details>\nLane: feature\n</details>\nLane: hotfix"), "hotfix")
 
     def test_an_html_comment_is_ignored_also_beside_a_real_line(self) -> None:
         hint = "<!-- Lane: feature|hotfix -->"
