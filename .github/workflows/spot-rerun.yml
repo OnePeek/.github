@@ -1,3 +1,6 @@
+# A superseded run (a newer or equal run of the same workflow, event and branch, or a branch head that moved or is gone)
+# is never re-run: a re-run would cancel the newer run (ci-runners.md section 4.1, W2.6). Checked before the logs are
+# read and again before the re-run; a failed read re-runs nothing and fails the job.
 # Shared: automatic re-run after a spot reclaim (onepeek-docs architecture/lld/infra/ci-runners.md section 4, row R1,
 # decided 2026-11-04). A spot runner that is reclaimed mid-job fails the job ("The runner has received a shutdown
 # signal" or "lost communication with the server"). This workflow reads the failed jobs of the finished run and their

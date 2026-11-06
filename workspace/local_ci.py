@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import hashlib
 import os
 import platform
 import pathlib
@@ -42,11 +43,95 @@ OPTIONAL_TOOLS = ("trivy",)
 # The versions CI pins (foundation-playbook §8a P3; scripts/test_local_ci.py keeps the shared workflows at these).
 # A different uv on the laptop fails the run with the fix; tflint runs natively at CI's version, else in CI's Docker image, else it is skipped (WARN), or FAILS under --release.
 UV_VERSION = "0.12.0"
+CI_PYTHON = "3.14"  # the runner image's Python minor version; workspace/local-ci/Dockerfile's base must be python:<this>
 TFLINT_VERSION = "0.65.0"
 TFLINT_IMAGE = "ghcr.io/terraform-linters/tflint"
 # One provider cache for every local run and worktree (§8a P6), unless the laptop sets TF_PLUGIN_CACHE_DIR itself.
 SHARED_PLUGIN_CACHE = pathlib.Path.home() / ".cache" / "onepeek" / "terraform-plugins"
+# Skip patterns are matched against the step with shell comments removed (§8c L1).
 REMOTE = re.compile(r"\bgh api\b|\bgh pr\b|\baws \b|GH_TOKEN|GITHUB_TOKEN|configure-aws-credentials|terraform (plan|apply)|\bgit push\b|(?m:terraform\b[^\n]*\binit\b(?![^\n]*-backend=false))|\bgit clone\b[^\n]*github\.com")
+
+
+def strip_comments(cmd: str) -> str:
+    """The step's text with shell comments removed (§8c L1): a `#` starts a comment only at the start of a word (line
+    start or after unquoted whitespace) and outside single and double quotes, and the comment runs to the end of the
+    line. `url#fragment` is not a comment. A line whose quotes do not close is kept whole, so this never hides text."""
+    out = []
+    for line in cmd.splitlines():
+        quote, i, cut = "", 0, None
+        while i < len(line):
+            ch = line[i]
+            if quote:
+                if ch == "\\" and quote in ('"', "$'"):   # a backslash escapes inside double quotes and ANSI-C quotes
+                    i += 1
+                elif ch == quote[-1]:
+                    quote = ""
+            elif ch == "\\":
+                i += 1
+            elif ch == "$" and line[i + 1:i + 2] == "'":   # $'...' (ANSI-C quoting), where \' is an escaped quote
+                quote = "$'"
+                i += 1
+            elif ch in "'\"":
+                quote = ch
+            elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+                cut = i
+                break
+            i += 1
+        out.append(line if quote else (line if cut is None else line[:cut]))
+    return "\n".join(out)
+
+
+TERRAFORM_TEST = re.compile(r"\bterraform\b[^\n;&|]*\btest\b")
+
+
+# Script tests run in a Linux container on macOS (§8c L2).
+LOCAL_CI_DIR = pathlib.Path(__file__).resolve().parent / "local-ci"
+SCRIPT_TESTS = re.compile(r"(?:\bpython3?\s+-m\s+(?:unittest|pytest)\b|\bpytest\b)[^\n]*\bscripts\b|(?:^|[\s;&|(])(?:bash\s+\S+|\S+\.sh)(?![\w.-])", re.M)
+NEEDS_NETWORK = re.compile(r"\b(pip3?|uv|npm|pnpm|yarn|npx|apt-get|curl|wget)\b|\bgit (clone|fetch|pull)\b|\bdocker pull\b")
+
+
+def image_tag(dockerfile: pathlib.Path | None = None) -> str:
+    """`onepeek-local-ci:<first 16 hex of the SHA-256 of the Dockerfile>`: a changed Dockerfile is a new tag."""
+    f = dockerfile or LOCAL_CI_DIR / "Dockerfile"
+    return "onepeek-local-ci:" + hashlib.sha256(f.read_bytes()).hexdigest()[:16]
+
+
+def wants_linux(code: str) -> bool:
+    """True when the step (comments removed) runs script tests: unittest or pytest over scripts/, or a shell script."""
+    return bool(SCRIPT_TESTS.search(code))
+
+
+def ensure_image(dockerfile: pathlib.Path | None = None) -> str:
+    """Build the image when its tag is missing; returns the tag. RuntimeError when the build fails."""
+    f = dockerfile or LOCAL_CI_DIR / "Dockerfile"
+    tag = image_tag(f)
+    if subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode:
+        r = subprocess.run(["docker", "build", "-q", "-t", tag, "-f", str(f), str(f.parent)], capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError("cannot build the local CI image: " + (r.stdout + r.stderr)[-600:])
+    return tag
+
+
+def container_step(cmd: str, cwd: pathlib.Path, env: dict[str, str], repo: pathlib.Path, files: dict[str, str], network: bool,
+                   tag: str) -> tuple[int, str, float]:
+    """The step in the Linux container: the repo (and its git directory, for a worktree) and the run's temp folder at the
+    same paths, the step's environment passed by name, `--network none` unless it reaches a registry, never
+    Docker-in-Docker. Runs as the laptop user so files it writes stay yours."""
+    t = time.time()
+    names = sorted(k for k in {**env, **files} if k not in ("PATH", "HOME", "VIRTUAL_ENV", "TF_PLUGIN_CACHE_DIR") and not k.startswith("AWS_"))
+    mounts = {str(repo.resolve()), str(run_root())}
+    common = subprocess.run(["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True)
+    if common.returncode == 0 and common.stdout.strip():
+        mounts.add(common.stdout.strip())
+    argv = ["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp", "-e", "CI=true",
+            *([] if network else ["--network", "none"])]
+    for m in sorted(mounts):
+        argv += ["-v", f"{m}:{m}"]
+    for k in names:
+        argv += ["-e", k]
+    argv += ["-w", str(cwd), tag, "bash", "-eo", "pipefail", "-c", cmd]
+    r = subprocess.run(argv, env={**os.environ, **env, **files}, capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr, time.time() - t
 
 
 def tool_version(tool: str) -> str | None:
@@ -266,7 +351,8 @@ def venv_bin() -> pathlib.Path:
     return _VENV / "bin"
 
 
-def run_step(cmd: str, cwd: pathlib.Path, env: dict[str, str], shell: str) -> tuple[int, str, float]:
+def run_step(cmd: str, cwd: pathlib.Path, env: dict[str, str], shell: str, linux: tuple | None = None) -> tuple[int, str, float]:
+    """linux: (repo, image tag, network) runs the step in the Linux container instead (§8c L2)."""
     t = time.time()
     env = {**env, "PATH": f"{venv_bin()}:{os.environ['PATH']}", "VIRTUAL_ENV": str(venv_bin().parent)}
     argv = ["bash", "-eo", "pipefail", "-c", cmd] if shell in ("", "bash") or shell.startswith("bash") else ["sh", "-ec", cmd]
@@ -282,17 +368,77 @@ def run_step(cmd: str, cwd: pathlib.Path, env: dict[str, str], shell: str) -> tu
     base.update({"AWS_SHARED_CREDENTIALS_FILE": "/dev/null", "AWS_CONFIG_FILE": "/dev/null"})
     # Terraform providers go to one shared cache, not a copy per repo or worktree (a workflow's own value is CI's).
     env = {**env, "TF_PLUGIN_CACHE_DIR": str(plugin_cache())}
+    if linux:
+        return container_step(cmd, cwd, env, linux[0], files, linux[2], linux[1])
     r = subprocess.run(argv, cwd=cwd, env={**base, "CI": "true", **files, **env}, capture_output=True, text=True)
     return r.returncode, (r.stdout + r.stderr), time.time() - t
 
 
-def shared_checks(repo: pathlib.Path, kind: str, name: str) -> list[tuple[str, list[str]]]:
+SHARED_PIN = re.compile(r"OnePeek/\.github/\.github/workflows/[^@\s]+@([0-9A-Za-z._/-]+)")
+_SHARED: dict[str, pathlib.Path] = {}
+
+
+def shared_worktree(pin: str) -> pathlib.Path:
+    """The shared `.github` at the caller's pin (§8c L4): a detached, temporary worktree of `<workspace>/.github`,
+    fetched when the commit is missing, removed at exit (also after SIGTERM, which exits through atexit).
+    RuntimeError when the pin cannot be found."""
+    if pin in _SHARED:
+        return _SHARED[pin]
+    src = WORKSPACE / ".github"
+    if not (src / ".git").exists():
+        raise RuntimeError(f"no shared checkout at {src} to read the pin {pin[:12]} from")
+    have = lambda: git("rev-parse", "--verify", "--quiet", f"{pin}^{{commit}}", cwd=src).returncode == 0  # noqa: E731
+    if not have():
+        git("fetch", "--quiet", "origin", pin, cwd=src)
+    if not have():
+        git("fetch", "--quiet", "origin", cwd=src)
+    if not have():
+        raise RuntimeError(f"the shared workflows' pin {pin[:12]} is not in {src} and could not be fetched from origin")
+    target = run_root() / f"shared-{re.sub(r'[^A-Za-z0-9]', '_', pin)[:40]}"
+    r = git("worktree", "add", "--detach", "--quiet", str(target), pin, cwd=src)
+    if r.returncode:
+        raise RuntimeError(f"cannot check out the pin {pin[:12]}: {r.stderr.strip()[-200:]}")
+
+    _SHARED[pin] = target
+    return target
+
+
+def cleanup_shared() -> None:
+    """Remove the pin worktrees this run made (at exit, and after SIGTERM, which exits through atexit)."""
+    src = WORKSPACE / ".github"
+    for pin, target in list(_SHARED.items()):
+        if src.is_dir():
+            git("worktree", "remove", "--force", str(target), cwd=src)
+        shutil.rmtree(target, ignore_errors=True)
+        if src.is_dir():
+            git("worktree", "prune", cwd=src)
+        del _SHARED[pin]
+
+
+atexit.register(cleanup_shared)  # registered after run_root's cleanup would be, so it runs first
+
+
+def shared_root(pin: str, shared: str | None) -> pathlib.Path:
+    """Where this run reads the shared workflows and lint from: --shared, else the caller's pin."""
+    if shared:
+        return pathlib.Path(shared).resolve()
+    return shared_worktree(pin) if pin else WORKSPACE / ".github"
+
+
+def shared_notice(shared: str) -> str:
+    path = pathlib.Path(shared).resolve()
+    branch = git("rev-parse", "--abbrev-ref", "HEAD", cwd=path).stdout.strip() or "?"
+    sha = git("rev-parse", "--short=7", "HEAD", cwd=path).stdout.strip() or "?"
+    return f"shared workflows from {path} ({branch} {sha}), not the pin"
+
+
+def shared_checks(repo: pathlib.Path, kind: str, name: str, shared: pathlib.Path | None = None) -> list[tuple[str, list[str]]]:
     checks = []
     if shutil.which("actionlint"):
         checks.append(("actionlint (with shellcheck)", ["actionlint"]))
     # OnePeek/.github lints itself with its own (changed) lint, as its workflow-lint job does; every other repo with the
     # shared checkout's.
-    lint = (repo if name == ".github" else WORKSPACE / ".github") / "scripts/check_runner_labels.py"
+    lint = (repo if name == ".github" else shared or WORKSPACE / ".github") / "scripts/check_runner_labels.py"
     if lint.exists():
         checks.append(("runner-label lint", [sys.executable, str(lint), "--kind", kind,
                                              "--repo", f"OnePeek/{name}", str(repo / ".github/workflows")]))
@@ -359,10 +505,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--skip-docker", action="store_true", help="skip steps that call docker")
     ap.add_argument("--release", action="store_true", help="a release run: a step that needs an optional tool the laptop lacks (trivy; tflint without Docker) fails instead of being skipped, even with --skip-docker")
     ap.add_argument("--list", action="store_true", help="print the steps, run nothing")
+    ap.add_argument("--native", action="store_true", help="on macOS, run script tests on the laptop, not in the Linux container (§8c L2)")
+    ap.add_argument("--shared", metavar="PATH", default=os.environ.get("ONEPEEK_SHARED_GITHUB") or None,
+                    help="read the shared workflows from this .github worktree, not from the caller's pins (§8c L4)")
     a = ap.parse_args(argv)
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # so a stopped run still removes its checkouts and temp files
     repo = pathlib.Path(a.repo).resolve()
+    print(f"local CI on {repo}", flush=True)
     if not (repo / ".github/workflows").is_dir():
         print(f"{repo}: no .github/workflows", file=sys.stderr)
         return 2
@@ -385,7 +535,21 @@ def main(argv: list[str] | None = None) -> int:
         print("FAIL  unresolved merge conflict markers (resolve them first): " + ", ".join(marks[:20]))
         return 1
 
-    for check, cmd in shared_checks(repo, kind, name):
+    if a.shared:
+        if not pathlib.Path(a.shared).is_dir():
+            print(f"FAIL  --shared {a.shared} is not a directory (check --shared and ONEPEEK_SHARED_GITHUB)")
+            return 1
+        print("NOTE  " + shared_notice(a.shared), flush=True)
+    lint_root = None
+    if name != ".github":
+        pins = [m.group(1) for p_ in sorted((repo / ".github/workflows").glob("*.yml")) for m in SHARED_PIN.finditer(p_.read_text(encoding="utf-8"))]
+        try:
+            if a.shared or pins:
+                lint_root = shared_root(max(set(pins), key=pins.count) if pins else "", a.shared)
+        except RuntimeError as e:
+            print(f"FAIL  {e}")
+            return 1
+    for check, cmd in shared_checks(repo, kind, name, lint_root):
         if a.list:
             print(f"[shared] {check}")
             continue
@@ -402,8 +566,15 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             inputs: dict[str, str] = {}
             if "uses" in job:
-                ref = job["uses"].split("@")[0]
-                local = WORKSPACE / ".github" / ref.split("OnePeek/.github/", 1)[-1] if ref.startswith("OnePeek/.github/") else None
+                ref, _, pin = job["uses"].partition("@")
+                pin = pin.split()[0] if pin.split() else ""
+                local = None
+                if ref.startswith("OnePeek/.github/"):
+                    try:
+                        local = shared_root(pin, a.shared) / ref.split("OnePeek/.github/", 1)[-1]
+                    except RuntimeError as e:
+                        print(f"FAIL  {path.name}:{job_id}: {e}")
+                        return 1
                 if not local or not local.exists():
                     skipped.append(f"{path.name}:{job_id} (reusable workflow {ref})")
                     continue
@@ -470,49 +641,79 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
             deps_missing = False
             docker_skipped = False
             aws_role = False
+            dead_tags: set[str] = set()  # image tags a skipped or untranslatable build would have made (§8c L3)
             for i, step in enumerate(job.get("steps") or []):
                 if "configure-aws-credentials" in str(step.get("uses") or ""):
                     aws_role = True  # every later step of the job may call AWS through a script, not only by its own text
+                if str(step.get("uses") or "").startswith("docker/build-push-action@"):
+                    if rc := run_build(label0, step, inputs, repo, workdir, a, skipped, dead_tags):
+                        return rc
+                    continue
                 cmd = step.get("run")
                 if not cmd:
                     continue
                 cmd = expand(substitute(cmd, inputs), a.ctx)
+                code = strip_comments(cmd)  # skip patterns see the code, not its comments (§8c L1)
                 label = f"{label0}: {step.get('name') or cmd.strip().splitlines()[0][:70]}"
+                tf_test = bool(TERRAFORM_TEST.search(code))
+
+                def skip(reason: str) -> bool:
+                    """Records the skip; True when the run must fail (a skipped `terraform test` under --release)."""
+                    if tf_test:
+                        print(f"{'FAIL' if a.release and not a.list else 'WARN'}  {label}: terraform test skipped: {reason}",
+                              file=sys.stderr if not a.release else sys.stdout)
+                        if a.release and not a.list:
+                            return True
+                        skipped.insert(0, f"terraform test skipped: {label} ({reason})")
+                    else:
+                        skipped.append(f"{label} ({reason})")
+                    return False
                 env = {**job_env, **{k: expand(substitute(str(v), inputs), a.ctx) for k, v in (step.get("env") or {}).items()
                                      if not EXPR.search(expand(substitute(str(v), inputs), a.ctx))}}
                 if aws_role:
-                    skipped.append(f"{label} (needs AWS: runs after the job assumes a role)")
+                    if skip("needs AWS: runs after the job assumes a role"):
+                        return 1
                     continue
-                if REMOTE.search(cmd) or any(k in (step.get("env") or {}) for k in ("GH_TOKEN", "GITHUB_TOKEN")):
-                    skipped.append(f"{label} (needs GitHub or AWS)")
+                if REMOTE.search(code) or any(k in (step.get("env") or {}) for k in ("GH_TOKEN", "GITHUB_TOKEN")):
+                    if skip("needs GitHub or AWS"):
+                        return 1
                     continue
                 secret_keys = {k for k, v in {**(job.get("env") or {}), **(step.get("env") or {})}.items() if "secrets." in str(v)}
-                if secret_keys == {"NODE_AUTH_TOKEN"} and re.search(r"\b(pnpm|npm|yarn) (install|ci)\b", cmd) \
+                if dead := sorted(t for t in dead_tags if t in code):
+                    if skip(f"SKIP: needs the image a skipped build makes ({dead[0]})"):
+                        return 1
+                    continue
+                if secret_keys == {"NODE_AUTH_TOKEN"} and re.search(r"\b(pnpm|npm|yarn) (install|ci)\b", code) \
                         and (pkg_token := packages_token()):
                     # The only secret is the package-registry read token: the laptop's gh login (read:packages) stands in,
                     # so the Node checks after it run instead of being skipped. The value is passed to the step, never printed.
                     env["NODE_AUTH_TOKEN"] = pkg_token
                 elif secret_keys:
-                    skipped.append(f"{label} (needs a repository secret)")
-                    if re.search(r"\b(pnpm|npm|yarn) (install|ci)\b", cmd):
+                    if skip(f"needs a repository secret"):
+                        return 1
+                    if re.search(r"\b(pnpm|npm|yarn) (install|ci)\b", code):
                         deps_missing = True
                     continue
                 if deps_missing and not (repo / step.get("working-directory", workdir) / "node_modules").exists() \
                         and re.search(r"\b(pnpm|npm|npx|yarn|node|eslint|tsc|vitest|spectral|prettier)\b", cmd):
-                    skipped.append(f"{label} (SKIP: Node dependencies are not installed; their Install step needs a package-registry token)")
+                    if skip(f"SKIP: Node dependencies are not installed; their Install step needs a package-registry token"):
+                        return 1
                     continue
-                if re.search(r"\bgitleaks (git|detect)\b", cmd):
-                    skipped.append(f"{label} (history scan: CI scans the pull request's commits; the pre-commit hook scans each commit)")
+                if re.search(r"\bgitleaks (git|detect)\b", code):
+                    if skip(f"history scan: CI scans the pull request's commits; the pre-commit hook scans each commit"):
+                        return 1
                     continue
                 if re.match(r"(Install|Set up|Download) ", str(step.get("name") or "")):
-                    skipped.append(f"{label} (tool install; the laptop has its own)")
+                    if skip(f"tool install; the laptop has its own"):
+                        return 1
                     continue
-                missing = [t for t in OPTIONAL_TOOLS if re.search(rf"(?m)^\s*{t}\b", cmd) and not shutil.which(t)]
+                missing = [t for t in OPTIONAL_TOOLS if re.search(rf"(?m)^\s*{t}\b", code) and not shutil.which(t)]
                 if missing and a.release and not a.list:
                     print(f"FAIL  {label}: {missing[0]} is not installed on this laptop (--release does not skip it)")
                     return 1
                 if missing:
-                    skipped.append(f"{label} (SKIP: {missing[0]} is not installed on this laptop)")
+                    if skip(f"SKIP: {missing[0]} is not installed on this laptop"):
+                        return 1
                     continue
                 tflint_docker = False
                 if TFLINT_CALL.search(cmd):
@@ -526,32 +727,37 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                             print(f"FAIL  {label}: {why}")
                             return 1
                         print(f"WARN  {label}: {why}; CI runs it", file=sys.stderr)
-                        skipped.append(f"{label} (SKIP: {why})")
+                        if skip(f"SKIP: {why}"):
+                            return 1
                         continue
                     tflint_docker = tflint_mode(not a.skip_docker) == "docker"
                     if tflint_docker and pure is None:
                         print(f"FAIL  {label}: this step runs other commands besides tflint, so it needs tflint {TFLINT_VERSION} on PATH (Docker runs only plain tflint commands)")
                         return 1
-                if any(re.search(rf"\bmv\s+{re.escape(c)}\b", cmd) for c in checkout_paths if not c.startswith("${{")):
-                    skipped.append(f"{label} (CI-only: places a checkout the laptop does not make)")
+                if any(re.search(rf"\bmv\s+{re.escape(c)}\b", code) for c in checkout_paths if not c.startswith("${{")):
+                    if skip(f"CI-only: places a checkout the laptop does not make"):
+                        return 1
                     continue
                 # A value from the other jobs' results (`needs`) only a CI run has; a script may read it without the step's
                 # text naming it, so such a step is always skipped.
                 from_needs = {str(k) for k, v in {**(job.get("env") or {}), **(step.get("env") or {})}.items()
                               if re.search(r"\$\{\{[^}]*\bneeds\b", str(v))}
                 unknown = [k for k in sorted(unresolved_env(job.get("env"), step.get("env"), ctx=a.ctx))
-                           if k in from_needs or re.search(r"\$\{?" + re.escape(k) + r"\b", cmd)]
+                           if k in from_needs or re.search(r"\$\{?" + re.escape(k) + r"\b", code)]
                 if EXPR.search(str(step.get("working-directory", workdir))):
                     unknown.append("its working directory")
                 if unknown:
-                    skipped.append(f"{label} (SKIP: needs {unknown[0]}, a value only a CI run has)")
+                    if skip(f"SKIP: needs {unknown[0]}, a value only a CI run has"):
+                        return 1
                     continue
-                if a.skip_docker and (re.search(r"\bdocker\b", cmd) or calls_docker_script(cmd, repo / step.get("working-directory", workdir))):
-                    skipped.append(f"{label} (docker)")
+                if a.skip_docker and (re.search(r"\bdocker\b", code) or calls_docker_script(cmd, repo / step.get("working-directory", workdir))):
+                    if skip(f"docker"):
+                        return 1
                     docker_skipped = True
                     continue
-                if docker_skipped and re.search(r"(127\.0\.0\.1|localhost):\d+", cmd + " " + " ".join(map(str, env.values()))):
-                    skipped.append(f"{label} (SKIP: needs a service an earlier skipped docker step starts)")
+                if docker_skipped and re.search(r"(127\.0\.0\.1|localhost):\d+", code + " " + " ".join(map(str, env.values()))):
+                    if skip(f"SKIP: needs a service an earlier skipped docker step starts"):
+                        return 1
                     continue
                 if a.list:
                     print(label)
@@ -566,8 +772,22 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                 # `npm pkg set` (the api-client's "Version as next snapshot") rewrites package.json in the working tree: put it back.
                 pkg = cwd / "package.json"
                 keep = pkg.read_bytes() if re.search(r"\bnpm pkg (set|delete|fix)\b", cmd) and pkg.is_file() else None
+                linux = None
+                if platform.system() == "Darwin" and not a.native and wants_linux(code):
+                    if a.skip_docker or not docker_ready():
+                        why = "Docker is not used (--skip-docker)" if a.skip_docker else "Docker is not available"
+                        if a.release:
+                            print(f"FAIL  {label}: script tests run in a Linux container on macOS and {why} (--native runs them here)")
+                            return 1
+                        print(f"WARN  {label}: script tests run here on the laptop, not in CI's Linux: {why}", file=sys.stderr)
+                    else:
+                        try:
+                            linux = (repo, ensure_image(), bool(NEEDS_NETWORK.search(code)))
+                        except RuntimeError as e:
+                            print(f"FAIL  {label}: {e}")
+                            return 1
                 try:
-                    rc, out, secs = run_step(cmd, cwd, env, str(step.get("shell") or job.get("shell") or ""))
+                    rc, out, secs = run_step(cmd, cwd, env, str(step.get("shell") or job.get("shell") or ""), linux)
                 finally:
                     if keep is not None:
                         pkg.write_bytes(keep)
@@ -578,10 +798,94 @@ def run_job_steps(label0: str, job: dict, wf_env: dict, inputs: dict, repo: path
                         job_env[k] = v
                 if envfile.exists():
                     envfile.write_text("", encoding="utf-8")
-                print(f"{'PASS' if rc == 0 else 'FAIL'}  {label}  ({secs:.0f}s)")
+                print(f"{'PASS' if rc == 0 else 'FAIL'}  {label}  ({secs:.0f}s){'  [linux container]' if linux else ''}")
                 if rc:
                     print(out[-6000:])
                     return 1
+    return 0
+
+
+BUILD_INPUTS = {"context", "file", "platforms", "tags", "build-args", "secrets", "load", "push", "target", "cache-from", "cache-to"}
+
+
+def build_command(step: dict, inputs: dict, ctx: dict, repo: pathlib.Path, workdir: str) -> tuple[list[str], dict[str, str], list[str]]:
+    """`docker buildx build --load` for a docker/build-push-action step with `load: true` and `push` not true (§8c L3).
+    Returns (argv, extra environment, tags). ValueError says why it cannot be translated: an unknown input, a push, an
+    expression the run does not know, a secret the laptop cannot supply."""
+    w = {k: expand(substitute(str(v), inputs), ctx) for k, v in (step.get("with") or {}).items()}
+    if unknown := sorted(set(w) - BUILD_INPUTS):
+        raise ValueError(f"unknown input {unknown[0]}")
+    if w.get("push", "false").strip().lower() == "true" or w.get("load", "false").strip().lower() != "true":
+        raise ValueError("it is not a load-only build (push or no load)")
+    for k, v in w.items():
+        if k not in ("cache-from", "cache-to") and EXPR.search(v) and not (k == "secrets" and "secrets." in v):
+            raise ValueError(f"{k} holds an expression the laptop cannot fill")
+    tags = [t.strip() for t in re.split(r"[\n,]", w.get("tags", "")) if t.strip()]
+    if not tags:
+        raise ValueError("no tags")
+    argv = ["docker", "buildx", "build", "--load"]
+    for t in tags:
+        argv += ["-t", t]
+    if w.get("file"):
+        argv += ["-f", w["file"]]
+    if w.get("platforms"):
+        argv += ["--platform", w["platforms"]]
+    if w.get("target"):
+        argv += ["--target", w["target"]]
+    for line in filter(None, (x.strip() for x in w.get("build-args", "").splitlines())):
+        argv += ["--build-arg", line]
+    env: dict[str, str] = {}
+    for line in filter(None, (x.strip() for x in str((step.get("with") or {}).get("secrets", "")).splitlines())):
+        sid, _, val = line.partition("=")
+        if "secrets." in val:
+            token = packages_token() if sid == "npm_token" else ""
+            if not token:
+                raise ValueError(f"secret {sid} needs a package-registry token (the laptop's gh login with read:packages)")
+            val = token
+        elif EXPR.search(expand(substitute(val, inputs), ctx)):
+            raise ValueError(f"secret {sid} holds an expression the laptop cannot fill")
+        else:
+            val = expand(substitute(val, inputs), ctx)
+        env_name = "LOCAL_CI_SECRET_" + re.sub(r"[^A-Za-z0-9]", "_", sid).upper()
+        env[env_name] = val
+        argv += ["--secret", f"id={sid},env={env_name}"]
+    argv.append(w.get("context") or ".")
+    return argv, env, tags
+
+
+def run_build(label0: str, step: dict, inputs: dict, repo: pathlib.Path, workdir: str, a, skipped: list, dead_tags: set) -> int:
+    """A docker/build-push-action step (§8c L3): built for real, or its tags are removed and the steps that use them skipped.
+    No step ever runs on an image this run did not build."""
+    label = f"{label0}: {step.get('name') or 'docker/build-push-action'}"
+    raw = expand(substitute(str((step.get("with") or {}).get("tags", "")), inputs), a.ctx)
+    tags = [t.strip() for t in re.split(r"[\n,]", raw) if t.strip() and not EXPR.search(t)]
+    try:
+        if a.skip_docker:
+            raise ValueError("--skip-docker")
+        argv, extra, tags = build_command(step, inputs, a.ctx, repo, ".")
+    except ValueError as e:
+        for t in tags:
+            if not a.list and docker_ready():
+                subprocess.run(["docker", "image", "rm", "-f", t], capture_output=True)
+        dead_tags.update(tags)
+        skipped.append(f"{label} (SKIP: build not run here: {e}; later steps that use its image are skipped)")
+        return 0
+    if a.list:
+        print(label)
+        return 0
+    if not docker_ready():
+        dead_tags.update(tags)
+        skipped.append(f"{label} (SKIP: Docker is not available)")
+        return 0
+    for t in tags:  # a tag from an earlier run never stands in for this build
+        subprocess.run(["docker", "image", "rm", "-f", t], capture_output=True)
+    t0 = time.time()
+    base = {k: v for k, v in os.environ.items() if k != "ONEPEEK_WORKSPACE" and not k.startswith("AWS_")}
+    r = subprocess.run(argv, cwd=repo, env={**base, **extra}, capture_output=True, text=True)
+    print(f"{'PASS' if r.returncode == 0 else 'FAIL'}  {label}  ({time.time() - t0:.0f}s)")
+    if r.returncode:
+        print((r.stdout + r.stderr)[-6000:])
+        return 1
     return 0
 
 

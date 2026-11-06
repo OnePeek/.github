@@ -1046,6 +1046,68 @@ class PeerCheckNames(unittest.TestCase):
         self.assertIn("workflow", fields)
 
 
+class ReviewThreads(unittest.TestCase):
+    """agent-operations.md §6.4 (F11): nothing merges while a review thread is unresolved."""
+
+    def test_each_unresolved_thread_is_named_by_path_and_line(self) -> None:
+        calls = []
+        with mock.patch.object(ship, "gh", side_effect=lambda *a: calls.append(a) or '["a.py",12]\n["b/c d.md",null]\n'):
+            self.assertEqual(ship.unresolved_threads(".github", 60), ["a.py:12", "b/c d.md:?"])
+        args = calls[0]
+        self.assertEqual(args[:3], ("api", "graphql", "--paginate"))
+        self.assertIn("repo=.github", args)
+        self.assertIn("n=60", args)
+        self.assertIn("$endCursor", args[args.index("-f") + 1])
+
+    def test_no_unresolved_thread_passes_and_any_one_stops(self) -> None:
+        with mock.patch.object(ship, "gh", return_value=""):
+            ship.refuse_unresolved("x", 1)
+        with mock.patch.object(ship, "gh", return_value='["a.py",3]\n'), mock.patch.object(ship, "say") as said, \
+                self.assertRaises(SystemExit) as stop:
+            ship.refuse_unresolved("x", 1)
+        self.assertIn("1 unresolved review thread", str(stop.exception))
+        said.assert_any_call("x#1: unresolved review thread a.py:3")
+
+    def test_a_failed_query_stops(self) -> None:  # fail closed: gh() raises SystemExit on a non-zero exit
+        with mock.patch.object(ship.subprocess, "run", return_value=done(1, "", "HTTP 502")), self.assertRaises(SystemExit):
+            ship.refuse_unresolved("x", 1)
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
+    def test_the_jq_filter_keeps_only_threads_not_resolved(self) -> None:
+        calls = []
+        with mock.patch.object(ship, "gh", side_effect=lambda *a: calls.append(a) or ""):
+            ship.unresolved_threads("x", 1)
+        jq = calls[0][calls[0].index("--jq") + 1]
+        page = {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
+            {"isResolved": True, "path": "done.py", "line": 1, "originalLine": 1},
+            {"isResolved": False, "path": "open.py", "line": 7, "originalLine": 5},
+            {"isResolved": False, "path": "outdated.py", "line": None, "originalLine": 9},
+            {"isResolved": None, "path": "odd.py", "line": 2, "originalLine": 2}]}}}}}
+        out = subprocess.run(["jq", "-r", jq], input=__import__("json").dumps(page), check=True, capture_output=True,
+                             text=True).stdout
+        with mock.patch.object(ship, "gh", return_value=out):
+            self.assertEqual(ship.unresolved_threads("x", 1), ["open.py:7", "outdated.py:9", "odd.py:2"])
+
+    def test_go_stops_before_the_merge_while_a_thread_is_unresolved(self) -> None:
+        merged = []
+        info = {"state": "OPEN", "baseRefName": "dev", "isDraft": False, "mergeable": "MERGEABLE", "headRefName": "b",
+                "headRefOid": "c" * 40, "body": "", "mergeCommit": None, "isCrossRepository": False}
+
+        def gh(*args):
+            if args[:2] == ("pr", "merge"):
+                merged.append(args)
+            if args[:2] == ("api", "graphql"):
+                return '["app/x.py",4]\n'
+            return ""
+        with mock.patch.object(ship, "docs_pin_problems", return_value=[]), \
+                mock.patch.object(ship, "pr_info", return_value=info), mock.patch.object(ship, "gh", side_effect=gh), \
+                mock.patch.object(ship, "wait_green"), mock.patch.object(ship, "remove_worktrees"), \
+                self.assertRaises(SystemExit) as stop:
+            ship.main(["backend-service#2", "--go"])
+        self.assertIn("unresolved review thread", str(stop.exception))
+        self.assertEqual(merged, [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

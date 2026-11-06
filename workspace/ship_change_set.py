@@ -845,6 +845,37 @@ def refresh_one(repo: str, n: int) -> int:
     return 0
 
 
+REVIEW_THREADS = """query($owner: String!, $repo: String!, $n: Int!, $endCursor: String) {
+  repository(owner: $owner, name: $repo) { pullRequest(number: $n) {
+    reviewThreads(first: 100, after: $endCursor) {
+      nodes { isResolved path line originalLine }
+      pageInfo { hasNextPage endCursor } } } } }"""
+
+
+def unresolved_threads(repo: str, n: int) -> list[str]:
+    """`path:line` of every review thread not resolved (agent-operations.md §6.4, F11). A thread whose resolution is not
+    `true` counts as unresolved, and a failed or unreadable query stops the run (fail closed, pitfalls.md 14)."""
+    out = gh("api", "graphql", "--paginate", "-f", f"query={REVIEW_THREADS}", "-f", f"owner={ORG}", "-f", f"repo={repo}",
+             "-F", f"n={n}", "--jq", ".data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved != true)"
+             " | [.path, (.line // .originalLine)] | @json")
+    threads = []
+    for line in out.splitlines():
+        if line.strip():
+            path, at = json.loads(line)
+            threads.append(f"{path}:{'?' if at is None else at}")
+    return threads
+
+
+def refuse_unresolved(repo: str, n: int) -> None:
+    """Right before a merge: stop while the pull request has any unresolved review thread, naming each one."""
+    threads = unresolved_threads(repo, n)
+    if threads:
+        for t in threads:
+            say(f"{repo}#{n}: unresolved review thread {t}")
+        raise SystemExit(f"STOP {repo}#{n}: {len(threads)} unresolved review thread(s); fix or answer and resolve "
+                         "each one, then run again; nothing after it is merged")
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("prs", nargs="*", help="<repo>#<number>, any order")
@@ -996,6 +1027,7 @@ def main(argv: list[str]) -> int:
             if why:
                 raise SystemExit(f"STOP {repo}#{n}: {why}")
         keep = [] if base_ref == RELEASE_BASE else ["--delete-branch"]  # a release pull request's head is `dev`: never deleted
+        refuse_unresolved(repo, n)  # every review thread read and resolved before the merge (§6.4)
         gh("pr", "merge", str(n), "-R", f"{ORG}/{repo}", method, *keep, "--match-head-commit", head)
         merged = pr_info(repo, n)
         if merged["state"] != "MERGED":

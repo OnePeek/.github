@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+# Packets and agent status files are never committed (agent-operations.md §5.5)
+.context/
