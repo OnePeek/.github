@@ -22,7 +22,7 @@ description: The shipper's procedure. Watch every open pull request, CI run, run
 `ship_change_set.py` enforces these rules. Check them yourself too.
 
 - **Unblock lane** (`Lane: hotfix` as the body's first line; a `Lane:` line anywhere else does not count, `development-cycle.md` §2b):
-  - Rule: the fast checks are green and there are no open real threads.
+  - Rule: the fast checks are green; CodeRabbit threads do not block and become follow-ups (`agent-operations.md` §6.6). A real defect named in a thread is still reported as a builder task.
   - After it merges: add it to the reviewer's post-merge queue in your report.
 - **Feature lane:**
   - the unblock-lane rule;
