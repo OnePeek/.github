@@ -1077,12 +1077,18 @@ SERVICES_FILE = "services:\n  api:\n    image: backend\n    triggers: [http]\n"
 TEMPLATE = json.dumps({"family": "onepeek-preprod-api", "containerDefinitions": [{"name": "api", "image": ""}]})
 
 
+# docker and cosign read the password from stdin as the real tools do: a stub that exits without reading it breaks the pipe
+# under `aws ecr get-login-password | docker login --password-stdin`, and the fake aws then exits 120 (Linux runners race this).
+READS_PASSWORD = 'case " $* " in *" --password-stdin "*) cat >/dev/null ;; esac\nexit 0'
+TOOL_STUBS = {"docker": READS_PASSWORD, "cosign": READS_PASSWORD, "curl": "exit 0"}
+
+
 class OperateRolling(unittest.TestCase):
     """operate.yml's phases (playbook §5.4a "Rollback on cancel", operate.yml): a redeploy writes rolling before its first
     update-service, so a failure puts it back; a rollback never puts back, and a failed one stays locked with an alert."""
 
     def operate(self, action):
-        stubs = {name: "exit 0" for name in ("docker", "cosign", "curl")}
+        stubs = TOOL_STUBS
         return run(OPERATE_STEP, keys={LEGACY: mine(), BACKEND: mine()}, files={"services.yaml": SERVICES_FILE}, stubs=stubs,
                    ACTION=action, SERVICE="api", TARGET="sha-" + "2" * 12 if action == "rollback" else "", REASON="test", LOCK_TOKEN=TOKEN,
                    AWS_REGION="ap-south-1", DOMAIN_PREPROD="preprod.example", AWS_GET_CALLER_IDENTITY="111111111111",
@@ -1119,7 +1125,7 @@ class OperateRolling(unittest.TestCase):
         quick = OPERATE_STEP.replace("SECONDS + 300", "SECONDS + 0")   # no alarm: the watch ends at once
         self.assertNotEqual(quick, OPERATE_STEP)
         out = run(quick, keys={LEGACY: mine(), BACKEND: mine()}, files={"services.yaml": SERVICES_FILE},
-                  stubs={name: "exit 0" for name in ("docker", "cosign", "curl")}, FAIL_PUT_OBJECT="AccessDenied",
+                  stubs=TOOL_STUBS, FAIL_PUT_OBJECT="AccessDenied",
                   ACTION="rollback", SERVICE="api", TARGET="sha-" + "2" * 12, REASON="test", LOCK_TOKEN=TOKEN,
                   AWS_REGION="ap-south-1", DOMAIN_PREPROD="preprod.example", AWS_GET_CALLER_IDENTITY="111111111111",
                   AWS_DESCRIBE_SERVICES=API_TD, AWS_CP=TEMPLATE, AWS_DESCRIBE_IMAGES="sha256:" + "a" * 64,
