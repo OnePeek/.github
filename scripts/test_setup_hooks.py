@@ -54,9 +54,6 @@ class SettingsWithoutTheGuard(unittest.TestCase):
         self.assertEqual(rc, 0, text)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class P19RegisteredParsesTheSettings(unittest.TestCase):
     """Review of #55: the hook counts only as a real PreToolUse entry on Bash, never as text anywhere in the file."""
@@ -80,3 +77,6 @@ class P19RegisteredParsesTheSettings(unittest.TestCase):
                      json.dumps({"hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "hooks/p19_guard.py"}]}]}}),
                      "not json hooks/p19_guard.py"):
             self.assertFalse(self.check(text), text)
+
+if __name__ == "__main__":
+    unittest.main()
