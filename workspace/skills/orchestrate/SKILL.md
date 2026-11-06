@@ -62,11 +62,15 @@ Your own docs rulings are never "mechanical". The reviewer reviews the code buil
    - Builder B takes `backend-service`, `onepeek-web` and the other repos.
    - A builder stays on one repo lane per session.
 3. **File ownership.** Never give two builders tasks that touch the same file. Check the file list of every open pull request (`gh pr view <n> --json files`). Put the tasks one after the other, or stack the pull requests.
+   - **One file, one open pull request per lane:** a further fix to a file that an open unblock-lane pull request already changes is a new commit on that pull request, briefed to its builder, not a new stacked pull request.
+   - A stacked pull request is based on the trunk with a `Depends on:` line, never on another pull request's branch (F39).
 4. **Work-in-progress limit:**
    - Each builder has 1 task at a time.
    - The reviewer works a queue, in this order: post-merge reviews of the unblock lane, then the head of the dependency chain, then features.
    - The shipper is always on.
    - **At most 4 background agents**, briefed through the agent types `builder`, `spec-reviewer` and `shipper`.
+   - **More than 3 high-risk pull requests waiting for review:** run two reviewers and one builder (the watcher script keeps merging); back to one reviewer at three or fewer (founder, 2026-11-06).
+   - **Order the reviewer's queue by the merge chain:** the pull request that unblocks the most others first (2026-11-06: #73 placed last held eight pull requests for 20 minutes).
 5. **Idle rule.** A slot with nothing in the unblock or feature queue stays idle. Never invent work. Never start feature work while something blocks merging.
 
 ## 6. Writing the brief

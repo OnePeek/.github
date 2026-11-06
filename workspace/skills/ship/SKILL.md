@@ -67,3 +67,6 @@ Send the orchestrator a summary once a day.
 - Merge past a red fast check or an open real defect.
 - Merge an unreviewed feature head.
 - Write into `reviews.json`, or reply to or resolve a thread yourself. The orchestrator posts them until the founder allows thread replies for this role.
+
+## Pin rounds (founder, 2026-11-06; operating-model §8 Shipping 9)
+- One pin round per `.github` merge train: merge only the newest tag's round, after the train's last `.github` merge. List older open pin pull requests in your report as superseded; the orchestrator closes them.

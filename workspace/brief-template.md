@@ -37,6 +37,8 @@ Slice (about 400 changed lines at most, generated files and merges aside):
   - Build: <behaviour 1>, <behaviour 2>, ...
   - Files expected to change: <paths>
   - Do NOT touch: <paths other open PRs own>
+  - Files an open unblock-lane PR of this lane already changes: add the fix there as a commit (PR #<n>), never a new stacked PR
+  - Base: the trunk (dev or main) with `Depends on: OnePeek/<repo>#<n>` for any order; never another PR's branch (F39)
 
 Known traps for this slice: <pitfalls.md numbers, or new ones>
 Hostile inputs (when the slice adds or changes a pattern that decides a privilege or a gate: network, credentials,
