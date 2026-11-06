@@ -16,7 +16,7 @@ Env: shell state does not persist between commands; prefix every command that ne
   `export ONEPEEK_WORKSPACE=<the folder holding the repos> &&` (pitfalls.md 37). Read docs from origin/main or the docs
   commit named below (`git -C "$ONEPEEK_WORKSPACE/onepeek-docs" show <ref>:<path>`), never from a shared checkout that may be stale.
 
-Symptom (unblock lane): the failing run's link, the log line, and the behaviour the docs expect (file §section).
+Symptom (unblock lane only; a feature brief leaves it out): the failing run's link, the log line, and the behaviour the docs expect (file §section).
   Never a guessed cause: the builder reproduces first and reports the cause it finds (2026-11-06, T-58).
 
 Spec (read in full before anything else):

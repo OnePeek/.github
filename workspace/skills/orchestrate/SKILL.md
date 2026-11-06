@@ -15,7 +15,7 @@ description: The orchestrator's procedure (the main session in the OnePeek works
    - the runner status;
    - the latest `ship-status.md`;
    - `git worktree list` in each repo, to find agent worktrees left behind.
-   - `git pull --ff-only` on the shared `main` checkouts of `.github` and `onepeek-docs`, so the tools and docs agents read are current (F38: a 79-commit-stale docs checkout lacked `operating-model.md`).
+   - check that the shared `.github` and `onepeek-docs` checkouts are on `main`, then `git -C <repo> pull --ff-only origin main`, so the tools and docs agents read are current (F38: a 79-commit-stale docs checkout lacked `operating-model.md`).
 4. Write the session plan into the task list: the 3 to 6 items you will finish, in order, each with its lane and its owner.
 5. Send the founder one line: what is done, what is next, and what you need from them, if anything.
 
