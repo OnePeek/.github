@@ -88,7 +88,8 @@ TERRAFORM_TEST = re.compile(r"\bterraform\b[^\n;&|]*\btest\b")
 # Script tests run in a Linux container on macOS (§8c L2).
 LOCAL_CI_DIR = pathlib.Path(__file__).resolve().parent / "local-ci"
 SCRIPT_TESTS = re.compile(r"(?:\bpython3?\s+-m\s+(?:unittest|pytest)\b|\bpytest\b)[^\n]*\bscripts\b|(?:^|[\s;&|(])(?:bash\s+\S+|\S+\.sh)(?![\w.-])", re.M)
-NEEDS_NETWORK = re.compile(r"\b(pip3?|uv|npm|pnpm|yarn|npx|apt-get|curl|wget)\b|\bgit (clone|fetch|pull)\b|\bdocker pull\b")
+# Each tool by its full name: `\buv\b` never matched `uvx`, so the contract step ran with no network (T-64).
+NEEDS_NETWORK = re.compile(r"\b(uv|uvx|pip|pip3|pipx|npm|npx|pnpm|pnpx|yarn|apt-get|curl|wget)\b|\bgit (clone|fetch|pull)\b|\bdocker pull\b")
 
 
 def image_tag(dockerfile: pathlib.Path | None = None) -> str:
