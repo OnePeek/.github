@@ -1443,12 +1443,13 @@ class HotfixLane(unittest.TestCase):
     or the thread refusal; the lane is read from the body right before the merge, and anything else is feature."""
 
     def test_only_a_plain_hotfix_line_outside_a_release_is_hotfix(self) -> None:
-        for body, base, want in (("Lane: hotfix", "dev", True), ("- Lane: hotfix (CI red)", "main", True),
-                                 ("```\nLane: hotfix\n```", "dev", False), ("## Lane: hotfix", "dev", False),
-                                 ("", "dev", False), (None, "dev", False), ("Lane: feature", "dev", False),
-                                 ("Lane: hot fix", "dev", False), ("Lane: hotfix\nLane: feature", "dev", False),
-                                 ("<!-- Lane: hotfix -->", "dev", False), ({"x": 1}, "dev", False),
-                                 ("Lane: hotfix", "release", False)):
+        for body, base, want in (("Lane: hotfix", "dev", True), ("<!-- hint -->\nLane: hotfix\nLane: feature", "main", True),
+                                 ("- Lane: hotfix", "dev", False), ("```\nLane: hotfix\n```", "dev", False),
+                                 ("## Lane: hotfix", "dev", False), ("Lane: hotfix\n---", "dev", False),
+                                 ("fix it\nLane: hotfix", "dev", False), ("", "dev", False), (None, "dev", False),
+                                 ("Lane: feature", "dev", False), ("Lane: docs", "main", False),
+                                 ("Lane: hot fix", "dev", False), ("<!-- Lane: hotfix -->", "dev", False),
+                                 ({"x": 1}, "dev", False), ("Lane: hotfix", "release", False)):
             with self.subTest(body=body, base=base):
                 self.assertIs(ship.hotfix({"body": body, "baseRefName": base}), want)
 
@@ -1457,7 +1458,8 @@ class HotfixLane(unittest.TestCase):
                 mock.patch.object(ship, "read_checks", return_value=[{"name": "CodeRabbit", "bucket": "pending"}]):
             i = {"headRefOid": "h3", "baseRefName": "dev", "author": {"login": "Karan-98-Mehta"}}
             self.assertIsNone(REAL_GATE("onepeek-web", 3, dict(i, body="Lane: hotfix")))
-            self.assertIn("no review at h3", REAL_GATE("onepeek-web", 3, dict(i, body="")))
+            for body in ("", "Lane: docs"):  # only hotfix skips the review gates
+                self.assertIn("no review at h3", REAL_GATE("onepeek-web", 3, dict(i, body=body)))
 
     def go(self, bodies: list[str]):
         """main --go on one pull request with an unresolved thread; `bodies` are the bodies successive reads return."""
@@ -1487,6 +1489,11 @@ class HotfixLane(unittest.TestCase):
         rc, merged, said = self.go(["Lane: hotfix"])
         self.assertEqual((rc, len(merged)), (0, 1))
         self.assertIn("backend-service#2: Lane: hotfix, post-merge review due (operating-model §3)", said)
+
+    def test_a_docs_lane_still_refuses_an_unresolved_thread(self) -> None:  # ruling T-53 round 3: docs keeps the gates
+        rc, merged, _ = self.go(["Lane: docs"])
+        self.assertIn("unresolved review thread", rc)
+        self.assertEqual(merged, [])
 
     def test_the_lane_is_read_again_before_the_merge(self) -> None:  # hotfix when planned, feature by the merge
         for bodies in (["Lane: hotfix"] * 4 + ["Lane: feature"], ["Lane: feature"] * 4 + ["Lane: hotfix"]):
