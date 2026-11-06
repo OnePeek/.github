@@ -33,7 +33,8 @@ OLDER = "2026-11-06T09:00:00Z"
 
 class FakeGh:
     def __init__(self, attempt=1, conclusion="failure", jobs=None, logs=None, notes=None, event="pull_request",
-                 others=None, head="aaaaaaa1111", runs_error=False, branch_error=None, on_logs=None):
+                 others=None, head="aaaaaaa1111", runs_error=False, branch_error=None, on_logs=None, branch="feat/x"):
+        self.branch = branch
         self.attempt, self.conclusion = attempt, conclusion
         self.event, self.others, self.head = event, others if others is not None else [], head
         self.runs_error, self.branch_error, self.on_logs = runs_error, branch_error, on_logs
@@ -55,7 +56,8 @@ class FakeGh:
                            for i, c in self.others)
         if "/branches/" in path:
             if self.branch_error:
-                raise sr.GhError(self.branch_error)
+                # branch_error is the HTTP status gh ends its error with; the message carries the branch name like the real one
+                raise sr.GhError(f"gh api repos/OnePeek/x/branches/{self.branch} failed: gh: error (HTTP {self.branch_error})", self.branch_error)
             return self.head + "\n"
         if path.startswith("repos/") and "/check-runs/" in path:
             job = int(path.split("/check-runs/")[1].split("/")[0])
@@ -74,7 +76,7 @@ class FakeGh:
         if "/jobs" in path:
             return "".join(json.dumps({"id": i, "name": n, "conclusion": c}) + "\n" for i, n, c in self.jobs)
         return json.dumps({"run_attempt": self.attempt, "conclusion": self.conclusion, "workflow_id": 7,
-                           "name": "checks", "event": self.event, "head_branch": "feat/x", "head_sha": "aaaaaaa1111",
+                           "name": "checks", "event": self.event, "head_branch": self.branch, "head_sha": "aaaaaaa1111",
                            "created_at": T0})
 
     def reruns(self) -> list[tuple]:
@@ -264,11 +266,11 @@ class Superseded(unittest.TestCase):
         self.check(FakeGh(event="push", head="aaaaaaa1111"), True)
 
     def test_a_deleted_branch_supersedes(self) -> None:
-        self.check(FakeGh(branch_error="gh: Not Found (HTTP 404)"), False, "no longer exists")
+        self.check(FakeGh(branch_error=404), False, "no longer exists")
 
     def test_schedule_and_dispatch_use_the_newer_run_rule_only(self) -> None:
         for event in ("schedule", "workflow_dispatch"):
-            self.check(FakeGh(event=event, head="bbbbbbb2222", branch_error="404"), True)
+            self.check(FakeGh(event=event, head="bbbbbbb2222", branch_error=404), True)
             self.check(FakeGh(event=event, others=[(43, NEWER)]), False)
 
     def test_a_push_during_the_log_wait_is_caught_by_the_second_check(self) -> None:
@@ -297,8 +299,30 @@ class Superseded(unittest.TestCase):
         self.assertIn("::warning::", err.getvalue())
         self.assertIn("runs of workflow 7", err.getvalue())
 
+    def test_a_branch_named_with_404_and_a_server_error_is_not_a_deleted_branch(self) -> None:
+        fake = FakeGh(event="push", branch="fix/404-page", branch_error=500)
+        err = io.StringIO()
+        with mock.patch.object(sr, "gh", fake), mock.patch.dict(os.environ, {"RUN_ID": "42", "REPO": "OnePeek/x"}), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(err):
+            self.assertEqual(sr.main(), 1)
+        self.assertEqual(fake.reruns(), [])
+        self.assertNotIn("no longer exists", out.getvalue())
+        self.assertIn("head of branch fix/404-page could not be read", err.getvalue())
+        # a real 404 on that same branch name is still a deleted branch
+        self.check(FakeGh(event="push", branch="fix/404-page", branch_error=404), False, "no longer exists")
+
+    def test_gh_reports_the_http_status_it_prints(self) -> None:
+        def done(stderr: str) -> mock.Mock:
+            return mock.Mock(returncode=1, stdout="", stderr=stderr)
+        for stderr, status in (("gh: Not Found (HTTP 404)", 404), ("gh: Internal Server Error (HTTP 500)", 500),
+                               ("could not connect to api.github.com", 0)):
+            with mock.patch.object(sr.subprocess, "run", return_value=done(stderr)):
+                with self.assertRaises(sr.GhError) as ctx:
+                    sr.gh("api", "repos/o/fix/404-page")
+            self.assertEqual(ctx.exception.status, status, stderr)
+
     def test_a_failed_branch_read_re_runs_nothing_and_exits_1(self) -> None:
-        fake = FakeGh(branch_error="500")
+        fake = FakeGh(branch_error=500)
         err = io.StringIO()
         with mock.patch.object(sr, "gh", fake), mock.patch.dict(os.environ, {"RUN_ID": "42", "REPO": "OnePeek/x"}), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):

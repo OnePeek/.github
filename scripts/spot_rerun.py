@@ -35,15 +35,23 @@ RUN_ID = re.compile(r"[1-9][0-9]{0,19}", re.ASCII)
 REPO = re.compile(r"(?!\.+/)[A-Za-z0-9._-]+/(?!\.+$)[A-Za-z0-9._-]+", re.ASCII)
 
 
+HTTP_STATUS = re.compile(r"\(HTTP ([0-9]{3})\)")
+
+
 class GhError(Exception):
-    """A gh call failed."""
+    """A gh call failed. `status` is the HTTP status gh printed at the end of its error ("gh: Not Found (HTTP 404)"), or 0."""
+
+    def __init__(self, message: str, status: int = 0) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def gh(*args: str) -> str:
     """Run the gh CLI and return stdout; tests replace this."""
     done = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
     if done.returncode != 0:
-        raise GhError(f"gh {' '.join(args[:2])} failed: {done.stderr.strip()[:300]}")
+        found = HTTP_STATUS.findall(done.stderr)
+        raise GhError(f"gh {' '.join(args[:2])} failed: {done.stderr.strip()[:300]}", int(found[-1]) if found else 0)
     return done.stdout
 
 
@@ -145,7 +153,7 @@ def superseded(repo: str, run_id: str, info: dict) -> str:
         try:
             head = gh("api", f"repos/{repo}/branches/{urllib.parse.quote(branch, safe='/')}", "--jq", ".commit.sha").strip()
         except GhError as e:
-            if "404" in str(e):
+            if e.status == 404:   # the status gh reported, never a "404" inside the message (a branch can be named fix/404-page)
                 return f"run {run_id} is superseded: the branch {clean(branch)} no longer exists"
             print(f"::warning::the head of branch {clean(branch)} could not be read: {e}", file=sys.stderr)
             raise
