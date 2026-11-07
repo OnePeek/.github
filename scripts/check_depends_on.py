@@ -6,7 +6,8 @@ A pull request whose CI needs another repo's unmerged change says so in its body
     Depends on: OnePeek/<repo>#<n>
 
 A repo's `docs-version.txt` is an implicit dependency (lesson L27, item a): when it names a onepeek-docs commit that is
-not on docs `dev` but is a commit of an open onepeek-docs pull request, that is the normal state of a change set until
+not on docs' trunk (its default branch, read from the API as check_pins.docs_trunk does; `dev`, decision 176) but
+is a commit of an open onepeek-docs pull request, that is the normal state of a change set until
 the merge (`ship_change_set.py` merges docs first), so `--check` prints a GitHub Actions notice and passes. With
 `--strict` (callers that gate a merge) that wait fails as a declared one does. When no open docs pull request contains
 the pin, the check fails in both modes; so does a declared `Depends on:` line that is unmerged or closed unmerged.
@@ -133,11 +134,13 @@ def open_docs_prs(sha: str, token: str) -> list[int]:
     return sorted(pr["number"] for pr in prs if pr.get("state") == "open")
 
 
-def docs_waiting(sha: str | None, status, prs, strict: bool = False) -> tuple[list[str], list[str]]:
-    """The implicit docs dependency (lesson L27 a) as (problems, notes). Nothing when there is no pin or it is on docs
-    dev. A pin in an open docs pull request is a note ("waiting for onepeek-docs#N ..."), the normal state of a change
+def docs_waiting(sha: str | None, status, prs, strict: bool = False, trunk: str | None = None) -> tuple[list[str], list[str]]:
+    """The implicit docs dependency (lesson L27 a) as (problems, notes). Nothing when there is no pin or it is on docs'
+    trunk. A pin in an open docs pull request is a note ("waiting for onepeek-docs#N ..."), the normal state of a change
     set, or a problem when `strict`; a pin in no open docs pull request is always a problem.
-    `status(sha)` is the compare status of docs' trunk against sha, `prs(sha)` the open docs pull requests containing it."""
+    `status(sha)` is the compare status of docs' trunk against sha, `prs(sha)` the open docs pull requests containing it.
+    `trunk` is the branch `status` compared against, named in the message (main passes the one docs_trunk read);
+    without it the message names no branch, so it never points people at a branch the check did not read."""
     if not sha or status(sha) in ("ahead", "identical"):
         return [], []
     found = prs(sha)
@@ -145,8 +148,9 @@ def docs_waiting(sha: str | None, status, prs, strict: bool = False) -> tuple[li
         return [f"waiting for {DOCS}#{found[0]} (docs-version.txt pins {sha[:7]}, a commit of that open pull request)"], []
     if found:
         return [], [f"waiting for {DOCS}#{found[0]} (docs-version.txt pins {sha[:7]}); ship_change_set.py merges it first"]
-    return [f"docs pin {sha[:7]} not on docs dev and in no open docs PR; move docs-version.txt to a commit on dev "
-            "or of the change set's docs pull request"], []
+    on = f"docs {trunk}" if trunk else "the docs trunk"
+    return [f"docs pin {sha[:7]} not on {on} and in no open docs PR; move docs-version.txt to a commit on "
+            f"{trunk or 'the docs trunk'} or of the change set's docs pull request"], []
 
 
 def waiting(deps: list[tuple[str, int]], state) -> list[str]:
@@ -199,14 +203,15 @@ def main(argv: list[str] | None = None) -> int:
             problems.append("no token to read onepeek-docs (pass the agents' App secrets, playbook §8a S6)"
                             + (f"; {DEPENDABOT_SECRETS}" if is_dependabot(os.environ) else ""))
         else:
-            found, notes = docs_waiting(pin, lambda s: check_pins.compare_status(s, docs_token),
-                                        lambda s: open_docs_prs(s, docs_token), a.strict)
+            trunk = check_pins.docs_trunk(docs_token)  # read once; SystemExit names an unreadable answer
+            found, notes = docs_waiting(pin, lambda s: check_pins.compare_status(s, docs_token, trunk=lambda _t: trunk),
+                                        lambda s: open_docs_prs(s, docs_token), a.strict, trunk=trunk)
             problems += found
             for note in notes:
                 print(f"::notice title=depends-on::{note}")
             waiting_docs = bool(notes)
             if not problems and not notes:
-                print(f"docs-version.txt pins {pin[:7]}, on onepeek-docs dev.")
+                print(f"docs-version.txt pins {pin[:7]}, on onepeek-docs {trunk}.")
     if deps:
         token = os.environ.get("GH_TOKEN", "")
         problems += waiting(deps, lambda r, n: api_state(r, n, token))

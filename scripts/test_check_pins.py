@@ -105,12 +105,12 @@ class DocsRule(Repo):
         for env in no:
             self.assertFalse(cp.docs_needed(env), env)
 
-    def test_an_ancestor_of_main_passes(self) -> None:
+    def test_an_ancestor_of_the_trunk_passes(self) -> None:
         for status in ("ahead", "identical"):
             d = self.repo(docs=f"# comment\nonepeek-docs@{A}\n")
             self.assertEqual(cp.docs_problems(d, "t", status=lambda sha, tok, s=status, **kw: s, trunk=TRUNK), [])
 
-    def test_a_commit_off_main_fails(self) -> None:
+    def test_a_commit_off_the_trunk_fails(self) -> None:
         d = self.repo(docs=f"onepeek-docs@{A}\n")
         for status in ("diverged", "behind", "missing"):
             out = cp.docs_problems(d, "t", status=lambda sha, tok, s=status, **kw: s, trunk=TRUNK)
@@ -128,7 +128,7 @@ class DocsRule(Repo):
             if branch == "dev":
                 self.assertNotIn("main", out[0])
 
-    def test_the_compare_reads_main_against_the_pinned_commit(self) -> None:
+    def test_the_compare_reads_the_trunk_against_the_pinned_commit(self) -> None:
         seen = []
         cp.docs_problems(self.repo(docs=f"onepeek-docs@{A}\n"), "tok", status=lambda sha, tok, **kw: seen.append((sha, tok)) or "ahead",
                          trunk=TRUNK)
@@ -269,7 +269,7 @@ class Main(Repo):
         d = self.repo(uses(B), docs=f"onepeek-docs@{A}\n")
         env = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_BASE_REF": "release", "GH_TOKEN": "t"}
         with mock.patch.object(cp, "remote_tags", return_value=cp.parse_tags(TAGS)), \
-                mock.patch.dict(cp.os.environ, env), mock.patch.object(cp, "docs_problems", return_value=["off main"]):
+                mock.patch.dict(cp.os.environ, env), mock.patch.object(cp, "docs_problems", return_value=["off the trunk"]):
             self.assertEqual(cp.main([str(d), "--docs", "auto"]), 1)
 
 
