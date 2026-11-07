@@ -119,14 +119,14 @@ def _api() -> str:
     return os.environ.get('GITHUB_API_URL', 'https://api.github.com')
 
 
-def docs_trunk(token: str, opener=urllib.request.urlopen) -> str:
+def docs_trunk(token: str, opener=None) -> str:
     """onepeek-docs' trunk: the repo's `default_branch` from `GET /repos/OnePeek/onepeek-docs` (decision 176: `main`
     today, `dev` after the rename). Any answer that is not a plain branch name is a refusal (SystemExit), never a
     silent fallback to a guessed name."""
     req = urllib.request.Request(f"{_api()}/repos/{ORG}/onepeek-docs",
                                  headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
     try:
-        with opener(req, timeout=30) as r:
+        with (opener or urllib.request.urlopen)(req, timeout=30) as r:  # looked up at call time, like compare_status
             branch = json.load(r).get("default_branch")
     except urllib.error.HTTPError as e:
         raise SystemExit(f"cannot read the default branch of onepeek-docs: HTTP {e.code}")
@@ -153,7 +153,9 @@ def compare_status(sha: str, token: str, trunk=None, opener=None) -> str:
         raise SystemExit(f"cannot compare {sha[:7]} with onepeek-docs {branch}: HTTP {e.code}")
 
 
-def docs_problems(repo: pathlib.Path, token: str, status=compare_status) -> list[str]:
+def docs_problems(repo: pathlib.Path, token: str, status=None, trunk=None) -> list[str]:
+    """The docs ancestor rule. The trunk is read once (`trunk`, default docs_trunk, looked up at call time) and named in
+    every message, so a failure never tells people to move the pin to a branch the check did not read."""
     has, sha = docs_pin(repo)
     if not has:
         return []
@@ -161,13 +163,14 @@ def docs_problems(repo: pathlib.Path, token: str, status=compare_status) -> list
         return ["docs-version.txt holds no onepeek-docs@<40-character sha> line"]
     if not token:
         return ["no token to read onepeek-docs (pass the agents' App secrets, playbook §8a S6)"]
-    st = status(sha, token)
+    branch = (trunk or docs_trunk)(token)  # SystemExit names an unreadable answer
+    st = (status or compare_status)(sha, token, trunk=lambda _token: branch)
     if st in ("ahead", "identical"):
         return []
     if st == "missing":
         return [f"docs-version.txt pins {sha[:7]}, which onepeek-docs does not have"]
-    return [f"docs-version.txt pins {sha[:7]}, which is not an ancestor of onepeek-docs main ({st}); "
-            "merge the docs pull request first, or move the pin to a commit on main"]
+    return [f"docs-version.txt pins {sha[:7]}, which is not an ancestor of onepeek-docs {branch} ({st}); "
+            f"merge the docs pull request first, or move the pin to a commit on {branch}"]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -190,10 +193,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"OK  no {ORG}/.github pins")
     run_docs = a.docs == "always" or (a.docs == "auto" and docs_needed(dict(os.environ)))
     if run_docs:
-        docs = docs_problems(repo, os.environ.get("GH_TOKEN", ""))
+        read: list[str] = []
+
+        def trunk(token: str) -> str:
+            read.append(docs_trunk(token))
+            return read[-1]
+
+        docs = docs_problems(repo, os.environ.get("GH_TOKEN", ""), trunk=trunk)
         problems += docs
         if not docs:
-            print("OK  docs-version.txt is an ancestor of onepeek-docs main (or the repo has none)")
+            print(f"OK  docs-version.txt is an ancestor of onepeek-docs {read[0]}" if read
+                  else "OK  no docs-version.txt, so no docs pin to check")
     else:
         print("--  docs-version.txt ancestor rule not run for this event (pull requests into dev pin the docs PR head)")
     for p in problems:
