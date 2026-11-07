@@ -6,7 +6,7 @@ A pull request whose CI needs another repo's unmerged change says so in its body
     Depends on: OnePeek/<repo>#<n>
 
 A repo's `docs-version.txt` is an implicit dependency (lesson L27, item a): when it names a onepeek-docs commit that is
-not on docs `main` but is a commit of an open onepeek-docs pull request, that is the normal state of a change set until
+not on docs `dev` but is a commit of an open onepeek-docs pull request, that is the normal state of a change set until
 the merge (`ship_change_set.py` merges docs first), so `--check` prints a GitHub Actions notice and passes. With
 `--strict` (callers that gate a merge) that wait fails as a declared one does. When no open docs pull request contains
 the pin, the check fails in both modes; so does a declared `Depends on:` line that is unmerged or closed unmerged.
@@ -135,9 +135,9 @@ def open_docs_prs(sha: str, token: str) -> list[int]:
 
 def docs_waiting(sha: str | None, status, prs, strict: bool = False) -> tuple[list[str], list[str]]:
     """The implicit docs dependency (lesson L27 a) as (problems, notes). Nothing when there is no pin or it is on docs
-    main. A pin in an open docs pull request is a note ("waiting for onepeek-docs#N ..."), the normal state of a change
+    dev. A pin in an open docs pull request is a note ("waiting for onepeek-docs#N ..."), the normal state of a change
     set, or a problem when `strict`; a pin in no open docs pull request is always a problem.
-    `status(sha)` is the compare status of main against sha, `prs(sha)` the open docs pull requests containing it."""
+    `status(sha)` is the compare status of docs' trunk against sha, `prs(sha)` the open docs pull requests containing it."""
     if not sha or status(sha) in ("ahead", "identical"):
         return [], []
     found = prs(sha)
@@ -145,7 +145,7 @@ def docs_waiting(sha: str | None, status, prs, strict: bool = False) -> tuple[li
         return [f"waiting for {DOCS}#{found[0]} (docs-version.txt pins {sha[:7]}, a commit of that open pull request)"], []
     if found:
         return [], [f"waiting for {DOCS}#{found[0]} (docs-version.txt pins {sha[:7]}); ship_change_set.py merges it first"]
-    return [f"docs pin {sha[:7]} not on main and in no open docs PR; move docs-version.txt to a commit on main "
+    return [f"docs pin {sha[:7]} not on docs dev and in no open docs PR; move docs-version.txt to a commit on dev "
             "or of the change set's docs pull request"], []
 
 
@@ -206,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"::notice title=depends-on::{note}")
             waiting_docs = bool(notes)
             if not problems and not notes:
-                print(f"docs-version.txt pins {pin[:7]}, on onepeek-docs main.")
+                print(f"docs-version.txt pins {pin[:7]}, on onepeek-docs dev.")
     if deps:
         token = os.environ.get("GH_TOKEN", "")
         problems += waiting(deps, lambda r, n: api_state(r, n, token))

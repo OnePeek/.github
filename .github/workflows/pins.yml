@@ -1,7 +1,7 @@
 # Shared: the pin check (onepeek-docs architecture/lld/infra/foundation-playbook.md §8a P2 and S4). Called by every
 # OnePeek repo on pull requests and on pushes to dev and release. Fails when the repo's OnePeek/.github pins are not
 # all the commit of one v* tag, and, on a push to dev or release or a pull request into release, when docs-version.txt
-# is not an ancestor of onepeek-docs main (pull requests into dev pin the open docs pull request's head during a
+# is not an ancestor of onepeek-docs dev (pull requests into dev pin the open docs pull request's head during a
 # change set, development-cycle §2a item 2). The logic is scripts/check_pins.py at the commit the caller pins this
 # workflow to. The docs rule reads the private docs repo with the agents' App token (S6): callers pass
 # AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY; without them only that rule fails, and only when it runs.
@@ -93,7 +93,7 @@ jobs:
           repositories: onepeek-docs
           permission-contents: read
 
-      - name: Pins are one tagged version; docs-version.txt is on docs main
+      - name: Pins are one tagged version; docs-version.txt is on docs dev
         env:
           SCRIPT: ${{ steps.docs.outputs.script }}
           GH_TOKEN: ${{ steps.app.outputs.token }}

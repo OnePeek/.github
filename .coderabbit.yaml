@@ -23,7 +23,6 @@ reviews:
     base_branches:
       - "^dev$"
       - "^release$"
-      - "^main$"
   path_filters:
     - "!**/node_modules/**"
     - "!**/.next/**"

@@ -3,7 +3,7 @@
 # `needs:` it, not only checks.yml, so no runner time is spent on a run whose result is already known. It fails with
 # "waiting for <repo>#<n>" while a pull request named in the body by a `Depends on: OnePeek/<repo>#<n>` line is
 # unmerged, and, with no line needed, when the caller's docs-version.txt names a onepeek-docs commit that is in no open
-# docs pull request and not on docs main. A pin that is a commit of an open docs pull request is the normal state of a
+# docs pull request and not on docs dev. A pin that is a commit of an open docs pull request is the normal state of a
 # change set until the merge: the job prints a notice ("waiting for onepeek-docs#<n>") and passes, because
 # ship_change_set.py merges docs first (its strict check, and preflight --release's, fail that wait). Callers trigger on
 # pull_request types opened, reopened and synchronize, never edited (it re-ran every check on a body edit): when a dependency merges, ship_change_set.py re-runs the

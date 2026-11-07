@@ -25,7 +25,7 @@ Lane: feature
 ## Checklist
 - [ ] Docs first: the LLD, contracts and any PRD/TRD/HLD updates are committed on the change set's docs pull request, which merges first (development-cycle §2a), or none is needed
 - [ ] Follows `code-guidelines.md` and this repo's guide: layers, no hard-coded values, typed inputs, tests
-- [ ] `docs-version.txt` points at the docs pull request's latest commit (or its merge on `main`)
+- [ ] `docs-version.txt` points at the docs pull request's latest commit (or its merge on `dev`)
 - [ ] No secrets and no personal data in code, tests, fixtures or logs
 - [ ] Tests and CI gates pass
 - [ ] Title follows Conventional Commits (`feat:`, `fix:`, `chore:` …), targeting `dev` (or `release` for a release)

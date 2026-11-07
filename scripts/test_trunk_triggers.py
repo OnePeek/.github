@@ -1,4 +1,4 @@
-"""Decision 176 (one trunk, `dev`): this repo's trunk workflows run under either name until the rename is done."""
+"""Decision 176 (one trunk, `dev`; no `main`): this repo's trunk workflows run on `dev` only."""
 from __future__ import annotations
 
 import pathlib
@@ -32,25 +32,28 @@ def runs_if(expr: str | None, ctx: dict) -> bool:
 
 
 class TrunkTriggers(unittest.TestCase):
-    def test_a_push_to_main_or_dev_cuts_the_tag(self) -> None:
-        self.assertEqual(load("tag-main.yml")[True]["push"]["branches"], ["main", "dev"])
+    def test_a_push_to_dev_cuts_the_tag(self) -> None:
+        self.assertEqual(load("tag-main.yml")[True]["push"]["branches"], ["dev"])
 
     def test_only_a_push_to_the_default_branch_cuts_the_tag(self) -> None:  # .github#90 B1
         job = load("tag-main.yml")["jobs"]["tag"]
         cases = [  # (pushed branch, default branch, the tag job runs)
-            ("main", "main", True),   # today: a merge to main
-            ("dev", "main", False),   # dev created or pushed while main is still the default
-            ("dev", "dev", True),     # after the rename
-            ("main", "dev", False),   # a stray main after the rename
+            ("dev", "dev", True),          # a merge to the trunk
+            ("release", "dev", False),     # any other branch the trigger may come to list
+            ("dev", "other", False),       # dev while some other branch is the default
         ]
         for ref, default, runs in cases:
             ctx = {"github": {"ref_name": ref, "event": {"repository": {"default_branch": default}}}}
             self.assertEqual(runs_if(job.get("if"), ctx), runs, (ref, default))
 
-    def test_workflow_lint_runs_on_pushes_and_pull_requests_into_main_or_dev(self) -> None:
+    def test_workflow_lint_runs_on_pushes_and_pull_requests_into_dev(self) -> None:
         on = load("workflow-lint.yml")[True]
-        self.assertEqual(on["push"]["branches"], ["main", "dev"])
-        self.assertEqual(on["pull_request"]["branches"], ["main", "dev"])
+        self.assertEqual(on["push"]["branches"], ["dev"])
+        self.assertEqual(on["pull_request"]["branches"], ["dev"])
+
+    def test_coderabbit_reviews_pull_requests_into_dev_and_release_only(self) -> None:
+        cfg = yaml.safe_load((WF.parents[1] / ".coderabbit.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(cfg["reviews"]["auto_review"]["base_branches"], ["^dev$", "^release$"])
 
     def test_the_image_bump_targets_the_default_branch_on_a_schedule_too(self) -> None:
         # A schedule event has no repository payload; it runs on the default branch, so ref_name is the fallback.
