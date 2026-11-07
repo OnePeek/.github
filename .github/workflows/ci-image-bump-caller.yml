@@ -19,7 +19,9 @@ jobs:
       contents: read
     with:
       runner: github
-      base: main
+      # The default branch (decision 176). A schedule event carries no repository payload, and runs on the default
+      # branch, so ref_name is that branch there.
+      base: ${{ github.event.repository.default_branch || github.ref_name }}
     secrets:
       CI_BUMP_APP_ID: ${{ secrets.CI_BUMP_APP_ID }}
       CI_BUMP_APP_PRIVATE_KEY: ${{ secrets.CI_BUMP_APP_PRIVATE_KEY }}

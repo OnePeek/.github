@@ -1,6 +1,8 @@
 """Tests for scripts/check_pins.py and pins.yml (foundation-playbook §8a P2, S4): one tagged version, docs on main."""
 from __future__ import annotations
 
+import contextlib
+import io
 import pathlib
 import shutil
 import subprocess
@@ -15,6 +17,7 @@ import check_pins as cp
 A, B, C, D = "a" * 40, "b" * 40, "c" * 40, "d" * 40
 TAGS = f"{A}\trefs/tags/v1.7.0\n{B}\trefs/tags/v1.8.0\n{C}\trefs/tags/v1.8.1\n{D}\trefs/tags/v1.8.1^{{}}\n" \
        f"{A}\trefs/tags/not-a-version\n"
+MAIN = lambda token: "main"  # noqa: E731  docs' trunk today
 WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / ".github/workflows/pins.yml"
 
 
@@ -105,17 +108,30 @@ class DocsRule(Repo):
     def test_an_ancestor_of_main_passes(self) -> None:
         for status in ("ahead", "identical"):
             d = self.repo(docs=f"# comment\nonepeek-docs@{A}\n")
-            self.assertEqual(cp.docs_problems(d, "t", status=lambda sha, tok, s=status: s), [])
+            self.assertEqual(cp.docs_problems(d, "t", status=lambda sha, tok, s=status, **kw: s, trunk=MAIN), [])
 
     def test_a_commit_off_main_fails(self) -> None:
         d = self.repo(docs=f"onepeek-docs@{A}\n")
         for status in ("diverged", "behind", "missing"):
-            out = cp.docs_problems(d, "t", status=lambda sha, tok, s=status: s)
+            out = cp.docs_problems(d, "t", status=lambda sha, tok, s=status, **kw: s, trunk=MAIN)
             self.assertEqual(len(out), 1, status)
+
+    def test_the_message_names_the_trunk_the_check_read(self) -> None:  # .github#90 S1
+        d = self.repo(docs=f"onepeek-docs@{A}\n")
+        for branch in ("main", "dev"):
+            seen: list = []
+            out = cp.docs_problems(d, "t", status=lambda sha, tok, trunk: seen.append(trunk(tok)) or "diverged",
+                                   trunk=lambda tok, b=branch: b)
+            self.assertEqual(seen, [branch])  # the compare uses the same trunk the message names
+            self.assertIn(f"not an ancestor of onepeek-docs {branch} (diverged)", out[0])
+            self.assertIn(f"move the pin to a commit on {branch}", out[0])
+            if branch == "dev":
+                self.assertNotIn("main", out[0])
 
     def test_the_compare_reads_main_against_the_pinned_commit(self) -> None:
         seen = []
-        cp.docs_problems(self.repo(docs=f"onepeek-docs@{A}\n"), "tok", status=lambda sha, tok: seen.append((sha, tok)) or "ahead")
+        cp.docs_problems(self.repo(docs=f"onepeek-docs@{A}\n"), "tok", status=lambda sha, tok, **kw: seen.append((sha, tok)) or "ahead",
+                         trunk=MAIN)
         self.assertEqual(seen, [(A, "tok")])
 
     def test_no_file_is_nothing_to_check_and_a_file_without_a_pin_fails(self) -> None:
@@ -125,6 +141,86 @@ class DocsRule(Repo):
     def test_no_token_fails_instead_of_passing(self) -> None:
         self.assertEqual(len(cp.docs_problems(self.repo(docs=f"onepeek-docs@{A}\n"), "")), 1)
 
+
+
+class Answer:
+    """A fake urlopen answer: a context manager whose body json.load reads."""
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def __enter__(self):
+        import io
+        return io.BytesIO(self.body)
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+
+def opener(body: bytes | None = None, error: Exception | None = None, seen: list | None = None):
+    def _open(req, timeout):
+        if seen is not None:
+            seen.append(req.full_url)
+        if error is not None:
+            raise error
+        return Answer(body)
+    return _open
+
+
+class DocsTrunk(unittest.TestCase):
+    """Decision 176: the docs trunk is read from the API (main today, dev after the rename); an unreadable answer fails."""
+
+    def test_today_main_is_read_and_compared_as_before(self) -> None:
+        seen: list = []
+        self.assertEqual(cp.docs_trunk("t", opener=opener(b'{"default_branch": "main"}', seen=seen)), "main")
+        self.assertEqual(seen, ["https://api.github.com/repos/OnePeek/onepeek-docs"])
+        urls: list = []
+        st = cp.compare_status(A, "t", trunk=lambda tok: "main", opener=opener(b'{"status": "ahead"}', seen=urls))
+        self.assertEqual((st, urls), ("ahead", [f"https://api.github.com/repos/OnePeek/onepeek-docs/compare/{A}...main"]))
+
+    def test_after_the_rename_dev_is_the_compare_base(self) -> None:
+        self.assertEqual(cp.docs_trunk("t", opener=opener(b'{"default_branch": "dev"}')), "dev")
+        urls: list = []
+        st = cp.compare_status(A, "t", trunk=lambda tok: "dev", opener=opener(b'{"status": "identical"}', seen=urls))
+        self.assertEqual((st, urls), ("identical", [f"https://api.github.com/repos/OnePeek/onepeek-docs/compare/{A}...dev"]))
+
+    def test_compare_status_reads_the_trunk_by_default(self) -> None:
+        urls: list = []
+        with mock.patch.object(cp, "docs_trunk", return_value="dev") as trunk:
+            cp.compare_status(A, "tok", opener=opener(b'{"status": "ahead"}', seen=urls))
+        trunk.assert_called_once_with("tok")
+        self.assertTrue(urls[0].endswith(f"/compare/{A}...dev"), urls)
+
+    def test_an_unreadable_answer_fails_naming_it_and_never_guesses_main(self) -> None:
+        import urllib.error
+        cases = {
+            "404": opener(error=urllib.error.HTTPError("u", 404, "Not Found", {}, None)),
+            "500": opener(error=urllib.error.HTTPError("u", 500, "err", {}, None)),
+            "timeout": opener(error=TimeoutError("timed out")),
+            "urlerror": opener(error=urllib.error.URLError("no route")),
+            "not json": opener(b"<html>"),
+            "a list": opener(b"[]"),
+            "no key": opener(b'{"name": "onepeek-docs"}'),
+            "null": opener(b'{"default_branch": null}'),
+            "a number": opener(b'{"default_branch": 7}'),
+        }
+        for name, op in cases.items():
+            with self.assertRaises(SystemExit, msg=name) as e:
+                cp.docs_trunk("t", opener=op)
+            self.assertIn("cannot read the default branch of onepeek-docs", str(e.exception.code), name)
+
+    def test_a_hostile_branch_name_fails_closed(self) -> None:
+        for value in ("../x", "..", "a..b", "dev main", " dev", "dev\n", "", "x/y", "-dev", "dev?x=1", "dev#x", "a" * 101):
+            body = ('{"default_branch": %s}' % __import__("json").dumps(value)).encode()
+            with self.assertRaises(SystemExit, msg=value):
+                cp.docs_trunk("t", opener=opener(body))
+
+    def test_a_failed_trunk_read_fails_the_docs_rule(self) -> None:
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "docs-version.txt").write_text(f"onepeek-docs@{A}\n")
+        with mock.patch.object(cp, "docs_trunk", side_effect=SystemExit("cannot read the default branch of onepeek-docs: HTTP 404")):
+            with self.assertRaises(SystemExit):
+                cp.docs_problems(d, "t", status=cp.compare_status)
 
 class Main(Repo):
     def test_exit_status_follows_the_problems(self) -> None:
@@ -140,6 +236,34 @@ class Main(Repo):
                 mock.patch.dict(cp.os.environ, env), mock.patch.object(cp, "compare_status") as compare:
             self.assertEqual(cp.main([str(d), "--docs", "auto"]), 0)
         compare.assert_not_called()
+
+    def test_the_ok_line_names_the_trunk_read_and_a_failed_read_never_says_main(self) -> None:  # .github#90 S1
+        d = self.repo(uses(B), docs=f"onepeek-docs@{A}\n")
+        env = {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/dev", "GH_TOKEN": "t"}
+        with mock.patch.object(cp, "remote_tags", return_value=cp.parse_tags(TAGS)), mock.patch.dict(cp.os.environ, env), \
+                mock.patch.object(cp, "docs_trunk", return_value="dev"), \
+                mock.patch.object(cp, "compare_status", return_value="ahead"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cp.main([str(d), "--docs", "auto"]), 0)
+        self.assertIn("OK  docs-version.txt is an ancestor of onepeek-docs dev", out.getvalue())
+        self.assertNotIn("main", out.getvalue())
+        failed = SystemExit("cannot read the default branch of onepeek-docs: HTTP 404")
+        with mock.patch.object(cp, "remote_tags", return_value=cp.parse_tags(TAGS)), mock.patch.dict(cp.os.environ, env), \
+                mock.patch.object(cp, "docs_trunk", side_effect=failed), \
+                mock.patch.object(cp, "compare_status", side_effect=AssertionError("no compare without a trunk")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            with self.assertRaises(SystemExit) as e:
+                cp.main([str(d), "--docs", "auto"])
+        self.assertIn("cannot read the default branch of onepeek-docs: HTTP 404", str(e.exception.code))
+        self.assertNotIn("main", str(e.exception.code) + out.getvalue())
+
+    def test_a_repo_without_a_docs_pin_says_so(self) -> None:
+        d = self.repo(uses(B))
+        with mock.patch.object(cp, "remote_tags", return_value=cp.parse_tags(TAGS)), \
+                mock.patch.object(cp, "docs_trunk", side_effect=AssertionError("nothing to read")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cp.main([str(d), "--docs", "always"]), 0)
+        self.assertIn("OK  no docs-version.txt, so no docs pin to check", out.getvalue())
 
     def test_auto_runs_the_docs_rule_on_a_release_pull_request(self) -> None:
         d = self.repo(uses(B), docs=f"onepeek-docs@{A}\n")

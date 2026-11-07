@@ -4,7 +4,7 @@ name: tag-main
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]  # decision 176: both names until the rename is done
 
 concurrency:
   group: tag-main
@@ -15,6 +15,9 @@ permissions:
 
 jobs:
   tag:
+    # Only the trunk cuts a tag: while both names are listed, creating or pushing the other one (decision 176 makes `dev`
+    # while `main` is still the default) would re-tag the same commit as the next patch version (.github#90 B1).
+    if: github.ref_name == github.event.repository.default_branch
     uses: ./.github/workflows/release-tag.yml
     with:
       first-version: v1.0.0 # after the old moving tag v1; this repo is not a pre-launch product repo
