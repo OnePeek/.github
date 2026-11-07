@@ -4,7 +4,7 @@ name: tag-main
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]  # decision 176: both names until the rename is done
 
 concurrency:
   group: tag-main

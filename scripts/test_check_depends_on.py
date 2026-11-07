@@ -131,6 +131,16 @@ class Main(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("not on main and in no open docs PR", out)
 
+    def test_the_docs_compare_reads_docs_trunk_and_an_unreadable_trunk_fails(self) -> None:  # decision 176
+        (self.dir / "docs-version.txt").write_text(f"onepeek-docs@{PIN}\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"BODY": "", "GH_TOKEN": "t", "DOCS_TOKEN": "d"}), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(cd.check_pins, "docs_trunk",
+                                  side_effect=SystemExit("cannot read the default branch of onepeek-docs: HTTP 404")):
+            with self.assertRaises(SystemExit) as e:
+                cd.main(["--check", "--repo-dir", str(self.dir)])
+        self.assertIn("cannot read the default branch of onepeek-docs", str(e.exception.code))
+
     def test_check_passes_on_a_pin_on_main_and_still_checks_declared_lines(self) -> None:
         self.assertEqual(self.run_main(["--check"], "", pin=PIN, status="ahead")[0], 0)
         rc, out = self.run_main(["--check"], BODY, pin=PIN, status="identical")
@@ -229,7 +239,7 @@ class Workflow(unittest.TestCase):
         self.assertEqual(next(s for s in STEPS if s.get("id") == "body")["if"], has_pr)
         self.assertEqual(STEPS[-1]["if"], has_pr)
         on = yaml.safe_load((WORKFLOW.parent / "workflow-lint.yml").read_text(encoding="utf-8"))[True]
-        self.assertEqual(on["push"]["branches"], ["main"])  # this repo's own caller is fine on push
+        self.assertEqual(on["push"]["branches"], ["main", "dev"])  # this repo's own caller is fine on push (decision 176)
 
     def test_the_docs_pin_gets_its_own_token_read_only_on_onepeek_docs(self) -> None:  # L27 (a)
         deps = next(s for s in STEPS if s.get("id") == "deps")
