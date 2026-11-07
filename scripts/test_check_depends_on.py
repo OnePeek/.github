@@ -76,7 +76,7 @@ class DocsWaiting(unittest.TestCase):  # lesson L27 (a): the implicit docs depen
                 problems, notes = cd.docs_waiting(PIN, lambda s, st=st: st, lambda s: [], strict)
                 self.assertEqual(notes, [])
                 self.assertEqual(len(problems), 1)
-                self.assertIn("docs pin aaaaaaa not on main and in no open docs PR", problems[0])
+                self.assertIn("docs pin aaaaaaa not on docs dev and in no open docs PR", problems[0])
 
     def test_only_open_pull_requests_count_lowest_first(self) -> None:
         prs = [{"number": 9, "state": "open"}, {"number": 3, "state": "closed"}, {"number": 4, "state": "open"}]
@@ -110,6 +110,12 @@ class Main(unittest.TestCase):
             rc = cd.main([*argv, "--repo-dir", str(self.dir)])
         return rc, buf.getvalue()
 
+    def test_a_pin_on_docs_dev_passes_and_says_so(self) -> None:  # decision 176: the trunk is dev
+        rc, out = self.run_main(["--check"], "", pin=PIN, status="ahead")
+        self.assertEqual(rc, 0)
+        self.assertIn("docs-version.txt pins aaaaaaa, on onepeek-docs dev.", out)
+        self.assertNotIn("main", out)
+
     def test_docs_pin_prints_the_pinned_commit_or_nothing(self) -> None:
         self.assertEqual(self.run_main(["--docs-pin"], ""), (0, "\n"))
         self.assertEqual(self.run_main(["--docs-pin"], "", pin=PIN), (0, PIN + "\n"))
@@ -129,7 +135,7 @@ class Main(unittest.TestCase):
     def test_check_fails_on_a_pin_in_no_open_docs_pull_request(self) -> None:
         rc, out = self.run_main(["--check"], "", pin=PIN)
         self.assertEqual(rc, 1)
-        self.assertIn("not on main and in no open docs PR", out)
+        self.assertIn("not on docs dev and in no open docs PR", out)
 
     def test_the_docs_compare_reads_docs_trunk_and_an_unreadable_trunk_fails(self) -> None:  # decision 176
         (self.dir / "docs-version.txt").write_text(f"onepeek-docs@{PIN}\n", encoding="utf-8")
@@ -239,7 +245,7 @@ class Workflow(unittest.TestCase):
         self.assertEqual(next(s for s in STEPS if s.get("id") == "body")["if"], has_pr)
         self.assertEqual(STEPS[-1]["if"], has_pr)
         on = yaml.safe_load((WORKFLOW.parent / "workflow-lint.yml").read_text(encoding="utf-8"))[True]
-        self.assertEqual(on["push"]["branches"], ["main", "dev"])  # this repo's own caller is fine on push (decision 176)
+        self.assertEqual(on["push"]["branches"], ["dev"])  # this repo's own caller is fine on push (decision 176)
 
     def test_the_docs_pin_gets_its_own_token_read_only_on_onepeek_docs(self) -> None:  # L27 (a)
         deps = next(s for s in STEPS if s.get("id") == "deps")
@@ -351,7 +357,7 @@ class Dependabot(unittest.TestCase):  # pitfall 8: Dependabot runs get no Action
                 mock.patch.object(cd, "open_docs_prs", return_value=[]):
             rc = cd.main(["--check", "--repo-dir", str(self.dir)])
         self.assertEqual(rc, 1)
-        self.assertIn("not on main and in no open docs PR", buf.getvalue())
+        self.assertIn("not on docs dev and in no open docs PR", buf.getvalue())
 
     def test_the_workflow_lists_files_only_for_dependabots_own_run_and_passes_them_on(self) -> None:
         files = next(s for s in STEPS if s.get("id") == "files")

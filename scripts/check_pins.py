@@ -7,10 +7,10 @@
 1. Every `uses:` in the repo's workflows that names `OnePeek/.github` (in any letter case) is a pin: its ref is a
    40-character commit SHA (a branch or a tag name fails), the commit of a `v*` tag of OnePeek/.github (S4), and all of
    them are the commit of **one** tag (P2).
-2. `docs-version.txt` (`onepeek-docs@<sha>`) is an ancestor of onepeek-docs `main`. With `--docs auto` (CI) this runs
-   only on a push to `dev` or `release` and on a pull request into `release`; a pull request into `dev` pins the open
-   docs pull request's head during a change set (development-cycle §2a item 2). It reads the private docs repo through
-   the API with GH_TOKEN (the App token in CI, `gh auth token` on a laptop).
+2. `docs-version.txt` (`onepeek-docs@<sha>`) is an ancestor of onepeek-docs' trunk (`dev`, read from the API). With
+   `--docs auto` (CI) this runs only on a push to `dev` or `release` and on a pull request into `release`; a pull
+   request into `dev` pins the open docs pull request's head during a change set (development-cycle §2a item 2). It
+   reads the private docs repo through the API with GH_TOKEN (the App token in CI, `gh auth token` on a laptop).
 
 A repo with no `docs-version.txt` (onepeek-docs, .github) has no docs pin to check. Exit 1 when a rule is broken.
 Standard library only: our runner image has no pip.
@@ -120,9 +120,8 @@ def _api() -> str:
 
 
 def docs_trunk(token: str, opener=None) -> str:
-    """onepeek-docs' trunk: the repo's `default_branch` from `GET /repos/OnePeek/onepeek-docs` (decision 176: `main`
-    today, `dev` after the rename). Any answer that is not a plain branch name is a refusal (SystemExit), never a
-    silent fallback to a guessed name."""
+    """onepeek-docs' trunk: the repo's `default_branch` from `GET /repos/OnePeek/onepeek-docs` (decision 176: `dev`).
+    Any answer that is not a plain branch name is a refusal (SystemExit), never a silent fallback to a guessed name."""
     req = urllib.request.Request(f"{_api()}/repos/{ORG}/onepeek-docs",
                                  headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
     try:
@@ -138,7 +137,7 @@ def docs_trunk(token: str, opener=None) -> str:
 
 
 def compare_status(sha: str, token: str, trunk=None, opener=None) -> str:
-    """GitHub's compare status of docs' trunk (its default branch, `main` until the rename) against the pinned commit:
+    """GitHub's compare status of docs' trunk (its default branch, `dev`) against the pinned commit:
     `ahead` or `identical` means the commit is an ancestor of the trunk."""
     branch = (trunk or docs_trunk)(token)
     req = urllib.request.Request(

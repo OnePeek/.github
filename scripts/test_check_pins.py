@@ -1,4 +1,4 @@
-"""Tests for scripts/check_pins.py and pins.yml (foundation-playbook §8a P2, S4): one tagged version, docs on main."""
+"""Tests for scripts/check_pins.py and pins.yml (foundation-playbook §8a P2, S4): one tagged version, docs on dev."""
 from __future__ import annotations
 
 import contextlib
@@ -17,7 +17,7 @@ import check_pins as cp
 A, B, C, D = "a" * 40, "b" * 40, "c" * 40, "d" * 40
 TAGS = f"{A}\trefs/tags/v1.7.0\n{B}\trefs/tags/v1.8.0\n{C}\trefs/tags/v1.8.1\n{D}\trefs/tags/v1.8.1^{{}}\n" \
        f"{A}\trefs/tags/not-a-version\n"
-MAIN = lambda token: "main"  # noqa: E731  docs' trunk today
+TRUNK = lambda token: "dev"  # noqa: E731  docs' trunk (decision 176)
 WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / ".github/workflows/pins.yml"
 
 
@@ -108,12 +108,12 @@ class DocsRule(Repo):
     def test_an_ancestor_of_main_passes(self) -> None:
         for status in ("ahead", "identical"):
             d = self.repo(docs=f"# comment\nonepeek-docs@{A}\n")
-            self.assertEqual(cp.docs_problems(d, "t", status=lambda sha, tok, s=status, **kw: s, trunk=MAIN), [])
+            self.assertEqual(cp.docs_problems(d, "t", status=lambda sha, tok, s=status, **kw: s, trunk=TRUNK), [])
 
     def test_a_commit_off_main_fails(self) -> None:
         d = self.repo(docs=f"onepeek-docs@{A}\n")
         for status in ("diverged", "behind", "missing"):
-            out = cp.docs_problems(d, "t", status=lambda sha, tok, s=status, **kw: s, trunk=MAIN)
+            out = cp.docs_problems(d, "t", status=lambda sha, tok, s=status, **kw: s, trunk=TRUNK)
             self.assertEqual(len(out), 1, status)
 
     def test_the_message_names_the_trunk_the_check_read(self) -> None:  # .github#90 S1
@@ -131,7 +131,7 @@ class DocsRule(Repo):
     def test_the_compare_reads_main_against_the_pinned_commit(self) -> None:
         seen = []
         cp.docs_problems(self.repo(docs=f"onepeek-docs@{A}\n"), "tok", status=lambda sha, tok, **kw: seen.append((sha, tok)) or "ahead",
-                         trunk=MAIN)
+                         trunk=TRUNK)
         self.assertEqual(seen, [(A, "tok")])
 
     def test_no_file_is_nothing_to_check_and_a_file_without_a_pin_fails(self) -> None:
@@ -167,17 +167,17 @@ def opener(body: bytes | None = None, error: Exception | None = None, seen: list
 
 
 class DocsTrunk(unittest.TestCase):
-    """Decision 176: the docs trunk is read from the API (main today, dev after the rename); an unreadable answer fails."""
+    """Decision 176: the docs trunk is read from the API (`dev`), never assumed; an unreadable answer fails."""
 
-    def test_today_main_is_read_and_compared_as_before(self) -> None:
+    def test_whatever_branch_the_api_names_is_read_and_compared(self) -> None:
         seen: list = []
-        self.assertEqual(cp.docs_trunk("t", opener=opener(b'{"default_branch": "main"}', seen=seen)), "main")
+        self.assertEqual(cp.docs_trunk("t", opener=opener(b'{"default_branch": "trunk"}', seen=seen)), "trunk")
         self.assertEqual(seen, ["https://api.github.com/repos/OnePeek/onepeek-docs"])
         urls: list = []
-        st = cp.compare_status(A, "t", trunk=lambda tok: "main", opener=opener(b'{"status": "ahead"}', seen=urls))
-        self.assertEqual((st, urls), ("ahead", [f"https://api.github.com/repos/OnePeek/onepeek-docs/compare/{A}...main"]))
+        st = cp.compare_status(A, "t", trunk=lambda tok: "trunk", opener=opener(b'{"status": "ahead"}', seen=urls))
+        self.assertEqual((st, urls), ("ahead", [f"https://api.github.com/repos/OnePeek/onepeek-docs/compare/{A}...trunk"]))
 
-    def test_after_the_rename_dev_is_the_compare_base(self) -> None:
+    def test_dev_is_the_compare_base(self) -> None:
         self.assertEqual(cp.docs_trunk("t", opener=opener(b'{"default_branch": "dev"}')), "dev")
         urls: list = []
         st = cp.compare_status(A, "t", trunk=lambda tok: "dev", opener=opener(b'{"status": "identical"}', seen=urls))
