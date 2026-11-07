@@ -233,7 +233,7 @@ class Workflow(unittest.TestCase):
 
     def test_the_docs_pin_gets_its_own_token_read_only_on_onepeek_docs(self) -> None:  # L27 (a)
         deps = next(s for s in STEPS if s.get("id") == "deps")
-        self.assertIn('--docs-pin', deps["run"])
+        self.assertIn('--docs-read', deps["run"])
         docs = next(s for s in STEPS if s.get("id") == "docs-app")
         self.assertEqual(docs["if"], "${{ github.event.pull_request.number != '' && steps.deps.outputs.docs != '' }}")
         self.assertEqual(docs["with"]["repositories"], "onepeek-docs")
@@ -260,6 +260,104 @@ class Workflow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+DEPENDABOT_ENV = {"PR_AUTHOR": "dependabot[bot]", "GITHUB_ACTOR": "dependabot[bot]", "GITHUB_EVENT_NAME": "pull_request"}
+
+
+class Dependabot(unittest.TestCase):  # pitfall 8: Dependabot runs get no Actions secrets, so no App token
+    def setUp(self) -> None:
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        (self.dir / "docs-version.txt").write_text(f"onepeek-docs@{PIN}\n", encoding="utf-8")
+
+    def run_main(self, argv: list[str], env: dict[str, str], body: str = "", files: list[str] | None = None,
+                 docs_token: str = "") -> tuple[int, str]:
+        env = {"BODY": body, "GH_TOKEN": "", "DOCS_TOKEN": docs_token, **env}
+        if files is not None:
+            (self.dir / "files.txt").write_text("\n".join(files) + "\n", encoding="utf-8")
+            env["CHANGED_FILES"] = str(self.dir / "files.txt")
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("PR_AUTHOR", "GITHUB_ACTOR", "GITHUB_EVENT_NAME", "CHANGED_FILES", "BODY_FILE", "IS_DRAFT")}
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {**clean, **env}, clear=True), contextlib.redirect_stdout(buf), \
+                mock.patch.object(cd, "api_state", side_effect=lambda r, n, t: ("open", False)), \
+                mock.patch.object(cd.check_pins, "compare_status", side_effect=AssertionError("no docs read")), \
+                mock.patch.object(cd, "open_docs_prs", side_effect=AssertionError("no docs read")):
+            rc = cd.main([*argv, "--repo-dir", str(self.dir)])
+        return rc, buf.getvalue()
+
+    def test_a_dependabot_bump_needs_no_read_and_passes_with_a_notice(self) -> None:
+        files = [".github/workflows/prerelease.yml"]  # onepeek-design-system#71
+        rc, out = self.run_main(["--check"], DEPENDABOT_ENV, files=files)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("::notice title=depends-on::Dependabot pull request with no `Depends on:` line that does not "
+                      "change docs-version.txt: no cross-repo read needed", out)
+        self.assertNotIn("::error", out)
+        self.assertEqual(self.run_main(["--docs-read"], DEPENDABOT_ENV, files=files), (0, "\n"))
+        self.assertEqual(self.run_main(["--docs-pin"], DEPENDABOT_ENV, files=files), (0, PIN + "\n"))
+
+    def test_a_human_pull_request_made_to_look_like_dependabot_still_needs_the_token(self) -> None:
+        body = "Bumps pnpm/action-setup from 6.1.0 to 6.1.1.\n---\nupdated-dependencies:\n- dependency-name: x\n"
+        for env in ({**DEPENDABOT_ENV, "PR_AUTHOR": "karan"},          # branch dependabot/..., title chore(deps): bump
+                    {**DEPENDABOT_ENV, "PR_AUTHOR": "dependabot"},     # a user named like the bot
+                    {**DEPENDABOT_ENV, "GITHUB_ACTOR": "karan"},       # a human pushed to Dependabot's branch
+                    {**DEPENDABOT_ENV, "GITHUB_EVENT_NAME": "pull_request_target"},
+                    {"PR_AUTHOR": "dependabot[bot]"}, {}):
+            rc, out = self.run_main(["--check"], env, body=body, files=["package.json"])
+            self.assertEqual(rc, 1, env)
+            self.assertIn("::error::no token to read onepeek-docs", out)
+            self.assertEqual(self.run_main(["--docs-read"], env, files=["package.json"]), (0, PIN + "\n"), env)
+        rc, out = self.run_main(["--check"], {**DEPENDABOT_ENV, "PR_AUTHOR": "karan"}, files=["package.json"])
+        self.assertNotIn("Dependabot secrets", out)  # the Dependabot hint names only Dependabot's own runs
+
+    def test_a_dependabot_pull_request_that_adds_a_depends_on_line_needs_the_token(self) -> None:
+        body = "Bump.\nDepends on: OnePeek/onepeek-docs#7\n"
+        self.assertEqual(self.run_main(["--repos"], DEPENDABOT_ENV, body=body, files=["package.json"]), (0, "onepeek-docs\n"))
+        self.assertEqual(self.run_main(["--docs-read"], DEPENDABOT_ENV, body=body, files=["package.json"]), (0, PIN + "\n"))
+        rc, out = self.run_main(["--check"], DEPENDABOT_ENV, body=body, files=["package.json"])
+        self.assertEqual(rc, 1)
+        self.assertIn("set AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY as Dependabot secrets "
+                      "(gh secret set --app dependabot)", out)
+
+    def test_a_dependabot_pull_request_that_changes_docs_version_needs_the_token(self) -> None:
+        for files in (["docs-version.txt"], ["package.json", "docs-version.txt"]):
+            self.assertEqual(self.run_main(["--docs-read"], DEPENDABOT_ENV, files=files), (0, PIN + "\n"))
+            rc, out = self.run_main(["--check"], DEPENDABOT_ENV, files=files)
+            self.assertEqual(rc, 1, files)
+            self.assertIn("as Dependabot secrets (gh secret set --app dependabot)", out)
+
+    def test_an_unknown_file_list_never_exempts(self) -> None:  # fail closed
+        for env in (DEPENDABOT_ENV, {**DEPENDABOT_ENV, "CHANGED_FILES": str(self.dir / "missing.txt")}):
+            self.assertEqual(self.run_main(["--docs-read"], env), (0, PIN + "\n"))
+            self.assertEqual(self.run_main(["--check"], env)[0], 1)
+
+    def test_with_the_token_a_dependabot_pull_request_that_needs_a_read_is_checked_as_any_other(self) -> None:
+        buf = io.StringIO()
+        (self.dir / "files.txt").write_text("docs-version.txt\n", encoding="utf-8")
+        env = {**DEPENDABOT_ENV, "BODY": "", "DOCS_TOKEN": "d", "CHANGED_FILES": str(self.dir / "files.txt")}
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(buf), \
+                mock.patch.object(cd.check_pins, "compare_status", return_value="diverged"), \
+                mock.patch.object(cd, "open_docs_prs", return_value=[]):
+            rc = cd.main(["--check", "--repo-dir", str(self.dir)])
+        self.assertEqual(rc, 1)
+        self.assertIn("not on main and in no open docs PR", buf.getvalue())
+
+    def test_the_workflow_lists_files_only_for_dependabots_own_run_and_passes_them_on(self) -> None:
+        files = next(s for s in STEPS if s.get("id") == "files")
+        for cond in ("github.event_name == 'pull_request'", "github.event.pull_request.user.login == 'dependabot[bot]'"):
+            self.assertIn(cond, files["if"])
+        self.assertNotIn("github.actor", files["if"])  # zizmor bot-conditions; the script checks GITHUB_ACTOR as well
+        self.assertIn('gh api --paginate "repos/${REPO}/pulls/${NUMBER}/files"', files["run"])
+        self.assertIn(".previous_filename", files["run"])
+        names = [s.get("id") for s in STEPS]
+        self.assertLess(names.index("files"), names.index("deps"))
+        for step in (next(s for s in STEPS if s.get("id") == "deps"), STEPS[-1]):
+            self.assertEqual(step["env"]["CHANGED_FILES"], "${{ steps.files.outputs.file }}")
+            self.assertEqual(step["env"]["PR_AUTHOR"], "${{ github.event.pull_request.user.login }}")
+        guard = next(s for s in STEPS if "HAS_APP" in s.get("env", {}))
+        self.assertIn("gh secret set --app dependabot", guard["run"])
+        self.assertEqual(guard["env"]["ACTOR"], "${{ github.actor }}")
 
 
 class DraftGate(unittest.TestCase):

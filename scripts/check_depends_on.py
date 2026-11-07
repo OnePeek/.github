@@ -13,11 +13,20 @@ the pin, the check fails in both modes; so does a declared `Depends on:` line th
 
     python3 check_depends_on.py --repos        # reads the body (BODY_FILE, else BODY); prints the named repos, comma-separated (for the App token)
     python3 check_depends_on.py --docs-pin     # prints the docs commit docs-version.txt names, or nothing
+    python3 check_depends_on.py --docs-read    # the same, but nothing for a Dependabot pull request that need not read it
     python3 check_depends_on.py --check        # reads the body, GH_TOKEN and DOCS_TOKEN; exit 1 "waiting for <repo>#<n>"
                                                # while a declared one is unmerged (DOCS_TOKEN: Contents and Pull requests
                                                # read on onepeek-docs, used only when docs-version.txt names a commit)
     IS_DRAFT=false python3 check_depends_on.py --check   # also a notice while an open dependency's pull request is not a draft
     python3 check_depends_on.py --check --strict   # the docs-pin wait fails too
+
+A Dependabot pull request has no Actions secrets, so no App token (lesson pitfall 8). When the pull request's author is
+`dependabot[bot]`, the run's actor is `dependabot[bot]` and the event is `pull_request` (PR_AUTHOR, GITHUB_ACTOR and
+GITHUB_EVENT_NAME), it has no `Depends on:` line, and the list of files it changes (the file CHANGED_FILES names, one
+path per line, from the API) does not hold docs-version.txt, it needs no cross-repo read: the docs pin is the base
+branch's, checked when it landed there (the pins job). Such a pull request skips the docs pin read and passes with a
+notice. Any other Dependabot pull request without the App token fails, naming the Dependabot secrets to set. Every other
+pull request is checked as before; a missing or unreadable CHANGED_FILES never exempts.
 
 The body is the pull request's live body, fetched by depends-on.yml through the API into BODY_FILE (the event payload
 holds the body as of the trigger, so a body edited after it would be ignored); BODY is the fallback for other callers.
@@ -37,6 +46,9 @@ import urllib.error
 import urllib.request
 
 ORG = "OnePeek"
+DEPENDABOT = "dependabot[bot]"
+DEPENDABOT_SECRETS = ("this is a Dependabot run, which gets Dependabot secrets only: set AGENTS_APP_CLIENT_ID and "
+                      "AGENTS_APP_PRIVATE_KEY as Dependabot secrets (gh secret set --app dependabot)")
 DOCS = "onepeek-docs"
 # A repo name is ASCII letters, digits, `.`, `_` and `-`, never only dots (`.` and `..` are not repos).
 LINE = re.compile(r"^[ \t]*Depends on:[ \t]*OnePeek/(?!\.+#)([A-Za-z0-9._-]+)#(\d+)[ \t]*$", re.M | re.I | re.ASCII)
@@ -68,6 +80,31 @@ def parse(body: str | None) -> list[tuple[str, int]]:
         if dep not in out:
             out.append(dep)
     return out
+
+
+def is_dependabot(env) -> bool:
+    """Dependabot's own pull request run: the pull request's author and the run's actor are both dependabot[bot] and the
+    event is pull_request. A branch name or a title proves nothing."""
+    return (env.get("PR_AUTHOR", "") == DEPENDABOT and env.get("GITHUB_ACTOR", "") == DEPENDABOT
+            and env.get("GITHUB_EVENT_NAME", "") == "pull_request")
+
+
+def changed_files(env) -> set[str] | None:
+    """The paths the pull request changes, from the file CHANGED_FILES names; None when it is unset or unreadable."""
+    path = env.get("CHANGED_FILES", "")
+    if not path:
+        return None
+    try:
+        return {line.strip() for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines() if line.strip()}
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def dependabot_needs_no_read(env, deps: list[tuple[str, int]]) -> bool:
+    """A Dependabot pull request with no `Depends on:` line that does not change docs-version.txt reads no other repo.
+    Fails closed: anything else, or an unknown file list, is False."""
+    files = changed_files(env)
+    return is_dependabot(env) and not deps and files is not None and "docs-version.txt" not in files
 
 
 def api_state(repo: str, n: int, token: str) -> tuple[str, bool]:
@@ -138,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--repos", action="store_true")
     g.add_argument("--docs-pin", action="store_true")
+    g.add_argument("--docs-read", action="store_true")
     g.add_argument("--check", action="store_true")
     ap.add_argument("--strict", action="store_true", help="with --check: waiting for the docs pull request fails")
     ap.add_argument("--repo-dir", default=".", help="the caller repo's checkout (its docs-version.txt)")
@@ -147,14 +185,19 @@ def main(argv: list[str] | None = None) -> int:
         print(",".join(dict.fromkeys(r for r, _ in deps)))
         return 0
     _, pin = check_pins.docs_pin(pathlib.Path(a.repo_dir))
-    if a.docs_pin:
-        print(pin or "")
+    exempt = bool(pin) and dependabot_needs_no_read(os.environ, deps)
+    if a.docs_pin or a.docs_read:
+        print("" if a.docs_read and exempt else pin or "")
         return 0
     problems, waiting_docs = [], False
-    if pin:
+    if exempt:
+        print(f"::notice title=depends-on::Dependabot pull request with no `Depends on:` line that does not change "
+              f"docs-version.txt: no cross-repo read needed; the pin {pin[:7]} is the base branch's")
+    elif pin:
         docs_token = os.environ.get("DOCS_TOKEN", "")
         if not docs_token:
-            problems.append("no token to read onepeek-docs (pass the agents' App secrets, playbook §8a S6)")
+            problems.append("no token to read onepeek-docs (pass the agents' App secrets, playbook §8a S6)"
+                            + (f"; {DEPENDABOT_SECRETS}" if is_dependabot(os.environ) else ""))
         else:
             found, notes = docs_waiting(pin, lambda s: check_pins.compare_status(s, docs_token),
                                         lambda s: open_docs_prs(s, docs_token), a.strict)
@@ -167,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
     if deps:
         token = os.environ.get("GH_TOKEN", "")
         problems += waiting(deps, lambda r, n: api_state(r, n, token))
-    elif not problems and not waiting_docs:
+    elif not problems and not waiting_docs and not exempt:
         print("No `Depends on:` lines: nothing to wait for.")
     for p in problems:
         print(f"::error::{p}")
