@@ -49,7 +49,7 @@ PIN = "a" * 40
 
 
 class DocsWaiting(unittest.TestCase):  # lesson L27 (a): the implicit docs dependency
-    def test_no_pin_or_a_pin_on_main_waits_for_nothing(self) -> None:
+    def test_no_pin_or_a_pin_on_the_trunk_waits_for_nothing(self) -> None:
         never = mock.Mock(side_effect=AssertionError("not asked"))
         self.assertEqual(cd.docs_waiting(None, never, never), ([], []))
         for st in ("ahead", "identical"):
@@ -76,7 +76,15 @@ class DocsWaiting(unittest.TestCase):  # lesson L27 (a): the implicit docs depen
                 problems, notes = cd.docs_waiting(PIN, lambda s, st=st: st, lambda s: [], strict)
                 self.assertEqual(notes, [])
                 self.assertEqual(len(problems), 1)
-                self.assertIn("docs pin aaaaaaa not on docs dev and in no open docs PR", problems[0])
+                self.assertIn("docs pin aaaaaaa not on the docs trunk and in no open docs PR", problems[0])
+                self.assertNotIn("main", problems[0])  # no trunk given: the message names no branch
+                self.assertNotIn(" dev", problems[0])
+
+    def test_the_problem_names_the_trunk_the_caller_read(self) -> None:  # PH2b: never a hard-coded branch
+        for trunk in ("dev", "main", "trunk"):
+            problems, _ = cd.docs_waiting(PIN, lambda s: "diverged", lambda s: [], trunk=trunk)
+            self.assertEqual(problems, [f"docs pin aaaaaaa not on docs {trunk} and in no open docs PR; move "
+                                        f"docs-version.txt to a commit on {trunk} or of the change set's docs pull request"])
 
     def test_only_open_pull_requests_count_lowest_first(self) -> None:
         prs = [{"number": 9, "state": "open"}, {"number": 3, "state": "closed"}, {"number": 4, "state": "open"}]
@@ -98,13 +106,14 @@ class Main(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, True)
 
     def run_main(self, argv: list[str], body: str, state=None, pin: str | None = None, status: str = "diverged",
-                 prs: list[int] | None = None, docs_token: str = "d") -> tuple[int, str]:
+                 prs: list[int] | None = None, docs_token: str = "d", trunk: str = "dev") -> tuple[int, str]:
         if pin:
             (self.dir / "docs-version.txt").write_text(f"# the docs commit\nonepeek-docs@{pin}\n", encoding="utf-8")
         buf = io.StringIO()
         with mock.patch.dict(os.environ, {"BODY": body, "GH_TOKEN": "t", "DOCS_TOKEN": docs_token}), \
                 contextlib.redirect_stdout(buf), \
                 mock.patch.object(cd, "api_state", side_effect=state or (lambda r, n, t: ("open", False))), \
+                mock.patch.object(cd.check_pins, "docs_trunk", return_value=trunk), \
                 mock.patch.object(cd.check_pins, "compare_status", return_value=status), \
                 mock.patch.object(cd, "open_docs_prs", return_value=prs or []):
             rc = cd.main([*argv, "--repo-dir", str(self.dir)])
@@ -115,6 +124,48 @@ class Main(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("docs-version.txt pins aaaaaaa, on onepeek-docs dev.", out)
         self.assertNotIn("main", out)
+
+    def test_every_message_names_the_trunk_read_from_the_api(self) -> None:  # PH2b: trunk dev, trunk main
+        for trunk, other in (("dev", "main"), ("main", "dev")):
+            rc, out = self.run_main(["--check"], "", pin=PIN, status="ahead", trunk=trunk)
+            self.assertEqual(rc, 0)
+            self.assertIn(f"docs-version.txt pins aaaaaaa, on onepeek-docs {trunk}.\n", out)
+            self.assertNotIn(other, out)
+            rc, out = self.run_main(["--check"], "", pin=PIN, trunk=trunk)
+            self.assertEqual(rc, 1)
+            self.assertIn(f"::error::docs pin aaaaaaa not on docs {trunk} and in no open docs PR; move "
+                          f"docs-version.txt to a commit on {trunk} or", out)
+            self.assertNotIn(f" {other} ", out)
+
+    def test_the_compare_uses_the_one_trunk_read(self) -> None:  # PH2b: the message and the compare agree
+        (self.dir / "docs-version.txt").write_text(f"onepeek-docs@{PIN}\n", encoding="utf-8")
+        seen, buf = [], io.StringIO()
+        with mock.patch.dict(os.environ, {"BODY": "", "GH_TOKEN": "t", "DOCS_TOKEN": "d"}), \
+                contextlib.redirect_stdout(buf), \
+                mock.patch.object(cd.check_pins, "docs_trunk", return_value="main") as read, \
+                mock.patch.object(cd.check_pins, "compare_status",
+                                  side_effect=lambda s, tok, trunk: seen.append(trunk(tok)) or "ahead"):
+            self.assertEqual(cd.main(["--check", "--repo-dir", str(self.dir)]), 0)
+        read.assert_called_once_with("d")
+        self.assertEqual(seen, ["main"])
+        self.assertIn("on onepeek-docs main.", buf.getvalue())
+
+    def test_a_missing_or_malformed_trunk_fails_closed_before_any_compare(self) -> None:  # PH2b failure modes
+        (self.dir / "docs-version.txt").write_text(f"onepeek-docs@{PIN}\n", encoding="utf-8")
+        for body in (b'{}', b'{"default_branch": null}', b'{"default_branch": ""}', b'not json', b'[]',
+                     b'{"default_branch": "a..b"}'):
+            resp = mock.MagicMock()
+            resp.__enter__.return_value = io.BytesIO(body)
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {"BODY": "", "GH_TOKEN": "t", "DOCS_TOKEN": "d"}), \
+                    contextlib.redirect_stdout(buf), \
+                    mock.patch.object(cd.check_pins.urllib.request, "urlopen", return_value=resp), \
+                    mock.patch.object(cd.check_pins, "compare_status", side_effect=AssertionError("no compare")), \
+                    mock.patch.object(cd, "open_docs_prs", side_effect=AssertionError("no list")):
+                with self.assertRaises(SystemExit) as e:
+                    cd.main(["--check", "--repo-dir", str(self.dir)])
+            self.assertIn("cannot read the default branch of onepeek-docs", str(e.exception.code), body)
+            self.assertNotIn("on onepeek-docs", buf.getvalue())
 
     def test_docs_pin_prints_the_pinned_commit_or_nothing(self) -> None:
         self.assertEqual(self.run_main(["--docs-pin"], ""), (0, "\n"))
@@ -147,7 +198,7 @@ class Main(unittest.TestCase):
                 cd.main(["--check", "--repo-dir", str(self.dir)])
         self.assertIn("cannot read the default branch of onepeek-docs", str(e.exception.code))
 
-    def test_check_passes_on_a_pin_on_main_and_still_checks_declared_lines(self) -> None:
+    def test_check_passes_on_a_pin_on_the_trunk_and_still_checks_declared_lines(self) -> None:
         self.assertEqual(self.run_main(["--check"], "", pin=PIN, status="ahead")[0], 0)
         rc, out = self.run_main(["--check"], BODY, pin=PIN, status="identical")
         self.assertEqual(rc, 1)
@@ -353,6 +404,7 @@ class Dependabot(unittest.TestCase):  # pitfall 8: Dependabot runs get no Action
         (self.dir / "files.txt").write_text("docs-version.txt\n", encoding="utf-8")
         env = {**DEPENDABOT_ENV, "BODY": "", "DOCS_TOKEN": "d", "CHANGED_FILES": str(self.dir / "files.txt")}
         with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(buf), \
+                mock.patch.object(cd.check_pins, "docs_trunk", return_value="dev"), \
                 mock.patch.object(cd.check_pins, "compare_status", return_value="diverged"), \
                 mock.patch.object(cd, "open_docs_prs", return_value=[]):
             rc = cd.main(["--check", "--repo-dir", str(self.dir)])
