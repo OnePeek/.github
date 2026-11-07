@@ -1,4 +1,4 @@
-"""Tests for scripts/check_pins.py and pins.yml (foundation-playbook §8a P2, S4): one tagged version, docs on main."""
+"""Tests for scripts/check_pins.py and pins.yml (foundation-playbook §8a P2, S4): one tagged version, docs on dev."""
 from __future__ import annotations
 
 import contextlib
