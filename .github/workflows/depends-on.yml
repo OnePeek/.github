@@ -13,7 +13,10 @@
 # (pull-requests: read, which the caller's job must grant), never from the event payload, which is the body at trigger
 # time and would miss a line added or removed after it. With no pull request in the event (a push, schedule or dispatch run of
 # the caller) there is nothing to wait for: every step but a notice is skipped, so the job passes and the jobs that need it run;
-# the docs ancestor rule on push is the pins job's, not this one's.
+# the docs ancestor rule on push is the pins job's, not this one's. Dependabot's own runs get no Actions secrets, so no
+# App token: a Dependabot pull request (author and actor dependabot[bot], event pull_request) with no `Depends on:` line
+# that does not change docs-version.txt needs no cross-repo read and passes with a notice; one that needs a read fails
+# naming the Dependabot secrets to set (check_depends_on.py, lessons pitfall 8).
 name: depends-on
 
 on:
@@ -81,28 +84,46 @@ jobs:
           gh api "repos/${REPO}/pulls/${NUMBER}" --jq '.body // ""' > "${RUNNER_TEMP}/pr-body.txt"
           echo "file=${RUNNER_TEMP}/pr-body.txt" >> "$GITHUB_OUTPUT"
 
-      - name: The repos the body names, and the docs commit docs-version.txt pins
+      - name: The files the pull request changes (Dependabot's own run only, to see whether it moves docs-version.txt)
+        # The author alone gates this read; check_depends_on.py also requires GITHUB_ACTOR (zizmor bot-conditions: never the actor alone).
+        id: files
+        if: ${{ github.event.pull_request.number != '' && github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api --paginate "repos/${REPO}/pulls/${NUMBER}/files" --jq '.[] | .filename, (.previous_filename // empty)' > "${RUNNER_TEMP}/pr-files.txt"
+          echo "file=${RUNNER_TEMP}/pr-files.txt" >> "$GITHUB_OUTPUT"
+
+      - name: The repos the body names, and the docs commit docs-version.txt pins (when it must be read)
         id: deps
         if: ${{ github.event.pull_request.number != '' }}
         env:
           SHA: ${{ steps.version.outputs.sha }}
           BODY_FILE: ${{ steps.body.outputs.file }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          CHANGED_FILES: ${{ steps.files.outputs.file }}
         run: |
           script=scripts/check_depends_on.py
           [ -n "${SHA}" ] && script=_shared/scripts/check_depends_on.py
           {
             echo "script=${script}"
             echo "repos=$(python3 "${script}" --repos)"
-            echo "docs=$(python3 "${script}" --docs-pin)"
+            echo "docs=$(python3 "${script}" --docs-read)"
           } >> "$GITHUB_OUTPUT"
 
       - name: The agents' GitHub App secrets are set (a dependency in another repo, or the docs pin, is read with them)
         if: ${{ github.event.pull_request.number != '' && (steps.deps.outputs.repos != '' || steps.deps.outputs.docs != '') }}
         env:
           HAS_APP: ${{ secrets.AGENTS_APP_CLIENT_ID != '' && secrets.AGENTS_APP_PRIVATE_KEY != '' }}
+          ACTOR: ${{ github.actor }}
         run: |
           if [ "${HAS_APP}" != "true" ]; then
             echo "::error::AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY must be passed: the Depends on lines name pull requests in other repos, or docs-version.txt pins a onepeek-docs commit (playbook §8a P1, S6)."
+            if [ "${ACTOR}" = "dependabot[bot]" ]; then
+              echo "::error::This is a Dependabot run, which gets Dependabot secrets only: set AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY as Dependabot secrets (gh secret set --app dependabot)."
+            fi
             exit 1
           fi
 
@@ -136,5 +157,7 @@ jobs:
           BODY_FILE: ${{ steps.body.outputs.file }}
           GH_TOKEN: ${{ steps.app.outputs.token }}
           DOCS_TOKEN: ${{ steps.docs-app.outputs.token }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          CHANGED_FILES: ${{ steps.files.outputs.file }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
         run: python3 "${SCRIPT}" --check
