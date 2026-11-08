@@ -260,17 +260,20 @@ class ArchitectureAwareTools(unittest.TestCase):
     text = (WORKFLOWS / "release-ecs.yml").read_text(encoding="utf-8")
 
     def test_syft_has_both_pinned_checksums_and_no_downloaded_checksum_file(self):
-        self.assertIn("syft_1.55.0_linux_${syft_arch}.tar.gz", self.text)
+        self.assertIn("syft_${VERSION}_linux_${asset}.tar.gz", self.text)
+        self.assertIn("SYFT_VERSION: 1.55.0", self.text)
         for sha in ("bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d",
                     "929bd163db2d7cd2255d3bcb8967208079813d7b46b0c952f7b794d8e2c7d304"):
             self.assertIn(sha, self.text)
         self.assertNotIn("syft.checksums", self.text)
 
     def test_syft_asset_follows_the_architecture_and_unknown_stops(self):
-        script = re.sub(r"^.*\./syft.*$", "", step("build-image", "Syft SPDX SBOM"), flags=re.M)
-        files = {"digest-backend.txt": f"backend={DIGEST}\n", "sbom.spdx.json": "{}"}
+        script = step("build-image", "Install syft")
+        files = {}
         for arch, asset, rc in (("X64", "linux_amd64", 0), ("ARM64", "linux_arm64", 0), ("RISCV", "", 1)):
-            out, calls, _ = run_step(script, aws_stub(IN_ECR), {"SIGNING_KEY": "k", "RUNNER_ARCH": arch}, files)
+            # A stub curl writes the archive (-o <file>), and a stub sha256sum accepts it: this test is about the asset name.
+            stubs = {"curl": 'while [ $# -gt 1 ]; do if [ "$1" = -o ]; then : > "$2"; fi; shift; done'}
+            out, calls, _ = run_step(script, aws_stub(IN_ECR), {"RUNNER_ARCH": arch, "VERSION": "1.55.0", "SHA256_A": "a", "SHA256_B": "b", "RUNNER_TEMP": tempfile.mkdtemp()}, files, stubs)
             self.assertEqual(out.returncode, rc, (arch, out.stdout, out.stderr))
             if asset:
                 self.assertIn(asset, calls)
