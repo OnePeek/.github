@@ -267,10 +267,10 @@ class ArchitectureAwareTools(unittest.TestCase):
         self.assertNotIn("syft.checksums", self.text)
 
     def test_syft_asset_follows_the_architecture_and_unknown_stops(self):
-        script = re.sub(r"^.*\./syft.*$", "", step("build-image", "Syft SPDX SBOM"), flags=re.M)
-        files = {"digest-backend.txt": f"backend={DIGEST}\n", "sbom.spdx.json": "{}"}
+        script = step("build-image", "Install syft")
+        files = {}
         for arch, asset, rc in (("X64", "linux_amd64", 0), ("ARM64", "linux_arm64", 0), ("RISCV", "", 1)):
-            out, calls, _ = run_step(script, aws_stub(IN_ECR), {"SIGNING_KEY": "k", "RUNNER_ARCH": arch}, files)
+            out, calls, _ = run_step(script, aws_stub(IN_ECR), {"RUNNER_ARCH": arch, "VERSION": "1.55.0", "SHA256_A": "a", "SHA256_B": "b", "RUNNER_TEMP": os.environ.get("TMPDIR", "/tmp")}, files)
             self.assertEqual(out.returncode, rc, (arch, out.stdout, out.stderr))
             if asset:
                 self.assertIn(asset, calls)
