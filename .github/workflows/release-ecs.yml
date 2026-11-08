@@ -93,6 +93,9 @@ env:
   COSIGN_EXPERIMENTAL: "1" # required by the OCI 1.1 referrers mode (delivery-pipelines §5)
   AWS_REGION: ap-south-1
   AWS_DEFAULT_REGION: ap-south-1
+  SYFT_VERSION: 1.55.0 # the Syft install step: pinned, checksum verified, both architectures
+  SYFT_SHA256_A: bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d # amd64
+  SYFT_SHA256_B: 929bd163db2d7cd2255d3bcb8967208079813d7b46b0c952f7b794d8e2c7d304 # arm64
   NAME: onepeek-${{ inputs.environment }}
   ENVIRONMENT: ${{ inputs.environment }}
   VERSION_FILE: .release-please-manifest.json
@@ -958,6 +961,47 @@ jobs:
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v2.6.5
+      - name: Cache the verified syft archive (the checksum is checked again on every use)
+        if: ${{ !inputs.dry-run }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-tools/syft
+          key: syft-${{ env.SYFT_VERSION }}-${{ runner.arch }}-${{ env.SYFT_SHA256_A }}-${{ env.SYFT_SHA256_B }}
+      - name: Install syft (pinned, checksum verified)
+        if: ${{ !inputs.dry-run }}
+        env:
+          VERSION: ${{ env.SYFT_VERSION }}
+          SHA256_A: ${{ env.SYFT_SHA256_A }}
+          SHA256_B: ${{ env.SYFT_SHA256_B }}
+        run: |
+          case "${RUNNER_ARCH}" in
+            X64) asset=amd64; sha="${SHA256_A}" ;;
+            ARM64) asset=arm64; sha="${SHA256_B}" ;;
+            *) echo "::error::Unsupported runner architecture ${RUNNER_ARCH}."; exit 1 ;;
+          esac
+          dir="${RUNNER_TEMP}/release-tools/syft"; mkdir -p "${dir}"
+          archive="${dir}/syft_${VERSION}_linux_${asset}.tar.gz"
+          url="https://github.com/anchore/syft/releases/download/v${VERSION}/syft_${VERSION}_linux_${asset}.tar.gz"
+          # A cached archive is never trusted: it is checked like a fresh download, and a bad one is discarded (F125).
+          if [ -f "${archive}" ] && ! echo "${sha}  ${archive}" | sha256sum -c --quiet -; then
+            echo "::warning::The cached syft archive failed its checksum; discarding it."
+            rm -f "${archive}"
+          fi
+          if [ ! -f "${archive}" ]; then
+            # Retries with a delay ride out a download-host outage (504 for two hours: F125); the checksum below still decides.
+            if ! curl -sSfL --connect-timeout 15 --max-time 90 --retry 5 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o "${archive}.part" "${url}"; then
+              rm -f "${archive}.part"
+              echo "::error::Could not download syft from github.com after retries (${url})."
+              exit 1
+            fi
+            mv "${archive}.part" "${archive}"
+          fi
+          if ! echo "${sha}  ${archive}" | sha256sum -c -; then
+            rm -f "${archive}"
+            echo "::error::The syft archive does not match its pinned SHA-256; not using it."
+            exit 1
+          fi
+          tar -xzf "${archive}" syft
       - name: Syft SPDX SBOM, then sign and attest (no public transparency log; OCI 1.1 referrers)
         if: ${{ !inputs.dry-run }}
         timeout-minutes: 15
@@ -970,15 +1014,6 @@ jobs:
           digest=$(cut -d= -f2 "digest-${IMAGE}.txt")
           ref="${registry}/${NAME}/${IMAGE}@${digest}"
           aws ecr get-login-password | docker login --username AWS --password-stdin "${registry}"
-          # Pinned by architecture (both SHA-256 values; syft v1.55.0): the runner may be x64 or ARM64.
-          case "${RUNNER_ARCH}" in
-            X64) syft_arch=amd64; syft_sha=bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d ;;
-            ARM64) syft_arch=arm64; syft_sha=929bd163db2d7cd2255d3bcb8967208079813d7b46b0c952f7b794d8e2c7d304 ;;
-            *) echo "::error::Unsupported runner architecture ${RUNNER_ARCH}."; exit 1 ;;
-          esac
-          curl -sSfL -o syft.tgz "https://github.com/anchore/syft/releases/download/v1.55.0/syft_1.55.0_linux_${syft_arch}.tar.gz"
-          echo "${syft_sha}  syft.tgz" | sha256sum -c -
-          tar -xzf syft.tgz syft
           ./syft "registry:${ref}" -o spdx-json=sbom.spdx.json
           # A reused image was signed and attested before its digest was recorded; the record step verifies the signature again.
           recorded_digest=$(aws ssm get-parameter --name "/onepeek/${ENVIRONMENT}/release/${IMAGE}/digest" --query Parameter.Value --output text 2>/dev/null || true)
