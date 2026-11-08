@@ -969,7 +969,6 @@ jobs:
           key: syft-${{ env.SYFT_VERSION }}-${{ runner.arch }}-${{ env.SYFT_SHA256_A }}-${{ env.SYFT_SHA256_B }}
       - name: Install syft (pinned, checksum verified)
         if: ${{ !inputs.dry-run }}
-        timeout-minutes: 6
         env:
           VERSION: ${{ env.SYFT_VERSION }}
           SHA256_A: ${{ env.SYFT_SHA256_A }}
