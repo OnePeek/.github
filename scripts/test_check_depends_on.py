@@ -16,7 +16,10 @@ import yaml
 import check_depends_on as cd
 
 WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / ".github/workflows/depends-on.yml"
-STEPS = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["depends-on"]["steps"]
+ALL_STEPS = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["depends-on"]["steps"]
+# The job-usage measurement step (scripts/job_usage.py, tested in test_job_usage.py) runs last on every event and
+# decides nothing; these tests read the steps before it.
+STEPS = ALL_STEPS[:-1] if ALL_STEPS[-1].get("shell") == "python3 -I {0}" else ALL_STEPS
 BODY = "Fixes the boot.\n\nDepends on: OnePeek/backend-service#73\n depends on: OnePeek/onepeek-web#5 \n" \
        "Depends on: OnePeek/backend-service#73\nSee OnePeek/onepeek-infra#9 (not a dependency)\n"
 
