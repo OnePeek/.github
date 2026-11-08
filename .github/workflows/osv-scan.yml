@@ -191,8 +191,8 @@ jobs:
         env:
           RUNNER_CLASS: light
           RUNNER_INPUT: ${{ inputs.runner }}
-        shell: python3 -I {0}
         run: |
+          cat > "$RUNNER_TEMP/job_usage.py" <<'PY'
           """Job usage: one JSON line with what a job on our own runners used (S0 of the infra stabilization plan, runner sizes).
 
           Run as the last step of every shared-workflow job that can run on our runners (`if: always()`, continue-on-error).
@@ -412,3 +412,5 @@ jobs:
               except BaseException:
                   pass
               sys.exit(0)
+          PY
+          python3 -I "$RUNNER_TEMP/job_usage.py"

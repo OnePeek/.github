@@ -24,6 +24,8 @@ WORKFLOWS = ROOT / ".github/workflows"
 NOT_MEASURED = {"pins.yml", "release-ecs.yml", "release-lock.yml", "release-tag.yml", "deploy-ecs.yml", "operate.yml",
                 "spot-rerun.yml"}
 STEP_IF = "${{ always() && runner.environment != 'github-hosted' }}"
+# The step's run: a verbatim copy of scripts/job_usage.py, written to the runner's temp folder and run isolated.
+RUN = "cat > \"$RUNNER_TEMP/job_usage.py\" <<'PY'\n{source}PY\npython3 -I \"$RUNNER_TEMP/job_usage.py\"\n"
 DEAD = "http://127.0.0.1:9"  # nothing listens on the discard port: refused at once
 
 
@@ -291,7 +293,7 @@ class Workflows(unittest.TestCase):
                     yield path.name, job_id, job
 
     def test_every_measured_job_ends_with_the_step(self):
-        source = (Path(__file__).parent / "job_usage.py").read_text()
+        run = RUN.format(source=(Path(__file__).parent / "job_usage.py").read_text())
         seen = []
         for name, job_id, job in self.jobs():
             if name in NOT_MEASURED:
@@ -302,19 +304,19 @@ class Workflows(unittest.TestCase):
             self.assertEqual(step.get("if"), STEP_IF, where)
             self.assertIs(step.get("continue-on-error"), True, where)
             self.assertEqual(step.get("timeout-minutes"), 1, where)
-            self.assertEqual(step.get("shell"), "python3 -I {0}", where)
-            self.assertEqual(step.get("run"), source, where)
+            self.assertNotIn("shell", step, where)
+            self.assertEqual(step.get("run"), run, where)
             self.assertEqual(step.get("env"), {"RUNNER_CLASS": labels.classify(job["runs-on"], "inputs.runner", False),
                                                "RUNNER_INPUT": "${{ inputs.runner }}"}, where)
-            self.assertEqual(sum(1 for s in job["steps"] if s.get("run") == source), 1, where)
+            self.assertEqual(sum(1 for s in job["steps"] if s.get("run") == run), 1, where)
         self.assertEqual(len(seen), 10, seen)
 
     def test_jobs_not_measured_have_no_step(self):
-        source = (Path(__file__).parent / "job_usage.py").read_text()
         for name, job_id, job in self.jobs():
             if name in NOT_MEASURED:
                 steps = job.get("steps") or []
-                self.assertFalse(any(isinstance(s, dict) and s.get("run") == source for s in steps), f"{name} {job_id}")
+                self.assertFalse(any(isinstance(s, dict) and "job_usage.py" in str(s.get("run")) for s in steps),
+                                 f"{name} {job_id}")
 
     def test_the_script_has_no_expression_and_no_runner_label(self):
         source = (Path(__file__).parent / "job_usage.py").read_text()
