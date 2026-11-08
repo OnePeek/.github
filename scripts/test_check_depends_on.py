@@ -61,14 +61,21 @@ class DocsWaiting(unittest.TestCase):  # lesson L27 (a): the implicit docs depen
             problems, notes = cd.docs_waiting(PIN, lambda s, st=st: st, lambda s: [145, 150])
             self.assertEqual(problems, [])
             self.assertEqual(len(notes), 1)
-            self.assertTrue(notes[0].startswith("waiting for onepeek-docs#145 (docs-version.txt pins aaaaaaa)"), notes[0])
+            self.assertTrue(notes[0].startswith("waiting for onepeek-docs#145 (docs-version.txt pins aaaaaaa, not yet on "
+                                                "the docs trunk)"), notes[0])  # no trunk read: no branch named (F23)
             self.assertIn("ship_change_set.py merges it first", notes[0])
+            _, notes = cd.docs_waiting(PIN, lambda s, st=st: st, lambda s: [145], trunk="dev")
+            self.assertTrue(notes[0].startswith("waiting for onepeek-docs#145 (docs-version.txt pins aaaaaaa, not yet on "
+                                                "docs dev); "), notes[0])
 
     def test_strict_fails_that_wait(self) -> None:
         problems, notes = cd.docs_waiting(PIN, lambda s: "diverged", lambda s: [145, 150], strict=True)
         self.assertEqual(notes, [])
         self.assertEqual(len(problems), 1)
-        self.assertTrue(problems[0].startswith("waiting for onepeek-docs#145"), problems[0])
+        self.assertTrue(problems[0].startswith("waiting for onepeek-docs#145 (docs-version.txt pins aaaaaaa, not yet on "
+                                               "the docs trunk, a commit of that open pull request)"), problems[0])
+        problems, _ = cd.docs_waiting(PIN, lambda s: "diverged", lambda s: [145], strict=True, trunk="dev")
+        self.assertIn("not yet on docs dev, a commit of that open pull request", problems[0])  # F23: names the trunk
 
     def test_a_pin_in_no_open_docs_pull_request_fails_even_when_not_strict(self) -> None:
         for st in ("diverged", "missing"):
@@ -174,8 +181,8 @@ class Main(unittest.TestCase):
     def test_check_passes_with_a_notice_while_the_docs_pull_request_is_open(self) -> None:
         rc, out = self.run_main(["--check"], "", pin=PIN, prs=[145])
         self.assertEqual(rc, 0)
-        self.assertIn("::notice title=depends-on::waiting for onepeek-docs#145 (docs-version.txt pins aaaaaaa); "
-                      "ship_change_set.py merges it first", out)
+        self.assertIn("::notice title=depends-on::waiting for onepeek-docs#145 (docs-version.txt pins aaaaaaa, not yet "
+                      "on docs dev); ship_change_set.py merges it first", out)
         self.assertNotIn("::error", out)
 
     def test_check_strict_fails_on_that_wait(self) -> None:

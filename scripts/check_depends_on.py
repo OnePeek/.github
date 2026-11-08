@@ -144,11 +144,13 @@ def docs_waiting(sha: str | None, status, prs, strict: bool = False, trunk: str 
     if not sha or status(sha) in ("ahead", "identical"):
         return [], []
     found = prs(sha)
-    if found and strict:
-        return [f"waiting for {DOCS}#{found[0]} (docs-version.txt pins {sha[:7]}, a commit of that open pull request)"], []
-    if found:
-        return [], [f"waiting for {DOCS}#{found[0]} (docs-version.txt pins {sha[:7]}); ship_change_set.py merges it first"]
     on = f"docs {trunk}" if trunk else "the docs trunk"
+    if found and strict:
+        return [f"waiting for {DOCS}#{found[0]} (docs-version.txt pins {sha[:7]}, not yet on {on}, a commit of that open "
+                f"pull request)"], []
+    if found:
+        return [], [f"waiting for {DOCS}#{found[0]} (docs-version.txt pins {sha[:7]}, not yet on {on}); "
+                    f"ship_change_set.py merges it first"]
     return [f"docs pin {sha[:7]} not on {on} and in no open docs PR; move docs-version.txt to a commit on "
             f"{trunk or 'the docs trunk'} or of the change set's docs pull request"], []
 
