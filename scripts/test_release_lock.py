@@ -637,6 +637,15 @@ class SharedLockWorkflow(unittest.TestCase):
         self.assertIn("capped=true", out.output.splitlines())
         self.assertEqual(out.keys, {WEB: web})
 
+    def test_a_failed_give_back_records_no_cap_and_fails_the_step(self):
+        # Ruling R-S2l0-2 (g97 m4): a key that could not be given back may still name this run, so it is no clean cap.
+        web = record("OnePeek/onepeek-web", "88", scope="web", phase="locked")
+        out = run(ACTION, keys={WEB: web}, ACTION="take", LOCK_SCOPE="infra", GITHUB_REPOSITORY=INFRA, LOCK_WAIT_CAP_SECONDS="1",
+                  FAIL_DELETE_OBJECT="AccessDenied")
+        self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("capped", out.output)
+        self.assertIn("could not be given back", out.stdout)
+
     def test_any_other_failure_still_fails_the_step_and_records_no_cap(self):
         out = run(ACTION, keys={INFRA_KEY: record()}, ACTION="take", LOCK_SCOPE="infra", GITHUB_REPOSITORY=INFRA, FAIL_GET_OBJECT="AccessDenied")
         self.assertNotEqual(out.returncode, 0)

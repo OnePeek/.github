@@ -15,7 +15,8 @@ latest successful release run, or null) and `error` (true when a read failed: th
 "Plan-relevant paths, and their drift check").
 
 Reads (only those of §5.4a's table; the App token is GH_TOKEN, `actions: read` and `contents: read`):
-  S3 head-object locks/<scope>.json; GET actions/workflows/release.yml/runs?branch=release; GET actions/runs/<id>/jobs
+  S3 head-object locks/<scope>.json (on a 404, list-objects-v2 of that key's name, to tell a missing bucket from a
+  missing key; the same locks/* grant); GET actions/workflows/release.yml/runs?branch=release; GET actions/runs/<id>/jobs
   ?filter=latest; GET commits/release; GET compare/<success head>...<head>; GET commits/<sha> (the merge message).
 """
 from __future__ import annotations
@@ -38,6 +39,7 @@ LINE = re.compile(r"^(release-[A-Za-z-]*):\s*(\S.*?)\s*$")
 CAP_STEP = "Wait cap reached (re-run)"  # §5.4a rule 2: a run that failed only at this step failed only at a wait cap
 QUEUED_AFTER_CAP = datetime.timedelta(minutes=10)  # the merge tool re-runs such a run at once (rule 3)
 QUEUED_AFTER_FIRST_SEEN = datetime.timedelta(minutes=5)  # GitHub creates the run a few seconds after the push
+COMPARE_FORWARD = ("ahead", "identical")  # any other compare status (behind, diverged, missing) fails, never settles
 COMPARE_FILE_LIMIT = 300  # the compare API lists at most 300 files; a compare at that limit counts as plan-relevant
 PAGE = 100
 MAX_PAGES = 30  # more runs than this is refused (fail closed), never read in part
@@ -133,7 +135,7 @@ class Run:
 
 
 class GitHub:
-    """The reads of §5.4a's table, through `gh api` (GH_TOKEN) and `aws s3api head-object`."""
+    """The reads of §5.4a's table, through `gh api` (GH_TOKEN) and `aws s3api head-object` (and list-objects-v2 on a 404)."""
 
     def __init__(self, bucket: str | None = None):
         self.bucket = bucket
@@ -146,9 +148,22 @@ class GitHub:
         if out.returncode == 0:
             return True
         err = out.stderr or ""
-        if "(404)" in err or "Not Found" in err or "NoSuchKey" in err:
+        if "(NoSuchKey)" in err:
             return False
-        raise ReadError(f"s3://{self.bucket}/{key} cannot be read: {err.strip()[:300]}")
+        if "(404)" not in err:
+            raise ReadError(f"s3://{self.bucket}/{key} cannot be read: {err.strip()[:300]}")
+        # head-object answers a missing bucket with the same 404 as a missing key: free only once a listing of the key's
+        # own name (the locks/* ListBucket grant, §5.4 "Grants") shows the bucket exists and the key is absent.
+        listed = _run(["aws", "s3api", "list-objects-v2", "--bucket", self.bucket, "--prefix", key, "--max-keys", "1",
+                       "--query", "KeyCount", "--output", "text"])
+        if listed.returncode != 0:
+            raise ReadError(f"s3://{self.bucket}/{key}: 404, and the bucket cannot be listed: {(listed.stderr or '').strip()[:300]}")
+        count = listed.stdout.strip()
+        if count == "0":
+            return False
+        if count.isdigit():
+            return True
+        raise ReadError(f"s3://{self.bucket}/{key}: 404, and the listing answered {count!r}")
 
     def release_runs(self, repo: str) -> list[Run]:
         runs = []
@@ -168,11 +183,14 @@ class GitHub:
             raise ReadError(f"{repo}'s release head is not a commit SHA: {sha!r}")
         return sha
 
-    def changed_paths(self, repo: str, base: str, head: str) -> list[str]:
-        files = _gh(f"repos/{OWNER}/{repo}/compare/{base}...{head}").get("files")
+    def changed_paths(self, repo: str, base: str, head: str) -> tuple[str, list[str]]:
+        """The compare's `status` (ahead, identical, behind, diverged) and its file names."""
+        doc = _gh(f"repos/{OWNER}/{repo}/compare/{base}...{head}")
+        files = doc.get("files")
         if not isinstance(files, list) or not all(isinstance(f, dict) and isinstance(f.get("filename"), str) for f in files):
             raise ReadError(f"compare {base[:7]}...{head[:7]}: no file list")
-        return [f["filename"] for f in files]
+        status = doc.get("status")
+        return (status if isinstance(status, str) else repr(status)), [f["filename"] for f in files]
 
     def commit_message(self, repo: str, sha: str) -> str:
         message = (_gh(f"repos/{OWNER}/{repo}/commits/{sha}").get("commit") or {}).get("message")
@@ -279,7 +297,12 @@ def settled(scope: str, gh: GitHub, independent: bool = False, now: datetime.dat
             return Verdict("fail", f"{repo}'s release head {head[:7]} has no release run (every app change releases)", success_head)
         if success_head is None:
             return Verdict("fail", f"{repo} has no successful release run to compare its head {head[:7]} with", success_head)
-        paths = gh.changed_paths(repo, success_head, head)
+        status, paths = gh.changed_paths(repo, success_head, head)
+        if status not in COMPARE_FORWARD:
+            # A three-dot compare lists only the head's side of the merge base: behind or diverged hides what the
+            # success head deployed, so it never proves that no path changed (ruling R-S2l0-2).
+            return Verdict("fail", f"{repo}'s release head {head[:7]} is not a descendant of its last successful release "
+                                   f"{success_head[:7]} (compare status {status}): not released", success_head)
         if len(paths) >= COMPARE_FILE_LIMIT:
             return Verdict("fail", f"{repo}: {len(paths)} files changed since {success_head[:7]} (the compare limit): counted as "
                                    "plan-relevant; its release head is not released", success_head)

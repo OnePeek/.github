@@ -428,6 +428,9 @@ jobs:
           }
           lock_fail_waiting() {  # lock_fail_waiting <holder> <scope> <run id>: the cap message; LOCK_CAPPED=1 lets a caller end at its "Wait cap reached (re-run)" step (§5.4a rule 2)
             echo "::error::waiting for $1 ($2, run $3); re-run"
+            # A key that could not be given back may still name this run, so the run does not hold "nothing": no cap, the
+            # step fails (§5.4a rule 2; ruling R-S2l0-2).
+            if [ -n "${LOCK_GIVEBACK_FAILED:-}" ]; then echo "::error::A key could not be given back during the wait, so this is not a clean wait cap."; return 1; fi
             # shellcheck disable=SC2034  # read by release-lock.yml's EXIT trap; the other copies fail at this step as before
             LOCK_CAPPED=1
             return 1
@@ -503,6 +506,7 @@ jobs:
           }
           lock_take() {  # takes every key of LOCK_SCOPE try-or-release; waits holding nothing within the limits, then fails with the re-run message
             local key keys rc state reason start own=0 queued=0 taken holder scope run kind where
+            LOCK_GIVEBACK_FAILED=""
             if [ -z "${LOCK_TOKEN:-}" ]; then echo "::error::No lock token."; return 1; fi
             if ! keys=$(lock_keys); then return 1; fi
             read -r -a keys <<< "${keys}"
@@ -540,7 +544,7 @@ jobs:
                 return 0
               fi
               for key in "${taken[@]}"; do   # try-or-release: give back what was taken, newest first, each on the ETag of its own write
-                if ! lock_delete "${key%%=*}" "${key#*=}"; then echo "::warning::s3://${LOCK_BUCKET}/${key%%=*} changed before it could be given back."; fi
+                if ! lock_delete "${key%%=*}" "${key#*=}"; then echo "::warning::s3://${LOCK_BUCKET}/${key%%=*} changed before it could be given back."; LOCK_GIVEBACK_FAILED=1; fi
               done
               if [ "${state}" = "failed" ]; then return 1; fi
               read -r holder scope run kind <<< "${LOCK_BLOCKER}"
@@ -1072,6 +1076,9 @@ jobs:
           }
           lock_fail_waiting() {  # lock_fail_waiting <holder> <scope> <run id>: the cap message; LOCK_CAPPED=1 lets a caller end at its "Wait cap reached (re-run)" step (§5.4a rule 2)
             echo "::error::waiting for $1 ($2, run $3); re-run"
+            # A key that could not be given back may still name this run, so the run does not hold "nothing": no cap, the
+            # step fails (§5.4a rule 2; ruling R-S2l0-2).
+            if [ -n "${LOCK_GIVEBACK_FAILED:-}" ]; then echo "::error::A key could not be given back during the wait, so this is not a clean wait cap."; return 1; fi
             # shellcheck disable=SC2034  # read by release-lock.yml's EXIT trap; the other copies fail at this step as before
             LOCK_CAPPED=1
             return 1
@@ -1147,6 +1154,7 @@ jobs:
           }
           lock_take() {  # takes every key of LOCK_SCOPE try-or-release; waits holding nothing within the limits, then fails with the re-run message
             local key keys rc state reason start own=0 queued=0 taken holder scope run kind where
+            LOCK_GIVEBACK_FAILED=""
             if [ -z "${LOCK_TOKEN:-}" ]; then echo "::error::No lock token."; return 1; fi
             if ! keys=$(lock_keys); then return 1; fi
             read -r -a keys <<< "${keys}"
@@ -1184,7 +1192,7 @@ jobs:
                 return 0
               fi
               for key in "${taken[@]}"; do   # try-or-release: give back what was taken, newest first, each on the ETag of its own write
-                if ! lock_delete "${key%%=*}" "${key#*=}"; then echo "::warning::s3://${LOCK_BUCKET}/${key%%=*} changed before it could be given back."; fi
+                if ! lock_delete "${key%%=*}" "${key#*=}"; then echo "::warning::s3://${LOCK_BUCKET}/${key%%=*} changed before it could be given back."; LOCK_GIVEBACK_FAILED=1; fi
               done
               if [ "${state}" = "failed" ]; then return 1; fi
               read -r holder scope run kind <<< "${LOCK_BLOCKER}"
@@ -1883,6 +1891,9 @@ jobs:
           }
           lock_fail_waiting() {  # lock_fail_waiting <holder> <scope> <run id>: the cap message; LOCK_CAPPED=1 lets a caller end at its "Wait cap reached (re-run)" step (§5.4a rule 2)
             echo "::error::waiting for $1 ($2, run $3); re-run"
+            # A key that could not be given back may still name this run, so the run does not hold "nothing": no cap, the
+            # step fails (§5.4a rule 2; ruling R-S2l0-2).
+            if [ -n "${LOCK_GIVEBACK_FAILED:-}" ]; then echo "::error::A key could not be given back during the wait, so this is not a clean wait cap."; return 1; fi
             # shellcheck disable=SC2034  # read by release-lock.yml's EXIT trap; the other copies fail at this step as before
             LOCK_CAPPED=1
             return 1
@@ -1958,6 +1969,7 @@ jobs:
           }
           lock_take() {  # takes every key of LOCK_SCOPE try-or-release; waits holding nothing within the limits, then fails with the re-run message
             local key keys rc state reason start own=0 queued=0 taken holder scope run kind where
+            LOCK_GIVEBACK_FAILED=""
             if [ -z "${LOCK_TOKEN:-}" ]; then echo "::error::No lock token."; return 1; fi
             if ! keys=$(lock_keys); then return 1; fi
             read -r -a keys <<< "${keys}"
@@ -1995,7 +2007,7 @@ jobs:
                 return 0
               fi
               for key in "${taken[@]}"; do   # try-or-release: give back what was taken, newest first, each on the ETag of its own write
-                if ! lock_delete "${key%%=*}" "${key#*=}"; then echo "::warning::s3://${LOCK_BUCKET}/${key%%=*} changed before it could be given back."; fi
+                if ! lock_delete "${key%%=*}" "${key#*=}"; then echo "::warning::s3://${LOCK_BUCKET}/${key%%=*} changed before it could be given back."; LOCK_GIVEBACK_FAILED=1; fi
               done
               if [ "${state}" = "failed" ]; then return 1; fi
               read -r holder scope run kind <<< "${LOCK_BLOCKER}"
