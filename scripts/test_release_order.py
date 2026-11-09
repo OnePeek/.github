@@ -42,9 +42,15 @@ import os, sys
 d = os.environ["FAKE_DIR"]
 open(os.path.join(d, "calls"), "a").write("aws " + " ".join(sys.argv[1:]) + "\n")
 mode = os.environ.get("FAKE_KEY", "absent")
+if sys.argv[2] == "list-objects-v2":
+    if mode == "nobucket":
+        sys.stderr.write("An error occurred (NoSuchBucket) when calling the ListObjectsV2 operation: x\n"); sys.exit(254)
+    print({"absent": "0", "raced": "1"}.get(mode, "None")); sys.exit(0)
 if mode == "held":
     print('{"ETag": "x"}'); sys.exit(0)
-if mode == "absent":
+if mode == "nosuchkey":
+    sys.stderr.write("An error occurred (NoSuchKey) when calling the HeadObject operation: x\n"); sys.exit(254)
+if mode in ("absent", "nobucket", "raced", "oddlist"):
     sys.stderr.write("An error occurred (404) when calling the HeadObject operation: Not Found\n"); sys.exit(254)
 sys.stderr.write("An error occurred (403) when calling the HeadObject operation: Forbidden\n"); sys.exit(254)
 """
@@ -107,10 +113,10 @@ class Fake:
         return p.read_text().splitlines() if p.exists() else []
 
 
-def responses(runs, head=HEAD, compare=None, extra=None, **kw) -> dict:
+def responses(runs, head=HEAD, compare=None, extra=None, status="ahead") -> dict:
     out = {RUNS + "&per_page=100&page=1": page(runs), f"{INFRA}/commits/release": {"json": {"sha": head}}}
     if compare is not None:
-        out[f"{INFRA}/compare/{OLD}...{head}"] = {"json": {"files": [{"filename": f} for f in compare]}}
+        out[f"{INFRA}/compare/{OLD}...{head}"] = {"json": {"status": status, "files": [{"filename": f} for f in compare]}}
     out.update(extra or {})
     return out
 
@@ -208,6 +214,30 @@ class Settled(unittest.TestCase):
             v, _ = verdict(responses([run_(1, OLD)], compare=["README.md", path]), first_seen=seen_long_ago())
             self.assertEqual(v.verdict, "fail", path)
 
+    def test_a_compare_that_is_not_ahead_or_identical_fails_never_settles(self):
+        # Ruling R-S2l0-2: a three-dot compare hides the success head's side when the head is behind or has diverged.
+        for status in ("behind", "diverged", None, "unknown"):
+            resp = responses([run_(1, OLD)], compare=["README.md"], status=status)
+            v, _ = verdict(resp, first_seen=seen_long_ago())
+            self.assertEqual(v.verdict, "fail", (status, v.reason))
+            self.assertIn("compare status", v.reason)
+        no_status = responses([run_(1, OLD)])
+        no_status[f"{INFRA}/compare/{OLD}...{HEAD}"] = {"json": {"files": []}}
+        self.assertEqual(verdict(no_status, first_seen=seen_long_ago())[0].verdict, "fail")
+        for status, files in (("ahead", ["README.md"]), ("identical", [])):
+            v, _ = verdict(responses([run_(1, OLD)], compare=files, status=status), first_seen=seen_long_ago())
+            self.assertEqual(v.verdict, "settled", (status, v.reason))
+
+    def test_a_key_is_free_only_when_the_object_is_absent_from_an_existing_bucket(self):
+        for key, expected in (("absent", "settled"), ("nosuchkey", "settled"), ("raced", "wait"), ("held", "wait")):
+            v, calls = verdict(responses([run_(1, HEAD)]), key=key)
+            self.assertEqual(v.verdict, expected, (key, v.reason))
+        _, calls = verdict(responses([run_(1, HEAD)]), key="absent")
+        self.assertIn("aws s3api list-objects-v2 --bucket onepeek-preprod-deploy --prefix locks/infra.json --max-keys 1 --query KeyCount --output text", calls)
+        for key in ("nobucket", "oddlist", "forbidden"):
+            v, _ = verdict(responses([run_(1, HEAD)]), key=key)
+            self.assertEqual((v.verdict, v.error), ("fail", True), (key, v.reason))
+
     def test_a_compare_at_the_300_file_limit_counts_as_plan_relevant(self):
         v, _ = verdict(responses([run_(1, OLD)], compare=[f"docs/{i}.md" for i in range(300)]), first_seen=seen_long_ago())
         self.assertEqual(v.verdict, "fail", v.reason)
@@ -265,6 +295,7 @@ class Settled(unittest.TestCase):
 
     def test_settled_makes_no_call_outside_the_reads_table(self):
         allowed = [r"^aws s3api head-object --bucket \S+ --key locks/(infra|backend|web|mcp)\.json$",
+                   r"^aws s3api list-objects-v2 --bucket \S+ --prefix locks/(infra|backend|web|mcp)\.json --max-keys 1 --query KeyCount --output text$",
                    r"^gh api repos/OnePeek/[a-z-]+/actions/workflows/release\.yml/runs\?branch=release&per_page=100&page=\d+$",
                    r"^gh api repos/OnePeek/[a-z-]+/actions/runs/\d+/jobs\?filter=latest&per_page=100&page=\d+$",
                    r"^gh api repos/OnePeek/[a-z-]+/commits/release$",
