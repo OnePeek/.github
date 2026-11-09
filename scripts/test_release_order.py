@@ -177,10 +177,11 @@ class Settled(unittest.TestCase):
 
     def test_a_cap_and_another_failed_step_or_job_is_failed_not_queued(self):
         both_steps = jobs([("Take", "failure"), (ro.CAP_STEP, "failure")])
+        cap_then_another = jobs([(ro.CAP_STEP, "failure"), ("Post the summary", "failure")])
         two_jobs = jobs([(ro.CAP_STEP, "failure")], [("apply", "failure")])
         cancelled = jobs([(ro.CAP_STEP, "failure")], [("apply", "skipped")], conclusions={1: "cancelled"})
         renamed = jobs([("Wait cap reached", "failure")])
-        for name, j in (("two steps", both_steps), ("two jobs", two_jobs), ("a cancelled job", cancelled), ("another name", renamed)):
+        for name, j in (("two steps", both_steps), ("the cap, then another step", cap_then_another), ("two jobs", two_jobs), ("a cancelled job", cancelled), ("another name", renamed)):
             resp = responses([run_(2, HEAD, conclusion="failure", ago=2), run_(1, OLD)],
                              extra={f"{INFRA}/actions/runs/2/jobs?filter=latest&per_page=100&page=1": j})
             self.assertEqual(verdict(resp)[0].verdict, "fail", name)
