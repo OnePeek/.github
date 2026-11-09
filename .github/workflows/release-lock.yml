@@ -98,7 +98,7 @@ jobs:
             echo "::error::AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY must be passed: without the App token a lock left by another repo's finished run could never be taken over (playbook §5.4)."
             exit 1
           fi
-      - name: The agents' GitHub App token (Actions read), to see whether another repo's lock holder has finished
+      - name: The agents' GitHub App token (Actions and Contents read), to see whether another repo's lock holder has finished and read the release order
         id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
@@ -107,6 +107,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: backend-service,onepeek-web,onepeek-infra,mcp-athena # the repos that take the lock (playbook §5.4)
           permission-actions: read
+          permission-contents: read # the release order's reads (playbook §5.4a "The run's GitHub reads")
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ inputs.role-to-assume }}
@@ -123,7 +124,7 @@ jobs:
           LOCK_APP_CLIENT_ID: ${{ secrets.AGENTS_APP_CLIENT_ID }}
           LOCK_APP_PRIVATE_KEY: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
           LOCK_APP_REPOS: backend-service,onepeek-web,onepeek-infra,mcp-athena
-          LOCK_APP_PERMISSIONS: '{"actions": "read"}'
+          LOCK_APP_PERMISSIONS: '{"actions": "read", "contents": "read"}'
           LOCK_ROLE_ARN: ${{ inputs.role-to-assume }}
           LOCK_ROLE_SESSION: ${{ github.event.repository.name }}-${{ github.run_id }}
         run: |
@@ -372,8 +373,10 @@ jobs:
             fi
             echo "${code}"
           }
-          lock_fail_waiting() {  # lock_fail_waiting <holder> <scope> <run id>: the cap message (ship_change_set.py re-runs on it)
+          lock_fail_waiting() {  # lock_fail_waiting <holder> <scope> <run id>: the cap message; LOCK_CAPPED=1 lets a caller end at its "Wait cap reached (re-run)" step (§5.4a rule 2)
             echo "::error::waiting for $1 ($2, run $3); re-run"
+            # shellcheck disable=SC2034  # read by release-lock.yml's EXIT trap; the other copies fail at this step as before
+            LOCK_CAPPED=1
             return 1
           }
           LOCK_BLOCKER=""
@@ -699,8 +702,20 @@ jobs:
             take)
               LOCK_TOKEN=$(python3 -c "import secrets;print(secrets.token_hex(16))")
               echo "token=${LOCK_TOKEN}" >> "$GITHUB_OUTPUT"
+              # At the wait cap (§5.4a rule 2) this step prints the re-run line, records capped=true and passes, holding
+              # nothing; the next step, "Wait cap reached (re-run)", fails the job, so the run reads as failed only at a cap.
+              # An EXIT trap, so lock_take still runs under errexit (any other failure keeps failing this step).
+              LOCK_CAPPED=""
+              trap 'rc=$?; if [ "${rc}" -ne 0 ] && [ "${LOCK_CAPPED}" = "1" ]; then echo "capped=true" >> "$GITHUB_OUTPUT"; exit 0; fi' EXIT
               lock_take ;;
             release) LOCK_TOKEN="${GIVEN_TOKEN}" lock_finish ;;
             freeze) lock_freeze ;;
             thaw) lock_thaw ;;
           esac
+      - name: Wait cap reached (re-run)
+        # The wait cap as a step of its own (playbook §5.4a rule 2): its name is what settled() and the merge tool read
+        # (actions: read alone) to count this run as failed only at a cap, and re-run it.
+        if: ${{ steps.lock.outputs.capped == 'true' }}
+        run: |
+          echo "::error::The wait cap was reached while waiting for the ${ENVIRONMENT} release lock; nothing is held. Re-run this run."
+          exit 1
