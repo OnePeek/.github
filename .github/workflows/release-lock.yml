@@ -826,7 +826,7 @@ jobs:
           # --- release-lock end ---
           # At the wait cap of take or freeze (§5.4a rule 2) this step prints the re-run line, records capped=true and passes,
           # holding nothing; the next step, "Wait cap reached (re-run)", fails the job, so the run reads as failed only at a
-          # cap. An EXIT trap, so lock_take and lock_freeze still run under errexit (any other failure keeps failing this step).
+          # cap. An EXIT trap, so the take and the freeze still run under errexit (any other failure keeps failing this step).
           LOCK_CAPPED=""
           case "${ACTION}" in
             take)
