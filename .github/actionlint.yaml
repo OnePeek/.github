@@ -1,0 +1,8 @@
+# actionlint configuration (onepeek-docs architecture/lld/infra/delivery-pipelines.md §6.5, "job.workflow_sha is real").
+# job.workflow_sha is a documented job context property ("the commit SHA of the workflow file that defines the current
+# job"), which actionlint 1.7.12 does not know yet. Only that one message is ignored (scripts/test_release_lock.py holds
+# the list to exactly this pattern); the ignore goes when actionlint learns the property.
+paths:
+  .github/workflows/**/*.{yml,yaml}:
+    ignore:
+      - 'property "workflow_sha" is not defined in object type'
