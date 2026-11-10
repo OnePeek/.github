@@ -1,7 +1,7 @@
 # Shared: a pull request into dev or release must not depend on a preview version of an @onepeek/* package
 # (founder decision 146). Previews (0.0.0-pr<N>.<sha>) are per pull request; merge the producer first. Called by Node repos.
-# The script below is a verbatim copy of scripts/check_no_prerelease_deps.py (a test keeps them identical), so the
-# check runs exactly at the commit the caller pinned.
+# The step is actions/no-prerelease-deps (scripts/check_no_prerelease_deps.py) at the commit the caller pins this
+# workflow to; fast-checks.yml runs the same action as one step of its `fast` job (decision 180).
 name: no-prerelease-deps
 
 on:
@@ -23,95 +23,39 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: No preview versions of @onepeek/* packages
+
+      # The composite actions and scripts are this workflow's own repository at the commit the caller pinned, read from
+      # the caller's pin (pins.yml's way since 2026-11-06; delivery-pipelines.md §6.5 ruling 4). A local call inside
+      # OnePeek/.github has no pin: it uses this run's commit. Any other caller without a pin fails here (fail closed).
+      - name: This workflow's version (the caller's pin of no-prerelease-deps.yml)
+        id: version
+        env:
+          FILE: no-prerelease-deps.yml
+          REPO: ${{ github.repository }}
+          RUN_SHA: ${{ github.sha }}
         run: |
-          cat > "$RUNNER_TEMP/check.py" <<'PY'
-          """Fail when a repo depends on a pull-request preview of an @onepeek/* package (decision 146).
+          sha=$(grep -rhoiE "OnePeek/\.github/\.github/workflows/${FILE//./\\.}@[0-9a-f]{40}" .github/workflows 2>/dev/null | head -n 1 | cut -d@ -f2 || true)
+          if [ -z "${sha}" ]; then
+            if [ "$(printf '%s' "${REPO}" | tr '[:upper:]' '[:lower:]')" != "onepeek/.github" ]; then
+              echo "::error::No pin of OnePeek/.github/.github/workflows/${FILE}@<commit SHA> in .github/workflows: call ${FILE} pinned by commit SHA."
+              exit 1
+            fi
+            sha="${RUN_SHA}"
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "${FILE} runs at ${sha}"
 
-          A preview (0.0.0-pr<N>.<sha>, dist-tag pr-<N>) is private and per pull request: a consumer that depends on one must
-          wait for the producer to merge and move to its real version. `-next` versions are allowed.
-          The lockfile is the primary source (what is really installed); package.json (every dependency section, overrides,
-          resolutions, pnpm.*, aliases, catalogs) and pnpm-workspace.yaml are checked too, so a bad spec fails before a lockfile exists.
-          """
-          from __future__ import annotations
+      - name: OnePeek/.github at that version (its composite actions and scripts)
+        id: shared
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OnePeek/.github
+          ref: ${{ steps.version.outputs.sha }}
+          path: _shared
+          persist-credentials: false
 
-          import json
-          import re
-          import sys
-          from pathlib import Path
-
-          SECTIONS = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies",
-                      "overrides", "resolutions", "pnpm", "catalog", "catalogs")
-          SPEC = re.compile(r"(?<![\w-])pr-\d+(?![\w-])|-pr\d+(?!\d)")  # dist-tag spec "pr-12" or a preview version 0.0.0-pr12.abc
-          LOCKFILES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock", "npm-shrinkwrap.json")
-          SKIP_DIRS = {"node_modules", ".git"}
-          OWN_FIELD = re.compile(r'"?(version|specifier|resolved|resolution|tarball)"?\s*:')
-
-
-          def _walk(node: object):
-              if isinstance(node, dict):
-                  for name, spec in node.items():
-                      if isinstance(spec, str):
-                          yield name, spec
-                      else:
-                          yield from _walk(spec)
-
-
-          def _bad(name: str, spec: str) -> bool:
-              return ("@onepeek/" in name or "@onepeek/" in spec) and bool(SPEC.search(spec))
-
-
-          def check_package_json(path: Path) -> list[str]:
-              data = json.loads(path.read_text())
-              return [f"{path}: {name} -> {spec}" for section in SECTIONS for name, spec in _walk(data.get(section, {})) if _bad(name, spec)]
-
-
-          def _indent(line: str) -> int:
-              return len(line) - len(line.lstrip())
-
-
-          def check_text(path: Path) -> list[str]:
-              """pnpm-workspace.yaml and lockfiles. A line naming @onepeek/ opens a block that ends at the next line indented the
-              same or less. In it, only the block's own version/specifier/resolved lines count (not its nested dependencies)."""
-              found, key_indent, child_indent = [], None, None
-              for n, line in enumerate(path.read_text().splitlines(), 1):
-                  if not line.strip():
-                      continue
-                  if key_indent is not None and _indent(line) <= key_indent:
-                      key_indent = child_indent = None
-                  if "@onepeek/" in line:
-                      key_indent, child_indent = _indent(line), None
-                      hit = SPEC.search(line)
-                  elif key_indent is not None:
-                      if child_indent is None:
-                          child_indent = _indent(line)
-                      hit = _indent(line) == child_indent and OWN_FIELD.match(line.strip()) and SPEC.search(line)
-                  else:
-                      hit = False
-                  if hit:
-                      found.append(f"{path}:{n}: {line.strip()}")
-              return found
-
-
-          def main(argv: list[str]) -> int:
-              root = Path(argv[0] if argv else ".")
-              found: list[str] = []
-              for p in sorted(root.rglob("*")):
-                  if SKIP_DIRS.intersection(p.parts) or not p.is_file():
-                      continue
-                  if p.name == "package.json":
-                      found += check_package_json(p)
-                  elif p.name == "pnpm-workspace.yaml" or p.name in LOCKFILES:
-                      found += check_text(p)
-              for line in found:
-                  print(f"::error::{line} is a pull-request preview of an @onepeek package; merge the producing pull request first and depend on its real version.")
-              return 1 if found else 0
-
-
-          if __name__ == "__main__":
-              sys.exit(main(sys.argv[1:]))
-          PY
-          python3 "$RUNNER_TEMP/check.py" .
+      - name: No preview versions of @onepeek/* packages
+        uses: ./_shared/actions/no-prerelease-deps
 
       - name: Job usage (CPU, memory, disk and instance type, as a notice; S0 runner sizes)
         # Measurement only: scripts/job_usage.py verbatim (scripts/test_job_usage.py), never fails or slows the job.

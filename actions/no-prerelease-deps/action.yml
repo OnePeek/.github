@@ -1,0 +1,15 @@
+# Shared check body: a pull request into dev or release must not depend on a preview version of an @onepeek/* package
+# (founder decision 146). Previews (0.0.0-pr<N>.<sha>) are per pull request; merge the producer first. One
+# implementation for no-prerelease-deps.yml (the `no-prerelease-deps` job) and fast-checks.yml (a step of the `fast`
+# job) (decision 180; delivery-pipelines.md §9.1 "Tiny jobs merged", orchestrator ruling R-S2i-1). The caller has
+# checked out the calling repo at the workspace root; the script is this action's own repository at the same commit,
+# so the check runs exactly at the version the caller pinned.
+name: no-prerelease-deps
+description: No dependency on a pull-request preview of an @onepeek/* package (decision 146).
+
+runs:
+  using: composite
+  steps:
+    - name: No preview versions of @onepeek/* packages
+      shell: bash
+      run: python3 -I "${GITHUB_ACTION_PATH}/../../scripts/check_no_prerelease_deps.py" .

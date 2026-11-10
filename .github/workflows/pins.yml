@@ -2,9 +2,10 @@
 # OnePeek repo on pull requests and on pushes to dev and release. Fails when the repo's OnePeek/.github pins are not
 # all the commit of one v* tag, and, on a push to dev or release or a pull request into release, when docs-version.txt
 # is not an ancestor of the docs trunk (pull requests into dev pin the open docs pull request's head during a
-# change set, development-cycle §2a item 2). The logic is scripts/check_pins.py at the commit the caller pins this
-# workflow to. The docs rule reads the private docs repo with the agents' App token (S6): callers pass
-# AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY; without them only that rule fails, and only when it runs.
+# change set, development-cycle §2a item 2). The logic is actions/pins (scripts/check_pins.py) at the commit the caller
+# pins this workflow to; fast-checks.yml runs the same action as one step of its `fast` job (decision 180). The docs
+# rule reads the private docs repo with the agents' App token (S6): callers pass AGENTS_APP_CLIENT_ID and
+# AGENTS_APP_PRIVATE_KEY; without them only that rule fails, and only when it runs.
 name: pins
 
 on:
@@ -34,15 +35,29 @@ jobs:
         with:
           persist-credentials: false
 
+      # The composite actions and scripts are this workflow's own repository at the commit the caller pinned, read from
+      # the caller's pin (pins.yml's way since 2026-11-06; delivery-pipelines.md §6.5 ruling 4). A local call inside
+      # OnePeek/.github has no pin: it uses this run's commit. Any other caller without a pin fails here (fail closed).
       - name: This workflow's version (the caller's pin of pins.yml)
         id: version
+        env:
+          FILE: pins.yml
+          REPO: ${{ github.repository }}
+          RUN_SHA: ${{ github.sha }}
         run: |
-          sha=$(grep -rhoiE 'OnePeek/\.github/\.github/workflows/pins\.yml@[0-9a-f]{40}' .github/workflows | head -n 1 | cut -d@ -f2 || true)
+          sha=$(grep -rhoiE "OnePeek/\.github/\.github/workflows/${FILE//./\\.}@[0-9a-f]{40}" .github/workflows 2>/dev/null | head -n 1 | cut -d@ -f2 || true)
+          if [ -z "${sha}" ]; then
+            if [ "$(printf '%s' "${REPO}" | tr '[:upper:]' '[:lower:]')" != "onepeek/.github" ]; then
+              echo "::error::No pin of OnePeek/.github/.github/workflows/${FILE}@<commit SHA> in .github/workflows: call ${FILE} pinned by commit SHA."
+              exit 1
+            fi
+            sha="${RUN_SHA}"
+          fi
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
-          echo "pins.yml runs at ${sha:-this repo (a local call)}"
+          echo "${FILE} runs at ${sha}"
 
-      - name: OnePeek/.github at that version
-        if: ${{ steps.version.outputs.sha != '' }}
+      - name: OnePeek/.github at that version (its composite actions and scripts)
+        id: shared
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: OnePeek/.github
@@ -50,51 +65,8 @@ jobs:
           path: _shared
           persist-credentials: false
 
-      # delivery-pipelines.md §6.4a (F35): every call passes the called workflow's required inputs and secrets. The
-      # script needs PyYAML, which our runner image lacks, so it runs in a venv with the pin workflow-lint.yml uses.
-      - name: Every reusable-workflow call passes its required inputs and secrets
-        env:
-          SHA: ${{ steps.version.outputs.sha }}
-        run: |
-          shared=.
-          [ -n "${SHA}" ] && shared=_shared
-          python3 -m venv "${RUNNER_TEMP}/cci"
-          "${RUNNER_TEMP}/cci/bin/pip" install --quiet pyyaml==6.0.3
-          "${RUNNER_TEMP}/cci/bin/python" "${shared}/scripts/check_caller_inputs.py" . --shared "${shared}"
-
-      - name: Does this event run the docs rule
-        id: docs
-        env:
-          SHA: ${{ steps.version.outputs.sha }}
-        run: |
-          script=scripts/check_pins.py
-          [ -n "${SHA}" ] && script=_shared/scripts/check_pins.py
-          echo "script=${script}" >> "$GITHUB_OUTPUT"
-          echo "needed=$(python3 "${script}" --docs-needed)" >> "$GITHUB_OUTPUT"
-
-      - name: The agents' GitHub App secrets are set (the docs rule reads the private docs repo)
-        if: ${{ steps.docs.outputs.needed == 'true' && hashFiles('docs-version.txt') != '' }}
-        env:
-          HAS_APP: ${{ secrets.AGENTS_APP_CLIENT_ID != '' && secrets.AGENTS_APP_PRIVATE_KEY != '' }}
-        run: |
-          if [ "${HAS_APP}" != "true" ]; then
-            echo "::error::AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY must be passed: the docs-version.txt rule reads the private onepeek-docs repo (playbook §8a P2, S6)."
-            exit 1
-          fi
-
-      - name: The agents' GitHub App token (Contents read on onepeek-docs)
-        id: app
-        if: ${{ steps.docs.outputs.needed == 'true' && hashFiles('docs-version.txt') != '' }}
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      - name: The pin check
+        uses: ./_shared/actions/pins
         with:
-          client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
-          private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: onepeek-docs
-          permission-contents: read
-
-      - name: Pins are one tagged version; docs-version.txt is on the docs trunk
-        env:
-          SCRIPT: ${{ steps.docs.outputs.script }}
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: python3 "${SCRIPT}" . --docs auto
+          app-client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
+          app-private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}

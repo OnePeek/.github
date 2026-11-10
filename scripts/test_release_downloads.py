@@ -17,21 +17,35 @@ from pathlib import Path
 
 import yaml
 
-WORKFLOWS = Path(__file__).resolve().parents[1] / ".github/workflows"
-# (workflow, job, install step name, cache step name, tool, asset for X64)
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOWS = ROOT / ".github/workflows"
+ACTIONS = ROOT / "actions"
+# (workflow or composite action, job (None for an action), install step name, cache step name, tool, asset for X64)
 TOOLS = [
-    ("secret-scan.yml", "gitleaks", "Install gitleaks", "Cache the verified gitleaks", "gitleaks"),
-    ("workflow-lint.yml", "actionlint", "Install actionlint", "Cache the verified actionlint", "actionlint"),
+    ("actions/gitleaks/action.yml", None, "Install gitleaks", "Cache the verified gitleaks", "gitleaks"),
+    ("workflow-lint.yml", "lint", "Install actionlint", "Cache the verified actionlint", "actionlint"),
     ("release-ecs.yml", "build-image", "Install syft", "Cache the verified syft", "syft"),
 ]
 
 
 def load(name):
-    return yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))
+    path = ROOT / name if name.startswith("actions/") else WORKFLOWS / name
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
 def steps_of(workflow, job):
-    return load(workflow)["jobs"][job]["steps"]
+    doc = load(workflow)
+    return doc["runs"]["steps"] if job is None else doc["jobs"][job]["steps"]
+
+
+def step_lists():
+    """(where, steps) for every job of every workflow and every composite action (decision 180 moved some here)."""
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        for job_name, job in (doc.get("jobs") or {}).items():
+            yield f"{path.name}:{job_name}", job.get("steps") or []
+    for path in sorted(ACTIONS.glob("*/action.yml")):
+        yield str(path.relative_to(ROOT)), yaml.safe_load(path.read_text(encoding="utf-8"))["runs"]["steps"]
 
 
 def index_of(steps, prefix):
@@ -110,30 +124,27 @@ server_archive = {t[4]: make_archive(t[4]) for t in TOOLS}
 class EveryDownloadIsResilient(unittest.TestCase):
     def test_every_release_download_curl_has_retry_cache_and_checksum(self):
         found = 0
-        for path in sorted(WORKFLOWS.glob("*.yml")):
-            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-            for job_name, job in (doc.get("jobs") or {}).items():
-                steps = job.get("steps") or []
-                for i, st in enumerate(steps):
-                    run = st.get("run", "")
-                    if "releases/download" not in run:
-                        continue
-                    found += 1
-                    where = f"{path.name}:{job_name}:{st.get('name')}"
-                    for flag in ("--retry 5", "--retry-all-errors", "--retry-delay", "--retry-max-time", "--connect-timeout", "--max-time"):
-                        self.assertIn(flag, run, f"{where} lacks curl {flag}")
-                    self.assertIn("sha256sum -c -", run, where)
-                    self.assertNotIn("|| true", run, where)
-                    self.assertNotIn("sha256sum -c - ||", run, where)
-                    self.assertRegex(run, r"mv \"\$\{archive\}\.part\"", where)  # a partial download is never the archive
-                    self.assertIn("::error::Could not download", run, where)
-                    cache = steps[i - 1]
-                    self.assertTrue(cache.get("uses", "").startswith("actions/cache@"), where + " needs the cache step right before it")
-                    self.assertRegex(cache["uses"], r"@[0-9a-f]{40}$", where)
-                    key = cache["with"]["key"]
-                    for part in ("_VERSION", "runner.arch", "_SHA256_A", "_SHA256_B"):
-                        self.assertIn(part, key, f"{where} cache key lacks {part}")
-                    self.assertEqual(cache.get("if"), st.get("if"), where + " cache and install share a condition")
+        for place, steps in step_lists():
+            for i, st in enumerate(steps):
+                run = st.get("run", "")
+                if "releases/download" not in run:
+                    continue
+                found += 1
+                where = f"{place}:{st.get('name')}"
+                for flag in ("--retry 5", "--retry-all-errors", "--retry-delay", "--retry-max-time", "--connect-timeout", "--max-time"):
+                    self.assertIn(flag, run, f"{where} lacks curl {flag}")
+                self.assertIn("sha256sum -c -", run, where)
+                self.assertNotIn("|| true", run, where)
+                self.assertNotIn("sha256sum -c - ||", run, where)
+                self.assertRegex(run, r"mv \"\$\{archive\}\.part\"", where)  # a partial download is never the archive
+                self.assertIn("::error::Could not download", run, where)
+                cache = steps[i - 1]
+                self.assertTrue(cache.get("uses", "").startswith("actions/cache@"), where + " needs the cache step right before it")
+                self.assertRegex(cache["uses"], r"@[0-9a-f]{40}$", where)
+                key = cache["with"]["key"]
+                for part in ("_VERSION", "runner.arch", "_SHA256_A", "_SHA256_B"):
+                    self.assertIn(part, key, f"{where} cache key lacks {part}")
+                self.assertEqual(cache.get("if"), st.get("if"), where + " cache and install share a condition")
         self.assertGreaterEqual(found, 3)
 
     def test_secret_scan_inputs_and_secrets_are_unchanged(self):
@@ -144,7 +155,13 @@ class EveryDownloadIsResilient(unittest.TestCase):
 
     def test_archive_hash_pins_sit_in_the_workflow_env(self):
         for workflow, job, _, _, tool in TOOLS:
-            env = load(workflow)["env"]
+            if job is None:  # a composite action has no env: its first steps write the pins to GITHUB_ENV
+                pins = next(s for s in steps_of(workflow, job) if s.get("name") == f"The {tool} pins")["run"]
+                env = dict(re.findall(r'echo "([A-Z0-9_]+)=([^"]+)"', pins))
+                self.assertEqual(index_of(steps_of(workflow, job), f"The {tool} pins") + 1,
+                                 index_of(steps_of(workflow, job), "Cache the verified"), workflow)
+            else:
+                env = load(workflow)["env"]
             pre = tool.upper()
             self.assertRegex(env[f"{pre}_SHA256_A"], r"^[0-9a-f]{64}\b")
             self.assertRegex(env[f"{pre}_SHA256_B"], r"^[0-9a-f]{64}\b")

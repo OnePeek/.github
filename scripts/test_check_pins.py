@@ -19,6 +19,7 @@ TAGS = f"{A}\trefs/tags/v1.7.0\n{B}\trefs/tags/v1.8.0\n{C}\trefs/tags/v1.8.1\n{D
        f"{A}\trefs/tags/not-a-version\n"
 TRUNK = lambda token: "dev"  # noqa: E731  docs' trunk (decision 176)
 WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / ".github/workflows/pins.yml"
+ACTION = pathlib.Path(__file__).resolve().parents[1] / "actions/pins/action.yml"  # pins.yml's steps (decision 180)
 
 
 def uses(sha: str, name: str = "secret-scan") -> str:
@@ -275,11 +276,12 @@ class Main(Repo):
 
 class Workflow(unittest.TestCase):
     def test_the_app_token_reads_only_onepeek_docs_and_only_when_the_docs_rule_runs(self) -> None:
-        steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["pins"]["steps"]
+        steps = yaml.safe_load(ACTION.read_text())["runs"]["steps"]
         app = next(s for s in steps if s.get("id") == "app")
         self.assertEqual(app["with"]["repositories"], "onepeek-docs")
         self.assertEqual(app["with"]["permission-contents"], "read")
-        self.assertIn("steps.docs.outputs.needed == 'true'", app["if"])
+        # `app` is "true" only when the docs rule runs and docs-version.txt exists (test_fast_checks.Docs runs it).
+        self.assertEqual(app["if"], "${{ steps.docs.outputs.app == 'true' }}")
         last = steps[-1]["run"]
         self.assertIn("--docs auto", last)
 
@@ -290,15 +292,17 @@ class Workflow(unittest.TestCase):
         (d / ".github/workflows").mkdir(parents=True)
         (d / ".github/workflows/c.yml").write_text(uses(A, "secret-scan") + uses(B, "pins"))
         out = d / "out"
-        r = subprocess.run(["bash", "-eo", "pipefail", "-c", step["run"]], cwd=d, env={"GITHUB_OUTPUT": str(out), "PATH": "/usr/bin:/bin"},
+        env = {"GITHUB_OUTPUT": str(out), "PATH": "/usr/bin:/bin", "FILE": "pins.yml", "RUN_SHA": "e" * 40}
+        r = subprocess.run(["bash", "-eo", "pipefail", "-c", step["run"]], cwd=d, env={**env, "REPO": "OnePeek/onepeek-web"},
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(out.read_text().strip(), f"sha={B}")
-        (d / ".github/workflows/c.yml").write_text("jobs: {}\n")  # a local call (this repo): no pin, local scripts
-        r = subprocess.run(["bash", "-eo", "pipefail", "-c", step["run"]], cwd=d, env={"GITHUB_OUTPUT": str(out), "PATH": "/usr/bin:/bin"},
+        out.unlink()
+        (d / ".github/workflows/c.yml").write_text("jobs: {}\n")  # a local call (this repo): no pin, this run's commit
+        r = subprocess.run(["bash", "-eo", "pipefail", "-c", step["run"]], cwd=d, env={**env, "REPO": "OnePeek/.github"},
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue(out.read_text().strip().endswith("sha="))
+        self.assertEqual(out.read_text().strip(), "sha=" + "e" * 40)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,74 @@
+# Shared check body: the pin check (onepeek-docs architecture/lld/infra/foundation-playbook.md §8a P2 and S4). One
+# implementation for pins.yml (the `pins` job), fast-checks.yml (a step of the `fast` job) and this repo's own
+# workflow-lint.yml (decision 180; delivery-pipelines.md §9.1 "Tiny jobs merged", orchestrator ruling R-S2i-1).
+# The caller has checked out the calling repo at the workspace root. The scripts are this action's own repository at
+# the same commit (`$GITHUB_ACTION_PATH/../..`), so the check runs exactly at the version the caller pinned.
+# Fails when the repo's OnePeek/.github pins are not all the commit of one v* tag, and, on a push to dev or release or
+# a pull request into release, when docs-version.txt is not an ancestor of the docs trunk. The docs rule reads the
+# private docs repo with the agents' App token (S6); without it only that rule fails, and only when it runs.
+name: pins
+description: The OnePeek/.github pins are one v* tag's commit; every reusable-workflow call passes its required inputs; docs-version.txt is on the docs trunk.
+
+inputs:
+  app-client-id:
+    description: The agents' GitHub App (playbook §8a S6), for Contents read on onepeek-docs. Needed where docs-version.txt exists.
+    required: false
+    default: ""
+  app-private-key:
+    description: The agents' GitHub App private key (with app-client-id).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # delivery-pipelines.md §6.4a (F35): every call passes the called workflow's required inputs and secrets. The
+    # script needs PyYAML, which our runner image lacks, so it runs in a venv with the pin workflow-lint.yml uses.
+    - name: Every reusable-workflow call passes its required inputs and secrets
+      shell: bash
+      run: |
+        shared="$(cd "${GITHUB_ACTION_PATH}/../.." && pwd)"
+        python3 -m venv "${RUNNER_TEMP}/cci"
+        "${RUNNER_TEMP}/cci/bin/pip" install --quiet pyyaml==6.0.3
+        "${RUNNER_TEMP}/cci/bin/python" "${shared}/scripts/check_caller_inputs.py" . --shared "${shared}"
+
+    - name: Does this event run the docs rule
+      id: docs
+      shell: bash
+      run: |
+        script="$(cd "${GITHUB_ACTION_PATH}/../.." && pwd)/scripts/check_pins.py"
+        echo "script=${script}" >> "$GITHUB_OUTPUT"
+        needed=$(python3 "${script}" --docs-needed)
+        echo "needed=${needed}" >> "$GITHUB_OUTPUT"
+        app=false
+        if [ "${needed}" = "true" ] && [ -f docs-version.txt ]; then app=true; fi
+        echo "app=${app}" >> "$GITHUB_OUTPUT"
+
+    - name: The agents' GitHub App secrets are set (the docs rule reads the private docs repo)
+      if: ${{ steps.docs.outputs.app == 'true' }}
+      shell: bash
+      env:
+        HAS_APP: ${{ inputs.app-client-id != '' && inputs.app-private-key != '' }}
+      run: |
+        if [ "${HAS_APP}" != "true" ]; then
+          echo "::error::AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY must be passed: the docs-version.txt rule reads the private onepeek-docs repo (playbook §8a P2, S6)."
+          exit 1
+        fi
+
+    - name: The agents' GitHub App token (Contents read on onepeek-docs)
+      id: app
+      if: ${{ steps.docs.outputs.app == 'true' }}
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      with:
+        client-id: ${{ inputs.app-client-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: ${{ github.repository_owner }}
+        repositories: onepeek-docs
+        permission-contents: read
+
+    - name: Pins are one tagged version; docs-version.txt is on the docs trunk
+      shell: bash
+      env:
+        SCRIPT: ${{ steps.docs.outputs.script }}
+        GH_TOKEN: ${{ steps.app.outputs.token }}
+      run: python3 "${SCRIPT}" . --docs auto
