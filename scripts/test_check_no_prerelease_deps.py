@@ -4,6 +4,8 @@ import textwrap
 import unittest
 from pathlib import Path
 
+import yaml
+
 import check_no_prerelease_deps as c
 
 
@@ -79,11 +81,17 @@ class T(unittest.TestCase):
     def test_node_modules_skipped(self):
         self.assertEqual(run({"node_modules/x/package.json": {"dependencies": {"@onepeek/ui": "0.0.0-pr1.x"}}}), 0)
 
-    def test_workflow_embeds_the_script_verbatim(self):
-        wf = (Path(__file__).parent.parent / ".github/workflows/no-prerelease-deps.yml").read_text()
-        body = wf.split("<<'PY'\n", 1)[1].split("          PY\n", 1)[0]
-        self.assertEqual(textwrap.dedent(body), (Path(__file__).parent / "check_no_prerelease_deps.py").read_text())
-
+    def test_the_workflow_runs_this_script_through_the_shared_action_at_its_own_commit(self):
+        # Decision 180 (ruling R-S2i-1): the body is actions/no-prerelease-deps, which no-prerelease-deps.yml and
+        # fast-checks.yml both run from the OnePeek/.github checkout at the caller's pin; no inlined copy is left.
+        root = Path(__file__).parent.parent
+        action = yaml.safe_load((root / "actions/no-prerelease-deps/action.yml").read_text())
+        (only,) = action["runs"]["steps"]
+        self.assertEqual(only["run"], 'python3 -I "${GITHUB_ACTION_PATH}/../../scripts/check_no_prerelease_deps.py" .')
+        for wf, job in (("no-prerelease-deps.yml", "no-prerelease-deps"), ("fast-checks.yml", "fast")):
+            steps = yaml.safe_load((root / ".github/workflows" / wf).read_text())["jobs"][job]["steps"]
+            self.assertIn("./_shared/actions/no-prerelease-deps", [s.get("uses") for s in steps], wf)
+            self.assertNotIn("SPEC = re.compile", (root / ".github/workflows" / wf).read_text(), wf)
 
 if __name__ == "__main__":
     unittest.main()

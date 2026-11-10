@@ -6,7 +6,8 @@
 # repos at dev for a pull request into dev; for a release pull request, at their release candidate: the head commit of
 # their open dev -> release pull request, else their release branch (delivery-pipelines §6.1), so what is checked is the
 # exact version that ships; and at release for a hotfix/* pull request into release. The checks themselves live in one
-# place, onepeek-infra's scripts/contract.py.
+# place, onepeek-infra's scripts/contract.py; the steps are actions/contract at the commit the caller pins this workflow
+# to, and fast-checks.yml runs the same action as one step of its `fast` job (decision 180).
 name: contract
 
 on:
@@ -40,132 +41,48 @@ jobs:
     runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
-      - name: The agents' App secrets are passed
-        id: tokens
-        env:
-          HAS_APP: ${{ secrets.AGENTS_APP_CLIENT_ID != '' && secrets.AGENTS_APP_PRIVATE_KEY != '' }}
-        run: |
-          if [ "${HAS_APP}" != "true" ]; then
-            echo "::error::Pass AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY (playbook §8a S6): the contract job reads the other repos."
-            exit 1
-          fi
-
-      - name: The agents' GitHub App token (Contents and Pull requests read on the three repos)
-        id: app
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      # Only for this workflow's own version; actions/contract checks the pull request out again as _<role>.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
-          private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: backend-service,onepeek-web,onepeek-infra # the repos this job names
-          permission-contents: read
-          permission-pull-requests: read
+          persist-credentials: false
 
-      - name: The other repos' ref (dev; the release candidate for a release pull request; release for a hotfix)
-        id: ref
+      # The composite actions and scripts are this workflow's own repository at the commit the caller pinned, read from
+      # the caller's pin (pins.yml's way since 2026-11-06; delivery-pipelines.md §6.5 ruling 4). A local call inside
+      # OnePeek/.github has no pin: it uses this run's commit. Any other caller without a pin fails here (fail closed).
+      - name: This workflow's version (the caller's pin of contract.yml)
+        id: version
         env:
-          ROLE: ${{ inputs.role }}
-          BASE_REF: ${{ inputs.base_ref }}
-          HEAD_REF: ${{ github.head_ref }}
-          OWNER: ${{ github.repository_owner }}
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+          FILE: contract.yml
+          REPO: ${{ github.repository }}
+          RUN_SHA: ${{ github.sha }}
         run: |
-          case "${ROLE}" in backend|web|infra) ;; *) echo "::error::role must be backend, web or infra, not '${ROLE}'."; exit 1 ;; esac
-          case "${BASE_REF}" in dev|release) ;; *) echo "::error::base_ref must be dev or release, not '${BASE_REF}'."; exit 1 ;; esac
-          for side in backend web infra; do
-            [ "${side}" = "${ROLE}" ] && continue
-            case "${side}" in backend) repo=backend-service ;; web) repo=onepeek-web ;; infra) repo=onepeek-infra ;; esac
-            if [ "${BASE_REF}" = dev ]; then
-              ref=dev
-            elif [[ "${HEAD_REF}" == hotfix/* ]]; then
-              ref=release   # a hotfix ships against what is live
-            else
-              # The release candidate (delivery-pipelines §6.1): the head commit of the open dev -> release pull request,
-              # which is exactly what its promotion ships, else the release branch, which is what runs. Fails closed.
-              if ! heads=$(gh api "repos/${OWNER}/${repo}/pulls?state=open&base=release&head=${OWNER}:dev" --jq '.[].head.sha'); then
-                echo "::error::Cannot read ${repo}'s open pull requests into release, so its release candidate is unknown."
-                exit 1
-              fi
-              if [ -z "${heads}" ]; then
-                ref=release
-              elif [[ "${heads}" =~ ^[0-9a-f]{40}$ ]]; then   # one line only: =~ anchors to the whole value
-                ref="${heads}"
-              else
-                echo "::error::${repo}: expected at most one open dev -> release pull request with a commit SHA, got: ${heads}"
-                exit 1
-              fi
+          sha=$(grep -rhoiE "OnePeek/\.github/\.github/workflows/${FILE//./\\.}@[0-9a-f]{40}" .github/workflows 2>/dev/null | head -n 1 | cut -d@ -f2 || true)
+          if [ -z "${sha}" ]; then
+            if [ "$(printf '%s' "${REPO}" | tr '[:upper:]' '[:lower:]')" != "onepeek/.github" ]; then
+              echo "::error::No pin of OnePeek/.github/.github/workflows/${FILE}@<commit SHA> in .github/workflows: call ${FILE} pinned by commit SHA."
+              exit 1
             fi
-            echo "${side} is taken at ${ref}"
-            echo "${side}=${ref}" >> "$GITHUB_OUTPUT"
-          done
+            sha="${RUN_SHA}"
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "${FILE} runs at ${sha}"
 
-      - name: This pull request
+      - name: OnePeek/.github at that version (its composite actions and scripts)
+        id: shared
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: _${{ inputs.role }}
+          repository: OnePeek/.github
+          ref: ${{ steps.version.outputs.sha }}
+          path: _shared
           persist-credentials: false
-
-      - name: onepeek-infra at its ref
-        if: ${{ inputs.role != 'infra' }}
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ github.repository_owner }}/onepeek-infra
-          ref: ${{ steps.ref.outputs.infra }}
-          token: ${{ steps.app.outputs.token }}
-          path: _infra
-          persist-credentials: false
-
-      - name: backend-service at its ref
-        if: ${{ inputs.role == 'infra' }}
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ github.repository_owner }}/backend-service
-          ref: ${{ steps.ref.outputs.backend }}
-          token: ${{ steps.app.outputs.token }}
-          path: _backend
-          persist-credentials: false
-
-      - name: onepeek-web at its ref
-        if: ${{ inputs.role == 'infra' }}
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ github.repository_owner }}/onepeek-web
-          ref: ${{ steps.ref.outputs.web }}
-          token: ${{ steps.app.outputs.token }}
-          path: _web
-          persist-credentials: false
-
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-        with:
-          version: "0.12.0" # foundation-playbook §8a P3; local_ci.py UV_VERSION
-
-      - name: The backend's own environment (its real validator and settings loader)
-        if: ${{ inputs.role != 'web' }}
-        run: uv sync --directory _backend --frozen --quiet
-
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: ${{ inputs.role != 'backend' }}
-        with:
-          node-version-file: _web/.node-version
-
-      - name: The contract logic's own tests (onepeek-infra pull requests)
-        if: ${{ inputs.role == 'infra' }}
-        working-directory: _infra
-        run: uvx --with pyyaml==6.0.3 python -m unittest scripts/test_contract.py
 
       - name: The contract between repos
-        env:
-          ROLE: ${{ inputs.role }}
-        run: |
-          # No AWS credentials or settings from the runner reach the loaders.
-          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE AWS_REGION AWS_DEFAULT_REGION
-          export AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_CONFIG_FILE=/dev/null
-          case "${ROLE}" in
-            backend) sides=(--backend _backend) ;;
-            web) sides=(--web _web) ;;
-            infra) sides=(--backend _backend --web _web) ;;
-          esac
-          uvx --with pyyaml==6.0.3 python _infra/scripts/contract.py --infra _infra "${sides[@]}"
+        uses: ./_shared/actions/contract
+        with:
+          role: ${{ inputs.role }}
+          base_ref: ${{ inputs.base_ref }}
+          app-client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
+          app-private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
 
       - name: Job usage (CPU, memory, disk and instance type, as a notice; S0 runner sizes)
         # Measurement only: scripts/job_usage.py verbatim (scripts/test_job_usage.py), never fails or slows the job.

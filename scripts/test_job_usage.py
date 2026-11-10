@@ -309,7 +309,7 @@ class Workflows(unittest.TestCase):
             self.assertEqual(step.get("env"), {"RUNNER_CLASS": labels.classify(job["runs-on"], "inputs.runner", False),
                                                "RUNNER_INPUT": "${{ inputs.runner }}"}, where)
             self.assertEqual(sum(1 for s in job["steps"] if s.get("run") == run), 1, where)
-        self.assertEqual(len(seen), 10, seen)
+        self.assertEqual(len(seen), 11, seen)  # fast-checks.yml fast joined with decision 180
 
     def test_jobs_not_measured_have_no_step(self):
         for name, job_id, job in self.jobs():
