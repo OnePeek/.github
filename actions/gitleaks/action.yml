@@ -1,0 +1,92 @@
+# Shared check body: scan new commits for secrets with gitleaks (pinned, checksum verified). One implementation for
+# secret-scan.yml (the `gitleaks` job), fast-checks.yml (a step of the `fast` job) and this repo's own workflow-lint.yml
+# (decision 180; delivery-pipelines.md §9.1 "Tiny jobs merged", orchestrator ruling R-S2i-1). The caller has checked out
+# the calling repo at the workspace root with its full history (`fetch-depth: 0`): on a pull request only its commits
+# are scanned, otherwise the whole history.
+name: gitleaks
+description: The lefthook pre-commit hook has a gitleaks step; gitleaks finds no secret in the new commits.
+
+runs:
+  using: composite
+  steps:
+    # The job brings its own Python packages: our runner image has no pip (ci-runners.md §8.3).
+    - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        version: "0.12.0" # foundation-playbook §8a P3; local_ci.py UV_VERSION
+
+    - name: Pre-commit hook has a gitleaks step that fails when gitleaks is missing
+      shell: bash
+      run: |
+        uv run --no-project --with pyyaml==6.0.3 python3 - <<'PY'
+        import sys, yaml
+        try:
+            run = yaml.safe_load(open("lefthook.yml"))["pre-commit"]["commands"]["gitleaks"]["run"]
+        except (OSError, KeyError, TypeError, yaml.YAMLError) as e:
+            sys.exit(f"::error::lefthook.yml needs pre-commit.commands.gitleaks.run ({type(e).__name__})")
+        if "command -v gitleaks" not in run or "exit 1" not in run:
+            sys.exit("::error::the lefthook gitleaks step must test `command -v gitleaks` and `exit 1` when it is missing")
+        PY
+
+    # The pinned version and archive checksums (a composite action has no `env:` of its own; later steps read them).
+    - name: The gitleaks pins
+      shell: bash
+      run: |
+        {
+          echo "GITLEAKS_VERSION=8.30.1"
+          echo "GITLEAKS_SHA256_A=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"  # x64 (amd64)
+          echo "GITLEAKS_SHA256_B=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080"  # arm64
+        } >> "$GITHUB_ENV"
+
+    - name: Cache the verified gitleaks archive (the checksum is checked again on every use)
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/release-tools/gitleaks
+        key: gitleaks-${{ env.GITLEAKS_VERSION }}-${{ runner.arch }}-${{ env.GITLEAKS_SHA256_A }}-${{ env.GITLEAKS_SHA256_B }}
+
+    - name: Install gitleaks (pinned, checksum verified)
+      shell: bash
+      env:
+        VERSION: ${{ env.GITLEAKS_VERSION }}
+        SHA256_A: ${{ env.GITLEAKS_SHA256_A }}
+        SHA256_B: ${{ env.GITLEAKS_SHA256_B }}
+      run: |
+        case "${RUNNER_ARCH}" in
+          X64) asset=linux_x64; sha="${SHA256_A}" ;;
+          ARM64) asset=linux_arm64; sha="${SHA256_B}" ;;
+          *) echo "::error::Unsupported runner architecture ${RUNNER_ARCH}."; exit 1 ;;
+        esac
+        dir="${RUNNER_TEMP}/release-tools/gitleaks"; mkdir -p "${dir}"
+        archive="${dir}/gitleaks_${VERSION}_${asset}.tar.gz"
+        url="https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_${asset}.tar.gz"
+        # A cached archive is never trusted: it is checked like a fresh download, and a bad one is discarded (F125).
+        if [ -f "${archive}" ] && ! echo "${sha}  ${archive}" | sha256sum -c --quiet -; then
+          echo "::warning::The cached gitleaks archive failed its checksum; discarding it."
+          rm -f "${archive}"
+        fi
+        if [ ! -f "${archive}" ]; then
+          # Retries with a delay ride out a download-host outage (504 for two hours: F125); the checksum below still decides.
+          if ! curl -sSfL --connect-timeout 15 --max-time 90 --retry 5 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o "${archive}.part" "${url}"; then
+            rm -f "${archive}.part"
+            echo "::error::Could not download gitleaks from github.com after retries (${url})."
+            exit 1
+          fi
+          mv "${archive}.part" "${archive}"
+        fi
+        if ! echo "${sha}  ${archive}" | sha256sum -c -; then
+          rm -f "${archive}"
+          echo "::error::The gitleaks archive does not match its pinned SHA-256; not using it."
+          exit 1
+        fi
+        tar -xzf "${archive}" gitleaks
+
+    - name: Scan
+      shell: bash
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        # On a pull request, scan only its commits; otherwise scan the whole history.
+        if [ -n "${BASE_SHA}" ]; then
+          ./gitleaks git --redact --no-banner --log-opts="${BASE_SHA}..HEAD" .
+        else
+          ./gitleaks git --redact --no-banner .
+        fi

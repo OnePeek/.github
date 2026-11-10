@@ -1,4 +1,10 @@
-# This repo's own check: lint the shared workflows with actionlint, and scan for secrets.
+# This repo's own check: lint the shared workflows with actionlint, and scan for secrets. The checks that run under a
+# minute are steps of one job, `lint` (decision 180; onepeek-docs architecture/lld/infra/delivery-pipelines.md §9.1
+# "Tiny jobs merged"; orchestrator rulings R-S2i-1 and R-S2i-5, provisional, 2026-11-10): every step runs even when
+# an earlier one failed (`if: always()`), the last step writes each check's result to the job summary and fails the
+# job when any check failed. The secrets scan and the pin check are the same composite actions (actions/) that
+# secret-scan.yml, pins.yml and fast-checks.yml run. depends-on stays its own job. The `fast` job calls
+# fast-checks.yml locally, so every change here proves the shared merged job end to end.
 name: workflow-lint
 
 on:
@@ -8,9 +14,11 @@ on:
     branches: [dev]
     types: [opened, reopened, synchronize]  # never edited: ship_change_set.py re-runs checks when a dependency merges
 
+# Cancel a superseded run only for a pull request, never a push to dev (decision 180; delivery-pipelines.md §9.1
+# "Cancel only pull-request runs", orchestrator ruling R-S2i-3).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -31,22 +39,33 @@ jobs:
       AGENTS_APP_CLIENT_ID: ${{ secrets.AGENTS_APP_CLIENT_ID }}
       AGENTS_APP_PRIVATE_KEY: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
 
-  actionlint:
+  lint:
     needs: depends-on
+    # GitHub-hosted (this repo is public). The limit: actionlint 10 (its install may retry for up to 5 minutes, F125),
+    # gitleaks 10 (the same), zizmor, runner labels, pins and the service list 5 each, less the boots they no longer pay.
     runs-on: ubuntu-latest
-    timeout-minutes: 10  # the install step may retry for up to 5 minutes (F125)
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The full history: gitleaks scans the pull request's commits.
+      - name: This repo
+        id: repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Cache the verified actionlint archive (the checksum is checked again on every use)
+        if: ${{ always() }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/release-tools/actionlint
           key: actionlint-${{ env.ACTIONLINT_VERSION }}-${{ runner.arch }}-${{ env.ACTIONLINT_SHA256_A }}-${{ env.ACTIONLINT_SHA256_B }}
 
       - name: Install actionlint (pinned, checksum verified)
+        id: actionlint-install
+        if: ${{ always() }}
         env:
           VERSION: ${{ env.ACTIONLINT_VERSION }}
           SHA256_A: ${{ env.ACTIONLINT_SHA256_A }}
@@ -82,58 +101,41 @@ jobs:
           tar -xzf "${archive}" actionlint
 
       - name: Lint workflows
+        id: actionlint
+        if: ${{ always() && steps.actionlint-install.outcome == 'success' }}
         run: ./actionlint -color
 
-  secrets:
-    needs: depends-on
-    uses: ./.github/workflows/secret-scan.yml
+      - name: Secrets scan (gitleaks)
+        id: secrets
+        if: ${{ always() }}
+        uses: ./actions/gitleaks
 
-  zizmor:
-    needs: depends-on
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Security lint of the workflows
-        run: pip install --quiet zizmor==1.31.1 && zizmor --no-progress --min-severity medium .github/workflows
+      - name: Security lint of the workflows and the composite actions
+        id: zizmor
+        if: ${{ always() }}
+        run: pip install --quiet zizmor==1.31.1 && zizmor --no-progress --min-severity medium .github/workflows actions
 
-  runner-labels:
-    needs: depends-on
-    # ci-runners.md section 5.4: where jobs may run (the rules, with a fixture each, are in scripts/test_check_runner_labels.py).
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      # ci-runners.md section 5.4: where jobs may run (the rules, with a fixture each, are in scripts/test_check_runner_labels.py).
       - name: Runner label rules (public repo)
+        id: runner-labels
+        if: ${{ always() }}
         run: |
           pip install --quiet pyyaml==6.0.3
           python scripts/check_runner_labels.py --kind public --repo OnePeek/.github \
             --list .github/workflow-lint/github-only-jobs.yaml .github/workflows
 
-  pins:
-    needs: depends-on
-    # The shared pin check runs here too (this repo has no pins and no docs-version.txt, so it proves the workflow runs).
-    uses: ./.github/workflows/pins.yml
+      # The shared pin check runs here too (this repo has no pins and no docs-version.txt, so it proves the action runs).
+      - name: Pins
+        id: pins
+        if: ${{ always() }}
+        uses: ./actions/pins
 
-  service-list:
-    needs: depends-on
-    # operate.yml's service choices must equal the services file; the render function must match release-ecs.yml; the
-    # release-lock waits fit the runners' lifetimes (scripts/check_lock_limits.py).
-    # local_ci.py runs the last step too (playbook §8a P5), with onepeek-infra at origin/dev as _infra.
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      # operate.yml's service choices must equal the services file; the render function must match release-ecs.yml; the
+      # release-lock waits fit the runners' lifetimes (scripts/check_lock_limits.py).
+      # local_ci.py runs the last step too (playbook §8a P5), with onepeek-infra at origin/dev as _infra.
       - name: The agents' App secrets are passed
         id: tokens
+        if: ${{ always() }}
         env:
           HAS_APP: ${{ secrets.AGENTS_APP_CLIENT_ID != '' && secrets.AGENTS_APP_PRIVATE_KEY != '' }}
         run: |
@@ -143,6 +145,7 @@ jobs:
           fi
       - name: The agents' GitHub App token (Contents read on onepeek-infra)
         id: app
+        if: ${{ always() && steps.tokens.outcome == 'success' }}
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
@@ -150,7 +153,10 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: onepeek-infra
           permission-contents: read
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: onepeek-infra at dev (_infra)
+        id: infra
+        if: ${{ always() && steps.app.outcome == 'success' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.repository_owner }}/onepeek-infra
           ref: dev
@@ -158,6 +164,8 @@ jobs:
           path: _infra
           persist-credentials: false
       - name: Tests, then the drift check
+        id: service-list
+        if: ${{ always() && steps.infra.outcome == 'success' }}
         run: |
           pip install --quiet pyyaml==6.0.3
           python -m unittest discover -s scripts -p 'test_*.py'
@@ -166,3 +174,67 @@ jobs:
           python scripts/check_lock_limits.py --infra-config _infra/config/ci.yaml
           # settled()'s plan-relevant paths against the filter in onepeek-infra's plan.yml, both ways (playbook §5.4a drift check).
           python scripts/release_order.py check-paths --infra-plan _infra/.github/workflows/plan.yml
+
+      # One line per check: <name>|<wanted: true, false or excused>|<the outcomes of its steps, comma-separated>.
+      # Runs whatever happened before (always()); it reads only step outcomes, never an output or a secret.
+      - name: Results (each check's result in the summary; fails when any check failed)
+        if: ${{ always() }}
+        env:
+          RESULTS: |
+            setup|true|${{ steps.repo.outcome }}
+            actionlint|true|${{ steps.actionlint-install.outcome }},${{ steps.actionlint.outcome }}
+            secrets|true|${{ steps.secrets.outcome }}
+            zizmor|true|${{ steps.zizmor.outcome }}
+            runner-labels|true|${{ steps.runner-labels.outcome }}
+            pins|true|${{ steps.pins.outcome }}
+            service-list|true|${{ steps.tokens.outcome }},${{ steps.app.outcome }},${{ steps.infra.outcome }},${{ steps.service-list.outcome }}
+        run: |
+          # scripts/test_fast_checks.py runs this script; workflow-lint.yml's lint job holds the same copy (a test keeps them equal).
+          fail=0
+          wanted=0
+          table="| check | result |"$'\n'"|---|---|"
+          while IFS='|' read -r name want outcomes; do
+            [ -n "${name}" ] || continue
+            if [ "${want}" = false ]; then
+              result="not requested"
+            else
+              [ "${name}" = setup ] || wanted=$((wanted + 1))
+              result=success
+              IFS=',' read -ra each <<< "${outcomes}"
+              [ "${#each[@]}" -gt 0 ] || result="not run"
+              for o in "${each[@]}"; do
+                case "${o}" in
+                  success) ;;
+                  failure) result=failed ;;
+                  *) [ "${result}" = failed ] || result="not run (${o:-no outcome})" ;;
+                esac
+              done
+              if [ "${want}" = excused ] && [ "${result}" != failed ] && [ "${result}" != success ]; then
+                result="skipped: a dev -> release promotion pull request (tree-only, certified on the push to dev, delivery-pipelines.md §8.1)"
+              elif [ "${result}" != success ]; then
+                fail=1
+              fi
+            fi
+            table="${table}"$'\n'"| ${name} | ${result} |"
+          done <<< "${RESULTS}"
+          if [ "${wanted}" -eq 0 ]; then
+            fail=1
+            table="${table}"$'\n'"| (none) | failed: no check was requested |"
+            echo "::error::No check was requested: turn on at least one check input."
+          fi
+          echo "${table}"
+          if ! { printf '### Checks\n\n%s\n' "${table}" >> "${GITHUB_STEP_SUMMARY}"; } 2>/dev/null; then
+            echo "::warning::Could not write the job summary; the table above and the exit status decide."
+          fi
+          if [ "${fail}" -ne 0 ]; then
+            echo "::error::A check failed or did not run; see the table above."
+          fi
+          exit "${fail}"
+
+  fast:
+    needs: depends-on
+    # The shared merged job, called locally: its version step takes this run's commit, so the actions it runs are this
+    # pull request's. One cheap check is enough to prove the mechanism (checkout, version, actions, results).
+    uses: ./.github/workflows/fast-checks.yml
+    with:
+      no-prerelease-deps: true

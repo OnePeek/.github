@@ -16,6 +16,8 @@ import yaml
 import check_caller_inputs as cci
 
 WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / ".github/workflows/pins.yml"
+# The steps of pins.yml moved to the composite action that pins.yml and fast-checks.yml run (decision 180, R-S2i-1).
+ACTION = pathlib.Path(__file__).resolve().parents[1] / "actions/pins/action.yml"
 CALLEE = """on:
   workflow_call:
     inputs:
@@ -207,16 +209,21 @@ class Calls(Fixture):
 
 
 class PinsStep(unittest.TestCase):
+    def steps(self) -> list:
+        return yaml.safe_load(ACTION.read_text())["runs"]["steps"]
+
     def step(self) -> dict:
-        steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["pins"]["steps"]
-        return next(s for s in steps if "check_caller_inputs.py" in str(s.get("run")))
+        return next(s for s in self.steps() if "check_caller_inputs.py" in str(s.get("run")))
 
     def test_it_runs_on_every_event_and_not_as_the_last_step(self) -> None:
-        steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["pins"]["steps"]
+        steps = self.steps()
         step = self.step()
         self.assertNotIn("if", step)
         self.assertLess(steps.index(step), len(steps) - 1)
-        self.assertGreater(steps.index(step), next(i for i, s in enumerate(steps) if (s.get("with") or {}).get("path") == "_shared"))
+        # pins.yml runs the action only after it has checked out OnePeek/.github at its pin as _shared.
+        wf = yaml.safe_load(WORKFLOW.read_text())["jobs"]["pins"]["steps"]
+        shared = next(i for i, s in enumerate(wf) if (s.get("with") or {}).get("path") == "_shared")
+        self.assertGreater(next(i for i, s in enumerate(wf) if s.get("uses") == "./_shared/actions/pins"), shared)
 
     def test_it_uses_the_pinned_checkout_or_this_repo_with_pyyaml_in_a_venv(self) -> None:
         run = self.step()["run"]
@@ -235,10 +242,15 @@ class PinsStep(unittest.TestCase):
             f"printf '#!/bin/sh\\nexec {sys.executable} \"$@\"\\n' > \"$3/bin/python\"\n"
             "chmod +x \"$3/bin/pip\" \"$3/bin/python\"\n")
         (fake / "python3").chmod(0o755)
-        for sha, want in (("a" * 40, "_shared/scripts . --shared _shared"), ("", "scripts . --shared .")):
+        # The action's own repository: _shared (a caller's pin) or this repo (a local call), never the caller's tree.
+        real = d  # `cd ... && pwd` prints the logical path
+        for action, want in (("_shared/actions/pins", f"_shared/scripts . --shared {real}/_shared"),
+                             ("actions/pins", f"scripts . --shared {real}")):
+            (d / action).mkdir(parents=True, exist_ok=True)
             temp = pathlib.Path(tempfile.mkdtemp(dir=d))
             r = subprocess.run(["bash", "-eo", "pipefail", "-c", run], cwd=d, capture_output=True, text=True,
-                               env={"SHA": sha, "RUNNER_TEMP": str(temp), "PATH": f"{fake}:/usr/bin:/bin"})
+                               env={"GITHUB_ACTION_PATH": str(d / action), "RUNNER_TEMP": str(temp),
+                                    "PATH": f"{fake}:/usr/bin:/bin"})
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stdout.strip(), want)
         self.assertEqual((d / "pip.log").read_text().splitlines(), ["install --quiet pyyaml==6.0.3"] * 2)
@@ -259,8 +271,10 @@ class PinsStep(unittest.TestCase):
         (fake / "python3").write_text("#!/bin/sh\nexit 0\n")  # the venv is already made above
         for f in (venv / "pip", venv / "python", fake / "python3"):
             f.chmod(0o755)
+        (d / "actions/pins").mkdir(parents=True)
         r = subprocess.run(["bash", "-eo", "pipefail", "-c", self.step()["run"]], cwd=d, capture_output=True, text=True,
-                           env={"SHA": "", "RUNNER_TEMP": str(temp), "PATH": f"{fake}:/usr/bin:/bin"})
+                           env={"GITHUB_ACTION_PATH": str(d / "actions/pins"), "RUNNER_TEMP": str(temp),
+                                "PATH": f"{fake}:/usr/bin:/bin"})
         self.assertEqual(r.returncode, 1)
         self.assertIn("without required input a", r.stdout)
         self.assertNotIn("continue-on-error", self.step())

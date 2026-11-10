@@ -1,4 +1,5 @@
-"""Tests of .github/workflows/contract.yml (decision 153; delivery-pipelines §6.1 row "contract between repos").
+"""Tests of .github/workflows/contract.yml and its body, actions/contract/action.yml (decision 153; delivery-pipelines §6.1
+row "contract between repos"; the body moved to the composite action with decision 180, ruling R-S2i-1).
 Run: python -m unittest discover -s scripts -p 'test_*.py'"""
 
 import os
@@ -12,8 +13,9 @@ from pathlib import Path
 import yaml
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/contract.yml"
+ACTION = Path(__file__).resolve().parents[1] / "actions/contract/action.yml"
 DOC = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-STEPS = DOC["jobs"]["contract"]["steps"]
+STEPS = yaml.safe_load(ACTION.read_text(encoding="utf-8"))["runs"]["steps"]
 
 
 def step(name: str) -> dict:
@@ -153,18 +155,28 @@ class AppToken(unittest.TestCase):
         out, _ = run("The agents' App secrets are passed", {"HAS_APP": "true"})
         self.assertEqual(out.returncode, 0)
         self.assertNotIn("ORG_READ_TOKEN", WORKFLOW.read_text(encoding="utf-8"))
+        self.assertNotIn("ORG_READ_TOKEN", ACTION.read_text(encoding="utf-8"))
+
+    def test_the_workflow_passes_its_inputs_and_the_app_secrets_to_the_action(self):
+        steps = DOC["jobs"]["contract"]["steps"]
+        call = next(s for s in steps if s.get("uses") == "./_shared/actions/contract")
+        self.assertEqual(call["with"], {"role": "${{ inputs.role }}", "base_ref": "${{ inputs.base_ref }}",
+                                        "app-client-id": "${{ secrets.AGENTS_APP_CLIENT_ID }}",
+                                        "app-private-key": "${{ secrets.AGENTS_APP_PRIVATE_KEY }}"})
+        self.assertNotIn("secrets.", ACTION.read_text(encoding="utf-8"))  # a composite action reads inputs only
 
 
 class ServiceListJob(unittest.TestCase):
-    """workflow-lint.yml service-list reads onepeek-infra with the App token (S6); its last step runs locally (P5)."""
+    """workflow-lint.yml's service-list steps (in its `lint` job since decision 180) read onepeek-infra with the App token
+    (S6); the drift step runs locally too (P5)."""
 
     def test_infra_is_read_with_the_app_token_and_the_drift_step_needs_no_secret(self):
-        steps = yaml.safe_load((WORKFLOW.parent / "workflow-lint.yml").read_text(encoding="utf-8"))["jobs"]["service-list"]["steps"]
+        steps = yaml.safe_load((WORKFLOW.parent / "workflow-lint.yml").read_text(encoding="utf-8"))["jobs"]["lint"]["steps"]
         app = next(s for s in steps if s.get("id") == "app")
         self.assertEqual((app["with"]["repositories"], app["with"]["permission-contents"]), ("onepeek-infra", "read"))
         infra = next(s for s in steps if (s.get("with") or {}).get("path") == "_infra")
         self.assertEqual(infra["with"]["token"], "${{ steps.app.outputs.token }}")
-        last = steps[-1]
+        last = next(s for s in steps if s.get("id") == "service-list")
         self.assertNotIn("secrets.", str(last))
         self.assertIn("_infra/config/services.preprod.yaml", last["run"])
 
