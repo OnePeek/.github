@@ -7,7 +7,10 @@
 #   take    take every key try-or-release, in the fixed order locks/release.json (during the move, §5.4a), infra.json,
 #           backend.json, web.json and mcp.json, waiting holding nothing; outputs the token that releases them.
 #   release remove every key that holds the given token (infra's records stay phase locked: nothing to put back).
-#   freeze  preprod-frozen (§5.4, §5.6): a hotfix/* run writes locks/frozen.json naming itself; every other take fails.
+#   freeze  preprod-frozen (§5.4, §5.4a "Freeze and thaw", §5.6): a hotfix/* run writes locks/frozen.json naming itself,
+#           without infra_head (every infra take is refused from then on); waits while a live run holds infra.json; then
+#           records infra_head and infra_settled from settled() at this workflow's own commit (_gh/). Every other take
+#           fails, and a take from the hotfix branch fails until infra_head is recorded.
 #   thaw    remove locks/frozen.json (the push that merges release back into dev).
 # Callers grant actions: read, pass AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY, and use no concurrency group.
 name: release-lock
@@ -69,10 +72,9 @@ env:
 jobs:
   lock:
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    # Waits only for take: the cap (120) plus 15 (playbook §5.4a; a named TIMEOUT_EXCEPTIONS entry, read as its larger value).
-    # TODO(.github #56): freeze's wait for a live infra.json holder is built with the release order; until then freeze keeps
-    # the 10-minute limit (playbook §5.4a "Freeze and thaw"), and becomes `inputs.action == 'take' || inputs.action == 'freeze'`.
-    timeout-minutes: ${{ inputs.action == 'take' && 135 || 10 }}
+    # Waits only for take and freeze (freeze, for a live infra.json holder): the cap (120) plus 15 (playbook §5.4a "Freeze and
+    # thaw"; a named TIMEOUT_EXCEPTIONS entry, read as its larger value). release and thaw never wait.
+    timeout-minutes: ${{ (inputs.action == 'take' || inputs.action == 'freeze') && 135 || 10 }}
     environment: ${{ inputs.environment == 'prod' && 'prod' || null }}
     permissions:
       contents: read
@@ -90,6 +92,27 @@ jobs:
           if [ "${SCOPE}" != "infra" ]; then echo "::error::scope must be infra (only infra calls release-lock.yml, playbook §5.4a), not '${SCOPE}'."; exit 1; fi
           case "${ACTION}" in take|release|freeze|thaw) ;; *) echo "::error::action must be take, release, freeze or thaw, not '${ACTION}'."; exit 1 ;; esac
           if [ "${ACTION}" = "release" ] && [ -z "${GIVEN_TOKEN}" ]; then echo "::error::release needs the token output of the take call."; exit 1; fi
+      - name: This workflow's own commit (freeze reads settled() at it)
+        if: ${{ inputs.action == 'freeze' }}
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          # actions/checkout with an empty ref silently checks out the default branch, so the value is refused before the
+          # checkout (playbook §5.4a "How freeze reaches settled()").
+          if ! [[ "${WORKFLOW_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::job.workflow_sha is '${WORKFLOW_SHA}', not a 40-character commit SHA, so freeze cannot read settled() at this workflow's own commit; nothing is frozen."
+            exit 1
+          fi
+      - name: OnePeek/.github at this workflow's own commit, for settled() (freeze only)
+        if: ${{ inputs.action == 'freeze' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OnePeek/.github
+          ref: ${{ job.workflow_sha }}
+          path: _gh
+          sparse-checkout: |
+            scripts
+          persist-credentials: false
       - name: The agents' GitHub App secrets are set (required, playbook §5.4)
         env:
           HAS_APP: ${{ secrets.AGENTS_APP_CLIENT_ID != '' && secrets.AGENTS_APP_PRIVATE_KEY != '' }}
@@ -127,6 +150,7 @@ jobs:
           LOCK_APP_PERMISSIONS: '{"actions": "read", "contents": "read"}'
           LOCK_ROLE_ARN: ${{ inputs.role-to-assume }}
           LOCK_ROLE_SESSION: ${{ github.event.repository.name }}-${{ github.run_id }}
+          LOCK_ORDER_SCRIPT: _gh/scripts/release_order.py # freeze's settled() for infra, checked out at job.workflow_sha (freeze only)
         run: |
           # --- release-lock begin (identical in release-ecs.yml, operate.yml and release-lock.yml; checked by scripts/check_service_list.py) ---
           # Release locks per scope (foundation-playbook §5.4, §5.4a): one key per scope in s3://onepeek-<env>-deploy/locks/
@@ -142,7 +166,8 @@ jobs:
           # finished is taken over by its phase: locked or done, removed; migrating, removed only once the migrate task has
           # stopped; rolling, never (cancel-release.yml repairs it). Anything unreadable fails closed: no lock, no deploy.
           # preprod-frozen: while s3://onepeek-<env>-deploy/locks/frozen.json exists (written from a hotfix/* branch, §5.6), it
-          # names that branch (repo and ref): any run from it may take the lock, every other take fails with the reason.
+          # names that branch (repo and ref): any run from it may take the lock once freeze has recorded infra_head, every
+          # other take (infra's included) fails with the reason, and every take reads it again after taking its keys.
           # Waits fit the runners (§5.4a): every wait counts towards LOCK_WAIT_CAP_SECONDS; a run of the same scope holding the key
           # is waited for at most LOCK_WAIT_SECONDS; at a limit the step fails with "waiting for <holder> (<scope>, run <id>);
           # re-run", holding nothing. Every LOCK_REMINT_SECONDS inside a wait the App token and the AWS role session are minted again.
@@ -269,25 +294,34 @@ jobs:
             if [ -n "${LOCK_TOKEN:-}" ]; then [ "${token}" = "${LOCK_TOKEN}" ]; return; fi
             [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${run}" = "${GITHUB_RUN_ID}" ] && [ "${attempt}" = "${GITHUB_RUN_ATTEMPT}" ]
           }
-          lock_frozen_branch() {  # lock_frozen_branch <file> -> "<repo> <ref>" of a preprod-frozen record; 1 when it is not one
+          lock_frozen_branch() {  # lock_frozen_branch <file> -> "<repo> <ref> <infra_head | ->" of a preprod-frozen record ("-": freeze has not recorded it yet); 1 when it is not one
             python3 -c '
           import json, re, sys
           try:
               record = json.load(open(sys.argv[1]))
               repo, ref = record["repo"], record["ref"]
+              head, settled = record.get("infra_head"), record.get("infra_settled")
           except Exception as error:
               sys.exit("not a preprod-frozen record: %r" % error)
           if not (re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) and re.fullmatch(r"refs/heads/hotfix/[A-Za-z0-9_./-]+", ref)):
               sys.exit("not a preprod-frozen record: " + json.dumps(record))
-          print(repo, ref)' "$1"
+          # Once recorded, infra_head is a commit SHA and infra_settled a boolean (§5.4a "Freeze and thaw"); anything else fails closed.
+          if head is not None and not (isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head) and isinstance(settled, bool)):
+              sys.exit("not a preprod-frozen record (infra_head or infra_settled): " + json.dumps(record))
+          print(repo, ref, head or "-")' "$1"
           }
-          lock_frozen_for_others() {  # 0 when preprod-frozen names another branch (the reason is printed), 1 when not frozen for us, 2 unreadable
-            local etag branch repo ref
+          lock_frozen_for_others() {  # 0 when preprod-frozen refuses this run (the reason is printed): it names another branch, or this branch before freeze recorded infra_head; 1 when not frozen for us, 2 unreadable
+            local etag branch repo ref head
             if ! etag=$(lock_read "${FROZEN_KEY}" lock-frozen.json); then return 2; fi
             if [ "${etag}" = "absent" ]; then return 1; fi
             if ! branch=$(lock_frozen_branch lock-frozen.json); then return 2; fi
-            read -r repo ref <<< "${branch}"
-            if [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${ref}" = "${GITHUB_REF:-}" ]; then return 1; fi
+            read -r repo ref head <<< "${branch}"
+            if [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${ref}" = "${GITHUB_REF:-}" ]; then
+              if [ "${head}" != "-" ]; then return 1; fi
+              # §5.4a "Freeze and thaw": a hotfix take refuses while frozen.json has no infra_head yet.
+              echo "preprod is frozen for this hotfix branch ${repo} ${ref}, but freeze has not recorded infra_head yet (it waits while a live infra release holds infra.json); re-run once freeze has finished"
+              return 0
+            fi
             python3 -c 'import json,sys;r=json.load(open(sys.argv[1]));print("preprod is frozen by %s (%s) for the hotfix branch %s %s, first frozen by %s" % (r.get("who","?"), r.get("why","?"), r["repo"], r["ref"], r.get("run","?")))' lock-frozen.json
             return 0
           }
@@ -486,6 +520,15 @@ jobs:
                 rc=0; lock_edge_busy || rc=$?
                 case "${rc}" in 0) state=held ;; 1) ;; *) state=failed ;; esac
               fi
+              if [ "${state}" = "free" ]; then   # once more after the take: a freeze written meanwhile refuses it (§5.4a "Freeze and thaw")
+                rc=0
+                reason=$(lock_frozen_for_others) || rc=$?
+                case "${rc}" in
+                  0) echo "::error::The ${ENVIRONMENT} release lock is refused: ${reason}."; state=failed ;;
+                  1) ;;
+                  *) echo "::error::s3://${LOCK_BUCKET}/${FROZEN_KEY} is unreadable, so nothing is deployed."; state=failed ;;
+                esac
+              fi
               if [ "${state}" = "free" ]; then
                 echo "Took the ${ENVIRONMENT} release lock of ${LOCK_SCOPE}: ${keys[*]}."
                 return 0
@@ -669,25 +712,104 @@ jobs:
               esac
             done
           }
-          lock_freeze() {  # preprod-frozen (§5.4, §5.6): only a hotfix/* run writes it, naming its branch (repo and ref)
-            local msg etag branch repo ref
-            case "${GITHUB_REF:-}" in refs/heads/hotfix/*) ;; *) echo "::error::Only a hotfix/* run freezes ${ENVIRONMENT} (playbook §5.6), not ${GITHUB_REF:-?}."; return 1 ;; esac
-            lock_record lock-frozen-mine.json
-            if aws s3api put-object --bucket "${LOCK_BUCKET}" --key "${FROZEN_KEY}" --body lock-frozen-mine.json --if-none-match '*' \
-              --content-type application/json >/dev/null 2>"${LOCK_ERR}"; then
-              echo "Froze ${ENVIRONMENT} for ${GITHUB_REPOSITORY} ${GITHUB_REF} (s3://${LOCK_BUCKET}/${FROZEN_KEY})."
-              return 0
-            fi
-            msg=$(cat "${LOCK_ERR}")
-            case "${msg}" in *"(PreconditionFailed)"*|*"(ConditionalRequestConflict)"*) ;; *) echo "::error::preprod-frozen could not be written: ${msg}"; return 1 ;; esac
-            if ! etag=$(lock_read "${FROZEN_KEY}" lock-frozen.json) || [ "${etag}" = "absent" ] || ! branch=$(lock_frozen_branch lock-frozen.json); then
-              echo "::error::preprod-frozen could not be read back."
-              return 1
-            fi
-            read -r repo ref <<< "${branch}"
-            if [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${ref}" = "${GITHUB_REF}" ]; then echo "${ENVIRONMENT} is already frozen for this branch."; return 0; fi
+          lock_frozen_mine() {  # lock_frozen_mine -> 0 frozen.json names this branch (LOCK_FROZEN_HEAD: its infra_head or -; LOCK_FROZEN_ETAG), 1 another branch or absent, 2 unreadable
+            local branch repo ref
+            LOCK_FROZEN_HEAD=""
+            if ! LOCK_FROZEN_ETAG=$(lock_read "${FROZEN_KEY}" lock-frozen.json); then return 2; fi
+            if [ "${LOCK_FROZEN_ETAG}" = "absent" ]; then return 1; fi
+            if ! branch=$(lock_frozen_branch lock-frozen.json); then return 2; fi
+            read -r repo ref LOCK_FROZEN_HEAD <<< "${branch}"
+            if [ "${repo}" = "${GITHUB_REPOSITORY}" ] && [ "${ref}" = "${GITHUB_REF}" ]; then return 0; fi
             echo "::error::${ENVIRONMENT} is already frozen for ${repo} ${ref}."
             return 1
+          }
+          lock_freeze() {  # preprod-frozen (§5.4a "Freeze and thaw", §5.6): only a hotfix/* run writes it, naming its branch (repo and ref)
+            # 1. frozen.json without infra_head: from then on every infra take is refused, and so is every hotfix take.
+            # 2. While infra.json is held by a live run, wait (the wait rules of §5.4a: the cap, the re-mint); that run keeps
+            #    its keys until its own unlock. A holder whose run has finished is not waited for.
+            # 3. settled() for infra (LOCK_ORDER_SCRIPT, the release order at this workflow's own commit): infra_head, the
+            #    head of infra's latest successful release run, and infra_settled, true only on a clean settled verdict.
+            local etag rc held holder hrepo hrun rest start tries
+            case "${GITHUB_REF:-}" in refs/heads/hotfix/*) ;; *) echo "::error::Only a hotfix/* run freezes ${ENVIRONMENT} (playbook §5.6), not ${GITHUB_REF:-?}."; return 1 ;; esac
+            lock_record lock-frozen-mine.json
+            rc=0
+            lock_put "${FROZEN_KEY}" lock-frozen-mine.json '*' || rc=$?
+            case "${rc}" in
+              0) etag="${LOCK_PUT_ETAG}"
+                 echo "Froze ${ENVIRONMENT} for ${GITHUB_REPOSITORY} ${GITHUB_REF} (s3://${LOCK_BUCKET}/${FROZEN_KEY}); every infra take is refused from now on." ;;
+              2|3)
+                rc=0; lock_frozen_mine || rc=$?
+                if [ "${rc}" -eq 2 ] || { [ "${rc}" -eq 1 ] && [ "${LOCK_FROZEN_ETAG}" = "absent" ]; }; then echo "::error::preprod-frozen could not be read back."; return 1; fi
+                if [ "${rc}" -ne 0 ]; then return 1; fi
+                if [ "${LOCK_FROZEN_HEAD}" != "-" ]; then echo "${ENVIRONMENT} is already frozen for this branch (infra_head ${LOCK_FROZEN_HEAD})."; return 0; fi
+                etag="${LOCK_FROZEN_ETAG}"
+                cp lock-frozen.json lock-frozen-mine.json
+                echo "${ENVIRONMENT} is already frozen for this branch, without infra_head yet: this run records it." ;;
+              *) return 1 ;;
+            esac
+            start=${SECONDS}
+            while :; do
+              if ! lock_remint_if_due; then return 1; fi
+              rc=0; lock_frozen_mine || rc=$?
+              if [ "${rc}" -ne 0 ] || [ "${LOCK_FROZEN_ETAG}" != "${etag}" ]; then
+                echo "::error::preprod-frozen changed while freeze waited (thawed, or written again), so freeze stops and records nothing."; return 1
+              fi
+              if ! held=$(lock_read locks/infra.json lock-infra.json); then
+                echo "::error::s3://${LOCK_BUCKET}/locks/infra.json is unreadable, so infra_head is not recorded and every hotfix take stays refused."; return 1
+              fi
+              if [ "${held}" = "absent" ]; then break; fi
+              if ! holder=$(lock_holder lock-infra.json); then
+                echo "::error::s3://${LOCK_BUCKET}/locks/infra.json holds no readable record, so infra_head is not recorded and every hotfix take stays refused."; return 1
+              fi
+              read -r hrepo hrun rest <<< "${holder}"
+              if lock_run_finished "${hrepo}" "${hrun}"; then
+                echo "s3://${LOCK_BUCKET}/locks/infra.json is held by $(lock_url "${hrepo}" "${hrun}"), which is not running: not waited for (the next infra take removes it)."
+                break
+              fi
+              if [ $((SECONDS - start)) -ge "${LOCK_WAIT_CAP_SECONDS}" ]; then
+                lock_fail_waiting "${hrepo}" infra "${hrun}"
+                return 1
+              fi
+              echo "Freeze waits: s3://${LOCK_BUCKET}/locks/infra.json is held by $(lock_url "${hrepo}" "${hrun}"), a live infra release, which keeps its keys until its own unlock."
+              sleep "${LOCK_POLL_SECONDS}"
+            done
+            # settled() for infra; a read error, or no verdict at all, records infra_settled false with the error, never true.
+            if ! GH_TOKEN="${LOCK_GH_TOKEN}" python3 -c '
+          import json, os, re, subprocess, sys
+          script, head, settled, reason = os.environ.get("LOCK_ORDER_SCRIPT", ""), None, False, ""
+          try:
+              if not script or not os.path.isfile(script):
+                  raise RuntimeError("no release-order script at %r" % script)
+              out = subprocess.run([sys.executable, script, "settled", "--scope", "infra", "--json"], capture_output=True, text=True, timeout=900)
+              lines = out.stdout.strip().splitlines()
+              doc = json.loads(lines[-1]) if out.returncode == 0 and lines else None
+              if not isinstance(doc, dict):
+                  raise RuntimeError("settled --scope infra gave no verdict (exit %d): %s" % (out.returncode, (out.stderr or out.stdout).strip()[:300]))
+              head, reason = doc.get("success_head"), str(doc.get("reason", ""))
+              settled = doc.get("verdict") == "settled" and doc.get("error") is False
+          except Exception as error:
+              reason = "the release order could not be read: %s" % error
+          if not (isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head)):
+              print("::error::infra_head cannot be recorded (the head of the latest successful infra release run is %r; %s), so every hotfix take stays refused; re-run freeze." % (head, reason))
+              sys.exit(1)
+          record = json.load(open("lock-frozen-mine.json"))
+          record.update(infra_head=head, infra_settled=settled, infra_settled_reason=reason)
+          json.dump(record, open("lock-frozen-record.json", "w"))
+          print("infra_head %s, infra_settled %s: %s" % (head, "true" if settled else "false", reason))'; then
+              return 1
+            fi
+            tries=0
+            while :; do
+              rc=0
+              lock_put "${FROZEN_KEY}" lock-frozen-record.json "${etag}" || rc=$?
+              if [ "${rc}" -eq 0 ]; then echo "Recorded infra_head and infra_settled in s3://${LOCK_BUCKET}/${FROZEN_KEY}."; return 0; fi
+              if [ "${rc}" -eq 1 ]; then return 1; fi
+              rc=0; lock_frozen_mine || rc=$?
+              if [ "${rc}" -eq 0 ] && [ "${LOCK_FROZEN_HEAD}" != "-" ]; then echo "Another freeze run of this branch has recorded infra_head ${LOCK_FROZEN_HEAD}."; return 0; fi
+              if [ "${rc}" -eq 0 ] && [ "${LOCK_FROZEN_ETAG}" = "${etag}" ] && [ "${tries}" -lt 3 ]; then tries=$((tries + 1)); sleep 1; continue; fi   # a 409 on an unchanged record
+              echo "::error::preprod-frozen changed before infra_head could be recorded (thawed, or written again), so freeze records nothing."
+              return 1
+            done
           }
           lock_thaw() {  # removes preprod-frozen (the push that merges release back into dev, §5.6)
             local etag rc
@@ -702,18 +824,20 @@ jobs:
             esac
           }
           # --- release-lock end ---
+          # At the wait cap of take or freeze (§5.4a rule 2) this step prints the re-run line, records capped=true and passes,
+          # holding nothing; the next step, "Wait cap reached (re-run)", fails the job, so the run reads as failed only at a
+          # cap. An EXIT trap, so lock_take and lock_freeze still run under errexit (any other failure keeps failing this step).
+          LOCK_CAPPED=""
           case "${ACTION}" in
             take)
               LOCK_TOKEN=$(python3 -c "import secrets;print(secrets.token_hex(16))")
               echo "token=${LOCK_TOKEN}" >> "$GITHUB_OUTPUT"
-              # At the wait cap (§5.4a rule 2) this step prints the re-run line, records capped=true and passes, holding
-              # nothing; the next step, "Wait cap reached (re-run)", fails the job, so the run reads as failed only at a cap.
-              # An EXIT trap, so lock_take still runs under errexit (any other failure keeps failing this step).
-              LOCK_CAPPED=""
               trap 'rc=$?; if [ "${rc}" -ne 0 ] && [ "${LOCK_CAPPED}" = "1" ]; then echo "capped=true" >> "$GITHUB_OUTPUT"; exit 0; fi' EXIT
               lock_take ;;
             release) LOCK_TOKEN="${GIVEN_TOKEN}" lock_finish ;;
-            freeze) lock_freeze ;;
+            freeze)
+              trap 'rc=$?; if [ "${rc}" -ne 0 ] && [ "${LOCK_CAPPED}" = "1" ]; then echo "capped=true" >> "$GITHUB_OUTPUT"; exit 0; fi' EXIT
+              lock_freeze ;;
             thaw) lock_thaw ;;
           esac
       - name: Wait cap reached (re-run)
@@ -721,5 +845,5 @@ jobs:
         # (actions: read alone) to count this run as failed only at a cap, and re-run it.
         if: ${{ steps.lock.outputs.capped == 'true' }}
         run: |
-          echo "::error::The wait cap was reached while waiting for the ${ENVIRONMENT} release lock; nothing is held. Re-run this run."
+          echo "::error::The wait cap was reached while waiting for the ${ENVIRONMENT} release lock; nothing is held (a freeze keeps frozen.json without infra_head, so hotfix takes stay refused until its re-run records it). Re-run this run."
           exit 1

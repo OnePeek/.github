@@ -87,6 +87,12 @@ class Limits(unittest.TestCase):
         problems = c.check(WORKFLOWS, LIFE, {**c.TABLE, ("release-ecs.yml", "deploy"): {"cap": 1, "cap_env": "X", "other": 1}})
         self.assertTrue(any("release-ecs.yml job deploy is in the limits table but does not wait" in p for p in problems), problems)
 
+    def test_a_freeze_waits_too(self):
+        # release-lock.yml's freeze waits for a live infra.json holder (§5.4a "Freeze and thaw"): its job is a waiting
+        # job even with no take.
+        problems = self.check(("release-lock.yml", "              lock_take ;;\n", "              true ;;\n"))
+        self.assertEqual(problems, [])
+
     def test_the_lifetimes_are_read_from_the_infra_config(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "ci.yaml"
