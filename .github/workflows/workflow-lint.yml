@@ -164,3 +164,5 @@ jobs:
           python scripts/check_service_list.py --services-file _infra/config/services.preprod.yaml
           # The release-lock waits against the reaper lifetimes in onepeek-infra's config/ci.yaml (playbook §5.4a limits test).
           python scripts/check_lock_limits.py --infra-config _infra/config/ci.yaml
+          # settled()'s plan-relevant paths against the filter in onepeek-infra's plan.yml, both ways (playbook §5.4a drift check).
+          python scripts/release_order.py check-paths --infra-plan _infra/.github/workflows/plan.yml

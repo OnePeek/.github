@@ -265,7 +265,8 @@ class Take(unittest.TestCase):
     def test_infras_partial_take_releases_every_key_it_took_in_reverse_then_waits_holding_nothing(self):
         web = record("OnePeek/onepeek-web", "88", scope="web", phase="rolling")
         out = run(ACTION, keys={WEB: web}, ACTION="take", LOCK_SCOPE="infra", GITHUB_REPOSITORY=INFRA, LOCK_WAIT_CAP_SECONDS="1")
-        self.assertEqual(out.returncode, 1)
+        self.assertEqual(out.returncode, 0)  # at the cap the step passes; "Wait cap reached (re-run)" fails the job
+        self.assertIn("capped=true", out.output)
         deletes = [l.split("--key ")[1].split()[0] for l in out.calls.splitlines() if "delete-object" in l]
         self.assertEqual(deletes[:3], [BACKEND, INFRA_KEY, LEGACY])
         self.assertEqual(out.keys, {WEB: web})
@@ -410,7 +411,7 @@ class Remint(unittest.TestCase):
     def held_run(self, **extra):
         return run(TAKE, keys={BACKEND: record(scope="infra")}, stubs={"openssl": OPENSSL, "curl": CURL},
                    **{"LOCK_REMINT_SECONDS": "1", **extra}, LOCK_WAIT_CAP_SECONDS="3", LOCK_APP_CLIENT_ID="Iv1.client", LOCK_APP_PRIVATE_KEY="-----PRIVATE KEY SECRET-----",
-                   LOCK_APP_REPOS="backend-service,onepeek-web,onepeek-infra,mcp-athena", LOCK_APP_PERMISSIONS='{"actions": "read"}',
+                   LOCK_APP_REPOS="backend-service,onepeek-web,onepeek-infra,mcp-athena", LOCK_APP_PERMISSIONS='{"actions": "read", "contents": "read"}',
                    LOCK_ROLE_ARN="arn:aws:iam::111111111111:role/onepeek-preprod-deploy-backend-service", LOCK_ROLE_SESSION="backend-service-5000",
                    ACTIONS_ID_TOKEN_REQUEST_URL="https://token?x=1", ACTIONS_ID_TOKEN_REQUEST_TOKEN="req",
                    AWS_ASSUME_ROLE_WITH_WEB_IDENTITY="AKIA sk st")  # fmt: skip
@@ -437,7 +438,7 @@ class Remint(unittest.TestCase):
         self.assertIn("::add-mask::new-app-token", out.stdout)
         self.assertIn("::add-mask::st", out.stdout)
         self.assertEqual(json.loads(out.token_request.splitlines()[0]), {"repositories": ["backend-service", "onepeek-web", "onepeek-infra", "mcp-athena"],
-                                                         "permissions": {"actions": "read"}})
+                                                         "permissions": {"actions": "read", "contents": "read"}})
 
     def test_no_new_mint_before_the_interval(self):
         out = self.held_run(LOCK_REMINT_SECONDS="3000")
@@ -453,7 +454,13 @@ class Remint(unittest.TestCase):
             self.assertEqual(take["env"]["LOCK_APP_REPOS"], "backend-service,onepeek-web,onepeek-infra,mcp-athena")
             app = next(s for s in doc["jobs"][LOCK_JOB[wf]]["steps"] if s.get("id") == "app")
             self.assertEqual(take["env"]["LOCK_APP_REPOS"], app["with"]["repositories"].split(" #")[0])
-            self.assertEqual(json.loads(take["env"]["LOCK_APP_PERMISSIONS"]), {"actions": app["with"]["permission-actions"]})
+            # Exactly actions and contents read, on exactly the four lock repos, at the mint and the re-mint (playbook §5.4a
+            # "The run's GitHub reads and their grants").
+            perms = {k.removeprefix("permission-"): v for k, v in app["with"].items() if k.startswith("permission-")}
+            self.assertEqual(perms, {"actions": "read", "contents": "read"}, wf)
+            self.assertEqual(json.loads(take["env"]["LOCK_APP_PERMISSIONS"]), perms, wf)
+            self.assertEqual(sorted(app["with"]["repositories"].split(" #")[0].split(",")),
+                             ["backend-service", "mcp-athena", "onepeek-infra", "onepeek-web"])
 
 
 class PhaseWrites(unittest.TestCase):
@@ -621,6 +628,47 @@ class SharedLockWorkflow(unittest.TestCase):
             self.assertEqual(r.returncode, code, (scope, action))
         self.assertNotIn("concurrency", LOCKWF)
         self.assertEqual(LOCKWF["jobs"]["lock"]["permissions"]["actions"], "read")
+
+    def test_at_the_wait_cap_the_step_records_capped_and_passes_holding_nothing(self):
+        web = record("OnePeek/onepeek-web", "88", scope="web", phase="locked")
+        out = run(ACTION, keys={WEB: web}, ACTION="take", LOCK_SCOPE="infra", GITHUB_REPOSITORY=INFRA, LOCK_WAIT_CAP_SECONDS="1")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("::error::waiting for OnePeek/onepeek-web (web, run 88); re-run", out.stdout)
+        self.assertIn("capped=true", out.output.splitlines())
+        self.assertEqual(out.keys, {WEB: web})
+
+    def test_a_failed_give_back_records_no_cap_and_fails_the_step(self):
+        # Ruling R-S2l0-2 (g97 m4): a key that could not be given back may still name this run, so it is no clean cap.
+        web = record("OnePeek/onepeek-web", "88", scope="web", phase="locked")
+        out = run(ACTION, keys={WEB: web}, ACTION="take", LOCK_SCOPE="infra", GITHUB_REPOSITORY=INFRA, LOCK_WAIT_CAP_SECONDS="1",
+                  FAIL_DELETE_OBJECT="AccessDenied")
+        self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("capped", out.output)
+        self.assertIn("could not be given back", out.stdout)
+
+    def test_any_other_failure_still_fails_the_step_and_records_no_cap(self):
+        out = run(ACTION, keys={INFRA_KEY: record()}, ACTION="take", LOCK_SCOPE="infra", GITHUB_REPOSITORY=INFRA, FAIL_GET_OBJECT="AccessDenied")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertNotIn("capped", out.output)
+        out = run(ACTION, ACTION="take", LOCK_SCOPE="infra", GITHUB_REPOSITORY=INFRA)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("capped", out.output)
+
+    def test_the_cap_is_a_step_of_its_own_named_wait_cap_reached_re_run(self):
+        steps = LOCKWF["jobs"]["lock"]["steps"]
+        names = [s.get("name", s.get("uses", "")) for s in steps]
+        at = names.index("Wait cap reached (re-run)")
+        self.assertEqual(steps[at - 1].get("id"), "lock")
+        cap = steps[at]
+        self.assertEqual(cap["if"], "${{ steps.lock.outputs.capped == 'true' }}")
+        r = subprocess.run(["bash", "-eo", "pipefail", "-c", cap["run"]], capture_output=True, text=True, env={**os.environ, "ENVIRONMENT": "preprod"})
+        self.assertEqual(r.returncode, 1)
+        # Any later step that runs under always() or failure() must not read the waiting step's success as a take.
+        for later in steps[at + 1:]:
+            cond = str(later.get("if", ""))
+            if "always()" in cond or "failure()" in cond:
+                self.assertIn("steps.lock.outputs.capped != 'true'", cond, later.get("name"))
+        self.assertEqual(sum(n == "Wait cap reached (re-run)" for n in names), 1)
 
     def test_its_limit_waits_only_for_take_and_freeze_keeps_10_minutes_until_the_release_order(self):
         # freeze's wait for a live infra.json holder is built with the release order (.github #56, playbook §5.4a "Freeze
@@ -1002,7 +1050,8 @@ class InfraOwnScope(unittest.TestCase):
         held = record(INFRA, "77", scope="infra")
         out = run(ACTION, keys={INFRA_KEY: held}, ACTION="take", LOCK_SCOPE="infra", GITHUB_REPOSITORY=INFRA,
                   LOCK_WAIT_SECONDS="1", LOCK_WAIT_CAP_SECONDS="6")
-        self.assertEqual(out.returncode, 1)
+        self.assertEqual(out.returncode, 0)  # the cap: capped=true, and the "Wait cap reached (re-run)" step fails the job
+        self.assertIn("capped=true", out.output)
         self.assertIn("::error::waiting for OnePeek/onepeek-infra (infra, run 77); re-run", out.stdout)
         # Asserted as time, not as a count of waits (pitfall 33): more than 5 real seconds of the 6 s cap, where the
         # 1-second app limit would end it after one wait.
