@@ -4,12 +4,13 @@
 # an earlier one failed (`if: always()`), the last step writes each check's result to the job summary and fails the
 # job when any check failed. The secrets scan and the pin check are the same composite actions (actions/) that
 # secret-scan.yml, pins.yml and fast-checks.yml run. depends-on stays its own job. The `fast` job calls
-# fast-checks.yml locally, so every change here proves the shared merged job end to end.
+# fast-checks.yml locally, so every change here proves the shared merged job end to end. The `ready` job (ready.yml,
+# called locally, shown as `ci / ready`) is the summary every job ends in (PIPE-SIMPLE v2 D6), proving it end to end.
 name: workflow-lint
 
 on:
   push:
-    branches: [dev]  # depends-on passes at once with no pull request (its notice); the pins job holds the docs ancestor rule on push
+    branches: [dev]  # depends-on passes at once with no pull request (its notice)
   pull_request:
     branches: [dev]
     types: [opened, reopened, synchronize]  # never edited: ship_change_set.py re-runs checks when a dependency merges
@@ -238,3 +239,17 @@ jobs:
     uses: ./.github/workflows/fast-checks.yml
     with:
       no-prerelease-deps: true
+      docs: true
+
+  ready:
+    # The one summary row (`ci / ready`): every other job passed. Local call: its scripts are this pull request's.
+    name: ci
+    if: ${{ always() }}
+    needs: [depends-on, lint, fast]
+    uses: ./.github/workflows/ready.yml
+    with:
+      runner: github
+      needs: ${{ toJSON(needs) }}
+      reproduce: |
+        lint: vanguard local-ci <worktree> --jobs lint
+        fast: vanguard local-ci <worktree> --jobs fast

@@ -1,0 +1,100 @@
+# Shared: the `ready` summary, a CI workflow's one required row (PIPE-SIMPLE v2 D6; charter principle 4). The caller's
+# last job calls this workflow; the check shows as `ci / ready` (the caller job's name `ci`, this workflow's job
+# `ready`), the row the merge tool reads. It passes only when every other job of the caller's workflow passed, or was
+# skipped by its own `if:` and is listed in `skippable` (a path filter); a failed, cancelled, unlisted-skipped or
+# unknown result fails it, and so does a caller job that does not need every other job or does not run `always()`.
+# It prints a table, job | result | how to reproduce locally, to the log and the job summary. Logic:
+# scripts/ready.py at the caller's pin (rules and failure messages in its header).
+#
+# Caller (the last job of the workflow; list every other job under `needs`):
+#
+#   ready:
+#     name: ci
+#     if: ${{ always() }}
+#     needs: [fast, tests, build]
+#     uses: OnePeek/.github/.github/workflows/ready.yml@<commit of a v* tag> # vX.Y.Z
+#     with:
+#       runner: ${{ vars.RUNNER || 'github' }}
+#       needs: ${{ toJSON(needs) }}
+#       skippable: build             # optional: jobs a path filter may skip (space-separated)
+#       reproduce: |                 # optional: <job>: <command>, shown for a job that did not pass
+#         tests: uv run pytest
+name: ready
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
+        type: string
+        default: github
+      needs:
+        description: "The caller's needs context, as ${{ toJSON(needs) }}."
+        type: string
+        required: true
+      skippable:
+        description: Space-separated job ids that may pass as skipped (skipped by their own if, such as a path filter).
+        type: string
+        default: ""
+      reproduce:
+        description: "Lines `<job>: <command>`: how to reproduce a job locally, shown for a job that did not pass."
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  ready:
+    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      # The caller's workflow files at the run's commit: the summary checks that its job needs every other job.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows
+
+      # The scripts are this workflow's own repository at the commit the caller pinned, read from the caller's pin
+      # (pins.yml's way; delivery-pipelines.md §6.5 ruling 4). A local call inside OnePeek/.github has no pin: it uses
+      # this run's commit. Any other caller without a pin fails here (fail closed).
+      - name: This workflow's version (the caller's pin of ready.yml)
+        id: version
+        env:
+          FILE: ready.yml
+          REPO: ${{ github.repository }}
+          RUN_SHA: ${{ github.sha }}
+        run: |
+          sha=$(grep -rhoiE "OnePeek/\.github/\.github/workflows/${FILE//./\\.}@[0-9a-f]{40}" .github/workflows 2>/dev/null | head -n 1 | cut -d@ -f2 || true)
+          if [ -z "${sha}" ]; then
+            if [ "$(printf '%s' "${REPO}" | tr '[:upper:]' '[:lower:]')" != "onepeek/.github" ]; then
+              echo "::error::No pin of OnePeek/.github/.github/workflows/${FILE}@<commit SHA> in .github/workflows: call ${FILE} pinned by commit SHA."
+              exit 1
+            fi
+            sha="${RUN_SHA}"
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "${FILE} runs at ${sha}"
+
+      - name: OnePeek/.github at that version (its scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OnePeek/.github
+          ref: ${{ steps.version.outputs.sha }}
+          path: _shared
+          persist-credentials: false
+          sparse-checkout: |
+            scripts
+
+      - name: Every job passed (the table, job | result | how to reproduce locally)
+        env:
+          NEEDS: ${{ inputs.needs }}
+          SKIPPABLE: ${{ inputs.skippable }}
+          REPRODUCE: ${{ inputs.reproduce }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          # The script needs PyYAML, which our runner image lacks: a venv with the pin workflow-lint.yml uses.
+          python3 -m venv "${RUNNER_TEMP}/ready"
+          "${RUNNER_TEMP}/ready/bin/pip" install --quiet pyyaml==6.0.3
+          "${RUNNER_TEMP}/ready/bin/python" -I _shared/scripts/ready.py
