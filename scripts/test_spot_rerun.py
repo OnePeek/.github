@@ -495,6 +495,7 @@ class Scan(unittest.TestCase):
             self.assertEqual(sr.main(), 1)
         self.assertIn("::error::", out.getvalue())
         self.assertEqual(fake.reruns(), [])
+        self.assertTrue(any(c[0] == "api" and "status=failure" in c[2] for c in fake.calls), fake.calls)  # scan mode ran
 
     def test_one_unreadable_run_fails_the_job_but_the_others_are_still_decided(self) -> None:
         fake = ScanGh(listing=[(41, "checks", 1), (42, "checks", 1)], logs={1: SHUTDOWN})

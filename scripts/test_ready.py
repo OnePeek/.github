@@ -125,6 +125,7 @@ class Needs(Case):
             code, text = self.run_ready(bad)
             self.assertEqual(code, 1, bad)
             self.assertIn("::error::", text)
+        self.assertIn("the needs context is empty or not an object", self.run_ready("{}")[1])
 
 
 class Workflow(Case):
