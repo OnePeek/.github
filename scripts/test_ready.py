@@ -206,7 +206,7 @@ class ReadyWorkflow(unittest.TestCase):
 
     def test_values_come_in_through_env_and_the_script_runs_at_the_pin(self) -> None:
         steps = self.DOC["jobs"]["ready"]["steps"]
-        last = steps[-1]
+        last = next(s for s in steps if "ready.py" in s.get("run", ""))
         self.assertNotIn("${{", last["run"])
         self.assertEqual(last["env"]["NEEDS"], "${{ inputs.needs }}")
         self.assertEqual(last["env"]["WORKFLOW_REF"], "${{ github.workflow_ref }}")
