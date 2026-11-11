@@ -1,4 +1,4 @@
-"""Tests for scripts/check_pins.py and pins.yml (foundation-playbook §8a P2, S4): one tagged version, docs on dev."""
+"""Tests for scripts/check_pins.py and pins.yml (foundation-playbook §8a P2, S4): one tagged version (the docs rule is gone, DOC-1)."""
 from __future__ import annotations
 
 import contextlib
@@ -93,18 +93,7 @@ class Pins(Repo):
 
 
 class DocsRule(Repo):
-    def test_runs_on_pushes_to_dev_and_release_and_release_pull_requests_only(self) -> None:
-        yes = [{"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/dev"},
-               {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/release"},
-               {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_BASE_REF": "release"}]
-        no = [{"GITHUB_EVENT_NAME": "pull_request", "GITHUB_BASE_REF": "dev"},
-              {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main"},
-              {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/feat/x"},
-              {"GITHUB_EVENT_NAME": "schedule"}]
-        for env in yes:
-            self.assertTrue(cp.docs_needed(env), env)
-        for env in no:
-            self.assertFalse(cp.docs_needed(env), env)
+    """The deprecated library functions Vanguard still imports (DOC-1 keeps them until VG-1); the check never runs them."""
 
     def test_an_ancestor_of_the_trunk_passes(self) -> None:
         for status in ("ahead", "identical"):
@@ -230,60 +219,41 @@ class Main(Repo):
             self.assertEqual(cp.main([str(good)]), 0)
             self.assertEqual(cp.main([str(bad)]), 1)
 
-    def test_auto_skips_the_docs_rule_on_a_pull_request_into_dev(self) -> None:
-        d = self.repo(uses(B), docs=f"onepeek-docs@{A}\n")
-        env = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_BASE_REF": "dev", "GH_TOKEN": ""}
-        with mock.patch.object(cp, "remote_tags", return_value=cp.parse_tags(TAGS)), \
-                mock.patch.dict(cp.os.environ, env), mock.patch.object(cp, "compare_status") as compare:
-            self.assertEqual(cp.main([str(d), "--docs", "auto"]), 0)
-        compare.assert_not_called()
+    def test_the_docs_rule_never_runs_with_or_without_docs_version_txt(self) -> None:  # DOC-1
+        for docs in (None, f"onepeek-docs@{A}\n", "garbage\n"):
+            d = self.repo(uses(B), docs=docs)
+            env = {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/dev", "GH_TOKEN": ""}
+            with mock.patch.object(cp, "remote_tags", return_value=cp.parse_tags(TAGS)), mock.patch.dict(cp.os.environ, env), \
+                    mock.patch.object(cp, "docs_trunk", side_effect=AssertionError("no docs read")), \
+                    mock.patch.object(cp, "compare_status", side_effect=AssertionError("no docs read")), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(cp.main([str(d)]), 0, docs)
+            self.assertNotIn("docs-version", out.getvalue())
 
-    def test_the_ok_line_names_the_trunk_read_and_a_failed_read_never_says_main(self) -> None:  # .github#90 S1
-        d = self.repo(uses(B), docs=f"onepeek-docs@{A}\n")
-        env = {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/dev", "GH_TOKEN": "t"}
-        with mock.patch.object(cp, "remote_tags", return_value=cp.parse_tags(TAGS)), mock.patch.dict(cp.os.environ, env), \
-                mock.patch.object(cp, "docs_trunk", return_value="dev"), \
-                mock.patch.object(cp, "compare_status", return_value="ahead"), \
-                contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(cp.main([str(d), "--docs", "auto"]), 0)
-        self.assertIn("OK  docs-version.txt is an ancestor of onepeek-docs dev", out.getvalue())
-        self.assertNotIn("main", out.getvalue())
-        failed = SystemExit("cannot read the default branch of onepeek-docs: HTTP 404")
-        with mock.patch.object(cp, "remote_tags", return_value=cp.parse_tags(TAGS)), mock.patch.dict(cp.os.environ, env), \
-                mock.patch.object(cp, "docs_trunk", side_effect=failed), \
-                mock.patch.object(cp, "compare_status", side_effect=AssertionError("no compare without a trunk")), \
-                contextlib.redirect_stdout(io.StringIO()) as out:
-            with self.assertRaises(SystemExit) as e:
-                cp.main([str(d), "--docs", "auto"])
-        self.assertIn("cannot read the default branch of onepeek-docs: HTTP 404", str(e.exception.code))
-        self.assertNotIn("main", str(e.exception.code) + out.getvalue())
-
-    def test_a_repo_without_a_docs_pin_says_so(self) -> None:
+    def test_the_docs_flags_are_gone(self) -> None:  # DOC-1
         d = self.repo(uses(B))
-        with mock.patch.object(cp, "remote_tags", return_value=cp.parse_tags(TAGS)), \
-                mock.patch.object(cp, "docs_trunk", side_effect=AssertionError("nothing to read")), \
-                contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(cp.main([str(d), "--docs", "always"]), 0)
-        self.assertIn("OK  no docs-version.txt, so no docs pin to check", out.getvalue())
+        for argv in ([str(d), "--docs", "auto"], ["--docs-needed"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as e:
+                cp.main(argv)
+            self.assertEqual(e.exception.code, 2, argv)
 
-    def test_auto_runs_the_docs_rule_on_a_release_pull_request(self) -> None:
-        d = self.repo(uses(B), docs=f"onepeek-docs@{A}\n")
-        env = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_BASE_REF": "release", "GH_TOKEN": "t"}
-        with mock.patch.object(cp, "remote_tags", return_value=cp.parse_tags(TAGS)), \
-                mock.patch.dict(cp.os.environ, env), mock.patch.object(cp, "docs_problems", return_value=["off the trunk"]):
-            self.assertEqual(cp.main([str(d), "--docs", "auto"]), 1)
+    def test_the_library_vanguard_imports_is_still_there(self) -> None:  # removed only after VG-1 stops importing it
+        for name in ("USES", "SHA", "DOCS_PIN", "pins", "pin_problems", "remote_tags", "parse_tags", "docs_pin",
+                     "docs_trunk", "compare_status", "docs_problems"):
+            self.assertTrue(hasattr(cp, name), name)
+        self.assertIn("trunk", cp.compare_status.__code__.co_varnames)
 
 
 class Workflow(unittest.TestCase):
-    def test_the_app_token_reads_only_onepeek_docs_and_only_when_the_docs_rule_runs(self) -> None:
-        steps = yaml.safe_load(ACTION.read_text())["runs"]["steps"]
-        app = next(s for s in steps if s.get("id") == "app")
-        self.assertEqual(app["with"]["repositories"], "onepeek-docs")
-        self.assertEqual(app["with"]["permission-contents"], "read")
-        # `app` is "true" only when the docs rule runs and docs-version.txt exists (test_fast_checks.Docs runs it).
-        self.assertEqual(app["if"], "${{ steps.docs.outputs.app == 'true' }}")
-        last = steps[-1]["run"]
-        self.assertIn("--docs auto", last)
+    def test_the_action_runs_no_docs_rule_and_keeps_its_inputs(self) -> None:  # DOC-1, no caller changes
+        doc = yaml.safe_load(ACTION.read_text())
+        self.assertEqual(sorted(doc["inputs"]), ["app-client-id", "app-private-key"])
+        text = ACTION.read_text()
+        for gone in ("--docs", "create-github-app-token", "docs-version.txt is on"):
+            self.assertNotIn(gone, text)
+        self.assertTrue(doc["runs"]["steps"][-1]["run"].rstrip().endswith('/scripts/check_pins.py" .'))
+        wf = yaml.safe_load(WORKFLOW.read_text())
+        self.assertEqual(sorted(wf[True]["workflow_call"]["secrets"]), ["AGENTS_APP_CLIENT_ID", "AGENTS_APP_PRIVATE_KEY"])
 
     def test_the_version_step_finds_the_callers_pin_of_pins_yml(self) -> None:
         step = next(s for s in yaml.safe_load(WORKFLOW.read_text())["jobs"]["pins"]["steps"] if s.get("id") == "version")

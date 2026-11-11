@@ -1,11 +1,8 @@
 # Shared: the pin check (onepeek-docs architecture/lld/infra/foundation-playbook.md §8a P2 and S4). Called by every
 # OnePeek repo on pull requests and on pushes to dev and release. Fails when the repo's OnePeek/.github pins are not
-# all the commit of one v* tag, and, on a push to dev or release or a pull request into release, when docs-version.txt
-# is not an ancestor of the docs trunk (pull requests into dev pin the open docs pull request's head during a
-# change set, development-cycle §2a item 2). The logic is actions/pins (scripts/check_pins.py) at the commit the caller
-# pins this workflow to; fast-checks.yml runs the same action as one step of its `fast` job (decision 180). The docs
-# rule reads the private docs repo with the agents' App token (S6): callers pass AGENTS_APP_CLIENT_ID and
-# AGENTS_APP_PRIVATE_KEY; without them only that rule fails, and only when it runs.
+# all the commit of one v* tag. The logic is actions/pins (scripts/check_pins.py) at the commit the caller pins this
+# workflow to; fast-checks.yml runs the same action as one step of its `fast` job (decision 180). The docs-version.txt
+# ancestor rule is gone (PIPE-SIMPLE v2 DOC-1); the AGENTS_APP_* secrets stay declared, unused, so no caller changes.
 name: pins
 
 on:
@@ -17,7 +14,7 @@ on:
         default: github
     secrets:
       AGENTS_APP_CLIENT_ID:
-        description: The agents' GitHub App (playbook §8a S6), for Contents read on onepeek-docs. Needed where docs-version.txt exists.
+        description: Unused since the docs rule went (DOC-1); kept so callers that pass it need no change.
         required: false
       AGENTS_APP_PRIVATE_KEY:
         description: The agents' GitHub App private key (with AGENTS_APP_CLIENT_ID).
