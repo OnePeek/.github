@@ -13,6 +13,15 @@ would cancel the newer, current run. superseded() is checked before any log is r
 a read that fails re-runs nothing (exit 1).
 
     RUN_ID=<github.event.workflow_run.id> REPO=<github.repository> python3 spot_rerun.py
+    WORKFLOWS='checks release' REPO=<github.repository> python3 spot_rerun.py     # scan mode (no RUN_ID)
+
+Scan mode (PIPE-SIMPLE v2 GH-1, plan item 3): a caller on a 10-minute `schedule` (or `workflow_dispatch`) has no
+workflow_run event, so RUN_ID is empty. The script lists the repo's failed runs created in the last
+SCAN_WINDOW_MINUTES, keeps those of the named workflows (WORKFLOWS, space-separated `name:`s) on attempt 1, and decides
+each exactly as above (run()). It is idempotent: run() re-reads each run first, and a run already re-run is on attempt
+2 or later (or no longer failed), so it is never re-run twice; the caller's concurrency group keeps two scans apart.
+A failed list read fails the job; a failed read of one run is reported, the others are still decided, and the job
+fails at the end (exit 1). An empty RUN_ID with no WORKFLOWS is an input error.
 
 RUN_ID and REPO are checked strictly (digits only; owner/name). The token is GH_TOKEN (actions: read, checks: read, and
 actions: write to re-run). Standard library only; the `gh` CLI does the API calls.
@@ -34,6 +43,8 @@ MARKERS = ("The runner has received a shutdown signal", "lost communication with
 RUN_ID = re.compile(r"[1-9][0-9]{0,19}", re.ASCII)
 REPO = re.compile(r"(?!\.+/)[A-Za-z0-9._-]+/(?!\.+$)[A-Za-z0-9._-]+", re.ASCII)
 
+
+SCAN_WINDOW_MINUTES = 60  # a scan looks this far back: covers late or skipped 10-minute schedules (GH-1 gap, provisional)
 
 HTTP_STATUS = re.compile(r"\(HTTP ([0-9]{3})\)")
 
@@ -210,8 +221,36 @@ def run(run_id: str, repo: str, workflow: str = "", rerun_all: str = "") -> int:
     return 0
 
 
+def scan(repo: str, workflows: str, rerun_all: str = "", now: float | None = None) -> int:
+    """Scan mode: decide every failed first-attempt run of the named workflows from the last SCAN_WINDOW_MINUTES."""
+    names = workflows.split()
+    if not names or not all(WORKFLOW_NAME.fullmatch(n) for n in names):
+        raise ValueError(f"WORKFLOWS must be space-separated workflow names, got {workflows!r}.")
+    if not REPO.fullmatch(repo):
+        raise ValueError(f"REPO must be <owner>/<name>, got {repo!r}.")
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime((time.time() if now is None else now) - SCAN_WINDOW_MINUTES * 60))
+    out = gh("api", "--paginate", f"repos/{repo}/actions/runs?status=failure&created=%3E%3D{since}&per_page=100",
+             "--jq", ".workflow_runs[] | {id, name, run_attempt}")
+    runs = [json.loads(line) for line in out.splitlines() if line.strip()]
+    found = sorted({(str(r.get("id")), str(r.get("name"))) for r in runs
+                    if r.get("name") in names and r.get("run_attempt") == 1 and RUN_ID.fullmatch(str(r.get("id")))})
+    if not found:
+        summary(f"No re-run: no failed first-attempt run of {', '.join(clean(n) for n in names)} since {since}.")
+        return 0
+    errors = 0
+    for run_id, name in found:
+        try:
+            run(run_id, repo, name, rerun_all)
+        except (ValueError, GhError, json.JSONDecodeError) as err:
+            print(f"::error::run {run_id}: {err}")
+            errors += 1
+    return 1 if errors else 0
+
+
 def main() -> int:
     try:
+        if not os.environ.get("RUN_ID", "") and os.environ.get("WORKFLOWS", "").strip():
+            return scan(os.environ.get("REPO", ""), os.environ.get("WORKFLOWS", ""), os.environ.get("RERUN_ALL", ""))
         return run(os.environ.get("RUN_ID", ""), os.environ.get("REPO", ""), os.environ.get("WORKFLOW", ""),
                    os.environ.get("RERUN_ALL", ""))
     except (ValueError, GhError, json.JSONDecodeError) as err:

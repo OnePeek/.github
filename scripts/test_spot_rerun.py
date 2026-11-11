@@ -395,14 +395,147 @@ class Workflow(unittest.TestCase):
         for step in self.job["steps"]:
             self.assertNotIn("${{", step.get("run", ""), step)
 
-    def test_caller_example_runs_only_on_failed_workflow_runs(self) -> None:
+    def test_this_repos_caller_is_the_scheduled_scan(self) -> None:  # GH-1: */10 schedule + dispatch, one at a time
         caller = yaml.safe_load((ROOT / ".github/workflows/spot-rerun-caller.yml").read_text(encoding="utf-8"))
         on = caller.get("on", caller.get(True))
-        self.assertEqual(on["workflow_run"]["types"], ["completed"])
+        self.assertEqual(on["schedule"], [{"cron": "*/10 * * * *"}])
+        self.assertIn("workflow_dispatch", on)
+        self.assertNotIn("workflow_run", on)
+        self.assertEqual(caller["concurrency"], {"group": "spot-rerun-caller", "cancel-in-progress": False})
         job = caller["jobs"]["spot-rerun"]
-        self.assertIn("conclusion == 'failure'", job["if"])
+        self.assertEqual(job["with"], {"runner": "github", "workflows": "workflow-lint"})
         self.assertEqual(job["permissions"], {"actions": "write", "checks": "read", "contents": "read"})
 
+    def test_both_caller_forms_stay_documented_and_the_scan_input_reaches_the_script(self) -> None:
+        self.assertIn('#       - cron: "*/10 * * * *"', self.text)
+        self.assertIn("#     workflow_run:", self.text)
+        self.assertIn("#       if: ${{ github.event.workflow_run.conclusion == 'failure' }}", self.text)
+        inputs = WORKFLOW.get("on", WORKFLOW.get(True))["workflow_call"]["inputs"]
+        self.assertEqual((inputs["workflows"]["type"], inputs["workflows"]["default"]), ("string", ""))
+        self.assertEqual(sorted(inputs), ["rerun_all_workflows", "runner", "workflows"])  # nothing a caller uses went
+        step = next(s for s in self.job["steps"] if "spot_rerun" in s.get("run", ""))
+        self.assertEqual(step["env"]["WORKFLOWS"], "${{ inputs.workflows }}")
+
+
+class ScanGh(FakeGh):
+    """FakeGh that also answers the failed-runs list of scan mode; attempts per run id, re-runs raise the attempt."""
+
+    def __init__(self, listing=None, list_error=False, attempts=None, **kw):
+        super().__init__(**kw)
+        self.listing = listing if listing is not None else [(42, "checks", 1)]
+        self.list_error, self.attempts = list_error, attempts or {}
+
+    def __call__(self, *args: str) -> str:
+        path = next((a for a in args[1:] if not a.startswith("--")), "") if args and args[0] == "api" else ""
+        if path.split("?")[0].endswith("/actions/runs") and "?" in path:
+            self.calls.append(args)
+            self.list_query = urllib.parse.parse_qs(path.split("?", 1)[1])
+            if self.list_error:
+                raise sr.GhError("gh api failed: (HTTP 502)", 502)
+            return "".join(json.dumps({"id": i, "name": n, "run_attempt": self.attempts.get(i, a)}) + "\n"
+                           for i, n, a in self.listing)
+        if args and args[0] == "run" and args[1] == "rerun":
+            self.attempts[int(args[2])] = 2
+        if path.startswith("repos/") and "/actions/runs/" in path and path.count("/") == 5:
+            self.calls.append(args)
+            run_id = int(path.rsplit("/", 1)[1])
+            return json.dumps({"run_attempt": self.attempts.get(run_id, self.attempt), "conclusion": self.conclusion,
+                               "workflow_id": 7, "name": "checks", "event": self.event, "head_branch": self.branch,
+                               "head_sha": "aaaaaaa1111", "created_at": T0})
+        return super().__call__(*args)
+
+
+def scan(fake: ScanGh, workflows="checks", repo="OnePeek/x", now=1_800_000_000.0) -> tuple[int, str]:
+    out = io.StringIO()
+    with mock.patch.object(sr, "gh", fake), mock.patch.object(sr, "LOG_WAIT_SECONDS", 0), contextlib.redirect_stdout(out):
+        return sr.scan(repo, workflows, "", now=now), out.getvalue()
+
+
+class Scan(unittest.TestCase):
+    """Scan mode (GH-1): a scheduled caller decides every failed first-attempt run of its workflows, never twice."""
+
+    def test_a_reclaimed_run_is_rerun_once_and_a_second_scan_leaves_it_alone(self) -> None:
+        fake = ScanGh(logs={1: SHUTDOWN})
+        self.assertEqual(scan(fake)[0], 0)
+        self.assertEqual(fake.reruns(), [("run", "rerun", "42", "--failed", "--repo", "OnePeek/x")])
+        code, out = scan(fake)  # the next 10-minute pass: the listing now shows attempt 2
+        self.assertEqual(code, 0)
+        self.assertEqual(len(fake.reruns()), 1)
+        self.assertIn("No re-run: no failed first-attempt run", out)
+
+    def test_a_run_rerun_between_the_list_and_the_decision_is_not_rerun_again(self) -> None:
+        fake = ScanGh(logs={1: SHUTDOWN}, attempts={})
+        fake.attempt = 2  # the run's own read says attempt 2: someone re-ran it after the list was read
+        code, out = scan(fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.reruns(), [])
+        self.assertIn("is on attempt 2", out)
+
+    def test_only_the_named_workflows_on_attempt_one_are_decided(self) -> None:
+        fake = ScanGh(listing=[(42, "checks", 1), (43, "other", 1), (44, "checks", 2), (45, "checks extra", 1)],
+                      logs={1: SHUTDOWN})
+        scan(fake, workflows="checks")
+        decided = [c for c in fake.calls if c[0] == "api" and "/actions/runs/" in c[1] and c[1].count("/") == 5]
+        self.assertEqual({c[1].rsplit("/", 1)[1] for c in decided}, {"42"})
+
+    def test_the_list_asks_for_failed_runs_of_the_last_window(self) -> None:
+        fake = ScanGh(listing=[])
+        code, out = scan(fake, now=1_800_000_000.0)
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.list_query["status"], ["failure"])
+        self.assertEqual(fake.list_query["created"], [">=2027-01-15T07:00:00Z"])  # now - 60 minutes, UTC
+        self.assertIn("No re-run: no failed first-attempt run of checks", out)
+
+    def test_a_failed_list_read_fails_visibly(self) -> None:  # brief failure mode: GitHub API error
+        fake = ScanGh(list_error=True)
+        out = io.StringIO()
+        with mock.patch.object(sr, "gh", fake), mock.patch.dict(os.environ, {"RUN_ID": "", "WORKFLOWS": "checks",
+                                                                             "REPO": "OnePeek/x"}), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(sr.main(), 1)
+        self.assertIn("::error::", out.getvalue())
+        self.assertEqual(fake.reruns(), [])
+
+    def test_one_unreadable_run_fails_the_job_but_the_others_are_still_decided(self) -> None:
+        fake = ScanGh(listing=[(41, "checks", 1), (42, "checks", 1)], logs={1: SHUTDOWN})
+        real = fake.__call__
+
+        def flaky(*args):
+            if args[0] == "api" and args[1].endswith("/actions/runs/41"):
+                raise sr.GhError("gh api failed: (HTTP 500)", 500)
+            return real(*args)
+
+        code, out = scan(flaky_wrap(fake, flaky))
+        self.assertEqual(code, 1)
+        self.assertIn("::error::run 41:", out)
+        self.assertIn(("run", "rerun", "42", "--failed", "--repo", "OnePeek/x"), fake.reruns())
+
+    def test_bad_workflow_names_or_repo_are_refused_before_any_call(self) -> None:
+        for workflows, repo in (("", "OnePeek/x"), ("a;b", "OnePeek/x"), ("ok", "a/$(x)"), ("$(x)", "OnePeek/x")):
+            fake = ScanGh()
+            with mock.patch.object(sr, "gh", fake), self.assertRaises(ValueError, msg=(workflows, repo)):
+                sr.scan(repo, workflows)
+            self.assertEqual(fake.calls, [])
+
+    def test_main_needs_run_id_or_workflows(self) -> None:
+        fake = ScanGh()
+        out = io.StringIO()
+        with mock.patch.object(sr, "gh", fake), mock.patch.dict(os.environ, {"RUN_ID": "", "WORKFLOWS": " ",
+                                                                             "REPO": "OnePeek/x"}), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(sr.main(), 1)
+        self.assertEqual(fake.calls, [])
+
+
+def flaky_wrap(fake: ScanGh, fn):
+    """A callable that answers through fn but keeps the fake's record (calls, reruns)."""
+    class Wrapped:
+        def __call__(self, *args):
+            return fn(*args)
+
+        def __getattr__(self, name):
+            return getattr(fake, name)
+    return Wrapped()
 
 if __name__ == "__main__":
     unittest.main()
