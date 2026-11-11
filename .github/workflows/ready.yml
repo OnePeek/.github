@@ -29,7 +29,7 @@ on:
         type: string
         default: github
       needs:
-        description: "The caller's needs context, as ${{ toJSON(needs) }}."
+        description: "The caller's needs context, as toJSON(needs) in an expression."
         type: string
         required: true
       skippable:
