@@ -36,6 +36,10 @@ on:
         description: Refuse pull-request previews of @onepeek/* packages (no-prerelease-deps.yml's body).
         type: boolean
         default: false
+      docs:
+        description: Run the docs check over docs/** and the root *.md (actions/docs; links, front matter, code fences).
+        type: boolean
+        default: false
       role:
         description: For contract, the calling repo, backend, web or infra.
         type: string
@@ -46,7 +50,7 @@ on:
         default: ""
     secrets:
       AGENTS_APP_CLIENT_ID:
-        description: The agents' GitHub App (playbook §8a S6), for the docs rule of pins and for contract.
+        description: The agents' GitHub App (playbook §8a S6), for contract (the pins docs rule is gone, DOC-1).
         required: false
       AGENTS_APP_PRIVATE_KEY:
         description: The agents' GitHub App private key (with AGENTS_APP_CLIENT_ID).
@@ -116,6 +120,11 @@ jobs:
         if: ${{ always() && inputs.no-prerelease-deps && steps.shared.outcome == 'success' }}
         uses: ./_shared/actions/no-prerelease-deps
 
+      - name: docs
+        id: docs
+        if: ${{ always() && inputs.docs && steps.shared.outcome == 'success' }}
+        uses: ./_shared/actions/docs
+
       - name: contract
         id: contract
         if: ${{ always() && inputs.contract && steps.shared.outcome == 'success' }}
@@ -137,6 +146,7 @@ jobs:
             pins|${{ inputs.pins }}|${{ steps.pins.outcome }}
             secrets|${{ inputs.secrets && ((github.event_name == 'pull_request' && github.base_ref == 'release' && github.head_ref == 'dev') && 'excused' || 'true') || 'false' }}|${{ steps.secrets.outcome }}
             no-prerelease-deps|${{ inputs.no-prerelease-deps }}|${{ steps.no-prerelease-deps.outcome }}
+            docs|${{ inputs.docs }}|${{ steps.docs.outcome }}
             contract|${{ inputs.contract }}|${{ steps.contract.outcome }}
         run: |
           # scripts/test_fast_checks.py runs this script; workflow-lint.yml's lint job holds the same copy (a test keeps them equal).

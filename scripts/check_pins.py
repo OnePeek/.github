@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """The pin check (onepeek-docs architecture/lld/infra/foundation-playbook.md §8a P2 and S4).
 
-    python3 check_pins.py <repo-dir> [--docs auto|always|never]
-    python3 check_pins.py --docs-needed     # prints true or false for this CI event (auto)
+    python3 check_pins.py <repo-dir>
 
-1. Every `uses:` in the repo's workflows that names `OnePeek/.github` (in any letter case) is a pin: its ref is a
+Every `uses:` in the repo's workflows that names `OnePeek/.github` (in any letter case) is a pin: its ref is a
    40-character commit SHA (a branch or a tag name fails), the commit of a `v*` tag of OnePeek/.github (S4), and all of
-   them are the commit of **one** tag (P2).
-2. `docs-version.txt` (`onepeek-docs@<sha>`) is an ancestor of onepeek-docs' trunk (`dev`, read from the API). With
-   `--docs auto` (CI) this runs only on a push to `dev` or `release` and on a pull request into `release`; a pull
-   request into `dev` pins the open docs pull request's head during a change set (development-cycle §2a item 2). It
-   reads the private docs repo through the API with GH_TOKEN (the App token in CI, `gh auth token` on a laptop).
+   them are the commit of **one** tag (P2). Exit 1 when the rule is broken.
 
-A repo with no `docs-version.txt` (onepeek-docs, .github) has no docs pin to check. Exit 1 when a rule is broken.
+The docs ancestor rule (`docs-version.txt` on onepeek-docs' trunk, and its `--docs` flag) is gone (PIPE-SIMPLE v2
+DOC-1: cross-repo docs are read at docs `dev`); a repo with or without `docs-version.txt` passes the same way.
+DEPRECATED, kept only as a library: docs_pin, docs_trunk, compare_status, docs_problems and DOCS_PIN are still imported
+by Vanguard's merge tool and preflight (tools/ship_change_set.py, tools/preflight.py, loaded from this repo's dev);
+the check itself never runs them. Delete them once Vanguard no longer imports them (PIPE-SIMPLE v2 VG-1).
 Standard library only: our runner image has no pip.
 """
 from __future__ import annotations
@@ -105,16 +104,6 @@ def docs_pin(repo: pathlib.Path) -> tuple[bool, str | None]:
     return True, None
 
 
-def docs_needed(env: dict[str, str]) -> bool:
-    """The docs ancestor rule applies on a push to dev or release and on a pull request into release (P2)."""
-    event = env.get("GITHUB_EVENT_NAME", "")
-    if event == "push":
-        return env.get("GITHUB_REF", "") in ("refs/heads/dev", "refs/heads/release")
-    if event == "pull_request":
-        return env.get("GITHUB_BASE_REF", "") == "release"
-    return False
-
-
 def _api() -> str:
     return os.environ.get('GITHUB_API_URL', 'https://api.github.com')
 
@@ -174,15 +163,8 @@ def docs_problems(repo: pathlib.Path, token: str, status=None, trunk=None) -> li
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("repo", nargs="?")
-    ap.add_argument("--docs", choices=("auto", "always", "never"), default="never")
-    ap.add_argument("--docs-needed", action="store_true", help="print whether this CI event runs the docs rule")
+    ap.add_argument("repo")
     a = ap.parse_args(argv)
-    if a.docs_needed:
-        print("true" if docs_needed(dict(os.environ)) else "false")
-        return 0
-    if not a.repo:
-        ap.error("repo is required")
     repo = pathlib.Path(a.repo)
     found = pins(repo)
     problems = pin_problems(found, remote_tags()) if found else []
@@ -190,21 +172,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"OK  {len(found)} {ORG}/.github pin(s), all at {found[0][3][:7]}")
     elif not found:
         print(f"OK  no {ORG}/.github pins")
-    run_docs = a.docs == "always" or (a.docs == "auto" and docs_needed(dict(os.environ)))
-    if run_docs:
-        read: list[str] = []
-
-        def trunk(token: str) -> str:
-            read.append(docs_trunk(token))
-            return read[-1]
-
-        docs = docs_problems(repo, os.environ.get("GH_TOKEN", ""), trunk=trunk)
-        problems += docs
-        if not docs:
-            print(f"OK  docs-version.txt is an ancestor of onepeek-docs {read[0]}" if read
-                  else "OK  no docs-version.txt, so no docs pin to check")
-    else:
-        print("--  docs-version.txt ancestor rule not run for this event (pull requests into dev pin the docs PR head)")
     for p in problems:
         print(f"::error::{p}")
     return 1 if problems else 0

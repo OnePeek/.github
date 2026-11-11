@@ -10,8 +10,34 @@
 # in scripts/spot_rerun.py). Runs on the small runner class, like depends-on.yml. Logic: scripts/spot_rerun.py at the
 # caller's pin.
 #
-# Caller (a repo's .github/workflows/spot-rerun-caller.yml; list its CI workflow names under `workflows`, never this
-# workflow's own caller). The pin is the commit of the `v*` tag, like every other shared workflow:
+# Caller, scheduled (preferred, PIPE-SIMPLE v2 GH-1: one run every 10 minutes instead of one row per finished run on
+# every pull request; list the repo's CI workflow names under `workflows`, never this workflow's own caller). Scan
+# mode is idempotent: a run already re-run is on attempt 2 and is left alone. The pin is the commit of a `v*` tag:
+#
+#   name: spot-rerun-caller
+#   on:
+#     schedule:
+#       - cron: "*/10 * * * *"
+#     workflow_dispatch:
+#   concurrency:
+#     group: spot-rerun-caller
+#     cancel-in-progress: false
+#   permissions:
+#     contents: read
+#   jobs:
+#     spot-rerun:
+#       uses: <this workflow, pinned to the commit of a v* tag, like every other shared workflow>
+#       permissions:
+#         actions: write   # read the runs, their jobs and logs, and re-run the failed jobs
+#         checks: read     # the job's annotations (where a lost runner is reported)
+#         contents: read
+#       with:
+#         runner: ${{ vars.RUNNER || 'github' }}
+#         workflows: checks release        # the repo's workflow names (`name:`), space-separated
+#         rerun_all_workflows: sandbox     # optional: workflows re-run whole, not only the failed jobs
+#
+# Caller on workflow_run (the original form, kept for callers not yet moved; list its CI workflow names under
+# `workflows:` of the trigger):
 #
 #   name: spot-rerun-caller
 #   on:
@@ -40,6 +66,10 @@ on:
         description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
         type: string
         default: github
+      workflows:
+        description: "Scan mode, for a caller on schedule or workflow_dispatch (no workflow_run event): space-separated names of the caller's workflows whose failed first-attempt runs of the last 60 minutes are decided (scripts/spot_rerun.py)."
+        type: string
+        default: ""
       rerun_all_workflows:
         description: "Space-separated names of the caller's workflows that are re-run whole (every job) instead of only the failed jobs, for a workflow whose jobs share a lock or state per attempt (onepeek-infra's sandbox, sandbox.md section 7c item 10)."
         type: string
@@ -86,6 +116,7 @@ jobs:
           RUN_ID: ${{ github.event.workflow_run.id }}
           WORKFLOW: ${{ github.event.workflow_run.name }}
           RERUN_ALL: ${{ inputs.rerun_all_workflows }}
+          WORKFLOWS: ${{ inputs.workflows }}
           REPO: ${{ github.repository }}
           SHA: ${{ steps.version.outputs.sha }}
         run: |
