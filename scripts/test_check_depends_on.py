@@ -129,84 +129,23 @@ class Main(unittest.TestCase):
             rc = cd.main([*argv, "--repo-dir", str(self.dir)])
         return rc, buf.getvalue()
 
-    def test_a_pin_on_docs_dev_passes_and_says_so(self) -> None:  # decision 176: the trunk is dev
-        rc, out = self.run_main(["--check"], "", pin=PIN, status="ahead")
-        self.assertEqual(rc, 0)
-        self.assertIn("docs-version.txt pins aaaaaaa, on onepeek-docs dev.", out)
-        self.assertNotIn("main", out)
+    def test_the_docs_pin_is_no_dependency_any_more(self) -> None:  # DOC-1 / DOC-3: the L27 branch is gone
+        for status, prs, token in (("diverged", [], ""), ("diverged", [7], "d"), ("ahead", [], "")):
+            with mock.patch.object(cd.check_pins, "docs_trunk", side_effect=AssertionError("no docs read")):
+                rc, out = self.run_main(["--check", "--strict"], "", pin=PIN, status=status, prs=prs, docs_token=token)
+            self.assertEqual(rc, 0, out)
+            self.assertNotIn("onepeek-docs", out)
+            self.assertIn("No `Depends on:` lines: nothing to wait for.", out)
 
-    def test_every_message_names_the_trunk_read_from_the_api(self) -> None:  # PH2b: trunk dev, trunk main
-        for trunk, other in (("dev", "main"), ("main", "dev")):
-            rc, out = self.run_main(["--check"], "", pin=PIN, status="ahead", trunk=trunk)
-            self.assertEqual(rc, 0)
-            self.assertIn(f"docs-version.txt pins aaaaaaa, on onepeek-docs {trunk}.\n", out)
-            self.assertNotIn(other, out)
-            rc, out = self.run_main(["--check"], "", pin=PIN, trunk=trunk)
-            self.assertEqual(rc, 1)
-            self.assertIn(f"::error::docs pin aaaaaaa not on docs {trunk} and in no open docs PR; move "
-                          f"docs-version.txt to a commit on {trunk} or", out)
-            self.assertNotIn(f" {other} ", out)
+    def test_the_deprecated_docs_flags_print_nothing(self) -> None:
+        self.assertEqual(self.run_main(["--docs-pin"], "", pin=PIN), (0, "\n"))
+        self.assertEqual(self.run_main(["--docs-read"], "", pin=PIN), (0, "\n"))
 
-    def test_the_compare_uses_the_one_trunk_read(self) -> None:  # PH2b: the message and the compare agree
-        (self.dir / "docs-version.txt").write_text(f"onepeek-docs@{PIN}\n", encoding="utf-8")
-        seen, buf = [], io.StringIO()
-        with mock.patch.dict(os.environ, {"BODY": "", "GH_TOKEN": "t", "DOCS_TOKEN": "d"}), \
-                contextlib.redirect_stdout(buf), \
-                mock.patch.object(cd.check_pins, "docs_trunk", return_value="main") as read, \
-                mock.patch.object(cd.check_pins, "compare_status",
-                                  side_effect=lambda s, tok, trunk: seen.append(trunk(tok)) or "ahead"):
-            self.assertEqual(cd.main(["--check", "--repo-dir", str(self.dir)]), 0)
-        read.assert_called_once_with("d")
-        self.assertEqual(seen, ["main"])
-        self.assertIn("on onepeek-docs main.", buf.getvalue())
-
-    def test_a_missing_or_malformed_trunk_fails_closed_before_any_compare(self) -> None:  # PH2b failure modes
-        (self.dir / "docs-version.txt").write_text(f"onepeek-docs@{PIN}\n", encoding="utf-8")
-        for body in (b'{}', b'{"default_branch": null}', b'{"default_branch": ""}', b'not json', b'[]',
-                     b'{"default_branch": "a..b"}'):
-            resp = mock.MagicMock()
-            resp.__enter__.return_value = io.BytesIO(body)
-            buf = io.StringIO()
-            with mock.patch.dict(os.environ, {"BODY": "", "GH_TOKEN": "t", "DOCS_TOKEN": "d"}), \
-                    contextlib.redirect_stdout(buf), \
-                    mock.patch.object(cd.check_pins.urllib.request, "urlopen", return_value=resp), \
-                    mock.patch.object(cd.check_pins, "compare_status", side_effect=AssertionError("no compare")), \
-                    mock.patch.object(cd, "open_docs_prs", side_effect=AssertionError("no list")):
-                with self.assertRaises(SystemExit) as e:
-                    cd.main(["--check", "--repo-dir", str(self.dir)])
-            self.assertIn("cannot read the default branch of onepeek-docs", str(e.exception.code), body)
-            self.assertNotIn("on onepeek-docs", buf.getvalue())
-
-    def test_docs_pin_prints_the_pinned_commit_or_nothing(self) -> None:
-        self.assertEqual(self.run_main(["--docs-pin"], ""), (0, "\n"))
-        self.assertEqual(self.run_main(["--docs-pin"], "", pin=PIN), (0, PIN + "\n"))
-
-    def test_check_passes_with_a_notice_while_the_docs_pull_request_is_open(self) -> None:
-        rc, out = self.run_main(["--check"], "", pin=PIN, prs=[145])
-        self.assertEqual(rc, 0)
-        self.assertIn("::notice title=depends-on::waiting for onepeek-docs#145 (docs-version.txt pins aaaaaaa, not yet "
-                      "on docs dev); ship_change_set.py merges it first", out)
-        self.assertNotIn("::error", out)
-
-    def test_check_strict_fails_on_that_wait(self) -> None:
-        rc, out = self.run_main(["--check", "--strict"], "", pin=PIN, prs=[145])
+    def test_a_declared_dependency_still_fails_with_a_docs_pin_present(self) -> None:
+        rc, out = self.run_main(["--check"], BODY, pin=PIN, prs=[7])
         self.assertEqual(rc, 1)
-        self.assertIn("::error::waiting for onepeek-docs#145", out)
-
-    def test_check_fails_on_a_pin_in_no_open_docs_pull_request(self) -> None:
-        rc, out = self.run_main(["--check"], "", pin=PIN)
-        self.assertEqual(rc, 1)
-        self.assertIn("not on docs dev and in no open docs PR", out)
-
-    def test_the_docs_compare_reads_docs_trunk_and_an_unreadable_trunk_fails(self) -> None:  # decision 176
-        (self.dir / "docs-version.txt").write_text(f"onepeek-docs@{PIN}\n", encoding="utf-8")
-        with mock.patch.dict(os.environ, {"BODY": "", "GH_TOKEN": "t", "DOCS_TOKEN": "d"}), \
-                contextlib.redirect_stdout(io.StringIO()), \
-                mock.patch.object(cd.check_pins, "docs_trunk",
-                                  side_effect=SystemExit("cannot read the default branch of onepeek-docs: HTTP 404")):
-            with self.assertRaises(SystemExit) as e:
-                cd.main(["--check", "--repo-dir", str(self.dir)])
-        self.assertIn("cannot read the default branch of onepeek-docs", str(e.exception.code))
+        self.assertNotIn("onepeek-docs", out)
+        self.assertIn("::error::waiting for backend-service#73", out)
 
     def test_check_passes_on_a_pin_on_the_trunk_and_still_checks_declared_lines(self) -> None:
         self.assertEqual(self.run_main(["--check"], "", pin=PIN, status="ahead")[0], 0)
@@ -214,27 +153,10 @@ class Main(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("::error::waiting for backend-service#73", out)
 
-    def test_check_reports_both_kinds_together(self) -> None:
-        rc, out = self.run_main(["--check", "--strict"], BODY, pin=PIN, prs=[7])
-        self.assertEqual(rc, 1)
-        self.assertIn("::error::waiting for onepeek-docs#7", out)
-        self.assertIn("::error::waiting for backend-service#73", out)
-
-    def test_a_declared_dependency_still_fails_when_the_docs_wait_is_only_a_notice(self) -> None:
-        rc, out = self.run_main(["--check"], BODY, pin=PIN, prs=[7])
-        self.assertEqual(rc, 1)
-        self.assertIn("::notice title=depends-on::waiting for onepeek-docs#7", out)
-        self.assertIn("::error::waiting for backend-service#73", out)
-
     def test_a_declared_dependency_closed_unmerged_fails(self) -> None:
         rc, out = self.run_main(["--check"], "Depends on: OnePeek/backend-service#73", state=lambda r, n, t: ("closed", False))
         self.assertEqual(rc, 1)
         self.assertIn("closed without merging", out)
-
-    def test_check_with_a_pin_needs_the_docs_token(self) -> None:
-        rc, out = self.run_main(["--check"], "", pin=PIN, status="ahead", docs_token="")
-        self.assertEqual(rc, 1)
-        self.assertIn("no token to read onepeek-docs", out)
 
     def test_with_no_pull_request_there_is_no_body_and_nothing_to_wait_for(self) -> None:
         # push, schedule and dispatch runs: depends-on.yml skips the body step, so neither BODY_FILE nor BODY is set.
@@ -273,6 +195,13 @@ class LiveBody(unittest.TestCase):
 
 
 class Workflow(unittest.TestCase):
+    def test_no_step_reads_the_docs_pin(self) -> None:  # DOC-1: no docs token, no file list, no --docs-read
+        text = WORKFLOW.read_text(encoding="utf-8")
+        steps = str(STEPS)
+        for gone in ("--docs-read", "DOCS_TOKEN", "docs-app", "CHANGED_FILES", "onepeek-docs"):
+            self.assertNotIn(gone, steps)
+        self.assertTrue(text.startswith("# DEPRECATED (PIPE-SIMPLE v2 DOC-3)"))
+
     def test_the_app_token_is_only_minted_for_named_repos_with_pull_requests_read(self) -> None:
         app = next(s for s in STEPS if s.get("id") == "app")
         self.assertEqual(app["if"], "${{ github.event.pull_request.number != '' && steps.deps.outputs.repos != '' }}")
@@ -308,27 +237,13 @@ class Workflow(unittest.TestCase):
         on = yaml.safe_load((WORKFLOW.parent / "workflow-lint.yml").read_text(encoding="utf-8"))[True]
         self.assertEqual(on["push"]["branches"], ["dev"])  # this repo's own caller is fine on push (decision 176)
 
-    def test_the_docs_pin_gets_its_own_token_read_only_on_onepeek_docs(self) -> None:  # L27 (a)
-        deps = next(s for s in STEPS if s.get("id") == "deps")
-        self.assertIn('--docs-read', deps["run"])
-        docs = next(s for s in STEPS if s.get("id") == "docs-app")
-        self.assertEqual(docs["if"], "${{ github.event.pull_request.number != '' && steps.deps.outputs.docs != '' }}")
-        self.assertEqual(docs["with"]["repositories"], "onepeek-docs")
-        self.assertEqual({k: v for k, v in docs["with"].items() if k.startswith("permission-")},
-                         {"permission-contents": "read", "permission-pull-requests": "read"})
-        self.assertEqual(STEPS[-1]["env"]["DOCS_TOKEN"], "${{ steps.docs-app.outputs.token }}")
-        guard = next(s for s in STEPS if "HAS_APP" in s.get("env", {}))
-        self.assertIn("steps.deps.outputs.docs != ''", guard["if"])
-
-    def test_the_callers_docs_version_file_is_checked_out(self) -> None:
-        # Cone-mode sparse checkout always keeps the root's files, so docs-version.txt is there; never turn cone off.
-        self.assertNotIn("sparse-checkout-cone-mode", STEPS[1]["with"])
-
     def test_the_callers_in_this_repo_run_it_first_and_every_other_job_needs_it(self) -> None:
         jobs = yaml.safe_load((WORKFLOW.parent / "workflow-lint.yml").read_text(encoding="utf-8"))["jobs"]
         self.assertEqual(jobs["depends-on"]["uses"], "./.github/workflows/depends-on.yml")
         for name, job in jobs.items():
-            if name != "depends-on":
+            if name == "ready":  # the summary needs every job, depends-on included (ready.yml)
+                self.assertIn("depends-on", job["needs"])
+            elif name != "depends-on":
                 self.assertEqual(job.get("needs"), "depends-on", name)
         on = yaml.safe_load((WORKFLOW.parent / "workflow-lint.yml").read_text(encoding="utf-8"))[True]
         self.assertNotIn("edited", on["pull_request"]["types"])  # L27 (d): the ship tool re-runs instead
@@ -337,105 +252,6 @@ class Workflow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-DEPENDABOT_ENV = {"PR_AUTHOR": "dependabot[bot]", "GITHUB_ACTOR": "dependabot[bot]", "GITHUB_EVENT_NAME": "pull_request"}
-
-
-class Dependabot(unittest.TestCase):  # pitfall 8: Dependabot runs get no Actions secrets, so no App token
-    def setUp(self) -> None:
-        self.dir = pathlib.Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.dir, True)
-        (self.dir / "docs-version.txt").write_text(f"onepeek-docs@{PIN}\n", encoding="utf-8")
-
-    def run_main(self, argv: list[str], env: dict[str, str], body: str = "", files: list[str] | None = None,
-                 docs_token: str = "") -> tuple[int, str]:
-        env = {"BODY": body, "GH_TOKEN": "", "DOCS_TOKEN": docs_token, **env}
-        if files is not None:
-            (self.dir / "files.txt").write_text("\n".join(files) + "\n", encoding="utf-8")
-            env["CHANGED_FILES"] = str(self.dir / "files.txt")
-        clean = {k: v for k, v in os.environ.items()
-                 if k not in ("PR_AUTHOR", "GITHUB_ACTOR", "GITHUB_EVENT_NAME", "CHANGED_FILES", "BODY_FILE", "IS_DRAFT")}
-        buf = io.StringIO()
-        with mock.patch.dict(os.environ, {**clean, **env}, clear=True), contextlib.redirect_stdout(buf), \
-                mock.patch.object(cd, "api_state", side_effect=lambda r, n, t: ("open", False)), \
-                mock.patch.object(cd.check_pins, "compare_status", side_effect=AssertionError("no docs read")), \
-                mock.patch.object(cd, "open_docs_prs", side_effect=AssertionError("no docs read")):
-            rc = cd.main([*argv, "--repo-dir", str(self.dir)])
-        return rc, buf.getvalue()
-
-    def test_a_dependabot_bump_needs_no_read_and_passes_with_a_notice(self) -> None:
-        files = [".github/workflows/prerelease.yml"]  # onepeek-design-system#71
-        rc, out = self.run_main(["--check"], DEPENDABOT_ENV, files=files)
-        self.assertEqual(rc, 0, out)
-        self.assertIn("::notice title=depends-on::Dependabot pull request with no `Depends on:` line that does not "
-                      "change docs-version.txt: no cross-repo read needed", out)
-        self.assertNotIn("::error", out)
-        self.assertEqual(self.run_main(["--docs-read"], DEPENDABOT_ENV, files=files), (0, "\n"))
-        self.assertEqual(self.run_main(["--docs-pin"], DEPENDABOT_ENV, files=files), (0, PIN + "\n"))
-
-    def test_a_human_pull_request_made_to_look_like_dependabot_still_needs_the_token(self) -> None:
-        body = "Bumps pnpm/action-setup from 6.1.0 to 6.1.1.\n---\nupdated-dependencies:\n- dependency-name: x\n"
-        for env in ({**DEPENDABOT_ENV, "PR_AUTHOR": "karan"},          # branch dependabot/..., title chore(deps): bump
-                    {**DEPENDABOT_ENV, "PR_AUTHOR": "dependabot"},     # a user named like the bot
-                    {**DEPENDABOT_ENV, "GITHUB_ACTOR": "karan"},       # a human pushed to Dependabot's branch
-                    {**DEPENDABOT_ENV, "GITHUB_EVENT_NAME": "pull_request_target"},
-                    {"PR_AUTHOR": "dependabot[bot]"}, {}):
-            rc, out = self.run_main(["--check"], env, body=body, files=["package.json"])
-            self.assertEqual(rc, 1, env)
-            self.assertIn("::error::no token to read onepeek-docs", out)
-            self.assertEqual(self.run_main(["--docs-read"], env, files=["package.json"]), (0, PIN + "\n"), env)
-        rc, out = self.run_main(["--check"], {**DEPENDABOT_ENV, "PR_AUTHOR": "karan"}, files=["package.json"])
-        self.assertNotIn("Dependabot secrets", out)  # the Dependabot hint names only Dependabot's own runs
-
-    def test_a_dependabot_pull_request_that_adds_a_depends_on_line_needs_the_token(self) -> None:
-        body = "Bump.\nDepends on: OnePeek/onepeek-docs#7\n"
-        self.assertEqual(self.run_main(["--repos"], DEPENDABOT_ENV, body=body, files=["package.json"]), (0, "onepeek-docs\n"))
-        self.assertEqual(self.run_main(["--docs-read"], DEPENDABOT_ENV, body=body, files=["package.json"]), (0, PIN + "\n"))
-        rc, out = self.run_main(["--check"], DEPENDABOT_ENV, body=body, files=["package.json"])
-        self.assertEqual(rc, 1)
-        self.assertIn("set AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY as Dependabot secrets "
-                      "(gh secret set --app dependabot)", out)
-
-    def test_a_dependabot_pull_request_that_changes_docs_version_needs_the_token(self) -> None:
-        for files in (["docs-version.txt"], ["package.json", "docs-version.txt"]):
-            self.assertEqual(self.run_main(["--docs-read"], DEPENDABOT_ENV, files=files), (0, PIN + "\n"))
-            rc, out = self.run_main(["--check"], DEPENDABOT_ENV, files=files)
-            self.assertEqual(rc, 1, files)
-            self.assertIn("as Dependabot secrets (gh secret set --app dependabot)", out)
-
-    def test_an_unknown_file_list_never_exempts(self) -> None:  # fail closed
-        for env in (DEPENDABOT_ENV, {**DEPENDABOT_ENV, "CHANGED_FILES": str(self.dir / "missing.txt")}):
-            self.assertEqual(self.run_main(["--docs-read"], env), (0, PIN + "\n"))
-            self.assertEqual(self.run_main(["--check"], env)[0], 1)
-
-    def test_with_the_token_a_dependabot_pull_request_that_needs_a_read_is_checked_as_any_other(self) -> None:
-        buf = io.StringIO()
-        (self.dir / "files.txt").write_text("docs-version.txt\n", encoding="utf-8")
-        env = {**DEPENDABOT_ENV, "BODY": "", "DOCS_TOKEN": "d", "CHANGED_FILES": str(self.dir / "files.txt")}
-        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(buf), \
-                mock.patch.object(cd.check_pins, "docs_trunk", return_value="dev"), \
-                mock.patch.object(cd.check_pins, "compare_status", return_value="diverged"), \
-                mock.patch.object(cd, "open_docs_prs", return_value=[]):
-            rc = cd.main(["--check", "--repo-dir", str(self.dir)])
-        self.assertEqual(rc, 1)
-        self.assertIn("not on docs dev and in no open docs PR", buf.getvalue())
-
-    def test_the_workflow_lists_files_only_for_dependabots_own_run_and_passes_them_on(self) -> None:
-        files = next(s for s in STEPS if s.get("id") == "files")
-        for cond in ("github.event_name == 'pull_request'", "github.event.pull_request.user.login == 'dependabot[bot]'"):
-            self.assertIn(cond, files["if"])
-        self.assertNotIn("github.actor", files["if"])  # zizmor bot-conditions; the script checks GITHUB_ACTOR as well
-        self.assertIn('gh api --paginate "repos/${REPO}/pulls/${NUMBER}/files"', files["run"])
-        self.assertIn(".previous_filename", files["run"])
-        names = [s.get("id") for s in STEPS]
-        self.assertLess(names.index("files"), names.index("deps"))
-        for step in (next(s for s in STEPS if s.get("id") == "deps"), STEPS[-1]):
-            self.assertEqual(step["env"]["CHANGED_FILES"], "${{ steps.files.outputs.file }}")
-            self.assertEqual(step["env"]["PR_AUTHOR"], "${{ github.event.pull_request.user.login }}")
-        guard = next(s for s in STEPS if "HAS_APP" in s.get("env", {}))
-        self.assertIn("gh secret set --app dependabot", guard["run"])
-        self.assertEqual(guard["env"]["ACTOR"], "${{ github.actor }}")
 
 
 class DraftGate(unittest.TestCase):
@@ -466,7 +282,7 @@ class DraftGate(unittest.TestCase):
         self.assertIn("::notice title=depends-on::backend-service#73 is still open", out.getvalue())
 
     def test_the_workflow_passes_the_draft_flag(self) -> None:
-        step = next(s for s in STEPS if s.get("name", "").startswith("Every dependency is merged"))
+        step = next(s for s in STEPS if s.get("name", "").startswith("Every declared dependency is merged"))
         self.assertIn("github.event.pull_request.draft", step["env"]["IS_DRAFT"])
 
     def test_an_api_error_in_the_notice_path_never_fails_the_job(self) -> None:

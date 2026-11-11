@@ -1,22 +1,15 @@
-# Shared: dependencies of a pull request (onepeek-docs architecture/lld/infra/foundation-playbook.md §8a P1, lessons
-# L26 and L27). Every pull-request workflow that runs on our runners starts with this job and every other job in it
-# `needs:` it, not only checks.yml, so no runner time is spent on a run whose result is already known. It fails with
-# "waiting for <repo>#<n>" while a pull request named in the body by a `Depends on: OnePeek/<repo>#<n>` line is
-# unmerged, and, with no line needed, when the caller's docs-version.txt names a onepeek-docs commit that is in no open
-# docs pull request and not on the docs trunk. A pin that is a commit of an open docs pull request is the normal state of a
-# change set until the merge: the job prints a notice ("waiting for onepeek-docs#<n>") and passes, because
-# ship_change_set.py merges docs first (its strict check, and preflight --release's, fail that wait). Callers trigger on
-# pull_request types opened, reopened and synchronize, never edited (it re-ran every check on a body edit): when a dependency merges, ship_change_set.py re-runs the
-# dependent pull request's checks. Reads use the agents' App token (S6): callers pass AGENTS_APP_CLIENT_ID and
-# AGENTS_APP_PRIVATE_KEY; they are needed when the body has such a line or the repo has docs-version.txt. The logic is
-# scripts/check_depends_on.py at the caller's pin. The body is read live from the API with the job's GITHUB_TOKEN
-# (pull-requests: read, which the caller's job must grant), never from the event payload, which is the body at trigger
-# time and would miss a line added or removed after it. With no pull request in the event (a push, schedule or dispatch run of
-# the caller) there is nothing to wait for: every step but a notice is skipped, so the job passes and the jobs that need it run;
-# the docs ancestor rule on push is the pins job's, not this one's. Dependabot's own runs get no Actions secrets, so no
-# App token: a Dependabot pull request (author and actor dependabot[bot], event pull_request) with no `Depends on:` line
-# that does not change docs-version.txt needs no cross-repo read and passes with a notice; one that needs a read fails
-# naming the Dependabot secrets to set (check_depends_on.py, lessons pitfall 8).
+# DEPRECATED (PIPE-SIMPLE v2 DOC-3): callers stop calling this workflow; the merge tool (vanguard ship) alone refuses a
+# pull request whose `Depends on:` pull request is open. It stays working because callers pinned to older tags still
+# call it; delete it (and scripts/check_depends_on.py) in a later sweep once no caller pins a tag that uses it.
+# Shared: dependencies of a pull request (onepeek-docs architecture/lld/infra/foundation-playbook.md §8a P1, lesson
+# L26). It fails with "waiting for <repo>#<n>" while a pull request named in the body by a
+# `Depends on: OnePeek/<repo>#<n>` line is unmerged. The docs-version.txt pin is no dependency any more (DOC-1: the
+# lesson L27 docs-pin branch is gone). Callers trigger on pull_request types opened, reopened and synchronize, never
+# edited. Reads use the agents' App token (S6): callers pass AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY; they are
+# needed when the body has such a line. The logic is scripts/check_depends_on.py at the caller's pin. The body is read
+# live from the API with the job's GITHUB_TOKEN (pull-requests: read, which the caller's job must grant), never from the
+# event payload. With no pull request in the event (a push, schedule or dispatch run of the caller) there is nothing to
+# wait for: every step but a notice is skipped, so the job passes and the jobs that need it run.
 name: depends-on
 
 on:
@@ -28,7 +21,7 @@ on:
         default: github
     secrets:
       AGENTS_APP_CLIENT_ID:
-        description: The agents' GitHub App (playbook §8a S6), for Pull requests read on the repos the body names and Contents and Pull requests read on onepeek-docs.
+        description: The agents' GitHub App (playbook §8a S6), for Pull requests read on the repos the body names.
         required: false
       AGENTS_APP_PRIVATE_KEY:
         description: The agents' GitHub App private key (with AGENTS_APP_CLIENT_ID).
@@ -84,43 +77,28 @@ jobs:
           gh api "repos/${REPO}/pulls/${NUMBER}" --jq '.body // ""' > "${RUNNER_TEMP}/pr-body.txt"
           echo "file=${RUNNER_TEMP}/pr-body.txt" >> "$GITHUB_OUTPUT"
 
-      - name: The files the pull request changes (Dependabot's own run only, to see whether it moves docs-version.txt)
-        # The author alone gates this read; check_depends_on.py also requires GITHUB_ACTOR (zizmor bot-conditions: never the actor alone).
-        id: files
-        if: ${{ github.event.pull_request.number != '' && github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          gh api --paginate "repos/${REPO}/pulls/${NUMBER}/files" --jq '.[] | .filename, (.previous_filename // empty)' > "${RUNNER_TEMP}/pr-files.txt"
-          echo "file=${RUNNER_TEMP}/pr-files.txt" >> "$GITHUB_OUTPUT"
-
-      - name: The repos the body names, and the docs commit docs-version.txt pins (when it must be read)
+      - name: The repos the body names
         id: deps
         if: ${{ github.event.pull_request.number != '' }}
         env:
           SHA: ${{ steps.version.outputs.sha }}
           BODY_FILE: ${{ steps.body.outputs.file }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          CHANGED_FILES: ${{ steps.files.outputs.file }}
         run: |
           script=scripts/check_depends_on.py
           [ -n "${SHA}" ] && script=_shared/scripts/check_depends_on.py
           {
             echo "script=${script}"
             echo "repos=$(python3 "${script}" --repos)"
-            echo "docs=$(python3 "${script}" --docs-read)"
           } >> "$GITHUB_OUTPUT"
 
-      - name: The agents' GitHub App secrets are set (a dependency in another repo, or the docs pin, is read with them)
-        if: ${{ github.event.pull_request.number != '' && (steps.deps.outputs.repos != '' || steps.deps.outputs.docs != '') }}
+      - name: The agents' GitHub App secrets are set (a dependency in another repo is read with them)
+        if: ${{ github.event.pull_request.number != '' && steps.deps.outputs.repos != '' }}
         env:
           HAS_APP: ${{ secrets.AGENTS_APP_CLIENT_ID != '' && secrets.AGENTS_APP_PRIVATE_KEY != '' }}
           ACTOR: ${{ github.actor }}
         run: |
           if [ "${HAS_APP}" != "true" ]; then
-            echo "::error::AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY must be passed: the Depends on lines name pull requests in other repos, or docs-version.txt pins a onepeek-docs commit (playbook §8a P1, S6)."
+            echo "::error::AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY must be passed: the Depends on lines name pull requests in other repos (playbook §8a P1, S6)."
             if [ "${ACTOR}" = "dependabot[bot]" ]; then
               echo "::error::This is a Dependabot run, which gets Dependabot secrets only: set AGENTS_APP_CLIENT_ID and AGENTS_APP_PRIVATE_KEY as Dependabot secrets (gh secret set --app dependabot)."
             fi
@@ -138,27 +116,12 @@ jobs:
           repositories: ${{ steps.deps.outputs.repos }}
           permission-pull-requests: read
 
-      - name: The agents' GitHub App token (Contents and Pull requests read on onepeek-docs, for the docs pin)
-        id: docs-app
-        if: ${{ github.event.pull_request.number != '' && steps.deps.outputs.docs != '' }}
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          client-id: ${{ secrets.AGENTS_APP_CLIENT_ID }}
-          private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: onepeek-docs
-          permission-contents: read
-          permission-pull-requests: read
-
-      - name: Every dependency is merged (declared, and the docs pin's pull request)
+      - name: Every declared dependency is merged
         if: ${{ github.event.pull_request.number != '' }}
         env:
           SCRIPT: ${{ steps.deps.outputs.script }}
           BODY_FILE: ${{ steps.body.outputs.file }}
           GH_TOKEN: ${{ steps.app.outputs.token }}
-          DOCS_TOKEN: ${{ steps.docs-app.outputs.token }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          CHANGED_FILES: ${{ steps.files.outputs.file }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
         run: python3 "${SCRIPT}" --check
 

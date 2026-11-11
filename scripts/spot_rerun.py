@@ -13,6 +13,16 @@ would cancel the newer, current run. superseded() is checked before any log is r
 a read that fails re-runs nothing (exit 1).
 
     RUN_ID=<github.event.workflow_run.id> REPO=<github.repository> python3 spot_rerun.py
+    WORKFLOWS='checks release' REPO=<github.repository> python3 spot_rerun.py     # scan mode (no RUN_ID)
+
+Scan mode (PIPE-SIMPLE v2 GH-1, plan item 3): a caller on a 10-minute `schedule` (or `workflow_dispatch`) has no
+workflow_run event, so RUN_ID is empty. The script lists the repo's failed runs created in the last
+SCAN_LIST_HOURS, keeps those of the named workflows (WORKFLOWS, space-separated `name:`s) on attempt 1 that finished
+(updated_at) in the last SCAN_DECIDE_MINUTES, and decides each exactly as above (run()), oldest finish first, while
+SCAN_BUDGET_SECONDS allows; runs left over are named and fail the job (the next scan takes them). It is idempotent: run() re-reads each run first, and a run already re-run is on attempt
+2 or later (or no longer failed), so it is never re-run twice; the caller's concurrency group keeps two scans apart.
+A failed list read fails the job; a failed read of one run is reported, the others are still decided, and the job
+fails at the end (exit 1). An empty RUN_ID with no WORKFLOWS is an input error.
 
 RUN_ID and REPO are checked strictly (digits only; owner/name). The token is GH_TOKEN (actions: read, checks: read, and
 actions: write to re-run). Standard library only; the `gh` CLI does the API calls.
@@ -34,6 +44,15 @@ MARKERS = ("The runner has received a shutdown signal", "lost communication with
 RUN_ID = re.compile(r"[1-9][0-9]{0,19}", re.ASCII)
 REPO = re.compile(r"(?!\.+/)[A-Za-z0-9._-]+/(?!\.+$)[A-Za-z0-9._-]+", re.ASCII)
 
+
+# Scan mode (GH-1 round 2, B1/B2; provisional): runs CREATED in the last SCAN_LIST_HOURS are listed (a sandbox or
+# release run lasts hours), and only those that FINISHED (updated_at) in the last SCAN_DECIDE_MINUTES are decided, so a
+# run is decided by at most two 10-minute scans. SCAN_BUDGET_SECONDS keeps the scan inside the job's 5-minute limit: a
+# run is started only while the worst case of one decision (RUN_WORST_SECONDS: every log wait plus reads) still fits.
+SCAN_LIST_HOURS = 24
+SCAN_DECIDE_MINUTES = 20
+SCAN_BUDGET_SECONDS = 240
+RUN_WORST_SECONDS = 120
 
 HTTP_STATUS = re.compile(r"\(HTTP ([0-9]{3})\)")
 
@@ -210,8 +229,48 @@ def run(run_id: str, repo: str, workflow: str = "", rerun_all: str = "") -> int:
     return 0
 
 
+def scan(repo: str, workflows: str, rerun_all: str = "", now: float | None = None, clock=time.monotonic) -> int:
+    """Scan mode: decide every failed first-attempt run of the named workflows that finished in the last
+    SCAN_DECIDE_MINUTES (listed among the runs created in the last SCAN_LIST_HOURS), oldest finish first, within
+    SCAN_BUDGET_SECONDS; runs left when the budget runs out are named and the scan fails (exit 1)."""
+    names = workflows.split()
+    if not names or not all(WORKFLOW_NAME.fullmatch(n) for n in names):
+        raise ValueError(f"WORKFLOWS must be space-separated workflow names, got {workflows!r}.")
+    if not REPO.fullmatch(repo):
+        raise ValueError(f"REPO must be <owner>/<name>, got {repo!r}.")
+    start = clock()
+    now = time.time() if now is None else now
+    stamp = lambda seconds_ago: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - seconds_ago))  # noqa: E731
+    created, since = stamp(SCAN_LIST_HOURS * 3600), stamp(SCAN_DECIDE_MINUTES * 60)
+    out = gh("api", "--paginate", f"repos/{repo}/actions/runs?status=failure&created=%3E%3D{created}&per_page=100",
+             "--jq", ".workflow_runs[] | {id, name, run_attempt, updated_at}")
+    runs = [json.loads(line) for line in out.splitlines() if line.strip()]
+    found = sorted({(str(r.get("updated_at")), str(r.get("id")), str(r.get("name"))) for r in runs
+                    if r.get("name") in names and r.get("run_attempt") == 1 and RUN_ID.fullmatch(str(r.get("id")))
+                    and str(r.get("updated_at") or "") > since})
+    if not found:
+        summary(f"No re-run: no failed first-attempt run of {', '.join(clean(n) for n in names)} finished since {since}.")
+        return 0
+    errors = 0
+    for i, (_, run_id, name) in enumerate(found):
+        if clock() - start + RUN_WORST_SECONDS > SCAN_BUDGET_SECONDS:
+            left = ", ".join(r for _, r, _ in found[i:])
+            print(f"::error::the scan's time budget ({SCAN_BUDGET_SECONDS} s) ran out; not decided: run(s) {left} "
+                  "(the next scan decides them while they finished in the last "
+                  f"{SCAN_DECIDE_MINUTES} minutes)")
+            return 1
+        try:
+            run(run_id, repo, name, rerun_all)
+        except (ValueError, GhError, json.JSONDecodeError) as err:
+            print(f"::error::run {run_id}: {err}")
+            errors += 1
+    return 1 if errors else 0
+
+
 def main() -> int:
     try:
+        if not os.environ.get("RUN_ID", "") and os.environ.get("WORKFLOWS", "").strip():
+            return scan(os.environ.get("REPO", ""), os.environ.get("WORKFLOWS", ""), os.environ.get("RERUN_ALL", ""))
         return run(os.environ.get("RUN_ID", ""), os.environ.get("REPO", ""), os.environ.get("WORKFLOW", ""),
                    os.environ.get("RERUN_ALL", ""))
     except (ValueError, GhError, json.JSONDecodeError) as err:

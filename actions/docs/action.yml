@@ -1,0 +1,15 @@
+# Shared check body: the docs check (PIPE-SIMPLE v2 audit (b) §2c and §4c; R-DOCS-LOCAL). fast-checks.yml runs it as
+# one step of its `fast` job when the caller passes `docs: true`. The caller has checked out the calling repo at the
+# workspace root. The script is this action's own repository at the same commit (`$GITHUB_ACTION_PATH/../..`), so the
+# check runs exactly at the version the caller pinned. Fails when a relative markdown link in `docs/**` or a root
+# `*.md` does not resolve, front matter does not parse, or a code fence is never closed (scripts/check_docs.py).
+name: docs
+description: The repo's markdown under docs/ and at the root has working relative links, parsable front matter and closed code fences.
+
+runs:
+  using: composite
+  steps:
+    - name: Relative links resolve, front matter parses, no unclosed code fence
+      shell: bash
+      run: |
+        python3 "$(cd "${GITHUB_ACTION_PATH}/../.." && pwd)/scripts/check_docs.py" .

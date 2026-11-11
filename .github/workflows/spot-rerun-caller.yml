@@ -1,24 +1,29 @@
-# This repo's own caller of spot-rerun.yml, and the example for every other repo (the snippet is in spot-rerun.yml's
-# header): when one of the listed workflows ends in failure and a spot reclaim caused it, its failed jobs run once more.
-# This repo is public, so it runs on GitHub-hosted runners (`runner: github`); private repos pass
-# `${{ vars.RUNNER || 'github' }}` and list their own workflow names.
+# This repo's own caller of spot-rerun.yml, and the example for every other repo (the snippets are in spot-rerun.yml's
+# header): every 10 minutes (and on demand), each failed first-attempt run of the listed workflows that finished in the last 20 minutes
+# whose failure a spot reclaim caused gets its failed jobs run once more (scan mode, PIPE-SIMPLE v2 GH-1). This repo is
+# public, so it runs on GitHub-hosted runners (`runner: github`); private repos pass `${{ vars.RUNNER || 'github' }}`
+# and list their own workflow names.
 name: spot-rerun-caller
 
 on:
-  workflow_run:  # zizmor: ignore[dangerous-triggers] reads the run through the API only; nothing of it is checked out
-    workflows: [workflow-lint]
-    types: [completed]
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: spot-rerun-caller
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
   spot-rerun:
-    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
     uses: ./.github/workflows/spot-rerun.yml
     permissions:
-      actions: write  # read the run's jobs and logs, and re-run the failed jobs
+      actions: write  # read the runs, their jobs and logs, and re-run the failed jobs
       checks: read    # the job's annotations (where a lost runner is reported)
       contents: read
     with:
       runner: github
+      workflows: workflow-lint
