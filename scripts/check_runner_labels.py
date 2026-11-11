@@ -7,7 +7,9 @@
   2. Private repos: `runs-on` is one of the forms of section 5.3 (no other labels, no `ghr-*`); jobs listed in
      .github/workflow-lint/github-only-jobs.yaml use the `github-only` form (plain `ubuntu-latest`). Exempt by name:
      onepeek-infra's ci-runner-canary.yml and ci-runner-image.yml, which name `onepeek-arm64` and
-     `onepeek-arm64-canary` directly.
+     `onepeek-arm64-canary` directly. A `pull_request` workflow may put the release guard RELEASE_GUARD in front of a
+     standard form, so every job of a release pull request runs on `onepeek-arm64-od` (sandbox.md section 7f items 5
+     and 8, R-E0-6); the job keeps the class of the standard form behind it. Exactly that text, nowhere else.
   3. Every job that can run on `onepeek-*` sets `timeout-minutes`: at most 60 (fast, arm-build), 150 (stateful), or its
      named TIMEOUT_EXCEPTIONS entry. An expression (for example one that depends on an input) is read as its larger value,
      and only when it is made of `inputs.*` comparisons with a literal, `&&`, `||`, parentheses and bare integer
@@ -38,6 +40,8 @@ EXEMPT = {("OnePeek/onepeek-infra", "ci-runner-canary.yml"), ("OnePeek/onepeek-i
 EXEMPT_LABELS = {"onepeek-arm64", "onepeek-arm64-canary"}
 MAPPING_REPO = "OnePeek/.github"  # the only public repo whose workflow_call workflows may hold the mapping
 PROD_GUARD = "inputs.environment == 'prod' && 'ubuntu-latest' || "
+RELEASE_GUARD = ("github.base_ref == 'release' && (vars.RUNNER == 'onepeek' || vars.RUNNER == 'canary') "
+                 "&& 'onepeek-arm64-od' || ")
 LIMITS = {"light": 30, "fast": 60, "arm-build": 60, "stateful": 150}
 # Named exceptions to rule 3 (ci-runners.md section 5.4), by (repo, workflow, job): the sandbox run lock waits up to
 # 80 minutes on the small class (sandbox.md section 7c item 4), under the spot reaper's 90-minute lifetime.
@@ -151,8 +155,9 @@ def _expr(value: object) -> str | None:
     return " ".join(m.group(1).split()) if m else None
 
 
-def classify(runs_on: object, var: str, allow_prod_guard: bool) -> str | None:
-    """The job class when runs-on is one of the allowed forms, else None."""
+def classify(runs_on: object, var: str, allow_prod_guard: bool, allow_release_guard: bool = False) -> str | None:
+    """The job class when runs-on is one of the allowed forms, else None. With allow_release_guard (a private
+    pull_request workflow) RELEASE_GUARD may stand once in front of a standard form; the class is that form's."""
     if runs_on == "ubuntu-latest":
         return "github-only"
     expr = _expr(runs_on)
@@ -160,6 +165,8 @@ def classify(runs_on: object, var: str, allow_prod_guard: bool) -> str | None:
         return None
     if allow_prod_guard and expr.startswith(PROD_GUARD):
         expr = expr[len(PROD_GUARD):]
+    if allow_release_guard and expr.startswith(RELEASE_GUARD):
+        expr = expr[len(RELEASE_GUARD):]
     for cls, form in _forms(var).items():
         if cls != "github-only" and expr == form:
             return cls
@@ -243,7 +250,7 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
                               + (" or a mapping form of section 5.3." if repo == MAPPING_REPO else "."))
                 continue
         else:
-            cls = classify(ro, "vars.RUNNER", False)
+            cls = classify(ro, "vars.RUNNER", False, allow_release_guard="pull_request" in triggers)
             if cls is None and (repo, name) in EXEMPT:
                 # An exempt workflow names the labels directly, or through a matrix of only those labels.
                 matrix = ((job.get("strategy") or {}).get("matrix") or {}).get("runner")

@@ -157,6 +157,71 @@ class Rule2Private(unittest.TestCase):
         self.assertIsInstance(lint.load_listed(path), set)
 
 
+RELEASE_GUARD = "github.base_ref == 'release' && (vars.RUNNER == 'onepeek' || vars.RUNNER == 'canary') && 'onepeek-arm64-od' || "
+LIGHT_PRIVATE = LIGHT_PUBLIC.replace("inputs.runner", "vars.RUNNER")
+ARM_PRIVATE = ("${{ vars.RUNNER == 'onepeek' && 'onepeek-arm64' || vars.RUNNER == 'canary' && 'onepeek-arm64-canary' "
+               "|| 'ubuntu-24.04-arm' }}")
+
+
+def release(form):
+    """A private standard form with the release guard in front (ci-runners.md section 5.3; sandbox.md section 7f item 5)."""
+    return "${{ " + RELEASE_GUARD + form[4:]
+
+
+class Rule2ReleaseForm(unittest.TestCase):
+    """sandbox.md section 7f items 5 and 8 (R-E0-6): a pull_request workflow may run every job on onepeek-arm64-od when
+    the base is release, in exactly this form, in front of a standard form."""
+
+    def test_the_release_form_in_front_of_each_standard_form_is_allowed(self):
+        for form in (LIGHT_PRIVATE, FAST_PRIVATE, ARM_PRIVATE, STATEFUL_PRIVATE):
+            self.assertEqual(run("private", "OnePeek/onepeek-infra", "sandbox.yml", own(release(form))), [], form)
+
+    def test_the_exact_text_of_infra_241_is_allowed(self):
+        # onepeek-infra#241 head ab5220f, .github/workflows/sandbox.yml line 61.
+        text = ("${{ github.base_ref == 'release' && (vars.RUNNER == 'onepeek' || vars.RUNNER == 'canary') && 'onepeek-arm64-od' "
+                "|| vars.RUNNER == 'onepeek' && 'onepeek-arm64-small' || vars.RUNNER == 'canary' && 'onepeek-arm64-canary' "
+                "|| 'ubuntu-latest' }}")
+        self.assertEqual(run("private", "OnePeek/onepeek-infra", "sandbox.yml", own(text)), [])
+
+    def test_the_release_form_keeps_the_class_limit_of_its_standard_form(self):
+        self.assertEqual(run("private", "OnePeek/x", "c.yml", own(release(LIGHT_PRIVATE), "30")), [])
+        errs = run("private", "OnePeek/x", "c.yml", own(release(LIGHT_PRIVATE), "31"))
+        self.assertTrue(any("rule 3" in e for e in errs), errs)
+
+    def test_a_trigger_list_or_mapping_with_pull_request_is_allowed(self):
+        for trigger in ("[pull_request, workflow_dispatch]", "{pull_request: {branches: [dev, release]}, workflow_dispatch: {}}"):
+            self.assertEqual(run("private", "OnePeek/x", "c.yml", own(release(FAST_PRIVATE), trigger=trigger)), [], trigger)
+
+    def test_hostile_forms_are_refused(self):
+        bad = {
+            "another label": release(FAST_PRIVATE).replace("'onepeek-arm64-od' ||", "'onepeek-arm64' ||", 1),
+            "the canary label": release(FAST_PRIVATE).replace("'onepeek-arm64-od' ||", "'onepeek-arm64-canary' ||", 1),
+            "a base other than release": release(FAST_PRIVATE).replace("'release'", "'dev'", 1),
+            "a head ref": release(FAST_PRIVATE).replace("github.base_ref", "github.head_ref", 1),
+            "no RUNNER guard": release(FAST_PRIVATE).replace("(vars.RUNNER == 'onepeek' || vars.RUNNER == 'canary') && ", ""),
+            "only the onepeek guard": release(FAST_PRIVATE).replace(" || vars.RUNNER == 'canary')", ")", 1),
+            "no standard tail": "${{ " + RELEASE_GUARD + "'ubuntu-latest' }}",
+            "no tail at all": "${{ " + RELEASE_GUARD.rstrip(" |") + " }}",
+            "a tail that is not a standard form": "${{ " + RELEASE_GUARD + "vars.RUNNER == 'onepeek' && 'self-hosted' || 'ubuntu-latest' }}",
+            "the guard twice": "${{ " + RELEASE_GUARD + release(FAST_PRIVATE)[4:],
+            "the guard after the tail": FAST_PRIVATE[:-3] + " || " + RELEASE_GUARD.rstrip(" |") + " }}",
+        }
+        for why, ro in bad.items():
+            errs = run("private", "OnePeek/onepeek-infra", "sandbox.yml", own(ro))
+            self.assertTrue(any("rule 2" in e for e in errs), (why, errs))
+
+    def test_a_workflow_without_a_pull_request_trigger_is_refused(self):
+        for trigger in ("push", "workflow_dispatch", "[push, workflow_dispatch]", "{workflow_call: {}}", "schedule"):
+            errs = run("private", "OnePeek/onepeek-infra", "sandbox.yml", own(release(FAST_PRIVATE), trigger=trigger))
+            self.assertTrue(any("rule 2" in e for e in errs), (trigger, errs))
+
+    def test_a_public_repo_may_not_use_the_release_form(self):
+        public = "${{ github.base_ref == 'release' && (inputs.runner == 'onepeek' || inputs.runner == 'canary') && 'onepeek-arm64-od' || " + FAST_PUBLIC[4:]
+        for ro in (public, release(FAST_PRIVATE)):
+            self.assertNotEqual(run("public", "OnePeek/.github", "a.yml", reusable(ro)), [], ro)
+            self.assertNotEqual(run("public", "OnePeek/.github", "a.yml", own(ro)), [], ro)
+
+
 class Rule3Timeouts(unittest.TestCase):
     def test_missing_or_large_timeout_is_refused(self):
         for m, limit in ((FAST_PRIVATE, 60), (STATEFUL_PRIVATE, 150)):
