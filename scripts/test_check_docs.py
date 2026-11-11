@@ -51,6 +51,14 @@ class Links(Case):
         self.assertEqual(self.problems({"src/README.md": "[x](nope.md)\n", "docs/n.txt": "[x](nope.md)\n"}), [])
 
 
+class Hostile(Case):
+    def test_a_newline_in_a_file_name_cannot_start_a_workflow_command(self) -> None:  # m2
+        got = self.problems({"docs/a\n::warning::x.md": "[x](nope.md)\n"})
+        self.assertEqual(len(got), 1)
+        self.assertNotIn("\n", got[0])
+        self.assertTrue(got[0].startswith("docs/a?::warning::x.md:1: "), got[0])
+
+
 class FrontMatter(Case):
     def test_good_front_matter_passes_and_links_after_it_are_checked(self) -> None:
         text = "---\ntitle: A\ntags:\n  - x\n- y\n# note\n\nowner: me\n---\n[x](nope.md)\n"

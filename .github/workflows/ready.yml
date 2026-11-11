@@ -2,7 +2,8 @@
 # last job calls this workflow; the check shows as `ci / ready` (the caller job's name `ci`, this workflow's job
 # `ready`), the row the merge tool reads. It passes only when every other job of the caller's workflow passed, or was
 # skipped by its own `if:` and is listed in `skippable` (a path filter); a failed, cancelled, unlisted-skipped or
-# unknown result fails it, and so does a caller job that does not need every other job or does not run `always()`.
+# unknown result fails it, and so does a caller job that does not need every other job or whose `if:` is anything but
+# exactly `${{ always() }}` (a longer condition could skip this job, and a skipped row is no failure to the merge tool).
 # It prints a table, job | result | how to reproduce locally, to the log and the job summary. Logic:
 # scripts/ready.py at the caller's pin (rules and failure messages in its header).
 #

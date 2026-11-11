@@ -1,5 +1,5 @@
 # This repo's own caller of spot-rerun.yml, and the example for every other repo (the snippets are in spot-rerun.yml's
-# header): every 10 minutes (and on demand), each failed first-attempt run of the listed workflows from the last hour
+# header): every 10 minutes (and on demand), each failed first-attempt run of the listed workflows that finished in the last 20 minutes
 # whose failure a spot reclaim caused gets its failed jobs run once more (scan mode, PIPE-SIMPLE v2 GH-1). This repo is
 # public, so it runs on GitHub-hosted runners (`runner: github`); private repos pass `${{ vars.RUNNER || 'github' }}`
 # and list their own workflow names.

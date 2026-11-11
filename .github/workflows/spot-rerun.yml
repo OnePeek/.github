@@ -67,7 +67,7 @@ on:
         type: string
         default: github
       workflows:
-        description: "Scan mode, for a caller on schedule or workflow_dispatch (no workflow_run event): space-separated names of the caller's workflows whose failed first-attempt runs of the last 60 minutes are decided (scripts/spot_rerun.py)."
+        description: "Scan mode, for a caller on schedule or workflow_dispatch (no workflow_run event): space-separated names of the caller's workflows whose failed first-attempt runs that finished in the last 20 minutes (created in the last 24 hours) are decided (scripts/spot_rerun.py)."
         type: string
         default: ""
       rerun_all_workflows:

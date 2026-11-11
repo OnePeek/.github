@@ -146,6 +146,18 @@ class Workflow(Case):
         self.assertEqual(code, 1)
         self.assertIn("needs `if: ${{ always() }}`", out)
 
+    def test_only_exactly_always_is_accepted(self) -> None:  # B3: a longer condition can skip the summary
+        green = needs(fast="success", tests="success", build="success")
+        for cond in ("${{ always() && needs.tests.result == 'success' }}", "always() && true", "${{ !cancelled() || always() }}",
+                     "${{ always() }} && false", "'always()'", "${{ success() }}  # always()"):
+            text = CALLER.format(sha="a" * 40, needs=ALL).replace("if: ${{ always() }}", f"if: {json.dumps(cond)}")
+            code, out = self.run_ready(green, text)
+            self.assertEqual(code, 1, cond)
+            self.assertIn("needs `if: ${{ always() }}`", out)
+        for cond in ("always()", "${{ always() }}", "${{always()}}"):
+            text = CALLER.format(sha="a" * 40, needs=ALL).replace("if: ${{ always() }}", f"if: {json.dumps(cond)}")
+            self.assertEqual(self.run_ready(green, text)[0], 0, cond)
+
     def test_no_or_two_ready_jobs_fail(self) -> None:
         text = CALLER.format(sha="a" * 40, needs=ALL)
         no = text.replace("workflows/ready.yml", "workflows/other.yml")
