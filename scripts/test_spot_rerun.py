@@ -432,8 +432,8 @@ class ScanGh(FakeGh):
             self.list_query = urllib.parse.parse_qs(path.split("?", 1)[1])
             if self.list_error:
                 raise sr.GhError("gh api failed: (HTTP 502)", 502)
-            return "".join(json.dumps({"id": i, "name": n, "run_attempt": self.attempts.get(i, a)}) + "\n"
-                           for i, n, a in self.listing)
+            return "".join(json.dumps({"id": e[0], "name": e[1], "run_attempt": self.attempts.get(e[0], e[2]),
+                                       "updated_at": e[3] if len(e) > 3 else JUST_NOW}) + "\n" for e in self.listing)
         if args and args[0] == "run" and args[1] == "rerun":
             self.attempts[int(args[2])] = 2
         if path.startswith("repos/") and "/actions/runs/" in path and path.count("/") == 5:
@@ -445,10 +445,14 @@ class ScanGh(FakeGh):
         return super().__call__(*args)
 
 
-def scan(fake: ScanGh, workflows="checks", repo="OnePeek/x", now=1_800_000_000.0) -> tuple[int, str]:
+NOW = 1_800_000_000.0  # 2027-01-15T08:00:00Z
+JUST_NOW = "2027-01-15T07:59:00Z"
+
+
+def scan(fake: ScanGh, workflows="checks", repo="OnePeek/x", now=NOW, clock=None) -> tuple[int, str]:
     out = io.StringIO()
     with mock.patch.object(sr, "gh", fake), mock.patch.object(sr, "LOG_WAIT_SECONDS", 0), contextlib.redirect_stdout(out):
-        return sr.scan(repo, workflows, "", now=now), out.getvalue()
+        return sr.scan(repo, workflows, "", now=now, clock=clock or (lambda: 0.0)), out.getvalue()
 
 
 class Scan(unittest.TestCase):
@@ -483,7 +487,7 @@ class Scan(unittest.TestCase):
         code, out = scan(fake, now=1_800_000_000.0)
         self.assertEqual(code, 0)
         self.assertEqual(fake.list_query["status"], ["failure"])
-        self.assertEqual(fake.list_query["created"], [">=2027-01-15T07:00:00Z"])  # now - 60 minutes, UTC
+        self.assertEqual(fake.list_query["created"], [">=2027-01-14T08:00:00Z"])  # now - 24 hours, UTC (B1)
         self.assertIn("No re-run: no failed first-attempt run of checks", out)
 
     def test_a_failed_list_read_fails_visibly(self) -> None:  # brief failure mode: GitHub API error
@@ -510,6 +514,39 @@ class Scan(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("::error::run 41:", out)
         self.assertIn(("run", "rerun", "42", "--failed", "--repo", "OnePeek/x"), fake.reruns())
+
+    def test_a_three_hour_old_run_that_just_failed_is_decided(self) -> None:  # B1: long sandbox or release runs
+        fake = ScanGh(listing=[(42, "checks", 1, JUST_NOW)], logs={1: SHUTDOWN})  # created 3 h ago is inside 24 h
+        self.assertEqual(scan(fake)[0], 0)
+        self.assertEqual(fake.reruns(), [("run", "rerun", "42", "--failed", "--repo", "OnePeek/x")])
+
+    def test_a_run_that_finished_before_the_decide_window_is_left_alone(self) -> None:
+        fake = ScanGh(listing=[(42, "checks", 1, "2027-01-15T07:39:59Z")], logs={1: SHUTDOWN})
+        code, out = scan(fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.reruns(), [])
+        self.assertIn("finished since 2027-01-15T07:40:00Z", out)
+
+    def test_an_ordinary_failure_is_decided_at_most_twice(self) -> None:  # B2: one run's log waits are not paid forever
+        fake = ScanGh(listing=[(42, "checks", 1, JUST_NOW)], logs={1: "plain test failure\n"})
+        decided = 0
+        for minutes in (0, 10, 20, 30, 40):
+            before = len([c for c in fake.calls if c[0] == "api" and any(x.endswith("/logs") for x in c)])
+            self.assertEqual(scan(fake, now=NOW + minutes * 60)[0], 0)
+            decided += len([c for c in fake.calls if c[0] == "api" and any(x.endswith("/logs") for x in c)]) > before
+        self.assertEqual(decided, 2)
+        self.assertEqual(fake.reruns(), [])
+
+    def test_the_time_budget_stops_cleanly_and_names_the_runs_left(self) -> None:  # B2: never killed by the timeout
+        fake = ScanGh(listing=[(41, "checks", 1, "2027-01-15T07:50:00Z"), (42, "checks", 1, "2027-01-15T07:55:00Z"),
+                               (43, "checks", 1, JUST_NOW)], logs={1: SHUTDOWN})
+        ticks = iter([0.0, 0.0, 130.0, 130.0])  # start, before run 41, before run 42 (no room for another worst case)
+        code, out = scan(fake, clock=lambda: next(ticks))
+        self.assertEqual(code, 1)
+        self.assertIn("::error::the scan's time budget (240 s) ran out; not decided: run(s) 42, 43", out)
+        decided = {c[1].rsplit("/", 1)[1] for c in fake.calls if c[0] == "api" and c[1].count("/") == 5
+                   and "/actions/runs/" in c[1]}
+        self.assertEqual(decided, {"41"})  # oldest finish first; nothing started after the budget check
 
     def test_bad_workflow_names_or_repo_are_refused_before_any_call(self) -> None:
         for workflows, repo in (("", "OnePeek/x"), ("a;b", "OnePeek/x"), ("ok", "a/$(x)"), ("$(x)", "OnePeek/x")):

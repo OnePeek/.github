@@ -12,7 +12,8 @@ Rules (fail closed: anything not known good is a failure):
    another shape fails.
 2. The caller's workflow file (WORKFLOW_REF, `<owner>/<repo>/.github/workflows/<file>@<ref>`, read from the checkout of
    the caller at the run's commit in the working directory) has exactly one job that calls ready.yml; that job's `if:`
-   holds `always()` (so it runs after a failure) and its `needs:` names every other job of the file, and NEEDS holds
+   is exactly `always()` (with or without `${{ }}`; anything more, such as `always() && ...`, could skip the summary,
+   and a skipped row is not a failure to the merge tool) and its `needs:` names every other job of the file, and NEEDS holds
    exactly those jobs. A job the summary does not wait on would be missing from the one row the merge tool reads.
 3. Each needed job's result: `success` passes. `skipped` passes only for a job listed in SKIPPABLE (a job its own `if:`
    skips, such as a path filter); a job skipped because a job it needs failed or was cancelled fails anyway, since that
@@ -35,6 +36,7 @@ RESULTS = ("success", "failure", "cancelled", "skipped")
 JOB_ID = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,99}", re.ASCII)
 WORKFLOW_REF = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/(\.github/workflows/[A-Za-z0-9._-]+\.ya?ml)@[^\s]+", re.ASCII)
 READY_USES = re.compile(r"(?:^\./|^onepeek/\.github/)\.github/workflows/ready\.yml(?:@|$)", re.I)
+ALWAYS = re.compile(r"\s*(?:always\(\)|\$\{\{\s*always\(\)\s*\}\})\s*")
 DEFAULT_REPRODUCE = "vanguard local-ci <worktree> --jobs <job>"
 
 
@@ -83,7 +85,7 @@ def check_workflow(ref: str, root: pathlib.Path, needed: set[str]) -> None:
     if len(ready) != 1:
         raise NotReady(f"{m.group(1)} must call ready.yml from exactly one job; found {len(ready)}")
     job = jobs[ready[0]]
-    if "always()" not in str(job.get("if", "")):
+    if ALWAYS.fullmatch(str(job.get("if", ""))) is None:
         raise NotReady(f"{m.group(1)} job {ready[0]} needs `if: ${{{{ always() }}}}`: without it a failure skips the summary")
     others = set(jobs) - {ready[0]}
     declared = set(needs_list(job))

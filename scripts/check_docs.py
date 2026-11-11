@@ -75,7 +75,7 @@ def target_ok(target: str, here: pathlib.Path, repo: pathlib.Path) -> str:
 
 
 def check_file(path: pathlib.Path, repo: pathlib.Path) -> list[str]:
-    rel = path.relative_to(repo)
+    rel = re.sub(r"[\r\n]", "?", str(path.relative_to(repo)))  # a newline in a name would start a new workflow command
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError) as e:
