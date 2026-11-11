@@ -22,7 +22,8 @@ PROMOTION = "(github.event_name == 'pull_request' && github.base_ref == 'release
 SECRET_CONTEXT = r"\$\{\{[^}]*(?<![\w.-])secrets\."
 # The checks fast-checks.yml can run: input, step id, composite action.
 CHECKS = [("pins", "pins", "pins"), ("secrets", "secrets", "gitleaks"),
-          ("no-prerelease-deps", "no-prerelease-deps", "no-prerelease-deps"), ("contract", "contract", "contract")]
+          ("no-prerelease-deps", "no-prerelease-deps", "no-prerelease-deps"), ("docs", "docs", "docs"),
+          ("contract", "contract", "contract")]
 # The old check workflows, kept with their job names, inputs and secrets until every caller has moved (expand first).
 OLD = {
     "pins.yml": ("pins", ["runner"], ["AGENTS_APP_CLIENT_ID", "AGENTS_APP_PRIVATE_KEY"], "pins"),
@@ -230,10 +231,10 @@ class FastJob(unittest.TestCase):
     def test_order_setup_checks_results_then_the_job_usage_step(self):
         ids = [s.get("id") for s in FAST]
         self.assertEqual(ids[:3], ["repo", "version", "shared"])
-        self.assertEqual(ids[3:7], ["pins", "secrets", "no-prerelease-deps", "contract"])  # previews before peers
-        self.assertTrue(FAST[7]["name"].startswith("Results"))
-        self.assertTrue(FAST[8]["name"].startswith("Job usage"))
-        self.assertEqual(len(FAST), 9)
+        self.assertEqual(ids[3:8], ["pins", "secrets", "no-prerelease-deps", "docs", "contract"])  # previews before peers
+        self.assertTrue(FAST[8]["name"].startswith("Results"))
+        self.assertTrue(FAST[9]["name"].startswith("Job usage"))
+        self.assertEqual(len(FAST), 10)
         self.assertEqual(FAST[0]["with"]["fetch-depth"], 0)  # gitleaks scans the pull request's commits
 
     def test_the_contract_step_gets_its_inputs_and_the_app_secrets(self):
@@ -361,7 +362,7 @@ class Actions(unittest.TestCase):
 
     def test_every_action_is_composite_with_bash_steps_and_no_secret_context(self):
         names = sorted(p.parent.name for p in ACTIONS.glob("*/action.yml"))
-        self.assertEqual(names, ["contract", "gitleaks", "no-prerelease-deps", "pins"])
+        self.assertEqual(names, ["contract", "docs", "gitleaks", "no-prerelease-deps", "pins"])
         for path in ACTIONS.glob("*/action.yml"):
             doc = yaml.safe_load(path.read_text(encoding="utf-8"))
             self.assertEqual(doc["runs"]["using"], "composite", path)
@@ -379,37 +380,38 @@ class Actions(unittest.TestCase):
         self.assertIn('"${GITHUB_ACTION_PATH}/../.."', pins[0]["run"])
         self.assertIn('--shared "${shared}"', pins[0]["run"])
 
-    def test_the_pins_app_token_runs_only_when_the_docs_rule_needs_it(self):
+    def test_the_docs_action_runs_check_docs_from_its_own_repository(self):
+        doc = yaml.safe_load((ACTIONS / "docs/action.yml").read_text())
+        self.assertEqual(len(doc["runs"]["steps"]), 1)
+        self.assertEqual(doc["runs"]["steps"][0]["run"].strip(),
+                         'python3 "$(cd "${GITHUB_ACTION_PATH}/../.." && pwd)/scripts/check_docs.py" .')
+        self.assertNotIn("inputs", doc)
+
+    def test_the_pins_action_has_no_docs_rule_step(self):  # DOC-1
         pins = yaml.safe_load((ACTIONS / "pins/action.yml").read_text())["runs"]["steps"]
-        for step in pins[2:4]:
-            self.assertEqual(step["if"], "${{ steps.docs.outputs.app == 'true' }}", step.get("name"))
-        self.assertEqual(pins[-1]["env"]["GH_TOKEN"], "${{ steps.app.outputs.token }}")
+        self.assertEqual(len(pins), 2)
+        self.assertTrue(all("docs" not in str(s.get("id", "")) and "app" != s.get("id") for s in pins))
 
 
-class Docs(unittest.TestCase):
-    """The docs-needed step of the pins action: the App is needed only when the rule runs and docs-version.txt exists."""
+class DocsAction(unittest.TestCase):
+    """actions/docs run as Actions runs it, against a caller checkout with good and broken markdown."""
 
-    def run_docs(self, needed, with_file):
-        step = yaml.safe_load((ACTIONS / "pins/action.yml").read_text())["runs"]["steps"][1]
+    def run_action(self, files):
+        step = yaml.safe_load((ACTIONS / "docs/action.yml").read_text())["runs"]["steps"][0]
         with tempfile.TemporaryDirectory() as d:
-            action = Path(d, "act/actions/pins")
-            action.mkdir(parents=True)
-            (Path(d, "act/scripts")).mkdir()
-            Path(d, "act/scripts/check_pins.py").write_text(f"print('{needed}')\n")
-            work = Path(d, "work")
-            work.mkdir()
-            if with_file:
-                (work / "docs-version.txt").write_text("x\n")
-            out_file = Path(d, "out")
-            env = {"PATH": os.environ["PATH"], "GITHUB_ACTION_PATH": str(action), "GITHUB_OUTPUT": str(out_file)}
-            out = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=work, env=env, capture_output=True, text=True, timeout=30)
-            self.assertEqual(out.returncode, 0, out.stderr)
-            return dict(line.split("=", 1) for line in out_file.read_text().split())
+            for name, text in files.items():
+                Path(d, name).parent.mkdir(parents=True, exist_ok=True)
+                Path(d, name).write_text(text)
+            env = {"PATH": os.environ["PATH"], "GITHUB_ACTION_PATH": str(ACTIONS / "docs")}
+            return subprocess.run(["bash", "-e", "-c", step["run"]], cwd=d, env=env, capture_output=True, text=True, timeout=30)
 
-    def test_app_only_when_needed_and_the_file_exists(self):
-        self.assertEqual(self.run_docs("true", True)["app"], "true")
-        self.assertEqual(self.run_docs("true", False)["app"], "false")
-        self.assertEqual(self.run_docs("false", True)["app"], "false")
+    def test_good_docs_pass_and_a_broken_link_fails(self):
+        good = {"README.md": "[guide](docs/guide.md)\n", "docs/guide.md": "# Guide\n[back](../README.md)\n"}
+        out = self.run_action(good)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        out = self.run_action({**good, "docs/guide.md": "[gone](missing.md)\n"})
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("::error::docs/guide.md:1: link 'missing.md' does not exist", out.stdout)
 
 
 class WorkflowLint(unittest.TestCase):
@@ -422,9 +424,9 @@ class WorkflowLint(unittest.TestCase):
 
     def test_three_jobs_and_the_tiny_ones_are_steps_of_lint(self):
         jobs = load("workflow-lint.yml")["jobs"]
-        self.assertEqual(list(jobs), ["depends-on", "lint", "fast"])
+        self.assertEqual(list(jobs), ["depends-on", "lint", "fast", "ready"])
         self.assertEqual(jobs["fast"]["uses"], "./.github/workflows/fast-checks.yml")
-        self.assertEqual(jobs["fast"]["with"], {"no-prerelease-deps": True})
+        self.assertEqual(jobs["fast"]["with"], {"no-prerelease-deps": True, "docs": True})
         uses = [s.get("uses") for s in LINT]
         self.assertIn("./actions/gitleaks", uses)
         self.assertIn("./actions/pins", uses)
