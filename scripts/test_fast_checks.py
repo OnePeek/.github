@@ -415,7 +415,28 @@ class DocsAction(unittest.TestCase):
 
 
 class WorkflowLint(unittest.TestCase):
-    """This repo's own check: depends-on, the merged `lint` job, and `fast` (the shared merged job, called locally)."""
+    """This repo's own check: the merged `lint` job, `fast` (the shared merged job, called locally) and `ready`."""
+
+    def test_no_depends_on_job_and_ready_needs_exactly_the_other_jobs(self):  # DOC-3 (A2b)
+        wf = load("workflow-lint.yml")
+        jobs = wf["jobs"]
+        self.assertNotIn("depends-on", jobs)
+        for name, job in jobs.items():
+            self.assertNotIn("depends-on", str(job.get("needs", "")), name)
+            self.assertNotIn("depends-on.yml", str(job.get("uses", "")), name)
+        self.assertEqual(jobs["ready"]["needs"], [n for n in jobs if n != "ready"])
+        self.assertNotIn("needs", jobs["lint"])
+        self.assertNotIn("needs", jobs["fast"])
+        self.assertEqual(wf[True]["push"]["branches"], ["dev"])
+        self.assertEqual(wf[True]["pull_request"]["types"], ["opened", "reopened", "synchronize"])
+
+    def test_the_depends_on_workflow_and_script_are_gone_and_nothing_calls_them(self):  # DOC-3 (A2b)
+        self.assertFalse((WORKFLOWS / "depends-on.yml").exists())
+        self.assertFalse((ROOT / "scripts/check_depends_on.py").exists())
+        for wf in sorted(WORKFLOWS.glob("*.y*ml")):
+            text = wf.read_text(encoding="utf-8")
+            self.assertNotIn("depends-on.yml", text, wf.name)
+            self.assertNotIn("check_depends_on", text, wf.name)
 
     def test_concurrency_cancels_only_pull_request_runs(self):  # R-S2i-3
         self.assertEqual(load("workflow-lint.yml")["concurrency"], {
@@ -424,7 +445,7 @@ class WorkflowLint(unittest.TestCase):
 
     def test_three_jobs_and_the_tiny_ones_are_steps_of_lint(self):
         jobs = load("workflow-lint.yml")["jobs"]
-        self.assertEqual(list(jobs), ["depends-on", "lint", "fast", "ready"])
+        self.assertEqual(list(jobs), ["lint", "fast", "ready"])
         self.assertEqual(jobs["fast"]["uses"], "./.github/workflows/fast-checks.yml")
         self.assertEqual(jobs["fast"]["with"], {"no-prerelease-deps": True, "docs": True})
         uses = [s.get("uses") for s in LINT]

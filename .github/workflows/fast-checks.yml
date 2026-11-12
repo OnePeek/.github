@@ -6,8 +6,7 @@
 # A caller turns on the checks it needs with the boolean inputs. Every requested check runs even when an earlier one
 # failed (`if: always()`, rulings R-S2i-1 and R-S2i-6), the last check step writes each check's result to
 # the job summary and the log, and the job fails when any check failed, so one failure never hides another.
-# depends-on stays its own job (vanguard config/ship.yaml depends_on_check matches it by name). The caller's check
-# name is `<caller job> / fast`.
+# The caller's check name is `<caller job> / fast`.
 # Order: no-prerelease-deps scans the whole working tree, so it runs before contract checks the other repos out.
 # A tree-only check (secrets, delivery-pipelines.md §8.1) skips itself on a dev -> release promotion pull request, as
 # its own job did there; release-gate makes that skip safe. The summary names the skip.
