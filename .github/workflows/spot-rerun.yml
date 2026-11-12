@@ -7,7 +7,7 @@
 # logs and, when one shows a reclaim and the run is on attempt 1, re-runs the failed jobs once (`gh run rerun --failed`)
 # and writes the job names to the run summary. A second failure, or any other failure, stays failed and visible.
 # The run id comes only from github.event.workflow_run.id and the repository from github.repository (strictly checked
-# in scripts/spot_rerun.py). Runs on the small runner class, like depends-on.yml. Logic: scripts/spot_rerun.py at the
+# in scripts/spot_rerun.py). Runs on the small runner class. Logic: scripts/spot_rerun.py at the
 # caller's pin.
 #
 # Caller, scheduled (preferred, PIPE-SIMPLE v2 GH-1: one run every 10 minutes instead of one row per finished run on
