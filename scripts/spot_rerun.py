@@ -4,7 +4,9 @@
 A caller runs spot-rerun.yml on `workflow_run: completed` with conclusion `failure`. This script reads the failed jobs
 of that run, the log of each and the check-run annotations of each. When either holds the runner's shutdown line ("The
 runner has received a shutdown signal", in the log) or GitHub's "lost communication with the server" (usually an
-annotation with no log), and the run is on its first attempt, it re-runs
+annotation with no log), or when a job on an onepeek-* runner label shows BOTH a Docker socket EOF line and
+"The operation was canceled." (a runner that died without a marker; the cancel line alone never counts), and the run
+is on its first attempt, it re-runs
 the failed jobs once (`gh run rerun <id> --failed`) and writes the reason (the job names) to the step summary.
 Otherwise it does nothing: a second reclaim, or an ordinary failure, stays failed and visible.
 
@@ -83,13 +85,26 @@ def validate(run_id: str, repo: str) -> None:
 
 def failed_jobs(repo: str, run_id: str) -> list[dict]:
     out = gh("api", "--paginate", f"repos/{repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100",
-             "--jq", ".jobs[] | {id, name, conclusion}")
+             "--jq", ".jobs[] | {id, name, conclusion, labels}")
     jobs = [json.loads(line) for line in out.splitlines() if line.strip()]
     return [j for j in jobs if j.get("conclusion") == "failure"]
 
 
 def reclaimed(text: str) -> bool:
     return any(m in text for m in MARKERS)
+
+
+DOCKER_SOCK_EOF = re.compile(r"docker\.sock\S*\s*:?\s*EOF\b")
+CANCELED_LINE = "The operation was canceled."
+
+
+def lost_runner(text: str, labels: object) -> bool:
+    """A runner that died under the job without printing a marker (OnePeek/vanguard run 43198978758, job test): the
+    Docker socket answers EOF on a line AND the step ends with "The operation was canceled.", on a job whose runner
+    label is an onepeek-* one. Both lines are needed; the cancel line alone is never enough (a person can cancel)."""
+    if not (isinstance(labels, list) and any(isinstance(l, str) and l.startswith("onepeek-") for l in labels)):
+        return False
+    return CANCELED_LINE in text and any(DOCKER_SOCK_EOF.search(line) for line in text.splitlines())
 
 
 def annotations_text(repo: str, job_id: str) -> str:
@@ -115,6 +130,7 @@ def reclaimed_jobs(repo: str, jobs: list[dict]) -> list[str]:
     apart (a reclaimed runner's log can reach the API late); the total wait stays inside the job's 5-minute limit.
     A job that prints a marker itself can force at most one extra re-run (attempt 1 only)."""
     ids = {str(j.get("id", "")): str(j.get("name", j.get("id", ""))) for j in jobs if RUN_ID.fullmatch(str(j.get("id", "")))}
+    labels = {str(j.get("id", "")): j.get("labels") for j in jobs}
     found: set[str] = set()
     for job_id in ids:
         try:
@@ -126,7 +142,8 @@ def reclaimed_jobs(repo: str, jobs: list[dict]) -> list[str]:
     for attempt in range(LOG_TRIES):
         for job_id in [j for j in ids if j not in found]:
             try:
-                if reclaimed(job_log(repo, job_id)):
+                log = job_log(repo, job_id)
+                if reclaimed(log) or lost_runner(log, labels.get(job_id)):
                     found.add(job_id)
                 else:
                     why[job_id] = "no marker in the log"
