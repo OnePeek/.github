@@ -24,6 +24,12 @@ LOST = ("The self-hosted runner: onepeek-arm64-abc123 lost communication with th
 SHUTDOWN_REAL = ("The runner has received a shutdown signal. This can happen when the runner service is stopped, or a "
                  "manually started runner is canceled.\n")
 CANCELED = "The operation was canceled."
+# Trimmed from OnePeek/vanguard run 43198978758 (attempt 1, job test): the Docker socket answered EOF, then the step was cancelled.
+DOCKER_EOF = ('2026-11-12T10:19:04.0267694Z FAIL  checks.yml:a: ./boot.sh  (0s)\n'
+              '2026-11-12T10:19:04.0270500Z error during connect: Get "http://%2Fvar%2Frun%2Fdocker.sock/_ping": EOF\n')
+CANCEL_LINE = "2026-11-12T10:19:04.1632830Z ##[error]The operation was canceled.\n"
+LOST_RUNNER_LOG = DOCKER_EOF + "\n" + CANCEL_LINE
+ONEPEEK = ["onepeek-arm64"]
 
 
 T0 = "2026-11-06T10:00:10Z"
@@ -74,7 +80,8 @@ class FakeGh:
                 raise sr.GhError("404")
             return self.logs[job]
         if "/jobs" in path:
-            return "".join(json.dumps({"id": i, "name": n, "conclusion": c}) + "\n" for i, n, c in self.jobs)
+            return "".join(json.dumps({"id": j[0], "name": j[1], "conclusion": j[2], "labels": j[3] if len(j) > 3 else []}) + "\n"
+                           for j in self.jobs)
         return json.dumps({"run_attempt": self.attempt, "conclusion": self.conclusion, "workflow_id": 7,
                            "name": "checks", "event": self.event, "head_branch": self.branch, "head_sha": "aaaaaaa1111",
                            "created_at": T0})
@@ -128,6 +135,36 @@ class Decision(unittest.TestCase):
         fake = FakeGh(logs={1: "plain failure"}, notes={1: [CANCELED]})
         go(fake)
         self.assertEqual(fake.reruns(), [])
+
+    def test_docker_eof_and_canceled_on_an_onepeek_runner_is_a_lost_runner(self) -> None:
+        fake = FakeGh(jobs=[(1, "test", "failure", ONEPEEK)], logs={1: LOST_RUNNER_LOG})
+        code, out = go(fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.reruns(), [("run", "rerun", "42", "--failed", "--repo", "OnePeek/x")])
+        self.assertIn("test", out)
+
+    def test_the_cancel_line_alone_is_not_a_lost_runner(self) -> None:
+        fake = FakeGh(jobs=[(1, "test", "failure", ONEPEEK)], logs={1: CANCEL_LINE})
+        go(fake)
+        self.assertEqual(fake.reruns(), [])
+
+    def test_the_docker_eof_line_alone_is_not_a_lost_runner(self) -> None:
+        fake = FakeGh(jobs=[(1, "test", "failure", ONEPEEK)], logs={1: DOCKER_EOF})
+        go(fake)
+        self.assertEqual(fake.reruns(), [])
+
+    def test_docker_eof_and_canceled_on_another_runner_is_not_a_lost_runner(self) -> None:
+        for labels in (["ubuntu-latest"], [], None, ["self-hosted", "linux"]):
+            with self.subTest(labels=labels):
+                fake = FakeGh(jobs=[(1, "test", "failure", labels)], logs={1: LOST_RUNNER_LOG})
+                go(fake)
+                self.assertEqual(fake.reruns(), [])
+
+    def test_the_job_list_asks_for_labels(self) -> None:
+        fake = FakeGh(jobs=[(1, "test", "failure", ONEPEEK)], logs={1: LOST_RUNNER_LOG})
+        go(fake)
+        jq = next(c[-1] for c in fake.calls if c[0] == "api" and "/jobs?" in " ".join(c))
+        self.assertIn("labels", jq)
 
     def test_job_printing_the_marker_forces_at_most_one_extra_rerun(self) -> None:
         # A job that prints a marker itself triggers a re-run on attempt 1 only; attempt 2 stays failed (bounded).

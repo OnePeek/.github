@@ -3,6 +3,9 @@
 One line per change a caller can see. Versions are the `v*` tags `tag-main.yml` cuts on every merge to `dev` (a `feat`
 raises the minor version); the release notes on each tag list every merged pull request.
 
+## Unreleased (SWEEP-B F474c)
+- `spot-rerun.yml`: a failed job on an `onepeek-*` runner whose log has both a Docker socket EOF line and "The operation was canceled." now counts as a lost runner and is re-run once (the cancel line alone never does). Callers pick it up when their pin moves to the tag cut from this merge.
+
 ## v1.28.0 (PIPE-SIMPLE v2 A2b)
 - Removed `depends-on.yml` and `scripts/check_depends_on.py` (DOC-3 final): no repo's `dev` calls them, and the merge tool (`vanguard ship`) reads a `Depends on:` line itself (`vanguard` `tools/depends_on.py`). A caller still naming `depends-on.yml` must drop that job before moving its pin to this tag; older tags keep the file. `workflow-lint.yml` loses its own `depends-on` job (`ready` needs `lint` and `fast`).
 
