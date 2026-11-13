@@ -166,16 +166,44 @@ class Decision(unittest.TestCase):
         jq = next(c[-1] for c in fake.calls if c[0] == "api" and "/jobs?" in " ".join(c))
         self.assertIn("labels", jq)
 
-    def test_job_printing_the_marker_forces_at_most_one_extra_rerun(self) -> None:
-        # A job that prints a marker itself triggers a re-run on attempt 1 only; attempt 2 stays failed (bounded).
-        fake = FakeGh(attempt=2, logs={1: SHUTDOWN_REAL})
+    def test_job_printing_the_marker_forces_at_most_two_extra_reruns(self) -> None:
+        # A job that prints a marker itself triggers a re-run on attempts 1 and 2 only; attempt 3 stays failed (bounded).
+        fake = FakeGh(attempt=3, logs={1: SHUTDOWN_REAL})
         go(fake)
         self.assertEqual(fake.reruns(), [])
 
-    def test_second_attempt_stays_failed(self) -> None:
+    def test_second_attempt_lost_again_is_rerun_once_more(self) -> None:  # F558: a2 lost again stayed failed
         fake = FakeGh(attempt=2, logs={1: SHUTDOWN})
-        go(fake)
+        code, out = go(fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.reruns(), [("run", "rerun", "42", "--failed", "--repo", "OnePeek/x")])
+        self.assertIn("tests", out)
+
+    def test_third_attempt_stays_failed_and_is_reported(self) -> None:
+        fake = FakeGh(attempt=3, logs={1: SHUTDOWN})
+        code, out = go(fake)
+        self.assertEqual(code, 0)
         self.assertEqual(fake.reruns(), [])
+        self.assertIn("No re-run: run 42 is on attempt 3", out)
+        self.assertEqual([c for c in fake.calls if any(x.endswith("/logs") for x in c)], [])  # no log read
+
+    def test_only_attempts_one_and_two_are_rerun(self) -> None:
+        for attempt, want in ((1, 1), (2, 1), (3, 0), (4, 0), (0, 0), (None, 0), ("2", 0), (2.0, 0), (True, 0)):
+            fake = FakeGh(attempt=attempt, logs={1: SHUTDOWN})
+            go(fake)
+            self.assertEqual(len(fake.reruns()), want, msg=repr(attempt))
+
+    def test_second_attempt_without_a_marker_is_never_rerun(self) -> None:
+        for logs in ({1: "AssertionError: 1 != 2\n"}, {1: CANCELED}, {}):
+            fake = FakeGh(attempt=2, logs=logs)
+            go(fake)
+            self.assertEqual(fake.reruns(), [], msg=repr(logs))
+
+    def test_second_attempt_still_skips_a_superseded_run(self) -> None:
+        fake = FakeGh(attempt=2, logs={1: SHUTDOWN}, head="bbbbbbb2222")
+        code, out = go(fake)
+        self.assertEqual(fake.reruns(), [])
+        self.assertIn("superseded", out)
 
     def test_a_listed_workflow_is_rerun_whole(self) -> None:
         fake = FakeGh(logs={1: SHUTDOWN})
@@ -472,7 +500,7 @@ class ScanGh(FakeGh):
             return "".join(json.dumps({"id": e[0], "name": e[1], "run_attempt": self.attempts.get(e[0], e[2]),
                                        "updated_at": e[3] if len(e) > 3 else JUST_NOW}) + "\n" for e in self.listing)
         if args and args[0] == "run" and args[1] == "rerun":
-            self.attempts[int(args[2])] = 2
+            self.attempts[int(args[2])] = self.attempts.get(int(args[2]), self.attempt) + 1
         if path.startswith("repos/") and "/actions/runs/" in path and path.count("/") == 5:
             self.calls.append(args)
             run_id = int(path.rsplit("/", 1)[1])
@@ -493,31 +521,43 @@ def scan(fake: ScanGh, workflows="checks", repo="OnePeek/x", now=NOW, clock=None
 
 
 class Scan(unittest.TestCase):
-    """Scan mode (GH-1): a scheduled caller decides every failed first-attempt run of its workflows, never twice."""
+    """Scan mode (GH-1): a scheduled caller decides every failed first- or second-attempt run of its workflows, each
+    attempt once (F558)."""
 
     def test_a_reclaimed_run_is_rerun_once_and_a_second_scan_leaves_it_alone(self) -> None:
         fake = ScanGh(logs={1: SHUTDOWN})
         self.assertEqual(scan(fake)[0], 0)
         self.assertEqual(fake.reruns(), [("run", "rerun", "42", "--failed", "--repo", "OnePeek/x")])
-        code, out = scan(fake)  # the next 10-minute pass: the listing now shows attempt 2
+        fake.conclusion = None  # attempt 2 is running; a listing read before the re-run still names the run
+        code, out = scan(fake)  # the next 10-minute pass
         self.assertEqual(code, 0)
         self.assertEqual(len(fake.reruns()), 1)
-        self.assertIn("No re-run: no failed first-attempt run", out)
+        self.assertIn("No re-run: run 42 did not fail", out)
 
     def test_a_run_rerun_between_the_list_and_the_decision_is_not_rerun_again(self) -> None:
         fake = ScanGh(logs={1: SHUTDOWN}, attempts={})
-        fake.attempt = 2  # the run's own read says attempt 2: someone re-ran it after the list was read
+        fake.attempt = 3  # the run's own read says attempt 3: it was re-run twice after the list was read
         code, out = scan(fake)
         self.assertEqual(code, 0)
         self.assertEqual(fake.reruns(), [])
-        self.assertIn("is on attempt 2", out)
+        self.assertIn("is on attempt 3", out)
 
-    def test_only_the_named_workflows_on_attempt_one_are_decided(self) -> None:
-        fake = ScanGh(listing=[(42, "checks", 1), (43, "other", 1), (44, "checks", 2), (45, "checks extra", 1)],
+    def test_only_the_named_workflows_on_attempt_one_or_two_are_decided(self) -> None:
+        fake = ScanGh(listing=[(42, "checks", 1), (43, "other", 1), (44, "checks", 2), (45, "checks extra", 1),
+                               (46, "checks", 3), (47, "checks", 0), (48, "checks", "2")],
                       logs={1: SHUTDOWN})
         scan(fake, workflows="checks")
         decided = [c for c in fake.calls if c[0] == "api" and "/actions/runs/" in c[1] and c[1].count("/") == 5]
-        self.assertEqual({c[1].rsplit("/", 1)[1] for c in decided}, {"42"})
+        self.assertEqual({c[1].rsplit("/", 1)[1] for c in decided}, {"42", "44"})
+
+    def test_a_run_lost_twice_is_rerun_twice_and_a_third_loss_stays_failed(self) -> None:  # F558
+        fake = ScanGh(logs={1: SHUTDOWN})
+        for attempt in (1, 2, 3):
+            fake.attempts[42] = attempt  # attempt <n> failed with a reclaim and finished just now
+            code, out = scan(fake)
+            self.assertEqual(code, 0)
+        self.assertEqual(fake.reruns(), [("run", "rerun", "42", "--failed", "--repo", "OnePeek/x")] * 2)
+        self.assertIn("No re-run: no failed first- or second-attempt run", out)
 
     def test_the_list_asks_for_failed_runs_of_the_last_window(self) -> None:
         fake = ScanGh(listing=[])
@@ -525,7 +565,7 @@ class Scan(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(fake.list_query["status"], ["failure"])
         self.assertEqual(fake.list_query["created"], [">=2027-01-14T08:00:00Z"])  # now - 24 hours, UTC (B1)
-        self.assertIn("No re-run: no failed first-attempt run of checks", out)
+        self.assertIn("No re-run: no failed first- or second-attempt run of checks", out)
 
     def test_a_failed_list_read_fails_visibly(self) -> None:  # brief failure mode: GitHub API error
         fake = ScanGh(list_error=True)
