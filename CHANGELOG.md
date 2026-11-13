@@ -3,10 +3,10 @@
 One line per change a caller can see. Versions are the `v*` tags `tag-main.yml` cuts on every merge to `dev` (a `feat`
 raises the minor version); the release notes on each tag list every merged pull request.
 
-## Unreleased (F558)
-- `spot-rerun.yml`: a run lost to a spot reclaim on attempt 2 is re-run once more (attempts 1 and 2 are re-run, so at most 3 attempts); a third loss stays failed and is reported in the summary. Still gated on the reclaim markers and every existing guard (superseded run, failed jobs only). Scan mode now lists failed runs on attempt 1 or 2. Callers pick it up when their pin moves to the tag cut from this merge.
+## v1.28.2 (F558)
+- `spot-rerun.yml`: a run lost to a spot reclaim on attempt 2 is re-run once more (attempts 1 and 2 are re-run, so at most 3 attempts); a third loss stays failed and is reported in the summary of its own `workflow_run` call (scan mode lists attempts 1 and 2 only, so it skips a third loss silently, F562). Still gated on the reclaim markers and every existing guard (superseded run, failed jobs only). Scan mode now lists failed runs on attempt 1 or 2. Callers pick it up when their pin moves to the tag cut from this merge.
 
-## Unreleased (SWEEP-B F474c)
+## v1.28.1 (SWEEP-B F474c)
 - `spot-rerun.yml`: a failed job on an `onepeek-*` runner whose log has both a Docker socket EOF line and "The operation was canceled." now counts as a lost runner and is re-run once (the cancel line alone never does). Callers pick it up when their pin moves to the tag cut from this merge.
 
 ## v1.28.0 (PIPE-SIMPLE v2 A2b)
