@@ -4,15 +4,16 @@
 # Shared: automatic re-run after a spot reclaim (onepeek-docs architecture/lld/infra/ci-runners.md section 4, row R1,
 # decided 2026-11-04). A spot runner that is reclaimed mid-job fails the job ("The runner has received a shutdown
 # signal" or "lost communication with the server"). This workflow reads the failed jobs of the finished run and their
-# logs and, when one shows a reclaim and the run is on attempt 1, re-runs the failed jobs once (`gh run rerun --failed`)
-# and writes the job names to the run summary. A second failure, or any other failure, stays failed and visible.
+# logs and, when one shows a reclaim and the run is on attempt 1 or 2 (F558), re-runs the failed jobs once more
+# (`gh run rerun --failed`) and writes the job names to the run summary. A third failure, or any other failure, stays
+# failed and visible.
 # The run id comes only from github.event.workflow_run.id and the repository from github.repository (strictly checked
 # in scripts/spot_rerun.py). Runs on the small runner class. Logic: scripts/spot_rerun.py at the
 # caller's pin.
 #
 # Caller, scheduled (preferred, PIPE-SIMPLE v2 GH-1: one run every 10 minutes instead of one row per finished run on
 # every pull request; list the repo's CI workflow names under `workflows`, never this workflow's own caller). Scan
-# mode is idempotent: a run already re-run is on attempt 2 and is left alone. The pin is the commit of a `v*` tag:
+# mode is idempotent: a run already re-run is on a later, running attempt and is left alone; attempt 3 never is. The pin is the commit of a `v*` tag:
 #
 #   name: spot-rerun-caller
 #   on:
@@ -67,7 +68,7 @@ on:
         type: string
         default: github
       workflows:
-        description: "Scan mode, for a caller on schedule or workflow_dispatch (no workflow_run event): space-separated names of the caller's workflows whose failed first-attempt runs that finished in the last 20 minutes (created in the last 24 hours) are decided (scripts/spot_rerun.py)."
+        description: "Scan mode, for a caller on schedule or workflow_dispatch (no workflow_run event): space-separated names of the caller's workflows whose failed first- or second-attempt runs that finished in the last 20 minutes (created in the last 24 hours) are decided (scripts/spot_rerun.py)."
         type: string
         default: ""
       rerun_all_workflows:
