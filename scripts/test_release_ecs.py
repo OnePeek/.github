@@ -20,7 +20,8 @@ OPERATE = (WORKFLOWS / "operate.yml").read_text(encoding="utf-8")
 DIGEST = "sha256:" + "a" * 64
 COMMIT = "sha-" + "f" * 12
 ENV = {"NAME": "onepeek-preprod", "ENVIRONMENT": "preprod", "IMAGE": "backend", "MAIN": "backend", "VERSION": "1.2.3",
-       "COMMIT": COMMIT, "NPM_TOKEN": "", "GITHUB_SHA": "f" * 40, "AWS_REGION": "ap-south-1"}  # fmt: skip
+       "COMMIT": COMMIT, "NPM_TOKEN": "", "GITHUB_SHA": "f" * 40, "AWS_REGION": "ap-south-1",
+       "LOCK_STABLE_POLL_SECONDS": "0"}  # fmt: skip
 
 
 def step(job: str, name: str) -> str:
@@ -67,6 +68,38 @@ def aws_stub(ecr: str, digest: str = DIGEST, commit: str = COMMIT) -> str:
 *"release/backend/commit"*) echo {commit};;
 *"release/backend/version"*) echo "the version record must not be read" >&2; exit 9;;
 esac"""
+
+
+# describe-services as ECS answers it, for the stability poll (F661): ROLLOUT is a JSON list, one entry per poll of a
+# service (the last repeats): COMPLETED, IN_PROGRESS or FAILED (the PRIMARY deployment's rolloutState), ERROR (the call
+# fails), GARBLED (not JSON), STEADY (no rolloutState, one deployment, running = desired) or TWO (no rolloutState, two
+# deployments).
+DESCRIBE_PY = r"""import json, os, sys
+svc = sys.argv[sys.argv.index("--services") + 1]
+seq = json.loads(os.environ.get("ROLLOUT", '["COMPLETED"]'))
+path = "polls-" + svc
+n = int(open(path).read()) if os.path.exists(path) else 0
+open(path, "w").write(str(n + 1))
+state = seq[min(n, len(seq) - 1)]
+if state == "ERROR":
+    sys.stderr.write("An error occurred (ThrottlingException) when calling the DescribeServices operation\n"); sys.exit(254)
+if state == "GARBLED":
+    print("not json"); sys.exit(0)
+primary = {"status": "PRIMARY", "taskDefinition": "arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-%s:8" % svc,
+           "runningCount": 1, "desiredCount": 1, "pendingCount": 0}
+deployments = [primary]
+if state in ("COMPLETED", "IN_PROGRESS", "FAILED"):
+    primary["rolloutState"] = state
+    primary["rolloutStateReason"] = {"FAILED": "ECS deployment circuit breaker: tasks failed to start.",
+                                     "IN_PROGRESS": "ECS deployment ecs-svc/1 in progress.", "COMPLETED": "ECS deployment ecs-svc/1 completed."}[state]
+if state in ("IN_PROGRESS", "TWO"):
+    primary["runningCount"], primary["pendingCount"] = 0, 1
+    deployments.append({"status": "ACTIVE", "taskDefinition": "x:7", "runningCount": 1, "desiredCount": 1, "pendingCount": 0})
+events = [{"createdAt": "2026-11-14T22:%02d:00Z" % i, "message": "(service %s) event %d" % (svc, i)} for i in range(20)]
+print(json.dumps({"services": [{"serviceName": svc, "deployments": deployments, "events": events}], "failures": []}))
+"""
+DESCRIBE = """*"describe-services"*"--output json"*) python3 ds.py "$@";;"""
+STABLE_FN = re.search(r"# --- stable-wait begin[^\n]*\n.*?# --- stable-wait end ---\n", step("deploy", "Verify, render, register and update each order"), re.S).group(0)
 
 
 IN_ECR = f"echo {DIGEST}"
@@ -681,6 +714,7 @@ class DropProtection(unittest.TestCase):
 
     def test_a_drop_in_the_rollout_stops_before_anything_is_registered(self):
         aws = f"""case "$*" in
+{DESCRIBE}
 *describe-services*) echo arn:td/api:7;;
 *describe-task-definition*) echo '{json.dumps(RUNNING)}';;
 *"s3 cp"*) echo '{json.dumps({"family": "f", "containerDefinitions": [{"name": "api", "environment": env("A")}]})}';;
@@ -691,7 +725,7 @@ esac"""
         out, calls, _ = run_step(script, aws, base)
         self.assertNotEqual(out.returncode, 0)
         self.assertNotIn("register-task-definition", calls)
-        out, calls, _ = run_step(script, aws, {**base, "ALLOW_DROP": "B S"})
+        out, calls, _ = run_step(script, aws, {**base, "ALLOW_DROP": "B S"}, files={"ds.py": DESCRIBE_PY})
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("register-task-definition", calls)
 
@@ -754,34 +788,39 @@ class RolloutOrder(unittest.TestCase):
         aws = """case "$*" in
 *"s3 cp"*) echo '{"family": "f", "containerDefinitions": [{"name": "c"}]}';;
 *register-task-definition*) echo arn:td/f:1;;
-*services-stable*) exit 255;;
+""" + DESCRIBE + """
 esac"""
         out, calls, _ = run_step(step("deploy", "Verify, render, register and update each order"), aws, {
-            "IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9", "ORDERS": '[["pgbouncer", "valkey"], ["api", "worker"]]'})  # fmt: skip
+            "IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9", "ORDERS": '[["pgbouncer", "valkey"], ["api", "worker"]]',
+            "ROLLOUT": '["FAILED"]'}, files={"ds.py": DESCRIBE_PY})  # fmt: skip
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
         self.assertIn("did not become stable", out.stdout)
         self.assertIn("update-service --cluster onepeek-preprod --service valkey", calls)
         self.assertNotIn("--service api", calls)
         self.assertNotIn("--service worker", calls)
-        self.assertEqual(calls.count("services-stable"), 1)
+        self.assertNotIn("--services api --output json", calls)
 
     def test_each_order_is_stable_before_the_next_starts(self):
         aws = """case "$*" in
 *"s3 cp"*) echo '{"family": "f", "containerDefinitions": [{"name": "c"}]}';;
 *register-task-definition*) echo arn:td/f:1;;
+""" + DESCRIBE + """
 esac"""
         out, calls, _ = run_step(step("deploy", "Verify, render, register and update each order"), aws, {
-            "IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9", "ORDERS": '[["pgbouncer", "valkey"], ["api", "worker"]]'})  # fmt: skip
+            "IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9", "ORDERS": '[["pgbouncer", "valkey"], ["api", "worker"]]',
+            "ROLLOUT": '["IN_PROGRESS", "COMPLETED"]'}, files={"ds.py": DESCRIBE_PY})  # fmt: skip
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        ecs = [line for line in calls.splitlines() if "update-service" in line or "services-stable" in line]
-        order = [("update", "pgbouncer"), ("update", "valkey"), ("wait", "pgbouncer valkey"), ("update", "api"), ("update", "worker"), ("wait", "api worker")]
+        ecs = [line for line in calls.splitlines() if "update-service" in line or "--output json" in line and "describe-services" in line]
+        order = [("update", "pgbouncer"), ("update", "valkey")] + [("poll", "pgbouncer"), ("poll", "valkey")] * 2 + \
+                [("update", "api"), ("update", "worker")] + [("poll", "api"), ("poll", "worker")] * 2
         seen = []
         for line in ecs:
-            if "services-stable" in line:
-                seen.append(("wait", line.split("--services ", 1)[1].strip()))
+            if "describe-services" in line:
+                seen.append(("poll", line.split("--services ", 1)[1].split()[0]))
             else:
                 seen.append(("update", line.split("--service ", 1)[1].split()[0]))
         self.assertEqual(seen, order)
+        self.assertNotIn("services-stable", calls)
 
     def test_a_dry_run_renders_every_family_and_changes_nothing(self):
         aws = """case "$*" in *"s3 cp"*) echo '{"family": "f", "containerDefinitions": [{"name": "c"}]}';; esac"""
@@ -791,6 +830,76 @@ esac"""
         self.assertIn("rendered 2 task definitions", out.stdout)
         self.assertNotIn("register-task-definition", calls)
         self.assertNotIn("update-service", calls)
+
+
+class StableWait(unittest.TestCase):
+    """F661: the rollout waits on each service's PRIMARY rolloutState, not on ECS's 10-minute waiter, and says why it failed."""
+
+    def wait(self, rollout, cap="30", services="api worker"):
+        aws = "case \"$*\" in\n" + DESCRIBE + "\nesac"
+        out, calls, _ = run_step(STABLE_FN + f"rollout_wait {cap} {services}\n", aws, {"ROLLOUT": json.dumps(rollout)},
+                                 files={"ds.py": DESCRIBE_PY}, extra_stubs={"sleep": "exit 0"})
+        return out, calls
+
+    def test_no_copy_of_the_release_workflows_waits_with_ecs_services_stable(self):
+        for name in ("release-ecs.yml", "operate.yml", "release-lock.yml"):
+            code = [line for line in (WORKFLOWS / name).read_text(encoding="utf-8").splitlines() if not line.strip().startswith("#")]
+            self.assertFalse([line for line in code if "wait services-stable" in line], name)
+        roll = step("deploy", "Verify, render, register and update each order")
+        self.assertIn('rollout_wait "${cap}" ${group}', roll)
+        self.assertNotIn("circuit breaker has rolled it back", TEXT)
+
+    def test_completed_after_in_progress_passes(self):
+        out, calls = self.wait(["IN_PROGRESS", "IN_PROGRESS", "COMPLETED"])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(calls.count("describe-services --cluster onepeek-preprod --services api --output json"), 3)
+        self.assertIn("Stable (every PRIMARY deployment COMPLETED): api worker.", out.stdout)
+
+    def test_a_failed_rollout_fails_at_once_with_its_reason_and_events(self):
+        out, calls = self.wait(["IN_PROGRESS", "FAILED"])
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(calls.count("--services api --output json"), 2)   # no waiting out the cap
+        self.assertIn("::error::A rollout FAILED (ECS rolloutState FAILED)", out.stdout)
+        self.assertIn("api: onepeek-preprod-api:8 rolloutState FAILED (ECS deployment circuit breaker: tasks failed to start.); running 1, desired 1, pending 0", out.stdout)
+        self.assertIn("(service api) event 14", out.stdout)
+        self.assertNotIn("(service api) event 15", out.stdout)   # the 15 newest only
+        self.assertNotIn("Timed out", out.stdout)
+
+    def test_the_cap_fails_and_says_it_timed_out_not_that_a_breaker_rolled_back(self):
+        out, calls = self.wait(["IN_PROGRESS"], cap="0")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("::error::Timed out: not every PRIMARY deployment of api worker was COMPLETED after 0 s (no rollout reported FAILED).", out.stdout)
+        self.assertIn("api: onepeek-preprod-api:8 rolloutState IN_PROGRESS (ECS deployment ecs-svc/1 in progress.); running 0, desired 1, pending 1; 2 deployment(s)", out.stdout)
+        self.assertNotIn("FAILED", out.stdout.replace("no rollout reported FAILED", ""))
+        self.assertNotIn("circuit breaker", out.stdout)
+
+    def test_an_unreadable_answer_is_never_success(self):
+        for bad in ("ERROR", "GARBLED"):
+            with self.subTest(bad):
+                out, calls = self.wait([bad])
+                self.assertEqual(out.returncode, 1, bad)
+                self.assertIn("unreadable 3 times in a row", out.stdout)
+                self.assertNotIn("Stable", out.stdout)
+                self.assertEqual(calls.count("--services api --output json"), 3)
+        out, _ = self.wait(["ERROR", "COMPLETED"])   # one throttle is polled again, not a failure
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_without_a_rollout_state_one_steady_deployment_is_stable(self):
+        out, _ = self.wait(["TWO", "STEADY"])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        out, _ = self.wait(["TWO"], cap="0")
+        self.assertEqual(out.returncode, 1)
+
+    def test_the_step_limits_cover_the_caps(self):
+        roll = next(s for s in RELEASE["jobs"]["deploy"]["steps"] if s.get("id") == "roll")
+        self.assertGreaterEqual(roll["timeout-minutes"], 45)
+        self.assertIn("roll_end=$((SECONDS + 2400))", roll["run"])
+        self.assertIn('if [ "${cap}" -gt 1500 ]; then cap=1500; fi', roll["run"])
+        deploy = RELEASE["jobs"]["deploy"]
+        self.assertGreater(deploy["timeout-minutes"], sum(s.get("timeout-minutes", 0) for s in deploy["steps"]))
+        rollback = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("id") == "rollback")
+        self.assertGreaterEqual(rollback["timeout-minutes"], 21)
+        self.assertIn("rollout_wait 1200 ${services}", rollback["run"])
 
 
 class BaselineReadiness(unittest.TestCase):
@@ -1351,12 +1460,13 @@ class JobGraph(unittest.TestCase):
         self.assertNotIn("matrix.", TEXT)
 
     def test_each_stage_keeps_the_steps_time_limits(self):
-        # delivery-pipelines §5: build 20, migrate 15, rollout 20, watch 12, now on the steps of the merged jobs.
+        # delivery-pipelines §5: build 20, migrate 15, rollout 20, watch 12, now on the steps of the merged jobs. F661 (ruling
+        # 2026-11-15): the rollout is 45, each order's rollout and deploy-alarm bake up to 25 minutes, all within 40.
         def limit(job, match):
             return next(s for s in RELEASE["jobs"][job]["steps"] if match(s))["timeout-minutes"]
         self.assertEqual(limit("build-image", lambda s: s.get("id") == "push"), 20)
         self.assertEqual(limit("deploy", lambda s: s.get("name", "").startswith("Verify, render, register and run the migrate")), 15)
-        self.assertEqual(limit("deploy", lambda s: s.get("id") == "roll"), 20)
+        self.assertEqual(limit("deploy", lambda s: s.get("id") == "roll"), 45)
         self.assertEqual(limit("verify", lambda s: s.get("id") == "watch"), 12)
         for name, job in RELEASE["jobs"].items():
             if "steps" in job:
