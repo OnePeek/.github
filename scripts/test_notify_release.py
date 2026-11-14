@@ -135,6 +135,9 @@ class Message(unittest.TestCase):
         text = nr.build_message(base_env(RESULTS='["failure"]', VERSION="v" * 5000), jobs=jobs, now=NOW)
         self.assertLess(len(text), 3000)
         self.assertIn("j&lt;b&gt;&amp;", text)
+        # The overall cap holds whatever field grows (here the repository name, which no field cap covers).
+        long_repo = nr.build_message(base_env(GITHUB_REPOSITORY="OnePeek/" + "r" * 5000), jobs=[], now=NOW)
+        self.assertLess(len(long_repo), 3000)
 
 
 class JobsApi(unittest.TestCase):

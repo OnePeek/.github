@@ -182,8 +182,7 @@ def main(env: dict | None = None) -> int:
         if ok:
             print("Posted the release notice to Slack:\n" + text)
         else:
-            print("::warning::The release notice was not posted to Slack (%s); the release is not affected."
-                  % said.replace(webhook, "***"))
+            print("::warning::The release notice was not posted to Slack (%s); the release is not affected." % said)
     except Exception as e:  # noqa: BLE001 - a notice never fails a release
         print("::warning::The release notice failed (%s); the release is not affected." % e.__class__.__name__)
     return 0
