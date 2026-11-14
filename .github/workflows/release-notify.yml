@@ -10,7 +10,7 @@
 #     needs: [<every other job>]
 #     if: ${{ always() && <not skipped> }}
 #     permissions: {contents: read, actions: read}
-#     uses: OnePeek/.github/.github/workflows/release-notify.yml@<sha> # <tag>
+#     uses: (this workflow, pinned by commit SHA like every shared workflow)
 #     with:
 #       environment: preprod
 #       results: ${{ toJSON(needs.*.result) }}
