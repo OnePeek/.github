@@ -3269,6 +3269,8 @@ jobs:
         env:
           SERVICES: ${{ needs.deploy.outputs.services }}
         run: |
+          set -o pipefail   # the runner's `bash -e {0}` has none (RV-107 B1)
+          # poll() is a pipeline (aws | tr | sed): without pipefail a failed describe-alarms would read as "no alarm".
           # aws-stack §10.4: each service has exactly two deploy alarms, onepeek-<env>-deploy-<service>-errors and
           # -latency; this release watches only those of the services it rolled (by exact name: a prefix for `api` would
           # also match `api-critical`), so a web release never fails on an api alarm. They may be switched off
