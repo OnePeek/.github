@@ -313,5 +313,19 @@ class Workflows(unittest.TestCase):
                 self.assertEqual(found, (name, job_id) in FAIL_OPEN, (name, job_id))
 
 
+    def test_the_header_says_prod_has_no_notice_on_purpose(self):
+        # F650: the spec did not exclude prod; the header says the exclusion is deliberate and why.
+        header = (WORKFLOWS / "release-ecs.yml").read_text(encoding="utf-8").split("\nname: release-ecs\n")[0]
+        self.assertIn("No notice for prod, on purpose", header)
+        self.assertIn("promote.yml", header.split("No notice for prod, on purpose")[1][:300])
+
+    def test_agents_md_lists_the_notify_workflow_and_the_fail_open_policy(self):
+        # F647, F650: the layout names release-notify.yml, the notify job and FAIL_OPEN.
+        agents = (WORKFLOWS.parent.parent / "AGENTS.md").read_text(encoding="utf-8")
+        layout = agents.split("## Build kit")[0]
+        for needle in ("release-notify.yml", "scripts/notify_release.py", "FAIL_OPEN", "`notify`"):
+            self.assertIn(needle, layout, needle)
+
+
 if __name__ == "__main__":
     unittest.main()

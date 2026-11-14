@@ -960,6 +960,16 @@ esac"""
         self.assertNotEqual(out.returncode, 0)
 
 
+class WatchRetries(unittest.TestCase):
+    def test_the_watch_polls_with_adaptive_retries_so_a_throttle_does_not_roll_back_a_healthy_release(self):
+        # F630: the AWS CLI's default is 3 attempts (legacy/standard); a throttled describe-alarms failed the watch.
+        watch = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("id") == "watch")
+        self.assertEqual(watch["env"]["AWS_RETRY_MODE"], "adaptive")
+        self.assertEqual(int(watch["env"]["AWS_MAX_ATTEMPTS"]), 6)
+        # Bounded: six attempts of a poll still end inside the step limit, so a hang ends as a failed step (rollback).
+        self.assertEqual(watch["timeout-minutes"], 12)
+
+
 class WatchShell(unittest.TestCase):
     def test_the_watch_step_sets_pipefail_itself_as_the_runner_gives_it_none(self):
         # The step has no `shell:`, so the runner runs `bash -e {0}`: poll() is a pipeline whose aws failure must fail it.
