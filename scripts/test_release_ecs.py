@@ -1030,7 +1030,8 @@ class Notify(unittest.TestCase):
         self.assertIn("verify", job["needs"])
         self.assertEqual(st["env"]["WATCH"], "${{ needs.verify.outputs.watch }}")
         self.assertEqual(st["env"]["ROLLBACK"], "${{ needs.verify.outputs.rollback }}")
-        self.assertEqual(RELEASE["jobs"]["verify"]["outputs"], {"watch": "${{ steps.watch.outcome }}", "rollback": "${{ steps.rollback.outcome }}"})
+        self.assertEqual(RELEASE["jobs"]["verify"]["outputs"], {"watch": "${{ steps.watch.outcome }}", "rollback": "${{ steps.rollback.outcome }}",
+                                                          "ready": "${{ steps.ready.outcome }}"})  # ready: the Slack notice (W1-SLACK-GH)
         # issues: write for the put-back's issue (playbook §5.4a "Rollback on cancel").
         self.assertEqual(job["permissions"], {"contents": "read", "id-token": "write", "deployments": "write", "issues": "write"})
 
@@ -1212,7 +1213,7 @@ class SkippedBuildBranch(unittest.TestCase):
             return found
 
         below = [j for j in jobs if ancestors(j) & {"build-image", "build-web"}]
-        self.assertEqual(below, ["db-bootstrap", "deploy", "verify", "finish", "api-client"])
+        self.assertEqual(below, ["db-bootstrap", "deploy", "verify", "finish", "api-client", "notify"])
         for job_id in below:
             self.assertRegex(str(jobs[job_id].get("if", "")), self.STATUS,
                              f"release-ecs.yml:{job_id}: below a skipped build job, so it needs !cancelled() or always()")
@@ -1222,9 +1223,10 @@ class JobGraph(unittest.TestCase):
     """Foundation-reset W2.1: five stages, because each job waits about a minute for a runner (2026-11-05: 11.9 of 19.1
     minutes were waiting). db-bootstrap stays a job (a reusable-workflow call under its own role), the build is two
     exclusive jobs (only the web build's token reads packages) and the API client publish is its own job (only it holds
-    packages: write), so 8 jobs are defined; the backend runs at most 7 and the web image at most 5."""
+    packages: write), plus the fail-open Slack notice last (W1-SLACK-GH), so 9 jobs are defined; the backend runs at most
+    8 and the web image at most 6."""
 
-    JOBS = ["prepare", "build-image", "build-web", "db-bootstrap", "deploy", "verify", "finish", "api-client"]
+    JOBS = ["prepare", "build-image", "build-web", "db-bootstrap", "deploy", "verify", "finish", "api-client", "notify"]
 
     def test_the_job_count_is_pinned(self):
         self.assertEqual(list(RELEASE["jobs"]), self.JOBS)
@@ -1263,17 +1265,17 @@ class JobGraph(unittest.TestCase):
         return ran
 
     def test_the_jobs_that_run_per_image_come_from_evaluating_the_conditions(self):
-        every = ["prepare", "build-image", "db-bootstrap", "deploy", "verify", "finish", "api-client"]
+        every = ["prepare", "build-image", "db-bootstrap", "deploy", "verify", "finish", "api-client", "notify"]
         self.assertEqual(self._simulate("backend", True, False), every)
         self.assertEqual(self._simulate("backend", False, False), [j for j in every if j != "db-bootstrap"])
-        web = ["prepare", "build-web", "db-bootstrap", "deploy", "verify", "finish"]
+        web = ["prepare", "build-web", "db-bootstrap", "deploy", "verify", "finish", "notify"]
         self.assertEqual(self._simulate("web", True, False), web)
         self.assertEqual(self._simulate("web", False, False), [j for j in web if j != "db-bootstrap"])
         # A dry run reads the digests back and deploys nothing live: no migrate, watch or client publish.
         self.assertEqual(self._simulate("backend", True, True), ["prepare", "build-image", "deploy", "finish"])
         self.assertEqual(self._simulate("web", True, True), ["prepare", "build-web", "deploy", "finish"])
-        self.assertEqual(len(self._simulate("backend", True, False)), 7)
-        self.assertEqual(len(self._simulate("web", False, False)), 5)
+        self.assertEqual(len(self._simulate("backend", True, False)), 8)
+        self.assertEqual(len(self._simulate("web", False, False)), 6)
 
     def test_the_stages_run_in_order(self):
         self.assertEqual(needs_of("deploy"), ["prepare", "build-image", "build-web", "db-bootstrap"])
@@ -1392,7 +1394,7 @@ class VerifyRollsBack(unittest.TestCase):
             self.assertEqual(out.returncode, code, result)
         names = [s.get("id") or s.get("name", "") for s in self.job["steps"]]
         check = names.index(st["name"])
-        for later in ("Baseline readiness", "Every service's task definition", "The repo's own", "watch"):
+        for later in ("ready", "Every service's task definition", "The repo's own", "watch"):  # ready: Baseline readiness
             i = names.index(next(n for n in names if n.startswith(later)))
             self.assertGreater(i, check, later)
             self.assertNotIn("always()", str(self.job["steps"][i].get("if", "")), later)
