@@ -106,6 +106,27 @@ elif op == "delete-object":
         fail("DeleteObject", "PreconditionFailed")
     os.remove(obj)
     os.remove(tag)
+elif op == "describe-task-definition" and "--query" not in args and not os.environ.get("AWS_DESCRIBE_TASK_DEFINITION") \
+        and not os.environ.get("SEQ_DESCRIBE_TASK_DEFINITION"):
+    # A whole revision as ECS describes it (any revision, ACTIVE or not): INACTIVE when TD_INACTIVE names its ARN, TD_STATUS
+    # instead for every revision; the read-only fields ECS adds come back too, as they do from the real call.
+    arn = opt("--task-definition")
+    family, rev = arn.split("/")[-1].rsplit(":", 1)
+    status = os.environ.get("TD_STATUS") or ("INACTIVE" if arn in os.environ.get("TD_INACTIVE", "").split() else "ACTIVE")
+    print(json.dumps({"taskDefinition": {
+        "taskDefinitionArn": arn, "family": family, "revision": int(rev), "status": status,
+        "containerDefinitions": [{"name": family.rsplit("-", 1)[-1], "image": "r/x@sha256:" + "a" * 64}],
+        "executionRoleArn": "arn:aws:iam::111111111111:role/exec", "networkMode": "awsvpc", "cpu": "256", "memory": "512",
+        "requiresCompatibilities": ["FARGATE"], "volumes": [], "compatibilities": ["EC2", "FARGATE"],
+        "requiresAttributes": [{"name": "ecs.capability.execution-role-awslogs"}], "registeredAt": "2026-11-01T00:00:00Z",
+        "registeredBy": "arn:aws:sts::111111111111:assumed-role/infra/x", "deregisteredAt": "2026-11-14T00:00:00Z"},
+        "tags": [{"key": "commit", "value": "sha-" + "1" * 12}, {"key": "release-run", "value": "4000"}]}))
+elif op == "register-task-definition" and not os.environ.get("AWS_REGISTER_TASK_DEFINITION"):
+    # Every registered body is logged in `registered`; the new revision is <family>:100, :101, ...
+    body = open(opt("--cli-input-json")[len("file://"):]).read()
+    with open(os.path.join(state, "registered"), "a") as f:
+        f.write(body.strip() + "\n")
+    print("arn:aws:ecs:ap-south-1:111111111111:task-definition/%s:%d" % (json.loads(body)["family"], 100 + counter("register")))
 else:
     name = op.replace("-", "_").upper()
     seq = os.environ.get("SEQ_" + name)
@@ -194,6 +215,7 @@ def run(script: str, keys: dict | None = None, gh: str = "echo in_progress", fro
         out.summary = read("summary") or ""  # type: ignore[attr-defined]
         out.token_request = read("token-request") or ""  # type: ignore[attr-defined]
         out.headers = read("headers") or ""  # type: ignore[attr-defined]
+        out.registered = read("registered") or ""  # type: ignore[attr-defined]
         return out
 
 
@@ -1376,6 +1398,79 @@ class FirstDeploy(unittest.TestCase):
         self.assertIn(f"--service api --task-definition {API_TD}", out.calls)
         self.assertIn("--service worker --desired-count 0", out.calls)
         self.assertNotIn("--task-definition first-deploy", out.calls)
+
+
+class PutBackInactive(unittest.TestCase):
+    """F589: a recorded revision deregistered since the release recorded it (an infra apply replacing a skeleton revision)
+    is INACTIVE, and ECS refuses UpdateService onto it; the put-back registers it again from its recorded definition and
+    moves the service to that new revision, and fails closed (the key stays rolling) when it cannot."""
+
+    API_INACTIVE = PREV["api"]
+    READ_ONLY = ("taskDefinitionArn", "revision", "status", "compatibilities", "requiresAttributes", "registeredAt",
+                 "registeredBy", "deregisteredAt")  # fmt: skip
+
+    def finish(self, **extra):
+        held = mine("rolling", previous=PREV)
+        return held, run(FINISH, keys={LEGACY: held, BACKEND: held}, LOCK_TOKEN=TOKEN, GH_TOKEN="gh", **extra)
+
+    def test_an_inactive_revision_is_registered_again_from_its_definition_and_the_service_moves_to_it(self):
+        _, out = self.finish(TD_INACTIVE=self.API_INACTIVE)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(f"aws ecs describe-task-definition --task-definition {self.API_INACTIVE} --include TAGS --output json", out.calls)
+        bodies = [json.loads(b) for b in out.registered.splitlines()]
+        self.assertEqual(len(bodies), 1)   # only the inactive one
+        body = bodies[0]
+        self.assertEqual(body["family"], "onepeek-preprod-api")
+        self.assertEqual(body["containerDefinitions"], [{"name": "api", "image": "r/x@sha256:" + "a" * 64}])
+        self.assertEqual((body["executionRoleArn"], body["networkMode"], body["cpu"], body["memory"], body["requiresCompatibilities"]),
+                         ("arn:aws:iam::111111111111:role/exec", "awsvpc", "256", "512", ["FARGATE"]))
+        self.assertEqual(body["tags"], [{"key": "commit", "value": "sha-" + "1" * 12}, {"key": "release-run", "value": "4000"}])
+        for field in self.READ_ONLY:
+            self.assertNotIn(field, body)
+        new = "arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-api:100"
+        self.assertIn(f"aws ecs update-service --cluster onepeek-preprod --service api --task-definition {new}", out.calls)
+        self.assertNotIn(f"--task-definition {self.API_INACTIVE} >", out.calls)
+        self.assertNotIn(f"--service api --task-definition {self.API_INACTIVE}", out.calls)
+        self.assertIn(f"aws ecs update-service --cluster onepeek-preprod --service worker --task-definition {PREV['worker']}", out.calls)
+        self.assertIn("onepeek-preprod-api:6 is inactive", out.stdout)
+        self.assertIn("onepeek-preprod-api:100", out.stdout)
+        self.assertEqual(out.keys, {})
+
+    def test_an_active_revision_is_used_as_recorded_and_nothing_is_registered(self):
+        _, out = self.finish()
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(out.registered, "")
+        self.assertNotIn("register-task-definition", out.calls)
+        for svc, td in PREV.items():
+            self.assertIn(f"aws ecs update-service --cluster onepeek-preprod --service {svc} --task-definition {td}", out.calls)
+
+    def test_a_revision_that_cannot_be_made_active_fails_the_put_back_and_keeps_the_key_rolling(self):
+        other_family = json.dumps({"taskDefinition": {"family": "onepeek-preprod-web", "status": "ACTIVE", "containerDefinitions": [{"name": "web"}]}})
+        no_container = json.dumps({"taskDefinition": {"family": "onepeek-preprod-api", "status": "INACTIVE", "containerDefinitions": []}})
+        wrong_arn = "arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-web:9"
+        cases = {
+            "describe fails": {"FAIL_DESCRIBE_TASK_DEFINITION": "ClientException"},
+            "describe unreadable": {"AWS_DESCRIBE_TASK_DEFINITION": "not json"},
+            "describe names another family": {"AWS_DESCRIBE_TASK_DEFINITION": other_family},
+            "no container to register": {"AWS_DESCRIBE_TASK_DEFINITION": no_container},
+            "neither active nor inactive": {"TD_STATUS": "DELETE_IN_PROGRESS"},
+            "register fails": {"TD_INACTIVE": self.API_INACTIVE, "FAIL_REGISTER_TASK_DEFINITION": "AccessDeniedException"},
+            "register answers another family": {"TD_INACTIVE": self.API_INACTIVE, "AWS_REGISTER_TASK_DEFINITION": wrong_arn},
+            "register answers nothing": {"TD_INACTIVE": self.API_INACTIVE, "AWS_REGISTER_TASK_DEFINITION": "None"},
+        }  # fmt: skip
+        for name, extra in cases.items():
+            with self.subTest(name):
+                held, out = self.finish(**extra)
+                self.assertEqual(out.returncode, 1, name + ": " + out.stdout + out.stderr)
+                self.assertNotIn("update-service", out.calls, name)
+                self.assertIn("::error::api could not be put back", out.stdout, name)
+                self.assertIn("cancel-release.yml", out.stdout, name)
+                self.assertEqual(out.keys, {LEGACY: held, BACKEND: held}, name)
+
+    def test_every_copy_of_the_lock_functions_carries_the_re_registration(self):
+        for text in (RELEASE_TEXT, OPERATE_TEXT, (WORKFLOWS / "release-lock.yml").read_text(encoding="utf-8")):
+            for block in re.findall(r"# --- release-lock begin.*?# --- release-lock end ---", text, re.S):
+                self.assertIn("lock_live_revision", block)
 
 
 class ManualPath(unittest.TestCase):
