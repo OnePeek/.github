@@ -895,6 +895,30 @@ esac"""
         self.assertIn("::warning::None of the deploy alarms", out.stdout)
         self.assertIn("could not detect a regression", summary)
 
+    def test_no_deploy_alarm_skips_the_watch_instead_of_waiting_it_out(self):
+        # C11: today's wait of 10 minutes with nothing to poll; the watch window here is 3 s, so a poll would show.
+        out, calls, summary = self.watch("", "", "3")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("--state-value ALARM", calls)
+        self.assertNotIn("sleep", calls)
+        self.assertIn("the 10-minute watch is skipped", out.stdout)
+        self.assertIn("the watch was skipped", summary)
+        self.assertNotIn("No deploy alarm in 10 minutes", out.stdout)
+
+    def test_deploy_alarms_that_exist_are_still_watched_for_the_whole_window(self):
+        out, calls, _ = self.watch("onepeek-preprod-deploy-api-errors", "", "1")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("Watching: onepeek-preprod-deploy-api-errors", out.stdout)
+        self.assertIn("--state-value ALARM", calls)
+        self.assertIn("No deploy alarm in 10 minutes", out.stdout)
+
+    def test_an_unreadable_alarm_list_fails_the_watch_and_never_skips_it(self):
+        script = step("verify", "10 minutes after stable").replace("SECONDS + 600", "SECONDS + 3")
+        aws = 'echo "An error occurred (AccessDenied) when calling the DescribeAlarms operation" >&2; exit 254'
+        out, calls, _, summary, _ = run_step(script, aws, extra_env={"SERVICES": '["api"]'}, extra_stubs={"sleep": "exit 0"}, with_summary=True)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertNotIn("skipped", out.stdout + summary)
+
     def test_it_asks_for_exactly_the_rolled_services_two_alarms(self):
         _, calls, _ = self.watch("", "", "0")
         self.assertIn("--alarm-names onepeek-preprod-deploy-api-errors onepeek-preprod-deploy-api-latency "
