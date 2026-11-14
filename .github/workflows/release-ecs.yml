@@ -3289,13 +3289,14 @@ jobs:
             aws cloudwatch describe-alarms --alarm-names "${names[@]}" "$@" --query 'MetricAlarms[].AlarmName' --output text \
               | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'
           }
-          known=$(poll)
+          known=$(poll)   # an unreadable alarm list fails the step (and so rolls back); only a readable empty one skips
           if [ -z "${known}" ]; then
-            echo "::warning::None of the deploy alarms ${names[*]} exists: the 10-minute watch cannot detect a regression."
-            echo "Warning: none of the deploy alarms (${names[*]}) exists, so the watch could not detect a regression." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Watching: ${known}"
+            # C11: with no alarm to poll, 10 minutes of polling cannot catch anything, so the watch is skipped, out loud.
+            echo "::warning::None of the deploy alarms ${names[*]} exists: the 10-minute watch is skipped, as it could not detect a regression."
+            echo "Warning: none of the deploy alarms (${names[*]}) exists, so the watch was skipped: it could not detect a regression." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
+          echo "Watching: ${known}"
           end=$((SECONDS + 600))
           while [ "${SECONDS}" -lt "${end}" ]; do
             alarms=$(poll --state-value ALARM)
