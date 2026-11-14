@@ -3,6 +3,10 @@
 One line per change a caller can see. Versions are the `v*` tags `tag-main.yml` cuts on every merge to `dev` (a `feat`
 raises the minor version); the release notes on each tag list every merged pull request.
 
+## v1.28.4 (W1-GH: F589, C11)
+- `release-ecs.yml`, `operate.yml`, `release-lock.yml` (the shared lock functions): the put-back of a `rolling` key no longer fails on a recorded revision that was deregistered since (an infra apply replacing a skeleton revision leaves it INACTIVE, and ECS refuses `UpdateService` onto it): it describes the revision, registers it again from its recorded definition and tags, and moves the service to the new revision. A revision it cannot describe, of another family, with no container, in any other status, or whose registration fails or answers another family, fails the put-back closed (the key stays `rolling`, as before). The deploy role needs `ecs:DescribeTaskDefinition` and `ecs:RegisterTaskDefinition` (it already has both for the rollout).
+- `release-ecs.yml` verify: when none of the rolled services' deploy alarms exists, the 10-minute watch is skipped with the same warning (it could not detect a regression) instead of waiting 10 minutes; with any alarm it watches as before. The step now sets `pipefail` itself (it has no `shell:`, so the runner runs it as `bash -e {0}`), so an unreadable alarm list, at the start or in any poll of the window, fails the step and rolls back instead of reading as "no alarm". Callers pick both up when their pin moves to the tag cut from this merge.
+
 ## v1.28.2 (F558)
 - `spot-rerun.yml`: a run lost to a spot reclaim on attempt 2 is re-run once more (attempts 1 and 2 are re-run, so at most 3 attempts); a third loss stays failed and is reported in the summary of its own `workflow_run` call (scan mode lists attempts 1 and 2 only, so it skips a third loss silently, F562). Still gated on the reclaim markers and every existing guard (superseded run, failed jobs only). Scan mode now lists failed runs on attempt 1 or 2. Callers pick it up when their pin moves to the tag cut from this merge.
 
