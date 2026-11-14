@@ -1,0 +1,106 @@
+# One Slack message to #deploys at the end of a release that does not run release-ecs.yml (the infra release, its last
+# job). Founder decision 2026-11-15, provisional rulings of W1-SLACK-GH; the rules are in release-ecs.yml's header,
+# "Release notices to Slack": one channel, one shared notifier (scripts/notify_release.py, read at this workflow's own
+# commit), one message per release at its end (SUCCESS, FAILED, CANCELLED; ROLLED BACK is release-ecs.yml's only),
+# never failing or slowing the release (GitHub-hosted, seconds long, continue-on-error on the job and every step; an
+# unset secret is a notice, a Slack error a warning; the webhook URL is never printed).
+#
+# A caller adds, as its last job (needs: every other job; `if: always()`, and not when the run skipped itself):
+#   notify:
+#     needs: [<every other job>]
+#     if: ${{ always() && <not skipped> }}
+#     permissions: {contents: read, actions: read}
+#     uses: (this workflow, pinned by commit SHA like every shared workflow)
+#     with:
+#       environment: preprod
+#       results: ${{ toJSON(needs.*.result) }}
+#     secrets:
+#       SLACK_DEPLOYS_WEBHOOK: ${{ secrets.SLACK_DEPLOYS_WEBHOOK }}
+name: release-notify
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "onepeek, canary or github; accepted like every shared workflow's, but this job always runs GitHub-hosted (seconds long, no cloud access, never waits for a runner)."
+        type: string
+        default: github
+      environment:
+        description: The environment released, for example preprod.
+        type: string
+        required: true
+      results:
+        description: "The caller's `toJSON(needs.*.result)`: the result of every job the notice waits for. A failure is FAILED, a cancel CANCELLED; success and skipped only are SUCCESS."
+        type: string
+        required: true
+      version:
+        description: The version or tag released; empty shows the short commit.
+        type: string
+        default: ""
+      status:
+        description: The readiness check's result when the caller knows it (for example success or failure); empty leaves it out.
+        type: string
+        default: ""
+      status-path:
+        description: What the readiness check read, for example /api/status.
+        type: string
+        default: status
+      started:
+        description: When the release started, in epoch seconds; empty takes this run attempt's first job start.
+        type: string
+        default: ""
+    secrets:
+      SLACK_DEPLOYS_WEBHOOK:
+        description: The #deploys incoming webhook (the organisation secret of the same name). Optional; unset, nothing is posted and a notice says so.
+        required: false
+
+permissions: {}
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read # the failed job and step, from this run's jobs API
+    steps:
+      - name: This workflow's own commit (the notifier is read at it)
+        id: sha
+        continue-on-error: true
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [[ "${WORKFLOW_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::job.workflow_sha is '${WORKFLOW_SHA}', not a commit SHA: no release notice is posted; the release is not affected."
+          fi
+      - name: OnePeek/.github at that commit (scripts/notify_release.py only)
+        id: shared
+        if: ${{ steps.sha.outputs.ok == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OnePeek/.github
+          ref: ${{ job.workflow_sha }}
+          path: _gh
+          sparse-checkout: scripts/notify_release.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: One release notice to Slack #deploys (never fails the release)
+        if: ${{ steps.shared.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_DEPLOYS_WEBHOOK }}
+          GH_TOKEN: ${{ github.token }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          VERSION: ${{ inputs.version }}
+          RESULTS: ${{ inputs.results }}
+          STATUS: ${{ inputs.status }}
+          STATUS_PATH: ${{ inputs.status-path }}
+          STARTED: ${{ inputs.started }}
+          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+        run: python3 -I _gh/scripts/notify_release.py

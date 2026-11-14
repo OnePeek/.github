@@ -752,7 +752,7 @@ class Wiring(unittest.TestCase):
 
     def test_unlock_always_runs_after_every_deploy_job(self):
         finish = RELEASE["jobs"]["finish"]
-        self.assertEqual(set(needs(RELEASE, "finish")), set(RELEASE["jobs"]) - {"finish", "api-client"})
+        self.assertEqual(set(needs(RELEASE, "finish")), set(RELEASE["jobs"]) - {"finish", "api-client", "notify"})
         self.assertIn("lock_finish", FINISH)
         steps = finish["steps"]
         unlock = next(i for i, s in enumerate(steps) if s.get("name") == "Release the release lock")
