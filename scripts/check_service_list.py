@@ -23,6 +23,7 @@ ONE_OFF = {"migration", "operator", "function"}
 LIST = re.compile(r"(# service-list begin\n\s*options: )\[[^\]]*\](\n\s*# service-list end)")
 BLOCK = re.compile(r"# --- render-taskdef begin[^\n]*\n(.*?)# --- render-taskdef end ---", re.S)
 LOCK = re.compile(r"# --- release-lock begin[^\n]*\n(.*?)# --- release-lock end ---", re.S)
+STABLE = re.compile(r"# --- stable-wait begin[^\n]*\n(.*?)# --- stable-wait end ---", re.S)
 
 
 def long_running(doc: dict) -> list[str]:
@@ -66,6 +67,13 @@ def main(argv: list[str] | None = None) -> int:
                         "operate.yml three (lock, operate, unlock), release-lock.yml one")
     elif len({b for found in locks.values() for b in found}) != 1:
         problems.append("the release-lock functions differ between release-ecs.yml, operate.yml and release-lock.yml")
+    # F661: the stability poll, inside every release-lock copy and once more in release-ecs.yml's rollout step.
+    stables = {"release-ecs.yml": blocks(release_text, STABLE), "operate.yml": blocks(text, STABLE),
+               "release-lock.yml": blocks(lock_file.read_text(encoding="utf-8"), STABLE) if lock_file.exists() else []}
+    if any(len(stables[f]) != n + (f == "release-ecs.yml") for f, n in wanted_copies.items()):
+        problems.append("stable-wait blocks: one in every release-lock block, plus the rollout step's in release-ecs.yml")
+    elif len({b for found in stables.values() for b in found}) != 1:
+        problems.append("the stable-wait function differs between its copies")
     for p in problems:
         print("::error::" + p)
     return 1 if problems else 0

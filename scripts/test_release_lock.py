@@ -26,7 +26,8 @@ INFRA = "OnePeek/onepeek-infra"
 ENV = {"NAME": "onepeek-preprod", "ENVIRONMENT": "preprod", "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": RUN,
        "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SHA": "f" * 40, "GITHUB_SERVER_URL": "https://github.com", "LOCK_SCOPE": "backend",
        "LOCK_WAIT_SECONDS": "2", "LOCK_WAIT_CAP_SECONDS": "4", "LOCK_QUEUED_WAIT_SECONDS": "2", "LOCK_MIGRATE_WAIT_SECONDS": "2",
-       "LOCK_REMINT_SECONDS": "3000", "LOCK_POLL_SECONDS": "1", "LOCK_LOOKUP_GAP_SECONDS": "0", "LOCK_GH_TOKEN": "t"}  # fmt: skip
+       "LOCK_REMINT_SECONDS": "3000", "LOCK_POLL_SECONDS": "1", "LOCK_LOOKUP_GAP_SECONDS": "0", "LOCK_GH_TOKEN": "t",
+       "LOCK_STABLE_POLL_SECONDS": "0"}  # fmt: skip
 LEGACY, BACKEND, WEB, INFRA_KEY, MCP = "locks/release.json", "locks/backend.json", "locks/web.json", "locks/infra.json", "locks/mcp.json"
 TASK = "arn:aws:ecs:ap-south-1:111111111111:task/onepeek-preprod/abc123"
 MIGRATE_TD = "arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-migrate:4"
@@ -121,6 +122,13 @@ elif op == "describe-task-definition" and "--query" not in args and not os.envir
         "requiresAttributes": [{"name": "ecs.capability.execution-role-awslogs"}], "registeredAt": "2026-11-01T00:00:00Z",
         "registeredBy": "arn:aws:sts::111111111111:assumed-role/infra/x", "deregisteredAt": "2026-11-14T00:00:00Z"},
         "tags": [{"key": "commit", "value": "sha-" + "1" * 12}, {"key": "release-run", "value": "4000"}]}))
+elif op == "describe-services" and "--query" not in args:
+    # The stability poll (rollout_wait, F661): the service as ECS describes it; its PRIMARY deployment's rolloutState is
+    # ROLLOUT_STATE (COMPLETED by default).
+    svc = opt("--services")
+    print(json.dumps({"services": [{"serviceName": svc, "events": [{"createdAt": "t", "message": "(service %s) event" % svc}],
+        "deployments": [{"status": "PRIMARY", "taskDefinition": "x/%s:1" % svc, "rolloutState": os.environ.get("ROLLOUT_STATE", "COMPLETED"),
+                         "runningCount": 1, "desiredCount": 1, "pendingCount": 0}]}], "failures": []}))
 elif op == "register-task-definition" and not os.environ.get("AWS_REGISTER_TASK_DEFINITION"):
     # Every registered body is logged in `registered`; the new revision is <family>:100, :101, ...
     body = open(opt("--cli-input-json")[len("file://"):]).read()
@@ -579,14 +587,14 @@ class Finish(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         for svc, td in PREV.items():
             self.assertIn(f"aws ecs update-service --cluster onepeek-preprod --service {svc} --task-definition {td}", out.calls)
-        self.assertIn("aws ecs wait services-stable --cluster onepeek-preprod --services api worker", out.calls)
+        self.assertIn("Stable (every PRIMARY deployment COMPLETED): api worker.", out.stdout)
         self.assertIn("aws lambda update-alias --function-name onepeek-preprod-sandbox-parse --name live --function-version 7", out.calls)
         self.assertIn("gh issue create --repo OnePeek/backend-service", out.calls)
         self.assertEqual(out.keys, {})
 
     def test_a_failed_put_back_keeps_the_key_rolling_and_names_cancel_release(self):
         held = mine("rolling", previous=PREV)
-        for fail in ({"FAIL_UPDATE_SERVICE": "ServiceNotFound"}, {"FAIL_WAIT": "Waiter failed"}):
+        for fail in ({"FAIL_UPDATE_SERVICE": "ServiceNotFound"}, {"ROLLOUT_STATE": "FAILED"}, {"FAIL_DESCRIBE_SERVICES": "ThrottlingException"}):
             out = self.finish(held, **fail)
             self.assertEqual(out.returncode, 1)
             self.assertIn("cancel-release.yml", out.stdout)
@@ -1382,7 +1390,7 @@ class FirstDeploy(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn(f"aws ecs update-service --cluster onepeek-preprod --service api --task-definition {API_TD}", out.calls)
         self.assertIn("aws ecs update-service --cluster onepeek-preprod --service worker --desired-count 0", out.calls)
-        self.assertIn("aws ecs wait services-stable --cluster onepeek-preprod --services api worker", out.calls)
+        self.assertIn("Stable (every PRIMARY deployment COMPLETED): api worker.", out.stdout)
         self.assertEqual(out.keys, {})
 
     def test_a_previous_entry_that_is_neither_a_revision_nor_first_deploy_still_refuses_the_put_back(self):
@@ -1480,7 +1488,21 @@ class PutBackInactive(unittest.TestCase):
         self.assertIn(f"aws ecs update-service --cluster onepeek-preprod --service api --task-definition {new}", out.calls)
         self.assertNotIn(f"--service api --task-definition {self.API_INACTIVE}", out.calls)
         self.assertIn(f"aws ecs update-service --cluster onepeek-preprod --service worker --task-definition {PREV['worker']}", out.calls)
-        self.assertIn("aws ecs wait services-stable --cluster onepeek-preprod --services api worker", out.calls)
+        self.assertIn("Stable (every PRIMARY deployment COMPLETED): api worker.", out.stdout)
+
+    def test_verifys_rollback_names_each_revision_and_waits_on_the_rollout_state(self):
+        # F661: the put-back says which revision each service goes to, and its wait reads the PRIMARY rolloutState.
+        out = self.rollback()
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("Put api back on onepeek-preprod-api:6.", out.stdout)
+        self.assertIn("Put worker back on onepeek-preprod-worker:3.", out.stdout)
+        self.assertIn("aws ecs describe-services --cluster onepeek-preprod --services api --output json", out.calls)
+        self.assertNotIn("services-stable", out.calls)
+        out = self.rollback(ROLLOUT_STATE="FAILED")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("A rollout FAILED (ECS rolloutState FAILED)", out.stdout)
+        self.assertIn("(service api) event", out.stdout)
+        self.assertIn("did not become stable in 20 minutes", out.stdout)
 
     def test_verifys_rollback_uses_an_active_revision_as_recorded(self):
         out = self.rollback()
@@ -1504,7 +1526,7 @@ class PutBackInactive(unittest.TestCase):
                 out = self.rollback(**extra)
                 self.assertEqual(out.returncode, 1, name + ": " + out.stdout + out.stderr)
                 self.assertNotIn("update-service", out.calls, name)
-                self.assertNotIn("services-stable", out.calls, name)
+                self.assertNotIn("describe-services", out.calls, name)
                 self.assertIn("::error::api could not be put back", out.stdout, name)
 
     def test_every_copy_of_the_lock_functions_carries_the_re_registration(self):
