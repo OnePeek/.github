@@ -1467,6 +1467,46 @@ class PutBackInactive(unittest.TestCase):
                 self.assertIn("cancel-release.yml", out.stdout, name)
                 self.assertEqual(out.keys, {LEGACY: held, BACKEND: held}, name)
 
+    def rollback(self, **extra):
+        return run(ROLLBACK["run"], PREVIOUS=json.dumps(PREV), HAS_SANDBOX="", **extra)
+
+    def test_verifys_rollback_registers_an_inactive_revision_again_and_moves_the_service_to_it(self):
+        # F621: verify's own rollback called update-service on the recorded revision directly, red on an INACTIVE one.
+        out = self.rollback(TD_INACTIVE=self.API_INACTIVE)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(f"aws ecs describe-task-definition --task-definition {self.API_INACTIVE} --include TAGS --output json", out.calls)
+        self.assertEqual(len(out.registered.splitlines()), 1)
+        new = "arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-api:100"
+        self.assertIn(f"aws ecs update-service --cluster onepeek-preprod --service api --task-definition {new}", out.calls)
+        self.assertNotIn(f"--service api --task-definition {self.API_INACTIVE}", out.calls)
+        self.assertIn(f"aws ecs update-service --cluster onepeek-preprod --service worker --task-definition {PREV['worker']}", out.calls)
+        self.assertIn("aws ecs wait services-stable --cluster onepeek-preprod --services api worker", out.calls)
+
+    def test_verifys_rollback_uses_an_active_revision_as_recorded(self):
+        out = self.rollback()
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("register-task-definition", out.calls)
+        for svc, td in PREV.items():
+            self.assertIn(f"aws ecs update-service --cluster onepeek-preprod --service {svc} --task-definition {td}", out.calls)
+
+    def test_verifys_rollback_fails_closed_when_a_revision_cannot_be_made_active(self):
+        # The step fails, so verify's end record is not written: the key stays rolling and finish tries the put-back again.
+        wrong_arn = "arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-web:9"
+        cases = {
+            "describe fails": {"FAIL_DESCRIBE_TASK_DEFINITION": "ClientException"},
+            "describe unreadable": {"AWS_DESCRIBE_TASK_DEFINITION": "not json"},
+            "neither active nor inactive": {"TD_STATUS": "DELETE_IN_PROGRESS"},
+            "register fails": {"TD_INACTIVE": self.API_INACTIVE, "FAIL_REGISTER_TASK_DEFINITION": "AccessDeniedException"},
+            "register answers another family": {"TD_INACTIVE": self.API_INACTIVE, "AWS_REGISTER_TASK_DEFINITION": wrong_arn},
+        }  # fmt: skip
+        for name, extra in cases.items():
+            with self.subTest(name):
+                out = self.rollback(**extra)
+                self.assertEqual(out.returncode, 1, name + ": " + out.stdout + out.stderr)
+                self.assertNotIn("update-service", out.calls, name)
+                self.assertNotIn("services-stable", out.calls, name)
+                self.assertIn("::error::api could not be put back", out.stdout, name)
+
     def test_every_copy_of_the_lock_functions_carries_the_re_registration(self):
         for text in (RELEASE_TEXT, OPERATE_TEXT, (WORKFLOWS / "release-lock.yml").read_text(encoding="utf-8")):
             for block in re.findall(r"# --- release-lock begin.*?# --- release-lock end ---", text, re.S):
