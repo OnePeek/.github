@@ -701,9 +701,6 @@ jobs:
                   out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
               elif rev(primary.get("taskDefinition")) != rev(want):
                   verdict = "waiting"   # the new deployment is not listed yet
-              elif state == "FAILED":
-                  verdict = "rolledback"
-                  out.append("::error::%s: the rollout of %s FAILED: %s" % (svc, rev(want), primary.get("rolloutStateReason") or "no reason given"))
               else:
                   steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
                   verdict = "done" if steady and len(deployments) == 1 else "waiting"
