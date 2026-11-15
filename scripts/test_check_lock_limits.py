@@ -58,8 +58,8 @@ class Limits(unittest.TestCase):
         self.assertTrue(any("above the stateful reaper lifetime 150 less 20" in p for p in problems), problems)
 
     def test_a_waiting_job_on_a_spot_class_is_held_to_the_spot_lifetime_and_the_class_cap(self):
-        od = "inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od'"
-        fast = "inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary'"
+        od = "runs-on: onepeek-arm64-od"
+        fast = "runs-on: ${{ inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64' }}"
         problems = self.check(("release-lock.yml", od, fast))
         self.assertTrue(any("above the fast lint cap 60" in p for p in problems), problems)
         self.assertTrue(any("above the fast reaper lifetime 90 less 20" in p for p in problems), problems)

@@ -23,9 +23,9 @@ on:
   workflow_call:
     inputs:
       runner:
-        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class (small) and this value choose runs-on (ci-runners.md section 5.3)."
+        description: "onepeek (the default), canary or public-hosted. Callers pass their repository's RUNNER setting, or github; github, onepeek, unset and any other value mean our runner class (F694, 2026-11-15: never GitHub-hosted). public-hosted is for the public repos' own CI only (scripts/check_runner_labels.py). The job's class and this value choose runs-on (ci-runners.md section 5.3)."
         type: string
-        default: github
+        default: onepeek
       environment:
         description: The environment released, for example preprod.
         type: string
@@ -61,10 +61,11 @@ jobs:
   notify:
     # No notice for prod (release-ecs.yml's header says why); a dry run or a run that skipped itself is the caller's `if:`.
     if: ${{ inputs.environment != 'prod' }}
-    # F680: on the caller's runner, like every other job of its release. A GitHub-hosted job in a private repository is
+    # F680, F694: our small class whatever the caller passes (an unset or `github` runner too, so infra's call with no
+    # runner input lands here), like every other job of its release. A GitHub-hosted job in a private repository is
     # not started at all once the account's Actions minutes or spending limit run out, and a job never started is red
     # whatever continue-on-error says (both releases of 2026-11-15).
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64-small' }}
     timeout-minutes: 3
     continue-on-error: true
     permissions:

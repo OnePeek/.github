@@ -1011,6 +1011,25 @@ class StableWait(unittest.TestCase):
         self.assertIn("id-token", RELEASE["jobs"]["deploy"]["permissions"])
         self.assertIn("id-token", RELEASE["jobs"]["verify"]["permissions"])
 
+    def test_no_stretch_between_role_sessions_outlasts_one(self):
+        # F668, RV-111 S3: from each credentials step to the next (or the job's end), the step limits sum to under the role's
+        # 1-hour session, so no step can meet expired credentials. The steps with no limit of their own are short checks.
+        for job_id in ("deploy", "verify"):
+            steps = RELEASE["jobs"][job_id]["steps"]
+            mints = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("aws-actions/configure-aws-credentials@")]
+            self.assertTrue(mints, job_id)
+            for start, end in zip(mints, mints[1:] + [len(steps)]):
+                stretch = sum(s.get("timeout-minutes", 0) for s in steps[start + 1:end])
+                self.assertLessEqual(stretch, 55, (job_id, steps[start].get("name"), stretch))
+
+    def test_the_second_deploy_session_runs_whenever_the_lambda_or_ops_step_runs(self):
+        steps = RELEASE["jobs"]["deploy"]["steps"]
+        i = next(i for i, s in enumerate(steps) if s.get("name", "").startswith("Lambda sandbox functions"))
+        again, ops = steps[i - 1], steps[i + 1]
+        self.assertTrue(again["name"].startswith("A fresh role session for the lambda and ops steps"), again["name"])
+        self.assertTrue(ops["name"].startswith("Verify, render, check the launch settings, register ops"), ops["name"])
+        self.assertEqual(again["if"], "${{ " + ops["if"][4:-3] + " || (" + steps[i]["if"][4:-3] + ") }}")
+
     def test_the_step_limits_cover_the_caps(self):
         roll = next(s for s in RELEASE["jobs"]["deploy"]["steps"] if s.get("id") == "roll")
         self.assertGreaterEqual(roll["timeout-minutes"], 45)
@@ -1018,6 +1037,9 @@ class StableWait(unittest.TestCase):
         self.assertIn('if [ "${cap}" -gt 1500 ]; then cap=1500; fi', roll["run"])
         deploy = RELEASE["jobs"]["deploy"]
         self.assertGreater(deploy["timeout-minutes"], sum(s.get("timeout-minutes", 0) for s in deploy["steps"]))
+        verify = RELEASE["jobs"]["verify"]
+        # RV-111 N1: at least 10 minutes over the step limits, for the steps with no limit of their own.
+        self.assertGreaterEqual(verify["timeout-minutes"], sum(s.get("timeout-minutes", 0) for s in verify["steps"]) + 10)
         rollback = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("id") == "rollback")
         self.assertGreaterEqual(rollback["timeout-minutes"], 21)
         self.assertIn("rollout_wait 1200 ${expect}", rollback["run"])

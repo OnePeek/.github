@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
-"""Workflow-lint rules for runner labels (onepeek-docs architecture/lld/infra/ci-runners.md section 5.4).
+"""Workflow-lint rules for runner labels (onepeek-infra docs/lld/ci-runners.md section 5.4).
+
+Founder ruling 2026-11-15 (F694; orchestrator option A, provisional): every job of a private repo runs on our runners,
+prod included, never on a GitHub-hosted runner. An unset runner, `github` or `onepeek` all mean our class; only the
+public repos' own CI stays GitHub-hosted, because our runners never take a public repo's job (ci-runners.md section 11.6)
+and public repos pay no hosted minutes. The one way to it from a shared workflow is the reserved runner value
+`public-hosted`, which only a public repo passes.
 
   1. Public repos: a workflow that is not `on: workflow_call` never names `self-hosted` or an `onepeek-*` label; a
-     `workflow_call` workflow names `onepeek-*` labels only inside the exact `inputs.runner` mapping of section 5.3;
-     no public workflow reads `vars.RUNNER`.
-  2. Private repos: `runs-on` is one of the forms of section 5.3 (no other labels, no `ghr-*`); jobs listed in
-     .github/workflow-lint/github-only-jobs.yaml use the `github-only` form (plain `ubuntu-latest`). Exempt by name:
-     onepeek-infra's ci-runner-canary.yml and ci-runner-image.yml, which name `onepeek-arm64` and
-     `onepeek-arm64-canary` directly. A `pull_request` workflow may put the release guard RELEASE_GUARD in front of a
-     standard form, so every job of a release pull request runs on `onepeek-arm64-od` (sandbox.md section 7f items 5
-     and 8, R-E0-6); the job keeps the class of the standard form behind it. Exactly that text, nowhere else.
+     `workflow_call` workflow of OnePeek/.github names labels only inside the exact `inputs.runner` mapping of section
+     5.3 (PUBLIC_HEAD may stand in front of a light or fast form, never with the stateful label); no public workflow
+     reads `vars.RUNNER`; every call of a shared or local reusable workflow passes `runner: public-hosted`, or the job
+     would wait for a runner that never takes it.
+  2. Private repos: `runs-on` is one of the forms of section 5.3 (no other labels, no `ghr-*`, no GitHub-hosted label:
+     the `github-only` form and .github/workflow-lint/github-only-jobs.yaml are retired); the text `public-hosted`
+     appears nowhere. Exempt by name: onepeek-infra's ci-runner-canary.yml and ci-runner-image.yml, which name
+     `onepeek-arm64` and `onepeek-arm64-canary` directly. A `pull_request` workflow may put the release guard
+     RELEASE_GUARD in front of a light or fast form, so every job of a release pull request runs on `onepeek-arm64-od`
+     (sandbox.md section 7f items 5 and 8, R-E0-6); the job keeps the class of the form behind it. Exactly that text,
+     nowhere else.
   3. Every job that can run on `onepeek-*` sets `timeout-minutes`: at most 60 (fast, arm-build), 150 (stateful), or its
      named TIMEOUT_EXCEPTIONS entry. An expression (for example one that depends on an input) is read as its larger value,
      and only when it is made of `inputs.*` comparisons with a literal, `&&`, `||`, parentheses and bare integer
@@ -23,7 +32,12 @@
      digests (foundation-playbook §12a slice 4 item 4). An image that is exactly one `${{ inputs.* }}` or
      `${{ matrix.* }}` expression passes: the caller names, and pins, the image.
 
+  7. Every repo: a GitHub-hosted label (`ubuntu-*`, `macos-*`, `windows-*`) appears in a job's runs-on only as
+     `ubuntu-latest` in a public repo: the whole runs-on of a job outside OnePeek/.github's workflow_call workflows, or
+     inside PUBLIC_HEAD of one of those.
+
 Usage: check_runner_labels.py --kind public|private --repo OnePeek/<name> [--list FILE] WORKFLOW_DIR
+(--list is accepted and ignored: github-only-jobs.yaml is retired, and callers at older pins may still pass it.)
 Exit status 1 when any rule is broken.
 """
 from __future__ import annotations
@@ -39,9 +53,11 @@ import yaml
 EXEMPT = {("OnePeek/onepeek-infra", "ci-runner-canary.yml"), ("OnePeek/onepeek-infra", "ci-runner-image.yml")}
 EXEMPT_LABELS = {"onepeek-arm64", "onepeek-arm64-canary"}
 MAPPING_REPO = "OnePeek/.github"  # the only public repo whose workflow_call workflows may hold the mapping
-PROD_GUARD = "inputs.environment == 'prod' && 'ubuntu-latest' || "
-RELEASE_GUARD = ("github.base_ref == 'release' && (vars.RUNNER == 'onepeek' || vars.RUNNER == 'canary') "
-                 "&& 'onepeek-arm64-od' || ")
+PUBLIC_HOSTED = "public-hosted"  # the reserved runner value: only a public repo's own CI passes it
+PUBLIC_HEAD = f"inputs.runner == '{PUBLIC_HOSTED}' && 'ubuntu-latest' || "
+RELEASE_GUARD = "github.base_ref == 'release' && 'onepeek-arm64-od' || "
+HOSTED = re.compile(r"(?<![\w-])(?:ubuntu|macos|windows)-[\w.-]+")
+STATEFUL = "onepeek-arm64-od"  # the stateful class: one plain label, whatever the runner input says
 LIMITS = {"light": 30, "fast": 60, "arm-build": 60, "stateful": 150}
 # Named exceptions to rule 3 (ci-runners.md section 5.4), by (repo, workflow, job): the sandbox run lock waits up to
 # 80 minutes on the small class (sandbox.md section 7c item 4), under the spot reaper's 90-minute lifetime.
@@ -131,20 +147,12 @@ def timeout_minutes(value: object) -> int | None:
 
 
 def _forms(var: str) -> dict[str, str]:
-    """The exact runs-on expressions of section 5.3, by job class, for `var` (inputs.runner or vars.RUNNER).
-
-    In the shared workflows the arm-build class falls back to ubuntu-latest (with QEMU) until hosted ARM is proven
-    on a private repo, so there it equals the fast form."""
-    arm_hosted = "ubuntu-latest" if var == "inputs.runner" else "ubuntu-24.04-arm"
-    def three(onepeek: str, canary: str, hosted: str) -> str:
-        return f"{var} == 'onepeek' && '{onepeek}' || {var} == 'canary' && '{canary}' || '{hosted}'"
-    return {
-        "light": three("onepeek-arm64-small", "onepeek-arm64-canary", "ubuntu-latest"),
-        "fast": three("onepeek-arm64", "onepeek-arm64-canary", "ubuntu-latest"),
-        "arm-build": three("onepeek-arm64", "onepeek-arm64-canary", arm_hosted),
-        "stateful": three("onepeek-arm64-od", "onepeek-arm64-od", "ubuntu-latest"),
-        "github-only": "ubuntu-latest",
-    }
+    """The exact runs-on expressions of section 5.3 for the light and fast classes, for `var` (inputs.runner or
+    vars.RUNNER). Anything but `canary` (unset, `github`, `onepeek`, a typo) lands on our class: fail closed to our
+    runners. The stateful class is the plain label STATEFUL (canary and every other value share it)."""
+    def two(onepeek: str) -> str:
+        return f"{var} == 'canary' && 'onepeek-arm64-canary' || '{onepeek}'"
+    return {"light": two("onepeek-arm64-small"), "fast": two("onepeek-arm64")}
 
 
 def _expr(value: object) -> str | None:
@@ -155,20 +163,21 @@ def _expr(value: object) -> str | None:
     return " ".join(m.group(1).split()) if m else None
 
 
-def classify(runs_on: object, var: str, allow_prod_guard: bool, allow_release_guard: bool = False) -> str | None:
-    """The job class when runs-on is one of the allowed forms, else None. With allow_release_guard (a private
-    pull_request workflow) RELEASE_GUARD may stand once in front of a standard form; the class is that form's."""
-    if runs_on == "ubuntu-latest":
-        return "github-only"
+def classify(runs_on: object, var: str, allow_public_head: bool = False, allow_release_guard: bool = False) -> str | None:
+    """The job class when runs-on is one of the allowed forms, else None. STATEFUL alone is stateful. With
+    allow_public_head (OnePeek/.github's workflow_call workflows) PUBLIC_HEAD may stand once in front of a light or fast
+    form; with allow_release_guard (a private pull_request workflow) RELEASE_GUARD may; the class is the form's behind."""
+    if runs_on == STATEFUL:
+        return "stateful"
     expr = _expr(runs_on)
     if expr is None:
         return None
-    if allow_prod_guard and expr.startswith(PROD_GUARD):
-        expr = expr[len(PROD_GUARD):]
-    if allow_release_guard and expr.startswith(RELEASE_GUARD):
+    if allow_public_head and expr.startswith(PUBLIC_HEAD):
+        expr = expr[len(PUBLIC_HEAD):]
+    elif allow_release_guard and expr.startswith(RELEASE_GUARD):
         expr = expr[len(RELEASE_GUARD):]
     for cls, form in _forms(var).items():
-        if cls != "github-only" and expr == form:
+        if expr == form:
             return cls
     return None
 
@@ -198,14 +207,26 @@ def _pushes_dev(triggers: dict) -> bool:
     return branches is None or "dev" in branches or "*" in branches or "**" in branches
 
 
-def load_listed(path: Path | None) -> set[tuple[str, str, str]]:
-    if path is None:
-        return set()
-    doc = yaml.safe_load(path.read_text()) or {}
-    return {(e["repo"], e["workflow"], e["job"]) for e in doc.get("jobs") or []}
+def hosted_ok(ro: object, kind: str, public_callable: bool) -> bool:
+    """Rule 7: where a GitHub-hosted label may stand. Only `ubuntu-latest`, only in a public repo: as the whole runs-on
+    of a job outside OnePeek/.github's workflow_call workflows, or inside PUBLIC_HEAD of one of those."""
+    text = ro if isinstance(ro, str) else json.dumps(ro)
+    found = HOSTED.findall(text)
+    if not found:
+        return True
+    if kind != "public" or found != ["ubuntu-latest"]:
+        return False
+    if public_callable:
+        expr = _expr(ro)
+        return expr is not None and expr.startswith(PUBLIC_HEAD)
+    return ro == "ubuntu-latest"
 
 
-def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str]]) -> list[str]:
+def _reusable_call(uses: str) -> bool:
+    return uses.startswith(("OnePeek/.github/.github/workflows/", "./.github/workflows/"))
+
+
+def check_file(path: Path, kind: str, repo: str) -> list[str]:
     errors: list[str] = []
     name = path.name
     where = f"{repo}:{name}"
@@ -225,9 +246,13 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
     if kind == "public":
         for job_id, job in jobs.items():
             given = (job.get("with") or {}).get("runner")
-            if given is not None and given != "github":
-                errors.append(f"{where}: job {job_id}: rule 1: a public repo passes no runner other than github, got {given!r}.")
+            if _reusable_call(str(job.get("uses", ""))) and given != PUBLIC_HOSTED:
+                errors.append(f"{where}: job {job_id}: rule 1: a public repo passes runner: {PUBLIC_HOSTED} to every shared "
+                              f"workflow (our runners never take a public repo's job), got {given!r}.")
         errors += _public(where, name, doc, jobs, callable_)
+    elif PUBLIC_HOSTED in text:
+        errors.append(f"{where}: rule 2: {PUBLIC_HOSTED!r} is reserved for the public repos' own CI; a private repo's jobs "
+                      "run on our runners only (founder ruling 2026-11-15).")
     for job_id, job in jobs.items():
         for image in _job_images(job):
             if CALLER_IMAGE.fullmatch(image.strip()):
@@ -243,11 +268,19 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
             continue
         ro = job["runs-on"]
         label = f"{where}: job {job_id}"
+        public_callable = kind == "public" and callable_ and repo == MAPPING_REPO
+        if not hosted_ok(ro, kind, public_callable):
+            errors.append(f"{label}: rule 7: runs-on {ro!r} names a GitHub-hosted runner; every job runs on our runners "
+                          "(founder ruling 2026-11-15), except a public repo's own CI on ubuntu-latest.")
+            continue
         if kind == "public":
-            cls = classify(ro, "inputs.runner", True) if callable_ and repo == MAPPING_REPO else None
-            if callable_ and cls is None and ro != "ubuntu-latest":
-                errors.append(f"{label}: rule 1: runs-on in a public workflow_call workflow must be ubuntu-latest"
-                              + (" or a mapping form of section 5.3." if repo == MAPPING_REPO else "."))
+            cls = classify(ro, "inputs.runner", True) if public_callable else None
+            if public_callable and cls is None:
+                errors.append(f"{label}: rule 1: runs-on in OnePeek/.github's workflow_call workflows must be a mapping "
+                              "form of section 5.3.")
+                continue
+            if callable_ and not public_callable and _names_runner(ro):
+                errors.append(f"{label}: rule 1: only OnePeek/.github's workflow_call workflows hold the runner mapping.")
                 continue
         else:
             cls = classify(ro, "vars.RUNNER", False, allow_release_guard="pull_request" in triggers)
@@ -260,9 +293,7 @@ def check_file(path: Path, kind: str, repo: str, listed: set[tuple[str, str, str
             if cls is None:
                 errors.append(f"{label}: rule 2: runs-on {ro!r} is not one of the forms of ci-runners.md section 5.3.")
                 continue
-        if (repo, name, job_id) in listed and ro != "ubuntu-latest":
-            errors.append(f"{label}: rule 2: listed in github-only-jobs.yaml, so runs-on must be ubuntu-latest.")
-        if cls is not None and cls != "github-only" and _names_runner(ro):
+        if cls is not None and _names_runner(ro):
             limit = TIMEOUT_EXCEPTIONS.get((repo, name, job_id), LIMITS[cls])
             tm = timeout_minutes(job.get("timeout-minutes"))
             if tm is None or tm > limit:
@@ -332,13 +363,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--kind", choices=["public", "private"], required=True)
     ap.add_argument("--repo", required=True, help="OnePeek/<name>")
-    ap.add_argument("--list", type=Path, help="github-only-jobs.yaml")
+    ap.add_argument("--list", type=Path, help="ignored: github-only-jobs.yaml is retired (founder ruling 2026-11-15)")
     ap.add_argument("dir", type=Path)
     a = ap.parse_args(argv)
-    listed = load_listed(a.list)
     errors: list[str] = []
     for p in sorted([*a.dir.glob("*.yml"), *a.dir.glob("*.yaml")]):
-        errors += check_file(p, a.kind, a.repo, listed)
+        errors += check_file(p, a.kind, a.repo)
     for e in errors:
         print(f"::error::{e}")
     if not errors:

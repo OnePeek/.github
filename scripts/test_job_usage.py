@@ -306,7 +306,7 @@ class Workflows(unittest.TestCase):
             self.assertEqual(step.get("timeout-minutes"), 1, where)
             self.assertNotIn("shell", step, where)
             self.assertEqual(step.get("run"), run, where)
-            self.assertEqual(step.get("env"), {"RUNNER_CLASS": labels.classify(job["runs-on"], "inputs.runner", False),
+            self.assertEqual(step.get("env"), {"RUNNER_CLASS": labels.classify(job["runs-on"], "inputs.runner", True),
                                                "RUNNER_INPUT": "${{ inputs.runner }}"}, where)
             self.assertEqual(sum(1 for s in job["steps"] if s.get("run") == run), 1, where)
         # fast-checks.yml fast joined with decision 180; ready.yml ready (GH-1); depends-on.yml gone (A2b)

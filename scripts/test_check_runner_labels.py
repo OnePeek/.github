@@ -1,4 +1,5 @@
-"""One fixture per workflow-lint rule of onepeek-docs architecture/lld/infra/ci-runners.md section 5.4."""
+"""One fixture per workflow-lint rule of onepeek-infra docs/lld/ci-runners.md section 5.4 (founder ruling 2026-11-15,
+F694: every job on our runners; only the public repos' own CI on ubuntu-latest, through `public-hosted`)."""
 import tempfile
 import textwrap
 import unittest
@@ -6,20 +7,25 @@ from pathlib import Path
 
 import check_runner_labels as lint
 
-FAST_PUBLIC = "${{ inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}"
-ARM_PUBLIC = "${{ inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}"
-LIGHT_PUBLIC = "${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}"
-STATEFUL_PUBLIC = "${{ inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}"
+FAST_PUBLIC = "${{ inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64' }}"
+LIGHT_PUBLIC = "${{ inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64-small' }}"
+STATEFUL_PUBLIC = "onepeek-arm64-od"
+HEAD = "inputs.runner == 'public-hosted' && 'ubuntu-latest' || "
+FAST_HOSTED = "${{ " + HEAD + FAST_PUBLIC[4:]
+LIGHT_HOSTED = "${{ " + HEAD + LIGHT_PUBLIC[4:]
 FAST_PRIVATE = FAST_PUBLIC.replace("inputs.runner", "vars.RUNNER")
-STATEFUL_PRIVATE = STATEFUL_PUBLIC.replace("inputs.runner", "vars.RUNNER")
-PROD_GUARD = "${{ inputs.environment == 'prod' && 'ubuntu-latest' || " + FAST_PUBLIC[4:]
+STATEFUL_PRIVATE = "onepeek-arm64-od"
+# The forms before the ruling: an unset or `github` runner fell back to ubuntu-latest, and prod went GitHub-hosted.
+OLD_FAST = "${{ inputs.runner == 'onepeek' && 'onepeek-arm64' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}"
+OLD_STATEFUL = "${{ inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}"
+OLD_PROD = "${{ inputs.environment == 'prod' && 'ubuntu-latest' || " + OLD_STATEFUL[4:]
 
 
-def run(kind, repo, name, text, listed=()):
+def run(kind, repo, name, text):
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / name
         p.write_text(textwrap.dedent(text))
-        return lint.check_file(p, kind, repo, set(listed))
+        return lint.check_file(p, kind, repo)
 
 
 def reusable(runs_on, timeout="5", extra=""):
@@ -60,8 +66,27 @@ class ExemptMatrix(unittest.TestCase):
 
 class Rule1Public(unittest.TestCase):
     def test_reusable_mapping_is_allowed(self):
-        for m in (LIGHT_PUBLIC, FAST_PUBLIC, ARM_PUBLIC, STATEFUL_PUBLIC, PROD_GUARD):
+        for m in (LIGHT_PUBLIC, FAST_PUBLIC, STATEFUL_PUBLIC, LIGHT_HOSTED, FAST_HOSTED):
             self.assertEqual(run("public", "OnePeek/.github", "a.yml", reusable(m)), [], m)
+
+    def test_the_old_hosted_fallback_and_prod_branch_are_refused(self):
+        # Today's code before the ruling: every one of these sends a private caller's job to GitHub-hosted runners.
+        for m in (OLD_FAST, OLD_STATEFUL, OLD_PROD, "${{ inputs.environment == 'prod' && 'ubuntu-latest' || " + FAST_PUBLIC[4:]):
+            errs = run("public", "OnePeek/.github", "a.yml", reusable(m))
+            self.assertTrue(any("rule 7" in e for e in errs), (m, errs))
+
+    def test_the_public_head_never_stands_before_the_stateful_label(self):
+        for m in ("${{ " + HEAD + "'onepeek-arm64-od' }}", "${{ " + HEAD + "inputs.runner == 'canary' && 'onepeek-arm64-od' || 'onepeek-arm64-od' }}"):
+            errs = run("public", "OnePeek/.github", "a.yml", reusable(m))
+            self.assertTrue(any("rule 1" in e for e in errs), (m, errs))
+
+    def test_the_public_head_names_only_ubuntu_latest_and_only_once_in_front(self):
+        for m in ("${{ inputs.runner == 'public-hosted' && 'ubuntu-24.04' || " + FAST_PUBLIC[4:],
+                  "${{ inputs.runner == 'public-hosted' && 'macos-latest' || " + FAST_PUBLIC[4:],
+                  "${{ " + FAST_PUBLIC[4:-3] + " || 'ubuntu-latest' }}",
+                  "${{ " + HEAD + HEAD + FAST_PUBLIC[4:],
+                  "${{ inputs.runner == 'github' && 'ubuntu-latest' || " + FAST_PUBLIC[4:]):
+            self.assertNotEqual(run("public", "OnePeek/.github", "a.yml", reusable(m)), [], m)
 
     def test_non_reusable_workflow_naming_onepeek_label_is_refused(self):
         errs = run("public", "OnePeek/plugin-owl", "ci.yml", own("onepeek-arm64"))
@@ -82,7 +107,7 @@ class Rule1Public(unittest.TestCase):
         self.assertTrue(any("rule 1" in e for e in errs), errs)
 
     def test_reusable_naming_a_label_outside_runs_on_is_refused(self):
-        errs = run("public", "OnePeek/.github", "a.yml", reusable(FAST_PUBLIC, extra="# x"), [])
+        errs = run("public", "OnePeek/.github", "a.yml", reusable(FAST_PUBLIC, extra="# x"))
         self.assertEqual(errs, [])
         text = reusable(FAST_PUBLIC).replace("steps: [{run: echo}]", "steps: [{run: echo onepeek-arm64}]")
         self.assertTrue(any("rule 1" in e for e in run("public", "OnePeek/.github", "a.yml", text)))
@@ -98,17 +123,26 @@ class Rule1PublicPassthrough(unittest.TestCase):
     def test_free_passthrough_in_a_public_reusable_workflow_is_refused(self):
         for ro in ("${{ inputs.label }}", "${{ inputs.runner }}", "ubuntu-24.04", "[ubuntu-latest]"):
             errs = run("public", "OnePeek/.github", "a.yml", reusable(ro))
-            self.assertTrue(any("rule 1" in e for e in errs), (ro, errs))
+            self.assertTrue(any("rule 1" in e or "rule 7" in e for e in errs), (ro, errs))
 
-    def test_plain_hosted_label_is_allowed(self):
-        self.assertEqual(run("public", "OnePeek/.github", "a.yml", reusable("ubuntu-latest")), [])
+    def test_a_plain_hosted_label_in_a_shared_workflow_is_refused(self):
+        # A private caller would land on it: OnePeek/.github's shared jobs reach ubuntu-latest only through the head.
+        errs = run("public", "OnePeek/.github", "a.yml", reusable("ubuntu-latest"))
+        self.assertTrue(any("rule 7" in e for e in errs), errs)
 
     def test_mapping_is_allowed_only_in_the_dot_github_repo(self):
-        errs = run("public", "OnePeek/plugin-owl", "a.yml", reusable(FAST_PUBLIC))
-        self.assertTrue(any("rule 1" in e for e in errs), errs)
+        for m in (FAST_PUBLIC, FAST_HOSTED, STATEFUL_PUBLIC):
+            errs = run("public", "OnePeek/plugin-owl", "a.yml", reusable(m))
+            self.assertTrue(any("rule 1" in e or "rule 7" in e for e in errs), (m, errs))
         self.assertEqual(run("public", "OnePeek/plugin-owl", "a.yml", reusable("ubuntu-latest")), [])
 
-    def test_a_public_repo_passes_no_runner_but_github(self):
+    def test_a_public_repos_own_workflow_runs_on_ubuntu_latest_only(self):
+        self.assertEqual(run("public", "OnePeek/.github", "ci.yml", own("ubuntu-latest")), [])
+        for ro in ("ubuntu-24.04", "macos-latest", "windows-latest", "[ubuntu-latest]"):
+            errs = run("public", "OnePeek/plugin-owl", "ci.yml", own(ro))
+            self.assertTrue(any("rule 7" in e for e in errs), (ro, errs))
+
+    def test_a_public_repo_passes_public_hosted_to_every_shared_call(self):
         call = """\
             on: pull_request
             jobs:
@@ -117,30 +151,35 @@ class Rule1PublicPassthrough(unittest.TestCase):
                 with:
                   runner: %s
             """
-        for given, ok in (("github", True), ("onepeek", False), ("canary", False), ("${{ vars.RUNNER }}", False)):
+        for given, ok in (("public-hosted", True), ("github", False), ("onepeek", False), ("canary", False),
+                          ("${{ vars.RUNNER }}", False), ("''", False)):
             errs = run("public", "OnePeek/plugin-owl", "c.yml", call % given)
             self.assertEqual(errs == [], ok, (given, errs))
+        # No runner at all lands on our runners, which never take a public repo's job: refused, local calls too.
+        bare = call.replace("                with:\n                  runner: %s\n", "")
+        self.assertTrue(any("rule 1" in e for e in run("public", "OnePeek/plugin-owl", "c.yml", bare)))
+        local = (call % "github").replace("OnePeek/.github/.github/workflows/secret-scan.yml@abc", "./.github/workflows/ready.yml")
+        self.assertTrue(any("rule 1" in e for e in run("public", "OnePeek/.github", "c.yml", local)))
+        self.assertEqual(run("public", "OnePeek/.github", "c.yml", local.replace("runner: github", "runner: public-hosted")), [])
 
 
 class Rule2Private(unittest.TestCase):
     def test_forms_of_section_5_3_are_allowed(self):
-        for m in (FAST_PRIVATE, STATEFUL_PRIVATE, "ubuntu-latest"):
+        for m in (FAST_PRIVATE, LIGHT_PRIVATE, STATEFUL_PRIVATE):
             self.assertEqual(run("private", "OnePeek/backend-service", "c.yml", own(m)), [], m)
 
     def test_other_labels_are_refused(self):
-        for m in ("self-hosted", "ghr-arm64", "onepeek-arm64", "ubuntu-24.04", "${{ matrix.os }}", "[self-hosted, linux]"):
+        for m in ("self-hosted", "ghr-arm64", "onepeek-arm64", "${{ matrix.os }}", "[self-hosted, linux]"):
             errs = run("private", "OnePeek/backend-service", "c.yml", own(m))
             self.assertTrue(any("rule 2" in e for e in errs), (m, errs))
 
-    def test_listed_job_must_be_github_only(self):
-        listed = [("OnePeek/onepeek-infra", "promote.yml", "j")]
-        self.assertEqual(run("private", "OnePeek/onepeek-infra", "promote.yml", own("ubuntu-latest"), listed), [])
-        errs = run("private", "OnePeek/onepeek-infra", "promote.yml", own(FAST_PRIVATE), listed)
-        self.assertTrue(any("github-only-jobs" in e for e in errs), errs)
-
-    def test_listed_job_in_another_repo_is_not_affected(self):
-        listed = [("OnePeek/onepeek-infra", "promote.yml", "j")]
-        self.assertEqual(run("private", "OnePeek/backend-service", "promote.yml", own(FAST_PRIVATE), listed), [])
+    def test_public_hosted_is_refused_anywhere_in_a_private_repo(self):
+        call = ("on: pull_request\njobs:\n  j:\n    uses: OnePeek/.github/.github/workflows/secret-scan.yml@abc\n"
+                "    with:\n      runner: public-hosted\n")
+        self.assertTrue(any("rule 2" in e for e in run("private", "OnePeek/onepeek-infra", "c.yml", call)))
+        self.assertEqual(run("private", "OnePeek/onepeek-infra", "c.yml", call.replace("public-hosted", "${{ vars.RUNNER || 'github' }}")), [])
+        head = "${{ vars.RUNNER == 'public-hosted' && 'ubuntu-latest' || " + FAST_PRIVATE[4:]
+        self.assertTrue(run("private", "OnePeek/onepeek-infra", "c.yml", own(head)))
 
     def test_canary_and_image_workflows_of_infra_are_exempt_by_name(self):
         for name in ("ci-runner-canary.yml", "ci-runner-image.yml"):
@@ -152,15 +191,39 @@ class Rule2Private(unittest.TestCase):
             errs = run("private", repo, name, own("onepeek-arm64"))
             self.assertTrue(any("rule 2" in e for e in errs), (repo, name, errs))
 
-    def test_the_shipped_list_parses(self):
-        path = Path(__file__).resolve().parents[1] / ".github" / "workflow-lint" / "github-only-jobs.yaml"
-        self.assertIsInstance(lint.load_listed(path), set)
+    def test_the_github_only_list_is_retired(self):
+        # Founder ruling 2026-11-15: no job is GitHub-hosted, so no list of jobs that must be. --list is still accepted
+        # (callers at older pins pass it) and read by nothing: a path that does not exist changes nothing.
+        root = Path(__file__).resolve().parents[1]
+        self.assertFalse((root / ".github" / "workflow-lint" / "github-only-jobs.yaml").exists())
+        self.assertFalse(hasattr(lint, "load_listed"))
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "c.yml").write_text(textwrap.dedent(own(FAST_PRIVATE)))
+            self.assertEqual(lint.main(["--kind", "private", "--repo", "OnePeek/x", "--list", str(Path(d) / "gone.yaml"), d]), 0)
 
 
-RELEASE_GUARD = "github.base_ref == 'release' && (vars.RUNNER == 'onepeek' || vars.RUNNER == 'canary') && 'onepeek-arm64-od' || "
+class Rule7NoGitHubHosted(unittest.TestCase):
+    """Founder ruling 2026-11-15 (F694): a GitHub-hosted label anywhere in a private repo's runs-on fails the check."""
+
+    def test_every_hosted_label_is_refused_in_a_private_repo(self):
+        for ro in ("ubuntu-latest", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-slim", "macos-latest", "macos-14",
+                   "windows-latest", "[ubuntu-latest]", "{group: x, labels: [ubuntu-latest]}",
+                   OLD_FAST.replace("inputs.runner", "vars.RUNNER"),
+                   "${{ vars.RUNNER == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}",
+                   "${{ github.event_name == 'push' && 'ubuntu-latest' || " + FAST_PRIVATE[4:]):
+            errs = run("private", "OnePeek/onepeek-infra", "c.yml", own(ro))
+            self.assertTrue(any("rule 7" in e for e in errs), (ro, errs))
+
+    def test_the_old_private_forms_are_refused(self):
+        old_light = "${{ vars.RUNNER == 'onepeek' && 'onepeek-arm64-small' || vars.RUNNER == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}"
+        old_arm = "${{ vars.RUNNER == 'onepeek' && 'onepeek-arm64' || vars.RUNNER == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-24.04-arm' }}"
+        for ro in (old_light, old_arm, OLD_STATEFUL.replace("inputs.runner", "vars.RUNNER")):
+            self.assertTrue(run("private", "OnePeek/backend-service", "c.yml", own(ro)), ro)
+
+
+RELEASE_GUARD = "github.base_ref == 'release' && 'onepeek-arm64-od' || "
+OLD_RELEASE_GUARD = "github.base_ref == 'release' && (vars.RUNNER == 'onepeek' || vars.RUNNER == 'canary') && 'onepeek-arm64-od' || "
 LIGHT_PRIVATE = LIGHT_PUBLIC.replace("inputs.runner", "vars.RUNNER")
-ARM_PRIVATE = ("${{ vars.RUNNER == 'onepeek' && 'onepeek-arm64' || vars.RUNNER == 'canary' && 'onepeek-arm64-canary' "
-               "|| 'ubuntu-24.04-arm' }}")
 
 
 def release(form):
@@ -173,15 +236,15 @@ class Rule2ReleaseForm(unittest.TestCase):
     the base is release, in exactly this form, in front of a standard form."""
 
     def test_the_release_form_in_front_of_each_standard_form_is_allowed(self):
-        for form in (LIGHT_PRIVATE, FAST_PRIVATE, ARM_PRIVATE, STATEFUL_PRIVATE):
+        for form in (LIGHT_PRIVATE, FAST_PRIVATE):
             self.assertEqual(run("private", "OnePeek/onepeek-infra", "sandbox.yml", own(release(form))), [], form)
 
-    def test_the_exact_text_of_infra_241_is_allowed(self):
-        # onepeek-infra#241 head ab5220f, .github/workflows/sandbox.yml line 61.
+    def test_the_text_of_infra_241_is_refused_now(self):
+        # onepeek-infra#241 head ab5220f, .github/workflows/sandbox.yml line 61: its tail falls back to ubuntu-latest.
         text = ("${{ github.base_ref == 'release' && (vars.RUNNER == 'onepeek' || vars.RUNNER == 'canary') && 'onepeek-arm64-od' "
                 "|| vars.RUNNER == 'onepeek' && 'onepeek-arm64-small' || vars.RUNNER == 'canary' && 'onepeek-arm64-canary' "
                 "|| 'ubuntu-latest' }}")
-        self.assertEqual(run("private", "OnePeek/onepeek-infra", "sandbox.yml", own(text)), [])
+        self.assertTrue(any("rule 7" in e for e in run("private", "OnePeek/onepeek-infra", "sandbox.yml", own(text))))
 
     def test_the_release_form_keeps_the_class_limit_of_its_standard_form(self):
         self.assertEqual(run("private", "OnePeek/x", "c.yml", own(release(LIGHT_PRIVATE), "30")), [])
@@ -198,8 +261,8 @@ class Rule2ReleaseForm(unittest.TestCase):
             "the canary label": release(FAST_PRIVATE).replace("'onepeek-arm64-od' ||", "'onepeek-arm64-canary' ||", 1),
             "a base other than release": release(FAST_PRIVATE).replace("'release'", "'dev'", 1),
             "a head ref": release(FAST_PRIVATE).replace("github.base_ref", "github.head_ref", 1),
-            "no RUNNER guard": release(FAST_PRIVATE).replace("(vars.RUNNER == 'onepeek' || vars.RUNNER == 'canary') && ", ""),
-            "only the onepeek guard": release(FAST_PRIVATE).replace(" || vars.RUNNER == 'canary')", ")", 1),
+            "the old RUNNER guard": "${{ " + OLD_RELEASE_GUARD + FAST_PRIVATE[4:],
+            "in front of the stateful label": "${{ " + RELEASE_GUARD + "'onepeek-arm64-od' }}",
             "no standard tail": "${{ " + RELEASE_GUARD + "'ubuntu-latest' }}",
             "no tail at all": "${{ " + RELEASE_GUARD.rstrip(" |") + " }}",
             "a tail that is not a standard form": "${{ " + RELEASE_GUARD + "vars.RUNNER == 'onepeek' && 'self-hosted' || 'ubuntu-latest' }}",
@@ -208,7 +271,7 @@ class Rule2ReleaseForm(unittest.TestCase):
         }
         for why, ro in bad.items():
             errs = run("private", "OnePeek/onepeek-infra", "sandbox.yml", own(ro))
-            self.assertTrue(any("rule 2" in e for e in errs), (why, errs))
+            self.assertTrue(any("rule 2" in e or "rule 7" in e for e in errs), (why, errs))
 
     def test_a_workflow_without_a_pull_request_trigger_is_refused(self):
         for trigger in ("push", "workflow_dispatch", "[push, workflow_dispatch]", "{workflow_call: {}}", "schedule"):
@@ -216,7 +279,7 @@ class Rule2ReleaseForm(unittest.TestCase):
             self.assertTrue(any("rule 2" in e for e in errs), (trigger, errs))
 
     def test_a_public_repo_may_not_use_the_release_form(self):
-        public = "${{ github.base_ref == 'release' && (inputs.runner == 'onepeek' || inputs.runner == 'canary') && 'onepeek-arm64-od' || " + FAST_PUBLIC[4:]
+        public = "${{ github.base_ref == 'release' && 'onepeek-arm64-od' || " + FAST_PUBLIC[4:]
         for ro in (public, release(FAST_PRIVATE)):
             self.assertNotEqual(run("public", "OnePeek/.github", "a.yml", reusable(ro)), [], ro)
             self.assertNotEqual(run("public", "OnePeek/.github", "a.yml", own(ro)), [], ro)
@@ -290,8 +353,8 @@ class Rule3Timeouts(unittest.TestCase):
         errs = run("public", "OnePeek/.github", "a.yml", reusable(FAST_PUBLIC, timeout="61"))
         self.assertTrue(any("rule 3" in e for e in errs), errs)
 
-    def test_github_only_job_needs_no_limit(self):
-        self.assertEqual(run("private", "OnePeek/x", "c.yml", own("ubuntu-latest", "300")), [])
+    def test_a_public_repos_hosted_job_needs_no_limit(self):
+        self.assertEqual(run("public", "OnePeek/plugin-owl", "c.yml", own("ubuntu-latest", "300")), [])
 
 
 class Rule4Triggers(unittest.TestCase):
@@ -304,8 +367,8 @@ class Rule4Triggers(unittest.TestCase):
         errs = run("private", "OnePeek/x", "c.yml", own(FAST_PRIVATE, trigger="workflow_run"))
         self.assertTrue(any("rule 4" in e for e in errs), errs)
 
-    def test_workflow_run_on_hosted_runner_is_allowed(self):
-        self.assertEqual(run("private", "OnePeek/x", "c.yml", own("ubuntu-latest", trigger="workflow_run")), [])
+    def test_workflow_run_on_hosted_runner_is_allowed_in_a_public_repo(self):
+        self.assertEqual(run("public", "OnePeek/plugin-owl", "c.yml", own("ubuntu-latest", trigger="workflow_run")), [])
 
 
 def caller(trigger, environment="preprod", flag=""):
@@ -421,29 +484,48 @@ class Rule6ImageDigests(unittest.TestCase):
 class SharedWorkflows(unittest.TestCase):
     def test_this_repos_workflows_pass_the_public_rules(self):
         root = Path(__file__).resolve().parents[1]
-        rc = lint.main(["--kind", "public", "--repo", "OnePeek/.github", "--list",
-                        str(root / ".github" / "workflow-lint" / "github-only-jobs.yaml"),
-                        str(root / ".github" / "workflows")])
+        rc = lint.main(["--kind", "public", "--repo", "OnePeek/.github", str(root / ".github" / "workflows")])
         self.assertEqual(rc, 0)
 
-    def test_every_reusable_workflow_has_the_runner_input_defaulting_to_github(self):
+    def test_every_reusable_workflow_has_the_runner_input_defaulting_to_onepeek(self):
         import yaml
         for p in sorted((Path(__file__).resolve().parents[1] / ".github" / "workflows").glob("*.yml")):
             doc = yaml.safe_load(p.read_text())
             call = (doc.get("on") or doc.get(True) or {}).get("workflow_call")
             if call is None:
                 continue
-            self.assertEqual(call["inputs"]["runner"]["default"], "github", p.name)
+            self.assertEqual(call["inputs"]["runner"]["default"], "onepeek", p.name)
             self.assertEqual(call["inputs"]["runner"]["type"], "string", p.name)
 
-    def test_prod_environment_never_reaches_a_self_hosted_label(self):
+    def test_the_release_workflows_never_reach_a_github_hosted_runner(self):
+        # Founder ruling 2026-11-15: prod included, whatever runner the caller passes (public-hosted too), every job of the
+        # release workflows runs on our runners; the stateful jobs name onepeek-arm64-od whatever the input.
         import yaml
-        for name in ("release-ecs.yml", "deploy-ecs.yml", "operate.yml"):
+        seen = 0
+        for name in ("release-ecs.yml", "deploy-ecs.yml", "operate.yml", "release-lock.yml", "release-notify.yml"):
             doc = yaml.safe_load((Path(__file__).resolve().parents[1] / ".github" / "workflows" / name).read_text())
             for job_id, job in doc["jobs"].items():
                 ro = job.get("runs-on")
-                if ro and "onepeek-" in ro:
-                    self.assertIn("inputs.environment == 'prod' && 'ubuntu-latest' ||", ro, (name, job_id))
+                if ro is None:
+                    continue
+                seen += 1
+                self.assertEqual(lint.HOSTED.findall(ro), [], (name, job_id))
+                self.assertNotIn("public-hosted", ro, (name, job_id))
+                self.assertNotIn("environment", ro, (name, job_id))
+                self.assertIn(ro, ("onepeek-arm64-od", FAST_PUBLIC, LIGHT_PUBLIC), (name, job_id))
+        self.assertEqual(seen, 14)
+
+    def test_this_repos_own_ci_passes_public_hosted(self):
+        import yaml
+        wf = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+        calls = []
+        for name in ("workflow-lint.yml", "tag-main.yml", "ci-image-bump-caller.yml", "spot-rerun-caller.yml"):
+            for job_id, job in yaml.safe_load((wf / name).read_text())["jobs"].items():
+                if "uses" in job:
+                    calls.append((name, job_id, (job.get("with") or {}).get("runner")))
+        self.assertEqual(calls, [("workflow-lint.yml", "fast", "public-hosted"), ("workflow-lint.yml", "ready", "public-hosted"),
+                                 ("tag-main.yml", "tag", "public-hosted"), ("ci-image-bump-caller.yml", "bump", "public-hosted"),
+                                 ("spot-rerun-caller.yml", "spot-rerun", "public-hosted")])
 
 
 if __name__ == "__main__":

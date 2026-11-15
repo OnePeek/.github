@@ -156,7 +156,7 @@ class SharedWorkflow(unittest.TestCase):
 
     def test_it_is_reusable_with_the_runner_input_and_light_class(self):
         call = self.wf[True]["workflow_call"]
-        self.assertEqual(call["inputs"]["runner"]["default"], "github")
+        self.assertEqual(call["inputs"]["runner"]["default"], "onepeek")
         job = self.wf["jobs"]["bump"]
         self.assertEqual(classify(job["runs-on"], "inputs.runner", True), "light")
         self.assertLessEqual(job["timeout-minutes"], 30)
@@ -239,7 +239,7 @@ class OwnCaller(unittest.TestCase):
         self.assertEqual(len(on["schedule"]), 1)
         job = self.wf["jobs"]["bump"]
         self.assertEqual(job["uses"], "./.github/workflows/ci-image-bump.yml")
-        self.assertEqual(job["with"]["runner"], "github")
+        self.assertEqual(job["with"]["runner"], "public-hosted")
         self.assertEqual(self.wf["permissions"], {"contents": "read"})
         self.assertEqual(set(job["secrets"]), {"CI_BUMP_APP_ID", "CI_BUMP_APP_PRIVATE_KEY"})
 

@@ -16,9 +16,9 @@ on:
   workflow_call:
     inputs:
       runner:
-        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
+        description: "onepeek (the default), canary or public-hosted. Callers pass their repository's RUNNER setting, or github; github, onepeek, unset and any other value mean our runner class (F694, 2026-11-15: never GitHub-hosted). public-hosted is for the public repos' own CI only (scripts/check_runner_labels.py). The job's class and this value choose runs-on (ci-runners.md section 5.3)."
         type: string
-        default: github
+        default: onepeek
       pins:
         description: Run the pin check (pins.yml's body, actions/pins).
         type: boolean
@@ -60,7 +60,7 @@ permissions:
 
 jobs:
   fast:
-    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner == 'public-hosted' && 'ubuntu-latest' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64-small' }}
     timeout-minutes: 25  # the sum of the merged jobs' limits less the boots they no longer pay (pins 5, gitleaks 10, contract 10)
     steps:
       # The full history: gitleaks scans the pull request's commits.

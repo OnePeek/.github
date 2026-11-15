@@ -22,4 +22,5 @@ jobs:
     if: github.ref_name == github.event.repository.default_branch
     uses: ./.github/workflows/release-tag.yml
     with:
+      runner: public-hosted  # this repo is public: GitHub-hosted (scripts/check_runner_labels.py rule 1)
       first-version: v1.0.0 # after the old moving tag v1; this repo is not a pre-launch product repo

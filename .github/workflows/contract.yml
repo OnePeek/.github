@@ -14,9 +14,9 @@ on:
   workflow_call:
     inputs:
       runner:
-        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
+        description: "onepeek (the default), canary or public-hosted. Callers pass their repository's RUNNER setting, or github; github, onepeek, unset and any other value mean our runner class (F694, 2026-11-15: never GitHub-hosted). public-hosted is for the public repos' own CI only (scripts/check_runner_labels.py). The job's class and this value choose runs-on (ci-runners.md section 5.3)."
         type: string
-        default: github
+        default: onepeek
       role:
         description: The calling repo, backend, web or infra.
         type: string
@@ -38,7 +38,7 @@ permissions:
 
 jobs:
   contract:
-    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner == 'public-hosted' && 'ubuntu-latest' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64-small' }}
     timeout-minutes: 10
     steps:
       # Only for this workflow's own version; actions/contract checks the pull request out again as _<role>.
