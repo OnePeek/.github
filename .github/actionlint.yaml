@@ -6,3 +6,11 @@ paths:
   .github/workflows/**/*.{yml,yaml}:
     ignore:
       - 'property "workflow_sha" is not defined in object type'
+# Our runner classes (onepeek-infra docs/lld/ci-runners.md section 5.3): the stateful jobs name onepeek-arm64-od
+# directly since the founder ruling of 2026-11-15 (F694). scripts/test_release_lock.py holds this list too.
+self-hosted-runner:
+  labels:
+    - onepeek-arm64
+    - onepeek-arm64-small
+    - onepeek-arm64-od
+    - onepeek-arm64-canary

@@ -87,9 +87,11 @@ if poll == "GARBLED":
 reasons = {"FAILED": "ECS deployment circuit breaker: tasks failed to start.", "IN_PROGRESS": "ECS deployment in progress.",
            "COMPLETED": "ECS deployment completed."}
 deployments = []
-for status, rev, state, running, desired in poll:
+for status, rev, state, running, desired, *dep_id in poll:
     d = {"status": status, "taskDefinition": "arn:aws:ecs:ap-south-1:111111111111:task-definition/" + rev.replace("SVC", svc),
          "runningCount": running, "desiredCount": desired, "pendingCount": max(desired - running, 0)}
+    if dep_id:
+        d["id"] = dep_id[0]
     if state:
         d["rolloutState"], d["rolloutStateReason"] = state, reasons[state]
     deployments.append(d)
@@ -835,8 +837,8 @@ NEW, OLD = "onepeek-preprod-SVC:6", "onepeek-preprod-SVC:5"
 WANT = "api=arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-api:6 worker=arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-worker:6"
 
 
-def dep(status, rev, state, running=1, desired=1):
-    return [status, rev, state, running, desired]
+def dep(status, rev, state, running=1, desired=1, dep_id=None):
+    return [status, rev, state, running, desired] + ([dep_id] if dep_id else [])
 
 
 class StableWait(unittest.TestCase):
@@ -897,6 +899,52 @@ class StableWait(unittest.TestCase):
         self.assertEqual(out.returncode, 1)
         self.assertIn("Timed out", out.stdout)
 
+    def test_a_stale_describe_right_after_a_put_back_waits_instead_of_reporting_a_rollback(self):
+        # F675: a put-back to :5 from :6; the first describe still shows PRIMARY :6 with the earlier :5 deployment ACTIVE.
+        # Listing :5 anywhere used to count as seen, so PRIMARY :6 read as "rolled back by ECS" at once.
+        out, calls = self.wait([[dep("PRIMARY", NEW, "COMPLETED"), dep("ACTIVE", OLD, "COMPLETED", 1, 0)],
+                                [dep("PRIMARY", OLD, "IN_PROGRESS", 0), dep("ACTIVE", NEW, "COMPLETED")],
+                                [dep("PRIMARY", OLD, "COMPLETED")]], services=WANT.replace(":6", ":5"))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("rolled back by ECS", out.stdout)
+        self.assertEqual(calls.count("--services api --output json"), 3)
+
+    def test_a_put_back_that_ecs_then_rolls_back_still_fails_at_once(self):
+        out, calls = self.wait([[dep("PRIMARY", NEW, "COMPLETED"), dep("ACTIVE", OLD, "COMPLETED", 1, 0)],
+                                [dep("PRIMARY", OLD, "IN_PROGRESS", 0), dep("ACTIVE", NEW, "COMPLETED")],
+                                [dep("PRIMARY", NEW, "IN_PROGRESS"), dep("ACTIVE", OLD, "FAILED", 0, 0)]],
+                               services=WANT.replace(":6", ":5"))
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("api was rolled back by ECS", out.stdout)
+        self.assertEqual(calls.count("--services api --output json"), 3)
+
+    def test_a_redeploy_keyed_on_its_deployment_id_never_passes_on_the_deployment_already_running(self):
+        # F675: a forced redeploy keeps the revision, so a stale describe (only the old deployment, COMPLETED, alone)
+        # looked done. With <service>=<revision>@<deployment id> only that deployment, PRIMARY and rolled out, is done.
+        want = " ".join(w + "@ecs-svc/2" for w in WANT.split())
+        out, calls = self.wait([[dep("PRIMARY", NEW, "COMPLETED", dep_id="ecs-svc/1")],
+                                [dep("PRIMARY", NEW, "IN_PROGRESS", 0, dep_id="ecs-svc/2"), dep("ACTIVE", NEW, "COMPLETED", dep_id="ecs-svc/1")],
+                                [dep("PRIMARY", NEW, "COMPLETED", dep_id="ecs-svc/2")]], services=want)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(calls.count("--services api --output json"), 3)
+        out, _ = self.wait([[dep("PRIMARY", NEW, "COMPLETED", dep_id="ecs-svc/1")]], services=want, cap="0")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("Timed out", out.stdout)
+
+    def test_a_redeploy_rolled_back_by_ecs_fails_at_once(self):
+        # The circuit breaker fails the forced deployment and starts a new one of the same revision: by id, a rollback.
+        want = " ".join(w + "@ecs-svc/2" for w in WANT.split())
+        out, calls = self.wait([[dep("PRIMARY", NEW, "IN_PROGRESS", 0, dep_id="ecs-svc/2"), dep("ACTIVE", NEW, "COMPLETED", dep_id="ecs-svc/1")],
+                                [dep("PRIMARY", NEW, "IN_PROGRESS", 1, dep_id="ecs-svc/3")]], services=want)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("api was rolled back by ECS", out.stdout)
+        self.assertEqual(calls.count("--services api --output json"), 2)
+        out, _ = self.wait([[dep("PRIMARY", NEW, "IN_PROGRESS", 0, dep_id="ecs-svc/2")],
+                            [dep("PRIMARY", NEW, "IN_PROGRESS", 1, dep_id="ecs-svc/3"), dep("ACTIVE", NEW, "FAILED", 0, 0, dep_id="ecs-svc/2")]],
+                           services=want)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("api was rolled back by ECS", out.stdout)
+
     def test_a_failed_primary_rollout_fails_at_once(self):
         out, calls = self.wait([[dep("PRIMARY", NEW, "IN_PROGRESS", 0)], [dep("PRIMARY", NEW, "FAILED", 0)]])
         self.assertEqual(out.returncode, 1)
@@ -946,6 +994,42 @@ class StableWait(unittest.TestCase):
         out, _ = self.wait([[dep("PRIMARY", NEW, "FAILED", 1, 0)]], services="api=-", cap="0")
         self.assertEqual(out.returncode, 1)
 
+    def test_credentials_are_minted_again_right_before_the_rollout_and_the_rollback(self):
+        # F668: the role's sessions last 1 h (the role's maximum: no max_session_duration in infra), but the deploy job's
+        # steps before the record may take 54 min, the record 5 and the rollout 45, and verify's checks 37 before a 25-minute rollback:
+        # expired credentials read as "describe-services unreadable 3 times" and fail a healthy rollout. A fresh session
+        # (OIDC, the same role) right before each long step gives it a full hour.
+        for job_id, step_id in (("deploy", "previous"), ("verify", "rollback")):
+            steps = RELEASE["jobs"][job_id]["steps"]
+            first = next(s for s in steps if str(s.get("uses", "")).startswith("aws-actions/configure-aws-credentials@"))
+            i = next(i for i, s in enumerate(steps) if s.get("id") == step_id)
+            again = steps[i - 1]
+            self.assertEqual(again.get("uses"), first["uses"], job_id)
+            self.assertEqual(again["with"], first["with"], job_id)
+            self.assertLessEqual(again["timeout-minutes"], 2, job_id)
+            self.assertEqual(again.get("if"), steps[i].get("if"), job_id)   # it runs exactly when the long step runs
+        self.assertIn("id-token", RELEASE["jobs"]["deploy"]["permissions"])
+        self.assertIn("id-token", RELEASE["jobs"]["verify"]["permissions"])
+
+    def test_no_stretch_between_role_sessions_outlasts_one(self):
+        # F668, RV-111 S3: from each credentials step to the next (or the job's end), the step limits sum to under the role's
+        # 1-hour session, so no step can meet expired credentials. The steps with no limit of their own are short checks.
+        for job_id in ("deploy", "verify"):
+            steps = RELEASE["jobs"][job_id]["steps"]
+            mints = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("aws-actions/configure-aws-credentials@")]
+            self.assertTrue(mints, job_id)
+            for start, end in zip(mints, mints[1:] + [len(steps)]):
+                stretch = sum(s.get("timeout-minutes", 0) for s in steps[start + 1:end])
+                self.assertLessEqual(stretch, 55, (job_id, steps[start].get("name"), stretch))
+
+    def test_the_second_deploy_session_runs_whenever_the_lambda_or_ops_step_runs(self):
+        steps = RELEASE["jobs"]["deploy"]["steps"]
+        i = next(i for i, s in enumerate(steps) if s.get("name", "").startswith("Lambda sandbox functions"))
+        again, ops = steps[i - 1], steps[i + 1]
+        self.assertTrue(again["name"].startswith("A fresh role session for the lambda and ops steps"), again["name"])
+        self.assertTrue(ops["name"].startswith("Verify, render, check the launch settings, register ops"), ops["name"])
+        self.assertEqual(again["if"], "${{ " + ops["if"][4:-3] + " || (" + steps[i]["if"][4:-3] + ") }}")
+
     def test_the_step_limits_cover_the_caps(self):
         roll = next(s for s in RELEASE["jobs"]["deploy"]["steps"] if s.get("id") == "roll")
         self.assertGreaterEqual(roll["timeout-minutes"], 45)
@@ -953,6 +1037,9 @@ class StableWait(unittest.TestCase):
         self.assertIn('if [ "${cap}" -gt 1500 ]; then cap=1500; fi', roll["run"])
         deploy = RELEASE["jobs"]["deploy"]
         self.assertGreater(deploy["timeout-minutes"], sum(s.get("timeout-minutes", 0) for s in deploy["steps"]))
+        verify = RELEASE["jobs"]["verify"]
+        # RV-111 N1: at least 10 minutes over the step limits, for the steps with no limit of their own.
+        self.assertGreaterEqual(verify["timeout-minutes"], sum(s.get("timeout-minutes", 0) for s in verify["steps"]) + 10)
         rollback = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("id") == "rollback")
         self.assertGreaterEqual(rollback["timeout-minutes"], 21)
         self.assertIn("rollout_wait 1200 ${expect}", rollback["run"])
@@ -1132,7 +1219,17 @@ class WatchRetries(unittest.TestCase):
         self.assertEqual(watch["env"]["AWS_RETRY_MODE"], "adaptive")
         self.assertEqual(int(watch["env"]["AWS_MAX_ATTEMPTS"]), 6)
         # Bounded: six attempts of a poll still end inside the step limit, so a hang ends as a failed step (rollback).
-        self.assertEqual(watch["timeout-minutes"], 12)
+        # F658: with the CLI's 60 s connect and read timeouts, one poll of 6 attempts could take 12 minutes, past the step
+        # limit, and a step timeout rolls a healthy release back. Each attempt is now at most 5 + 10 s, so the worst poll
+        # is 6 x 15 s plus 5 adaptive backoffs of at most 20 s = 190 s; the window (600 s) starts before the first poll, so
+        # the window plus one worst poll leaves at least 120 s before the step limit.
+        for line in watch["run"].splitlines():
+            if "aws " in line and not line.strip().startswith("#"):
+                self.assertIn("--cli-connect-timeout 5 --cli-read-timeout 10", line)
+        run = watch["run"]
+        self.assertLess(run.index("end=$((SECONDS + 600))"), run.index("known=$(poll)"))
+        worst_poll = 6 * (5 + 10) + 5 * 20
+        self.assertGreaterEqual(watch["timeout-minutes"] * 60 - 600 - worst_poll, 120)
 
 
 class WatchShell(unittest.TestCase):
@@ -1500,8 +1597,8 @@ class JobGraph(unittest.TestCase):
         # check (and every earlier step) gates every change.
         for name in ("build-image", "build-web", "deploy", "verify"):
             steps = RELEASE["jobs"][name]["steps"]
-            if name == "verify":
-                steps = steps[:next(i for i, s in enumerate(steps) if s.get("id") == "rollback")]
+            if name == "verify":   # up to the rollback and its own fresh role session (F668), which share its `if`
+                steps = steps[:next(i for i, s in enumerate(steps) if s.get("id") == "rollback") - 1]
             for s in steps:
                 self.assertNotRegex(str(s.get("if", "")), r"always\(\)|cancelled\(\)", f"{name}: {s.get('name') or s.get('uses')}")
 
@@ -1523,7 +1620,8 @@ class JobGraph(unittest.TestCase):
         self.assertEqual(limit("build-image", lambda s: s.get("id") == "push"), 20)
         self.assertEqual(limit("deploy", lambda s: s.get("name", "").startswith("Verify, render, register and run the migrate")), 15)
         self.assertEqual(limit("deploy", lambda s: s.get("id") == "roll"), 45)
-        self.assertEqual(limit("verify", lambda s: s.get("id") == "watch"), 12)
+        # F658: the watch's 10-minute window, one worst bounded poll (190 s) and 120 s to spare: 16, not 12.
+        self.assertEqual(limit("verify", lambda s: s.get("id") == "watch"), 16)
         for name, job in RELEASE["jobs"].items():
             if "steps" in job:
                 total = sum(s.get("timeout-minutes", 0) for s in job["steps"])

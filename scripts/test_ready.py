@@ -210,8 +210,8 @@ class ReadyWorkflow(unittest.TestCase):
     def test_one_job_named_ready_with_the_runner_input_and_no_hard_coded_label(self) -> None:  # F413
         self.assertEqual(list(self.DOC["jobs"]), ["ready"])
         runs_on = self.DOC["jobs"]["ready"]["runs-on"]
-        self.assertEqual(runs_on, "${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == "
-                                  "'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}")
+        self.assertEqual(runs_on, "${{ inputs.runner == 'public-hosted' && 'ubuntu-latest' || inputs.runner == "
+                                  "'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64-small' }}")
         inputs = self.DOC[True]["workflow_call"]["inputs"]
         self.assertEqual(sorted(inputs), ["needs", "reproduce", "runner", "skippable"])
         self.assertTrue(inputs["needs"]["required"])

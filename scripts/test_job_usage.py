@@ -21,7 +21,7 @@ ROOT = Path(__file__).parent.parent
 WORKFLOWS = ROOT / ".github/workflows"
 # Jobs on our runners that do not measure: pins.yml, the release paths (release-*, deploy-ecs, operate: the stateful
 # on-demand class, not sized by S0) and spot-rerun (a workflow_run follow-up).
-NOT_MEASURED = {"pins.yml", "release-ecs.yml", "release-lock.yml", "release-tag.yml", "deploy-ecs.yml", "operate.yml",
+NOT_MEASURED = {"pins.yml", "release-ecs.yml", "release-lock.yml", "release-notify.yml", "release-tag.yml", "deploy-ecs.yml", "operate.yml",
                 "spot-rerun.yml"}
 STEP_IF = "${{ always() && runner.environment != 'github-hosted' }}"
 # The step's run: a verbatim copy of scripts/job_usage.py, written to the runner's temp folder and run isolated.
@@ -306,7 +306,7 @@ class Workflows(unittest.TestCase):
             self.assertEqual(step.get("timeout-minutes"), 1, where)
             self.assertNotIn("shell", step, where)
             self.assertEqual(step.get("run"), run, where)
-            self.assertEqual(step.get("env"), {"RUNNER_CLASS": labels.classify(job["runs-on"], "inputs.runner", False),
+            self.assertEqual(step.get("env"), {"RUNNER_CLASS": labels.classify(job["runs-on"], "inputs.runner", True),
                                                "RUNNER_INPUT": "${{ inputs.runner }}"}, where)
             self.assertEqual(sum(1 for s in job["steps"] if s.get("run") == run), 1, where)
         # fast-checks.yml fast joined with decision 180; ready.yml ready (GH-1); depends-on.yml gone (A2b)

@@ -152,7 +152,7 @@ class SharedWorkflow(unittest.TestCase):
     def test_it_is_reusable_with_the_runner_input_and_light_class(self):
         self.assertIn("workflow_call", self.wf.get(True, self.wf.get("on")))
         inputs = self.wf[True]["workflow_call"]["inputs"]
-        self.assertEqual(inputs["runner"]["default"], "github")
+        self.assertEqual(inputs["runner"]["default"], "onepeek")
         job = self.wf["jobs"]["osv-scan"]
         self.assertEqual(classify(job["runs-on"], "inputs.runner", True), "light")
         self.assertLessEqual(job["timeout-minutes"], 30)

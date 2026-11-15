@@ -443,7 +443,7 @@ class Workflow(unittest.TestCase):
     def test_is_reusable_with_runner_input_on_the_small_class(self) -> None:
         on = WORKFLOW.get("on", WORKFLOW.get(True))
         self.assertEqual(list(on), ["workflow_call"])
-        self.assertEqual(on["workflow_call"]["inputs"]["runner"]["default"], "github")
+        self.assertEqual(on["workflow_call"]["inputs"]["runner"]["default"], "onepeek")
         self.assertIn("onepeek-arm64-small", self.job["runs-on"])
         self.assertLessEqual(self.job["timeout-minutes"], 30)
 
@@ -468,7 +468,7 @@ class Workflow(unittest.TestCase):
         self.assertNotIn("workflow_run", on)
         self.assertEqual(caller["concurrency"], {"group": "spot-rerun-caller", "cancel-in-progress": False})
         job = caller["jobs"]["spot-rerun"]
-        self.assertEqual(job["with"], {"runner": "github", "workflows": "workflow-lint"})
+        self.assertEqual(job["with"], {"runner": "public-hosted", "workflows": "workflow-lint"})
         self.assertEqual(job["permissions"], {"actions": "write", "checks": "read", "contents": "read"})
 
     def test_both_caller_forms_stay_documented_and_the_scan_input_reaches_the_script(self) -> None:

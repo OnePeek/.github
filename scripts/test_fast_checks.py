@@ -447,7 +447,7 @@ class WorkflowLint(unittest.TestCase):
         jobs = load("workflow-lint.yml")["jobs"]
         self.assertEqual(list(jobs), ["lint", "fast", "ready"])
         self.assertEqual(jobs["fast"]["uses"], "./.github/workflows/fast-checks.yml")
-        self.assertEqual(jobs["fast"]["with"], {"no-prerelease-deps": True, "docs": True})
+        self.assertEqual(jobs["fast"]["with"], {"runner": "public-hosted", "no-prerelease-deps": True, "docs": True})
         uses = [s.get("uses") for s in LINT]
         self.assertIn("./actions/gitleaks", uses)
         self.assertIn("./actions/pins", uses)

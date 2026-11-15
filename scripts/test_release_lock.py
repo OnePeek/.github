@@ -136,11 +136,13 @@ elif op == "describe-services" and "--query" not in args:
             if "--desired-count" in words:
                 desired = int(words[words.index("--desired-count") + 1])
     print(json.dumps({"services": [{"serviceName": svc, "events": [{"createdAt": "t", "message": "(service %s) event" % svc}],
-        "deployments": [{"status": "PRIMARY", "taskDefinition": td, "rolloutState": os.environ.get("ROLLOUT_STATE", "COMPLETED"),
+        "deployments": [{"id": "ecs-svc/7", "status": "PRIMARY", "taskDefinition": td, "rolloutState": os.environ.get("ROLLOUT_STATE", "COMPLETED"),
                          "rolloutStateReason": "ECS deployment circuit breaker: tasks failed to start.", "runningCount": desired,
                          "desiredCount": desired, "pendingCount": 0}]}], "failures": []}))
 elif op == "update-service" and "--query" in args and not os.environ.get("AWS_UPDATE_SERVICE"):
-    print("arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-%s:6" % opt("--service"))   # a redeploy keeps its revision
+    # A redeploy keeps its revision; it also asks for its new deployment's id (F675), which the stability poll then sees.
+    td = "arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-%s:6" % opt("--service")
+    print(td + "\tecs-svc/7" if "deployments" in opt("--query") else td)
 elif op == "register-task-definition" and not os.environ.get("AWS_REGISTER_TASK_DEFINITION"):
     # Every registered body is logged in `registered`; the new revision is <family>:100, :101, ...
     body = open(opt("--cli-input-json")[len("file://"):]).read()
@@ -1271,7 +1273,9 @@ class FreezeCheckout(unittest.TestCase):
         conf = yaml.safe_load((WORKFLOWS.parent / "actionlint.yaml").read_text(encoding="utf-8"))
         ignores = [i for entry in conf["paths"].values() for i in entry.get("ignore", [])]
         self.assertEqual(ignores, ['property "workflow_sha" is not defined in object type'])
-        self.assertEqual(set(conf), {"paths"})
+        self.assertEqual(set(conf), {"paths", "self-hosted-runner"})
+        self.assertEqual(conf["self-hosted-runner"], {"labels": ["onepeek-arm64", "onepeek-arm64-small", "onepeek-arm64-od",
+                                                               "onepeek-arm64-canary"]})
 
     def test_freeze_arms_the_same_cap_trap_as_take(self):
         # A freeze at its cap passes its step with capped=true, so the job fails at "Wait cap reached (re-run)" alone.
@@ -1593,9 +1597,9 @@ class OperateRolling(unittest.TestCase):
     """operate.yml's phases (playbook §5.4a "Rollback on cancel", operate.yml): a redeploy writes rolling before its first
     update-service, so a failure puts it back; a rollback never puts back, and a failed one stays locked with an alert."""
 
-    def operate(self, action):
+    def operate(self, action, **extra):
         stubs = TOOL_STUBS
-        return run(OPERATE_STEP, keys={LEGACY: mine(), BACKEND: mine()}, files={"services.yaml": SERVICES_FILE}, stubs=stubs,
+        return run(OPERATE_STEP, **extra, keys={LEGACY: mine(), BACKEND: mine()}, files={"services.yaml": SERVICES_FILE}, stubs=stubs,
                    ACTION=action, SERVICE="api", TARGET="sha-" + "2" * 12 if action == "rollback" else "", REASON="test", LOCK_TOKEN=TOKEN,
                    AWS_REGION="ap-south-1", DOMAIN_PREPROD="preprod.example", AWS_GET_CALLER_IDENTITY="111111111111",
                    AWS_DESCRIBE_SERVICES=API_TD, AWS_CP=TEMPLATE, AWS_DESCRIBE_IMAGES="sha256:" + "a" * 64,
@@ -1612,6 +1616,24 @@ class OperateRolling(unittest.TestCase):
         rolling = next(i for i, l in enumerate(lines) if "put-object" in l and BACKEND in l)
         update = next(i for i, l in enumerate(lines) if "update-service" in l)
         self.assertLess(rolling, update)
+
+    def test_a_redeploy_waits_on_its_own_deployment_by_id(self):
+        # F675: the revision cannot tell a forced redeploy from the deployment already running it; the id from
+        # update-service's answer can.
+        out = self.operate("redeploy")
+        self.assertIn("Redeploying api (same revision, onepeek-preprod-api:6, deployment ecs-svc/7).", out.stdout)
+        self.assertIn("deployments[?status=='PRIMARY'].id", out.calls)
+        self.assertIn('expect="${expect:-} ${svc}=${td}@${dep}"', OPERATE_STEP)   # rollout_wait keys on that deployment
+        self.assertIn("describe-services --cluster onepeek-preprod --services api --output json", out.calls)
+
+    def test_a_redeploy_answer_without_a_deployment_id_fails_closed_before_any_wait(self):
+        for answer in (API_TD, API_TD + "\tNone", API_TD + "\tecs-svc/7; rm -rf /"):
+            with self.subTest(answer):
+                out = self.operate("redeploy", AWS_UPDATE_SERVICE=answer)
+                self.assertEqual(out.returncode, 1)
+                self.assertIn("::error::api: update-service named no new deployment id", out.stdout)
+                self.assertNotIn("describe-services --cluster onepeek-preprod --services api --output json", out.calls)
+                self.assertNotIn("Deploy alarms", out.stdout)
 
     def test_a_failed_rollback_stays_locked_never_rolling_and_fails_with_an_alert(self):
         out = self.operate("rollback")

@@ -207,11 +207,13 @@ class Main(unittest.TestCase):
         self.assertEqual(json.loads(call["body"])["text"].splitlines()[0], "[backend-service] 0.7.0 -> preprod: SUCCESS")
         self.assertNotIn(HOOK, out.stdout + out.stderr)
 
-    def test_an_unset_secret_is_one_notice_and_no_post(self):
+    def test_an_unset_secret_is_one_warning_and_no_post(self):
+        # F680: a missing secret must be visible: a warning shows on the run's summary page, a notice is easy to miss.
         for hook in ("", "   "):
             out = self.run_main(hook=hook)
             self.assertEqual(out.returncode, 0)
-            self.assertEqual(out.stdout.count("::notice::"), 1, out.stdout)
+            self.assertEqual(out.stdout.count("::warning::"), 1, out.stdout)
+            self.assertNotIn("::notice::", out.stdout)
             self.assertIn("SLACK_DEPLOYS_WEBHOOK is not set", out.stdout)
             self.assertFalse(self.log.exists())
 
@@ -274,12 +276,17 @@ class Workflows(unittest.TestCase):
             self.assertEqual(job["steps"][1]["with"]["ref"], "${{ job.workflow_sha }}")
             self.assertEqual(job["steps"][1]["with"]["sparse-checkout"], "scripts/notify_release.py")
 
-    def test_the_notify_jobs_are_fail_open_short_and_github_hosted(self):
+    def test_the_notify_jobs_are_fail_open_short_and_on_the_callers_runner(self):
+        # F680: on both releases of 2026-11-15 the notify job, pinned to ubuntu-latest, was never started ("recent account
+        # payments have failed or your spending limit needs to be increased"): a job that never starts is red whatever
+        # continue-on-error says. It runs where every other job of the release runs: our small class (F694: prod, an unset
+        # runner and `github` too, so infra's call with no runner input needs no change), canary on canary.
         for name in ("release-ecs.yml", "release-notify.yml"):
             job = load(name)["jobs"]["notify"]
             self.assertIs(job["continue-on-error"], True, name)
             self.assertLessEqual(job["timeout-minutes"], 3, name)
-            self.assertEqual(job["runs-on"], "ubuntu-latest", name)
+            self.assertEqual(job["runs-on"], "${{ inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64-small' }}",
+                             name)
             self.assertEqual(job["permissions"], {"contents": "read", "actions": "read"}, name)
             for step in job["steps"]:
                 self.assertIs(step.get("continue-on-error"), True, (name, step.get("name")))
@@ -305,6 +312,11 @@ class Workflows(unittest.TestCase):
         self.assertEqual(len(ready), 1)
         self.assertIn("/api/status", ready[0]["run"])
         self.assertNotIn("outputs.token", json.dumps(env))  # never the lock token (a step env is shown in the log)
+
+    def test_release_notify_sends_nothing_for_prod_itself(self):
+        # F657: the header and AGENTS.md say no notice for prod; the guard is in the shared workflow, not left to the caller.
+        job = load("release-notify.yml")["jobs"]["notify"]
+        self.assertEqual(job["if"], "${{ inputs.environment != 'prod' }}")
 
     def test_fail_open_policy_only_the_notify_jobs_continue_on_error_in_release_workflows(self):
         for name in RELEASE_WORKFLOWS:

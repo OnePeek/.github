@@ -12,7 +12,7 @@ exact file, checked out from OnePeek/.github at the workflow's own commit. It po
 RESULT is ROLLED BACK (ROLLBACK=success), else CANCELLED (a needed job was cancelled), else FAILED (a needed job failed,
 or WATCH is set and is not success), else SUCCESS. Nothing is posted at the start of a release (the channel stays quiet).
 
-It never fails or slows a release: an unset SLACK_WEBHOOK is one ::notice:: and no post; a Slack error or timeout
+It never fails or slows a release: an unset SLACK_WEBHOOK is one ::warning:: and no post (F680: visible); a Slack error or timeout
 (curl --max-time 10, one retry) or any error of this script is one ::warning::; the exit status is always 0. The webhook
 URL is never printed or put on a command line: curl reads it from its standard input (--config -), and any output of
 curl is scrubbed of it before it is shown.
@@ -175,7 +175,7 @@ def main(env: dict | None = None) -> int:
     webhook = env.get("SLACK_WEBHOOK", "").strip()
     try:
         if not webhook:
-            print("::notice::SLACK_DEPLOYS_WEBHOOK is not set: no release notice is posted to Slack.")
+            print("::warning::SLACK_DEPLOYS_WEBHOOK is not set: no release notice is posted to Slack (F680: set the secret, or pass it from the caller).")
             return 0
         text = build_message(env)
         ok, said = post(webhook, text)
