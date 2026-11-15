@@ -28,9 +28,10 @@
 #    a dry run or a run the order check skipped (nothing was released). No notice for prod, on purpose: this workflow
 #    refuses prod (prod is promote-only, promote.yml), so the job's `environment != 'prod'` only keeps that refused run
 #    quiet; prod notices come with promote.yml at launch (RV-108, F650).
-# 3. It never fails or slows a release: the job is GitHub-hosted, seconds long, `continue-on-error` (job and steps, the
-#    only fail-open job in the release workflows, listed in scripts/test_notify_release.py FAIL_OPEN); an unset secret is
-#    one ::notice:: and no post; a Slack error or timeout (curl --max-time 10, one retry) is one ::warning::. The webhook
+# 3. It never fails or slows a release: the job runs on the caller's runner (small class; F680: a GitHub-hosted job is not
+#    even started once the account's Actions minutes run out, and is then red), seconds long, `continue-on-error` (job and
+#    steps, the only fail-open job in the release workflows, listed in scripts/test_notify_release.py FAIL_OPEN); an unset
+#    secret is one ::warning:: (visible) and no post; a Slack error or timeout (curl --max-time 10, one retry) is one ::warning::. The webhook
 #    URL is never printed (a secret, masked by the runner; curl reads it from standard input; no `set -x`).
 # `dry-run: true` (§15) renders every task definition and checks every signature, and changes nothing.
 name: release-ecs
@@ -696,7 +697,7 @@ jobs:
             LOCK_LIVE_REVISION="${arn}"
           }
           # --- stable-wait begin (identical in every copy; checked by scripts/check_service_list.py) ---
-          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
+          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision[@deployment id] | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
             # ECS's own waiter (`aws ecs wait services-stable`, 40 x 15 s) is shorter than a preprod rollout plus the deploy-alarm bake
             # time, and it says nothing about why. This polls describe-services every LOCK_STABLE_POLL_SECONDS (15). A service is done
             # only when its PRIMARY deployment runs the expected revision (the one just registered, or the one put back), its
@@ -704,10 +705,14 @@ jobs:
             # drained (what ECS's own waiter asks). `-` instead of a revision: the service was scaled to 0, done once nothing runs.
             # The services run with circuit-breaker and deploy-alarm rollback: ECS then marks the new deployment FAILED and makes a
             # deployment of the OLD revision PRIMARY, which completes. So a deployment of the expected revision that is FAILED, or a
-            # PRIMARY on another revision once the expected one was listed, is a rollback by ECS and fails at once. A poll before the
-            # new deployment is listed waits. Any failure, and the cap, print per service every deployment's revision, state and
-            # reason, the running, desired and pending counts and the 15 newest events, and say which happened. An unreadable answer
-            # is never success: it is polled again, and three in a row fail the wait.
+            # PRIMARY on another revision once the expected one was PRIMARY, is a rollback by ECS and fails at once. A poll before the
+            # new deployment is PRIMARY waits: right after update-service a stale describe can still show the old PRIMARY with the
+            # expected revision listed as an older deployment (a put-back), and that is not a rollback (F675). A forced redeploy
+            # keeps its revision, so it passes `@<deployment id>` (from update-service's answer): then that deployment, not the
+            # revision, must be PRIMARY and rolled out, and another PRIMARY once it was listed, or it FAILED, is a rollback. Any
+            # failure, and the cap, print per service every deployment's revision, state and reason, the running, desired and
+            # pending counts and the 15 newest events, and say which happened. An unreadable answer is never success: it is polled
+            # again, and three in a row fail the wait.
             local cap="$1" end unread=0 arg verdict names=()
             shift
             for arg in "$@"; do
@@ -731,6 +736,7 @@ jobs:
           rev = lambda arn: str(arn or "?").split("/")[-1]
           for arg in sys.argv[1:]:
               svc, want = arg.split("=", 1)
+              want, _, dep_id = want.partition("@")
               try:
                   described = json.load(open("lock-stable-%s.json" % svc))
                   s = [x for x in described["services"] if x["serviceName"] == svc][0]
@@ -740,20 +746,27 @@ jobs:
                   out.append("%s: describe-services unreadable" % svc)
                   verdicts.append("unreadable")
                   continue
-              mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
-              if mine:
+              if dep_id:   # a redeploy: that deployment, by id
+                  mine = [d for d in deployments if d.get("id") == dep_id]
+                  on_mine = primary.get("id") == dep_id
+                  listed = bool(mine)
+              else:   # F675: the expected revision counts as seen only once it is PRIMARY
+                  mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
+                  on_mine = rev(primary.get("taskDefinition")) == rev(want)
+                  listed = on_mine
+              if listed and want != "-":
                   open("lock-stable-seen-" + svc, "w").close()
               seen = os.path.exists("lock-stable-seen-" + svc)
               state = primary.get("rolloutState")
               failed = [d for d in mine if d.get("rolloutState") == "FAILED"]
               if want == "-":
                   verdict = "done" if len(deployments) == 1 and primary.get("desiredCount") == 0 and primary.get("runningCount") == 0 else "waiting"
-              elif failed or (seen and rev(primary.get("taskDefinition")) != rev(want)):
+              elif failed or (seen and not on_mine):
                   verdict = "rolledback"
                   reason = (failed or [primary])[0].get("rolloutStateReason") or primary.get("rolloutStateReason") or "no reason given"
                   out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
-              elif rev(primary.get("taskDefinition")) != rev(want):
-                  verdict = "waiting"   # the new deployment is not listed yet
+              elif not on_mine:
+                  verdict = "waiting"   # the new deployment is not PRIMARY yet
               else:
                   steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
                   verdict = "done" if steady and len(deployments) == 1 else "waiting"
@@ -1913,7 +1926,7 @@ jobs:
             LOCK_LIVE_REVISION="${arn}"
           }
           # --- stable-wait begin (identical in every copy; checked by scripts/check_service_list.py) ---
-          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
+          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision[@deployment id] | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
             # ECS's own waiter (`aws ecs wait services-stable`, 40 x 15 s) is shorter than a preprod rollout plus the deploy-alarm bake
             # time, and it says nothing about why. This polls describe-services every LOCK_STABLE_POLL_SECONDS (15). A service is done
             # only when its PRIMARY deployment runs the expected revision (the one just registered, or the one put back), its
@@ -1921,10 +1934,14 @@ jobs:
             # drained (what ECS's own waiter asks). `-` instead of a revision: the service was scaled to 0, done once nothing runs.
             # The services run with circuit-breaker and deploy-alarm rollback: ECS then marks the new deployment FAILED and makes a
             # deployment of the OLD revision PRIMARY, which completes. So a deployment of the expected revision that is FAILED, or a
-            # PRIMARY on another revision once the expected one was listed, is a rollback by ECS and fails at once. A poll before the
-            # new deployment is listed waits. Any failure, and the cap, print per service every deployment's revision, state and
-            # reason, the running, desired and pending counts and the 15 newest events, and say which happened. An unreadable answer
-            # is never success: it is polled again, and three in a row fail the wait.
+            # PRIMARY on another revision once the expected one was PRIMARY, is a rollback by ECS and fails at once. A poll before the
+            # new deployment is PRIMARY waits: right after update-service a stale describe can still show the old PRIMARY with the
+            # expected revision listed as an older deployment (a put-back), and that is not a rollback (F675). A forced redeploy
+            # keeps its revision, so it passes `@<deployment id>` (from update-service's answer): then that deployment, not the
+            # revision, must be PRIMARY and rolled out, and another PRIMARY once it was listed, or it FAILED, is a rollback. Any
+            # failure, and the cap, print per service every deployment's revision, state and reason, the running, desired and
+            # pending counts and the 15 newest events, and say which happened. An unreadable answer is never success: it is polled
+            # again, and three in a row fail the wait.
             local cap="$1" end unread=0 arg verdict names=()
             shift
             for arg in "$@"; do
@@ -1948,6 +1965,7 @@ jobs:
           rev = lambda arn: str(arn or "?").split("/")[-1]
           for arg in sys.argv[1:]:
               svc, want = arg.split("=", 1)
+              want, _, dep_id = want.partition("@")
               try:
                   described = json.load(open("lock-stable-%s.json" % svc))
                   s = [x for x in described["services"] if x["serviceName"] == svc][0]
@@ -1957,20 +1975,27 @@ jobs:
                   out.append("%s: describe-services unreadable" % svc)
                   verdicts.append("unreadable")
                   continue
-              mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
-              if mine:
+              if dep_id:   # a redeploy: that deployment, by id
+                  mine = [d for d in deployments if d.get("id") == dep_id]
+                  on_mine = primary.get("id") == dep_id
+                  listed = bool(mine)
+              else:   # F675: the expected revision counts as seen only once it is PRIMARY
+                  mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
+                  on_mine = rev(primary.get("taskDefinition")) == rev(want)
+                  listed = on_mine
+              if listed and want != "-":
                   open("lock-stable-seen-" + svc, "w").close()
               seen = os.path.exists("lock-stable-seen-" + svc)
               state = primary.get("rolloutState")
               failed = [d for d in mine if d.get("rolloutState") == "FAILED"]
               if want == "-":
                   verdict = "done" if len(deployments) == 1 and primary.get("desiredCount") == 0 and primary.get("runningCount") == 0 else "waiting"
-              elif failed or (seen and rev(primary.get("taskDefinition")) != rev(want)):
+              elif failed or (seen and not on_mine):
                   verdict = "rolledback"
                   reason = (failed or [primary])[0].get("rolloutStateReason") or primary.get("rolloutStateReason") or "no reason given"
                   out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
-              elif rev(primary.get("taskDefinition")) != rev(want):
-                  verdict = "waiting"   # the new deployment is not listed yet
+              elif not on_mine:
+                  verdict = "waiting"   # the new deployment is not PRIMARY yet
               else:
                   steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
                   verdict = "done" if steady and len(deployments) == 1 else "waiting"
@@ -2447,6 +2472,16 @@ jobs:
           uv run --frozen --no-dev app api routes --env "${ENVIRONMENT}" --services-file services.yaml --out gateway-routes.json
           # No encryption flags: the bucket default applies (aws-stack §16). `--sse aws:kms` alone would ask for the AWS-managed key.
           aws s3 cp gateway-routes.json "s3://${NAME}-deploy/gateway-routes.json" --only-show-errors
+      - name: A fresh role session for the record and the rollout (F668)
+        # The role's sessions last at most 1 h; the steps before may take 54 minutes, the record 5 and the rollout 45, and
+        # expired credentials would read as "describe-services unreadable" and fail a healthy rollout. Same role, via OIDC.
+        # Right before the record, so the record stays right before the rollout.
+        timeout-minutes: 2
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - name: Record every service's current task definition and the sandbox live versions, then phase rolling (for the put-back)
         timeout-minutes: 5
         id: previous
@@ -2947,7 +2982,7 @@ jobs:
             LOCK_LIVE_REVISION="${arn}"
           }
           # --- stable-wait begin (identical in every copy; checked by scripts/check_service_list.py) ---
-          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
+          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision[@deployment id] | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
             # ECS's own waiter (`aws ecs wait services-stable`, 40 x 15 s) is shorter than a preprod rollout plus the deploy-alarm bake
             # time, and it says nothing about why. This polls describe-services every LOCK_STABLE_POLL_SECONDS (15). A service is done
             # only when its PRIMARY deployment runs the expected revision (the one just registered, or the one put back), its
@@ -2955,10 +2990,14 @@ jobs:
             # drained (what ECS's own waiter asks). `-` instead of a revision: the service was scaled to 0, done once nothing runs.
             # The services run with circuit-breaker and deploy-alarm rollback: ECS then marks the new deployment FAILED and makes a
             # deployment of the OLD revision PRIMARY, which completes. So a deployment of the expected revision that is FAILED, or a
-            # PRIMARY on another revision once the expected one was listed, is a rollback by ECS and fails at once. A poll before the
-            # new deployment is listed waits. Any failure, and the cap, print per service every deployment's revision, state and
-            # reason, the running, desired and pending counts and the 15 newest events, and say which happened. An unreadable answer
-            # is never success: it is polled again, and three in a row fail the wait.
+            # PRIMARY on another revision once the expected one was PRIMARY, is a rollback by ECS and fails at once. A poll before the
+            # new deployment is PRIMARY waits: right after update-service a stale describe can still show the old PRIMARY with the
+            # expected revision listed as an older deployment (a put-back), and that is not a rollback (F675). A forced redeploy
+            # keeps its revision, so it passes `@<deployment id>` (from update-service's answer): then that deployment, not the
+            # revision, must be PRIMARY and rolled out, and another PRIMARY once it was listed, or it FAILED, is a rollback. Any
+            # failure, and the cap, print per service every deployment's revision, state and reason, the running, desired and
+            # pending counts and the 15 newest events, and say which happened. An unreadable answer is never success: it is polled
+            # again, and three in a row fail the wait.
             local cap="$1" end unread=0 arg verdict names=()
             shift
             for arg in "$@"; do
@@ -2982,6 +3021,7 @@ jobs:
           rev = lambda arn: str(arn or "?").split("/")[-1]
           for arg in sys.argv[1:]:
               svc, want = arg.split("=", 1)
+              want, _, dep_id = want.partition("@")
               try:
                   described = json.load(open("lock-stable-%s.json" % svc))
                   s = [x for x in described["services"] if x["serviceName"] == svc][0]
@@ -2991,20 +3031,27 @@ jobs:
                   out.append("%s: describe-services unreadable" % svc)
                   verdicts.append("unreadable")
                   continue
-              mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
-              if mine:
+              if dep_id:   # a redeploy: that deployment, by id
+                  mine = [d for d in deployments if d.get("id") == dep_id]
+                  on_mine = primary.get("id") == dep_id
+                  listed = bool(mine)
+              else:   # F675: the expected revision counts as seen only once it is PRIMARY
+                  mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
+                  on_mine = rev(primary.get("taskDefinition")) == rev(want)
+                  listed = on_mine
+              if listed and want != "-":
                   open("lock-stable-seen-" + svc, "w").close()
               seen = os.path.exists("lock-stable-seen-" + svc)
               state = primary.get("rolloutState")
               failed = [d for d in mine if d.get("rolloutState") == "FAILED"]
               if want == "-":
                   verdict = "done" if len(deployments) == 1 and primary.get("desiredCount") == 0 and primary.get("runningCount") == 0 else "waiting"
-              elif failed or (seen and rev(primary.get("taskDefinition")) != rev(want)):
+              elif failed or (seen and not on_mine):
                   verdict = "rolledback"
                   reason = (failed or [primary])[0].get("rolloutStateReason") or primary.get("rolloutStateReason") or "no reason given"
                   out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
-              elif rev(primary.get("taskDefinition")) != rev(want):
-                  verdict = "waiting"   # the new deployment is not listed yet
+              elif not on_mine:
+                  verdict = "waiting"   # the new deployment is not PRIMARY yet
               else:
                   steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
                   verdict = "done" if steady and len(deployments) == 1 else "waiting"
@@ -3363,7 +3410,7 @@ jobs:
           aws ecr get-login-password | cosign login "${IMAGE_REF%%/*}" --username AWS --password-stdin >/dev/null  # cosign reads the signature from ECR (first live release: 401)
           cosign verify --experimental-oci11 --insecure-ignore-tlog=true --key "${SIGNING_KEY}" "${IMAGE_REF}" >/dev/null
           # --- stable-wait begin (identical in every copy; checked by scripts/check_service_list.py) ---
-          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
+          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision[@deployment id] | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
             # ECS's own waiter (`aws ecs wait services-stable`, 40 x 15 s) is shorter than a preprod rollout plus the deploy-alarm bake
             # time, and it says nothing about why. This polls describe-services every LOCK_STABLE_POLL_SECONDS (15). A service is done
             # only when its PRIMARY deployment runs the expected revision (the one just registered, or the one put back), its
@@ -3371,10 +3418,14 @@ jobs:
             # drained (what ECS's own waiter asks). `-` instead of a revision: the service was scaled to 0, done once nothing runs.
             # The services run with circuit-breaker and deploy-alarm rollback: ECS then marks the new deployment FAILED and makes a
             # deployment of the OLD revision PRIMARY, which completes. So a deployment of the expected revision that is FAILED, or a
-            # PRIMARY on another revision once the expected one was listed, is a rollback by ECS and fails at once. A poll before the
-            # new deployment is listed waits. Any failure, and the cap, print per service every deployment's revision, state and
-            # reason, the running, desired and pending counts and the 15 newest events, and say which happened. An unreadable answer
-            # is never success: it is polled again, and three in a row fail the wait.
+            # PRIMARY on another revision once the expected one was PRIMARY, is a rollback by ECS and fails at once. A poll before the
+            # new deployment is PRIMARY waits: right after update-service a stale describe can still show the old PRIMARY with the
+            # expected revision listed as an older deployment (a put-back), and that is not a rollback (F675). A forced redeploy
+            # keeps its revision, so it passes `@<deployment id>` (from update-service's answer): then that deployment, not the
+            # revision, must be PRIMARY and rolled out, and another PRIMARY once it was listed, or it FAILED, is a rollback. Any
+            # failure, and the cap, print per service every deployment's revision, state and reason, the running, desired and
+            # pending counts and the 15 newest events, and say which happened. An unreadable answer is never success: it is polled
+            # again, and three in a row fail the wait.
             local cap="$1" end unread=0 arg verdict names=()
             shift
             for arg in "$@"; do
@@ -3398,6 +3449,7 @@ jobs:
           rev = lambda arn: str(arn or "?").split("/")[-1]
           for arg in sys.argv[1:]:
               svc, want = arg.split("=", 1)
+              want, _, dep_id = want.partition("@")
               try:
                   described = json.load(open("lock-stable-%s.json" % svc))
                   s = [x for x in described["services"] if x["serviceName"] == svc][0]
@@ -3407,20 +3459,27 @@ jobs:
                   out.append("%s: describe-services unreadable" % svc)
                   verdicts.append("unreadable")
                   continue
-              mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
-              if mine:
+              if dep_id:   # a redeploy: that deployment, by id
+                  mine = [d for d in deployments if d.get("id") == dep_id]
+                  on_mine = primary.get("id") == dep_id
+                  listed = bool(mine)
+              else:   # F675: the expected revision counts as seen only once it is PRIMARY
+                  mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
+                  on_mine = rev(primary.get("taskDefinition")) == rev(want)
+                  listed = on_mine
+              if listed and want != "-":
                   open("lock-stable-seen-" + svc, "w").close()
               seen = os.path.exists("lock-stable-seen-" + svc)
               state = primary.get("rolloutState")
               failed = [d for d in mine if d.get("rolloutState") == "FAILED"]
               if want == "-":
                   verdict = "done" if len(deployments) == 1 and primary.get("desiredCount") == 0 and primary.get("runningCount") == 0 else "waiting"
-              elif failed or (seen and rev(primary.get("taskDefinition")) != rev(want)):
+              elif failed or (seen and not on_mine):
                   verdict = "rolledback"
                   reason = (failed or [primary])[0].get("rolloutStateReason") or primary.get("rolloutStateReason") or "no reason given"
                   out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
-              elif rev(primary.get("taskDefinition")) != rev(want):
-                  verdict = "waiting"   # the new deployment is not listed yet
+              elif not on_mine:
+                  verdict = "waiting"   # the new deployment is not PRIMARY yet
               else:
                   steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
                   verdict = "done" if steady and len(deployments) == 1 else "waiting"
@@ -3586,7 +3645,7 @@ jobs:
     needs: [prepare, build-image, build-web, deploy]
     if: ${{ !cancelled() && !inputs.dry-run && (needs.deploy.result == 'success' || (needs.deploy.result == 'failure' && needs.deploy.outputs.previous != '')) }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 70   # above the sum of its step limits (10 + 5 + 10 + 12 + 25), so a hang ends as a failed step and the rollback still runs
+    timeout-minutes: 70   # above the sum of its step limits (10 + 5 + 10 + 16 + 2 + 25), so a hang ends as a failed step and the rollback still runs
     permissions:
       contents: read
       id-token: write
@@ -3664,7 +3723,7 @@ jobs:
             -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN bash "${SCRIPT}"
       - name: 10 minutes after stable, poll the rolled services' deploy alarms every 30 s
         id: watch
-        timeout-minutes: 12
+        timeout-minutes: 16   # F658: the 10-minute window, one worst poll (190 s, see poll()) and 120 s to spare
         env:
           SERVICES: ${{ needs.deploy.outputs.services }}
           # F630: adaptive retries, 6 attempts per call (the CLI's default is 3), so an API throttle in one poll does not
@@ -3690,10 +3749,13 @@ jobs:
             echo "::error::The rollout reported no services, so there is nothing to watch."
             exit 1
           fi
+          # F658: each attempt is bounded (connect 5 s, read 10 s; the CLI's default is 60 s each), so a poll of 6 attempts
+          # with adaptive backoff (at most 20 s each) ends within 190 s, and the last poll of the window ends inside the step.
           poll() {  # $@: extra describe-alarms options; prints the matching alarm names on one line
-            aws cloudwatch describe-alarms --alarm-names "${names[@]}" "$@" --query 'MetricAlarms[].AlarmName' --output text \
+            aws cloudwatch describe-alarms --cli-connect-timeout 5 --cli-read-timeout 10 --alarm-names "${names[@]}" "$@" --query 'MetricAlarms[].AlarmName' --output text \
               | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'
           }
+          end=$((SECONDS + 600))   # F658: the window starts before the first poll, so a slow first poll does not lengthen it
           known=$(poll)   # an unreadable alarm list fails the step (and so rolls back); only a readable empty one skips
           if [ -z "${known}" ]; then
             # C11: with no alarm to poll, 10 minutes of polling cannot catch anything, so the watch is skipped, out loud.
@@ -3702,13 +3764,22 @@ jobs:
             exit 0
           fi
           echo "Watching: ${known}"
-          end=$((SECONDS + 600))
           while [ "${SECONDS}" -lt "${end}" ]; do
             alarms=$(poll --state-value ALARM)
             if [ -n "${alarms}" ]; then echo "::error::Deploy alarms firing: ${alarms}"; exit 1; fi
             sleep 30
           done
           echo "No deploy alarm in 10 minutes."
+      - name: A fresh role session for the rollback (F668)
+        # The checks before it may take 37 minutes and the put-back 25: past the role's 1-hour session. Same role, via OIDC;
+        # it runs exactly when the rollback runs, and if it fails the rollback still runs on the first session.
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.creds.outcome == 'success' && steps.watch.outcome != 'success' }}
+        timeout-minutes: 2
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - name: Put every service back on the revision recorded before the rollout (versions stay aligned, E2/E3)
         id: rollback
         # On a failed rollout or ops registration (deploy failed after recording previous), smoke or watch: the
@@ -4210,7 +4281,7 @@ jobs:
             LOCK_LIVE_REVISION="${arn}"
           }
           # --- stable-wait begin (identical in every copy; checked by scripts/check_service_list.py) ---
-          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
+          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision[@deployment id] | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
             # ECS's own waiter (`aws ecs wait services-stable`, 40 x 15 s) is shorter than a preprod rollout plus the deploy-alarm bake
             # time, and it says nothing about why. This polls describe-services every LOCK_STABLE_POLL_SECONDS (15). A service is done
             # only when its PRIMARY deployment runs the expected revision (the one just registered, or the one put back), its
@@ -4218,10 +4289,14 @@ jobs:
             # drained (what ECS's own waiter asks). `-` instead of a revision: the service was scaled to 0, done once nothing runs.
             # The services run with circuit-breaker and deploy-alarm rollback: ECS then marks the new deployment FAILED and makes a
             # deployment of the OLD revision PRIMARY, which completes. So a deployment of the expected revision that is FAILED, or a
-            # PRIMARY on another revision once the expected one was listed, is a rollback by ECS and fails at once. A poll before the
-            # new deployment is listed waits. Any failure, and the cap, print per service every deployment's revision, state and
-            # reason, the running, desired and pending counts and the 15 newest events, and say which happened. An unreadable answer
-            # is never success: it is polled again, and three in a row fail the wait.
+            # PRIMARY on another revision once the expected one was PRIMARY, is a rollback by ECS and fails at once. A poll before the
+            # new deployment is PRIMARY waits: right after update-service a stale describe can still show the old PRIMARY with the
+            # expected revision listed as an older deployment (a put-back), and that is not a rollback (F675). A forced redeploy
+            # keeps its revision, so it passes `@<deployment id>` (from update-service's answer): then that deployment, not the
+            # revision, must be PRIMARY and rolled out, and another PRIMARY once it was listed, or it FAILED, is a rollback. Any
+            # failure, and the cap, print per service every deployment's revision, state and reason, the running, desired and
+            # pending counts and the 15 newest events, and say which happened. An unreadable answer is never success: it is polled
+            # again, and three in a row fail the wait.
             local cap="$1" end unread=0 arg verdict names=()
             shift
             for arg in "$@"; do
@@ -4245,6 +4320,7 @@ jobs:
           rev = lambda arn: str(arn or "?").split("/")[-1]
           for arg in sys.argv[1:]:
               svc, want = arg.split("=", 1)
+              want, _, dep_id = want.partition("@")
               try:
                   described = json.load(open("lock-stable-%s.json" % svc))
                   s = [x for x in described["services"] if x["serviceName"] == svc][0]
@@ -4254,20 +4330,27 @@ jobs:
                   out.append("%s: describe-services unreadable" % svc)
                   verdicts.append("unreadable")
                   continue
-              mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
-              if mine:
+              if dep_id:   # a redeploy: that deployment, by id
+                  mine = [d for d in deployments if d.get("id") == dep_id]
+                  on_mine = primary.get("id") == dep_id
+                  listed = bool(mine)
+              else:   # F675: the expected revision counts as seen only once it is PRIMARY
+                  mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
+                  on_mine = rev(primary.get("taskDefinition")) == rev(want)
+                  listed = on_mine
+              if listed and want != "-":
                   open("lock-stable-seen-" + svc, "w").close()
               seen = os.path.exists("lock-stable-seen-" + svc)
               state = primary.get("rolloutState")
               failed = [d for d in mine if d.get("rolloutState") == "FAILED"]
               if want == "-":
                   verdict = "done" if len(deployments) == 1 and primary.get("desiredCount") == 0 and primary.get("runningCount") == 0 else "waiting"
-              elif failed or (seen and rev(primary.get("taskDefinition")) != rev(want)):
+              elif failed or (seen and not on_mine):
                   verdict = "rolledback"
                   reason = (failed or [primary])[0].get("rolloutStateReason") or primary.get("rolloutStateReason") or "no reason given"
                   out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
-              elif rev(primary.get("taskDefinition")) != rev(want):
-                  verdict = "waiting"   # the new deployment is not listed yet
+              elif not on_mine:
+                  verdict = "waiting"   # the new deployment is not PRIMARY yet
               else:
                   steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
                   verdict = "done" if steady and len(deployments) == 1 else "waiting"
@@ -5063,7 +5146,7 @@ jobs:
             LOCK_LIVE_REVISION="${arn}"
           }
           # --- stable-wait begin (identical in every copy; checked by scripts/check_service_list.py) ---
-          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
+          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision[@deployment id] | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
             # ECS's own waiter (`aws ecs wait services-stable`, 40 x 15 s) is shorter than a preprod rollout plus the deploy-alarm bake
             # time, and it says nothing about why. This polls describe-services every LOCK_STABLE_POLL_SECONDS (15). A service is done
             # only when its PRIMARY deployment runs the expected revision (the one just registered, or the one put back), its
@@ -5071,10 +5154,14 @@ jobs:
             # drained (what ECS's own waiter asks). `-` instead of a revision: the service was scaled to 0, done once nothing runs.
             # The services run with circuit-breaker and deploy-alarm rollback: ECS then marks the new deployment FAILED and makes a
             # deployment of the OLD revision PRIMARY, which completes. So a deployment of the expected revision that is FAILED, or a
-            # PRIMARY on another revision once the expected one was listed, is a rollback by ECS and fails at once. A poll before the
-            # new deployment is listed waits. Any failure, and the cap, print per service every deployment's revision, state and
-            # reason, the running, desired and pending counts and the 15 newest events, and say which happened. An unreadable answer
-            # is never success: it is polled again, and three in a row fail the wait.
+            # PRIMARY on another revision once the expected one was PRIMARY, is a rollback by ECS and fails at once. A poll before the
+            # new deployment is PRIMARY waits: right after update-service a stale describe can still show the old PRIMARY with the
+            # expected revision listed as an older deployment (a put-back), and that is not a rollback (F675). A forced redeploy
+            # keeps its revision, so it passes `@<deployment id>` (from update-service's answer): then that deployment, not the
+            # revision, must be PRIMARY and rolled out, and another PRIMARY once it was listed, or it FAILED, is a rollback. Any
+            # failure, and the cap, print per service every deployment's revision, state and reason, the running, desired and
+            # pending counts and the 15 newest events, and say which happened. An unreadable answer is never success: it is polled
+            # again, and three in a row fail the wait.
             local cap="$1" end unread=0 arg verdict names=()
             shift
             for arg in "$@"; do
@@ -5098,6 +5185,7 @@ jobs:
           rev = lambda arn: str(arn or "?").split("/")[-1]
           for arg in sys.argv[1:]:
               svc, want = arg.split("=", 1)
+              want, _, dep_id = want.partition("@")
               try:
                   described = json.load(open("lock-stable-%s.json" % svc))
                   s = [x for x in described["services"] if x["serviceName"] == svc][0]
@@ -5107,20 +5195,27 @@ jobs:
                   out.append("%s: describe-services unreadable" % svc)
                   verdicts.append("unreadable")
                   continue
-              mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
-              if mine:
+              if dep_id:   # a redeploy: that deployment, by id
+                  mine = [d for d in deployments if d.get("id") == dep_id]
+                  on_mine = primary.get("id") == dep_id
+                  listed = bool(mine)
+              else:   # F675: the expected revision counts as seen only once it is PRIMARY
+                  mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
+                  on_mine = rev(primary.get("taskDefinition")) == rev(want)
+                  listed = on_mine
+              if listed and want != "-":
                   open("lock-stable-seen-" + svc, "w").close()
               seen = os.path.exists("lock-stable-seen-" + svc)
               state = primary.get("rolloutState")
               failed = [d for d in mine if d.get("rolloutState") == "FAILED"]
               if want == "-":
                   verdict = "done" if len(deployments) == 1 and primary.get("desiredCount") == 0 and primary.get("runningCount") == 0 else "waiting"
-              elif failed or (seen and rev(primary.get("taskDefinition")) != rev(want)):
+              elif failed or (seen and not on_mine):
                   verdict = "rolledback"
                   reason = (failed or [primary])[0].get("rolloutStateReason") or primary.get("rolloutStateReason") or "no reason given"
                   out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
-              elif rev(primary.get("taskDefinition")) != rev(want):
-                  verdict = "waiting"   # the new deployment is not listed yet
+              elif not on_mine:
+                  verdict = "waiting"   # the new deployment is not PRIMARY yet
               else:
                   steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
                   verdict = "done" if steady and len(deployments) == 1 else "waiting"
@@ -5972,7 +6067,7 @@ jobs:
             LOCK_LIVE_REVISION="${arn}"
           }
           # --- stable-wait begin (identical in every copy; checked by scripts/check_service_list.py) ---
-          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
+          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision[@deployment id] | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
             # ECS's own waiter (`aws ecs wait services-stable`, 40 x 15 s) is shorter than a preprod rollout plus the deploy-alarm bake
             # time, and it says nothing about why. This polls describe-services every LOCK_STABLE_POLL_SECONDS (15). A service is done
             # only when its PRIMARY deployment runs the expected revision (the one just registered, or the one put back), its
@@ -5980,10 +6075,14 @@ jobs:
             # drained (what ECS's own waiter asks). `-` instead of a revision: the service was scaled to 0, done once nothing runs.
             # The services run with circuit-breaker and deploy-alarm rollback: ECS then marks the new deployment FAILED and makes a
             # deployment of the OLD revision PRIMARY, which completes. So a deployment of the expected revision that is FAILED, or a
-            # PRIMARY on another revision once the expected one was listed, is a rollback by ECS and fails at once. A poll before the
-            # new deployment is listed waits. Any failure, and the cap, print per service every deployment's revision, state and
-            # reason, the running, desired and pending counts and the 15 newest events, and say which happened. An unreadable answer
-            # is never success: it is polled again, and three in a row fail the wait.
+            # PRIMARY on another revision once the expected one was PRIMARY, is a rollback by ECS and fails at once. A poll before the
+            # new deployment is PRIMARY waits: right after update-service a stale describe can still show the old PRIMARY with the
+            # expected revision listed as an older deployment (a put-back), and that is not a rollback (F675). A forced redeploy
+            # keeps its revision, so it passes `@<deployment id>` (from update-service's answer): then that deployment, not the
+            # revision, must be PRIMARY and rolled out, and another PRIMARY once it was listed, or it FAILED, is a rollback. Any
+            # failure, and the cap, print per service every deployment's revision, state and reason, the running, desired and
+            # pending counts and the 15 newest events, and say which happened. An unreadable answer is never success: it is polled
+            # again, and three in a row fail the wait.
             local cap="$1" end unread=0 arg verdict names=()
             shift
             for arg in "$@"; do
@@ -6007,6 +6106,7 @@ jobs:
           rev = lambda arn: str(arn or "?").split("/")[-1]
           for arg in sys.argv[1:]:
               svc, want = arg.split("=", 1)
+              want, _, dep_id = want.partition("@")
               try:
                   described = json.load(open("lock-stable-%s.json" % svc))
                   s = [x for x in described["services"] if x["serviceName"] == svc][0]
@@ -6016,20 +6116,27 @@ jobs:
                   out.append("%s: describe-services unreadable" % svc)
                   verdicts.append("unreadable")
                   continue
-              mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
-              if mine:
+              if dep_id:   # a redeploy: that deployment, by id
+                  mine = [d for d in deployments if d.get("id") == dep_id]
+                  on_mine = primary.get("id") == dep_id
+                  listed = bool(mine)
+              else:   # F675: the expected revision counts as seen only once it is PRIMARY
+                  mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
+                  on_mine = rev(primary.get("taskDefinition")) == rev(want)
+                  listed = on_mine
+              if listed and want != "-":
                   open("lock-stable-seen-" + svc, "w").close()
               seen = os.path.exists("lock-stable-seen-" + svc)
               state = primary.get("rolloutState")
               failed = [d for d in mine if d.get("rolloutState") == "FAILED"]
               if want == "-":
                   verdict = "done" if len(deployments) == 1 and primary.get("desiredCount") == 0 and primary.get("runningCount") == 0 else "waiting"
-              elif failed or (seen and rev(primary.get("taskDefinition")) != rev(want)):
+              elif failed or (seen and not on_mine):
                   verdict = "rolledback"
                   reason = (failed or [primary])[0].get("rolloutStateReason") or primary.get("rolloutStateReason") or "no reason given"
                   out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
-              elif rev(primary.get("taskDefinition")) != rev(want):
-                  verdict = "waiting"   # the new deployment is not listed yet
+              elif not on_mine:
+                  verdict = "waiting"   # the new deployment is not PRIMARY yet
               else:
                   steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
                   verdict = "done" if steady and len(deployments) == 1 else "waiting"
@@ -6343,11 +6450,13 @@ jobs:
   notify:
     # Last, after every other job, whatever happened: one Slack message to #deploys with the release's result (see the
     # header: Release notices to Slack). Never for a dry run, prod, or a run the order check skipped. Fail-open by
-    # design: GitHub-hosted, seconds long, continue-on-error on the job and every step, so a Slack or GitHub hiccup never
-    # fails or slows a release. Its steps are identical to release-notify.yml's (scripts/test_notify_release.py).
+    # design: the caller's runner (small class), seconds long, continue-on-error on the job and every step, so a Slack or
+    # GitHub hiccup never fails or slows a release. Its steps are identical to release-notify.yml's
+    # (scripts/test_notify_release.py). F680: not GitHub-hosted: a private repository's GitHub-hosted job is never started
+    # once the account's Actions minutes or spending limit run out, and a job never started is red despite continue-on-error.
     needs: [prepare, build-image, build-web, db-bootstrap, deploy, verify, finish, api-client]
     if: ${{ always() && !inputs.dry-run && inputs.environment != 'prod' && needs.prepare.outputs.skip != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 3
     continue-on-error: true
     permissions:

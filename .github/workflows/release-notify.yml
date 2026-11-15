@@ -2,8 +2,8 @@
 # job). Founder decision 2026-11-15, provisional rulings of W1-SLACK-GH; the rules are in release-ecs.yml's header,
 # "Release notices to Slack": one channel, one shared notifier (scripts/notify_release.py, read at this workflow's own
 # commit), one message per release at its end (SUCCESS, FAILED, CANCELLED; ROLLED BACK is release-ecs.yml's only),
-# never failing or slowing the release (GitHub-hosted, seconds long, continue-on-error on the job and every step; an
-# unset secret is a notice, a Slack error a warning; the webhook URL is never printed).
+# never failing or slowing the release (on the caller's runner, small class, seconds long, continue-on-error on the job
+# and every step; an unset secret and a Slack error are warnings; the webhook URL is never printed). Never for prod.
 #
 # A caller adds, as its last job (needs: every other job; `if: always()`, and not when the run skipped itself):
 #   notify:
@@ -12,6 +12,7 @@
 #     permissions: {contents: read, actions: read}
 #     uses: (this workflow, pinned by commit SHA like every shared workflow)
 #     with:
+#       runner: ${{ vars.RUNNER || 'github' }}
 #       environment: preprod
 #       results: ${{ toJSON(needs.*.result) }}
 #     secrets:
@@ -22,7 +23,7 @@ on:
   workflow_call:
     inputs:
       runner:
-        description: "onepeek, canary or github; accepted like every shared workflow's, but this job always runs GitHub-hosted (seconds long, no cloud access, never waits for a runner)."
+        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class (small) and this value choose runs-on (ci-runners.md section 5.3)."
         type: string
         default: github
       environment:
@@ -51,14 +52,19 @@ on:
         default: ""
     secrets:
       SLACK_DEPLOYS_WEBHOOK:
-        description: The #deploys incoming webhook (the organisation secret of the same name). Optional; unset, nothing is posted and a notice says so.
+        description: The #deploys incoming webhook (the organisation secret of the same name). Optional; unset, nothing is posted and a warning says so.
         required: false
 
 permissions: {}
 
 jobs:
   notify:
-    runs-on: ubuntu-latest
+    # No notice for prod (release-ecs.yml's header says why); a dry run or a run that skipped itself is the caller's `if:`.
+    if: ${{ inputs.environment != 'prod' }}
+    # F680: on the caller's runner, like every other job of its release. A GitHub-hosted job in a private repository is
+    # not started at all once the account's Actions minutes or spending limit run out, and a job never started is red
+    # whatever continue-on-error says (both releases of 2026-11-15).
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 3
     continue-on-error: true
     permissions:
