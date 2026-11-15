@@ -1621,6 +1621,7 @@ class OperateRolling(unittest.TestCase):
         out = self.operate("redeploy")
         self.assertIn("Redeploying api (same revision, onepeek-preprod-api:6, deployment ecs-svc/7).", out.stdout)
         self.assertIn("deployments[?status=='PRIMARY'].id", out.calls)
+        self.assertIn('expect="${expect:-} ${svc}=${td}@${dep}"', OPERATE_STEP)   # rollout_wait keys on that deployment
         self.assertIn("describe-services --cluster onepeek-preprod --services api --output json", out.calls)
 
     def test_a_redeploy_answer_without_a_deployment_id_fails_closed_before_any_wait(self):
