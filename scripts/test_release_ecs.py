@@ -70,31 +70,29 @@ def aws_stub(ecr: str, digest: str = DIGEST, commit: str = COMMIT) -> str:
 esac"""
 
 
-# describe-services as ECS answers it, for the stability poll (F661): ROLLOUT is a JSON list, one entry per poll of a
-# service (the last repeats): COMPLETED, IN_PROGRESS or FAILED (the PRIMARY deployment's rolloutState), ERROR (the call
-# fails), GARBLED (not JSON), STEADY (no rolloutState, one deployment, running = desired) or TWO (no rolloutState, two
-# deployments).
+# describe-services as ECS answers it, for the stability poll (F661). ROLLOUT is a JSON list, one entry per poll of a
+# service (the last repeats): "ERROR" (the call fails), "GARBLED" (not JSON), or the deployments, each
+# [status, revision, rolloutState or null, running, desired]; "SVC" in a revision is the service's name.
 DESCRIBE_PY = r"""import json, os, sys
 svc = sys.argv[sys.argv.index("--services") + 1]
-seq = json.loads(os.environ.get("ROLLOUT", '["COMPLETED"]'))
+polls = json.loads(os.environ.get("ROLLOUT", '[[["PRIMARY", "f:1", "COMPLETED", 1, 1]]]'))
 path = "polls-" + svc
 n = int(open(path).read()) if os.path.exists(path) else 0
 open(path, "w").write(str(n + 1))
-state = seq[min(n, len(seq) - 1)]
-if state == "ERROR":
+poll = polls[min(n, len(polls) - 1)]
+if poll == "ERROR":
     sys.stderr.write("An error occurred (ThrottlingException) when calling the DescribeServices operation\n"); sys.exit(254)
-if state == "GARBLED":
+if poll == "GARBLED":
     print("not json"); sys.exit(0)
-primary = {"status": "PRIMARY", "taskDefinition": "arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-%s:8" % svc,
-           "runningCount": 1, "desiredCount": 1, "pendingCount": 0}
-deployments = [primary]
-if state in ("COMPLETED", "IN_PROGRESS", "FAILED"):
-    primary["rolloutState"] = state
-    primary["rolloutStateReason"] = {"FAILED": "ECS deployment circuit breaker: tasks failed to start.",
-                                     "IN_PROGRESS": "ECS deployment ecs-svc/1 in progress.", "COMPLETED": "ECS deployment ecs-svc/1 completed."}[state]
-if state in ("IN_PROGRESS", "TWO"):
-    primary["runningCount"], primary["pendingCount"] = 0, 1
-    deployments.append({"status": "ACTIVE", "taskDefinition": "x:7", "runningCount": 1, "desiredCount": 1, "pendingCount": 0})
+reasons = {"FAILED": "ECS deployment circuit breaker: tasks failed to start.", "IN_PROGRESS": "ECS deployment in progress.",
+           "COMPLETED": "ECS deployment completed."}
+deployments = []
+for status, rev, state, running, desired in poll:
+    d = {"status": status, "taskDefinition": "arn:aws:ecs:ap-south-1:111111111111:task-definition/" + rev.replace("SVC", svc),
+         "runningCount": running, "desiredCount": desired, "pendingCount": max(desired - running, 0)}
+    if state:
+        d["rolloutState"], d["rolloutStateReason"] = state, reasons[state]
+    deployments.append(d)
 events = [{"createdAt": "2026-11-14T22:%02d:00Z" % i, "message": "(service %s) event %d" % (svc, i)} for i in range(20)]
 print(json.dumps({"services": [{"serviceName": svc, "deployments": deployments, "events": events}], "failures": []}))
 """
@@ -725,7 +723,7 @@ esac"""
         out, calls, _ = run_step(script, aws, base)
         self.assertNotEqual(out.returncode, 0)
         self.assertNotIn("register-task-definition", calls)
-        out, calls, _ = run_step(script, aws, {**base, "ALLOW_DROP": "B S"}, files={"ds.py": DESCRIBE_PY})
+        out, calls, _ = run_step(script, aws, {**base, "ALLOW_DROP": "B S", "ROLLOUT": json.dumps([[["PRIMARY", "api:8", "COMPLETED", 1, 1]]])}, files={"ds.py": DESCRIBE_PY})
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("register-task-definition", calls)
 
@@ -792,7 +790,7 @@ class RolloutOrder(unittest.TestCase):
 esac"""
         out, calls, _ = run_step(step("deploy", "Verify, render, register and update each order"), aws, {
             "IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9", "ORDERS": '[["pgbouncer", "valkey"], ["api", "worker"]]',
-            "ROLLOUT": '["FAILED"]'}, files={"ds.py": DESCRIBE_PY})  # fmt: skip
+            "ROLLOUT": '[[["PRIMARY", "f:1", "FAILED", 0, 1]]]'}, files={"ds.py": DESCRIBE_PY})  # fmt: skip
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
         self.assertIn("did not become stable", out.stdout)
         self.assertIn("update-service --cluster onepeek-preprod --service valkey", calls)
@@ -808,7 +806,8 @@ esac"""
 esac"""
         out, calls, _ = run_step(step("deploy", "Verify, render, register and update each order"), aws, {
             "IMAGE_REF": REF, "SIGNING_KEY": "k", "DRY_RUN": "false", "GITHUB_RUN_ID": "9", "ORDERS": '[["pgbouncer", "valkey"], ["api", "worker"]]',
-            "ROLLOUT": '["IN_PROGRESS", "COMPLETED"]'}, files={"ds.py": DESCRIBE_PY})  # fmt: skip
+            "ROLLOUT": '[[["PRIMARY", "f:1", "IN_PROGRESS", 0, 1], ["ACTIVE", "f:0", "COMPLETED", 1, 1]], [["PRIMARY", "f:1", "COMPLETED", 1, 1]]]'},
+            files={"ds.py": DESCRIBE_PY})  # fmt: skip
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         ecs = [line for line in calls.splitlines() if "update-service" in line or "--output json" in line and "describe-services" in line]
         order = [("update", "pgbouncer"), ("update", "valkey")] + [("poll", "pgbouncer"), ("poll", "valkey")] * 2 + \
@@ -832,10 +831,19 @@ esac"""
         self.assertNotIn("update-service", calls)
 
 
-class StableWait(unittest.TestCase):
-    """F661: the rollout waits on each service's PRIMARY rolloutState, not on ECS's 10-minute waiter, and says why it failed."""
+NEW, OLD = "onepeek-preprod-SVC:6", "onepeek-preprod-SVC:5"
+WANT = "api=arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-api:6 worker=arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-worker:6"
 
-    def wait(self, rollout, cap="30", services="api worker"):
+
+def dep(status, rev, state, running=1, desired=1):
+    return [status, rev, state, running, desired]
+
+
+class StableWait(unittest.TestCase):
+    """F661: the rollout waits until each service runs the revision it expects, rolled out and alone, not on ECS's
+    10-minute waiter; a rollback by ECS (circuit breaker or deploy alarm), a FAILED rollout and the cap fail, saying which."""
+
+    def wait(self, rollout, cap="30", services=WANT):
         aws = "case \"$*\" in\n" + DESCRIBE + "\nesac"
         out, calls, _ = run_step(STABLE_FN + f"rollout_wait {cap} {services}\n", aws, {"ROLLOUT": json.dumps(rollout)},
                                  files={"ds.py": DESCRIBE_PY}, extra_stubs={"sleep": "exit 0"})
@@ -846,31 +854,61 @@ class StableWait(unittest.TestCase):
             code = [line for line in (WORKFLOWS / name).read_text(encoding="utf-8").splitlines() if not line.strip().startswith("#")]
             self.assertFalse([line for line in code if "wait services-stable" in line], name)
         roll = step("deploy", "Verify, render, register and update each order")
-        self.assertIn('rollout_wait "${cap}" ${group}', roll)
+        self.assertIn('rollout_wait "${cap}" ${expect}', roll)
+        self.assertIn('expect="${expect} ${svc}=${arn}"', roll)
         self.assertNotIn("circuit breaker has rolled it back", TEXT)
 
-    def test_completed_after_in_progress_passes(self):
-        out, calls = self.wait(["IN_PROGRESS", "IN_PROGRESS", "COMPLETED"])
+    def test_the_new_revision_completed_and_alone_passes(self):
+        out, calls = self.wait([[dep("PRIMARY", NEW, "IN_PROGRESS", 0), dep("ACTIVE", OLD, "COMPLETED")],
+                                [dep("PRIMARY", NEW, "COMPLETED"), dep("ACTIVE", OLD, "COMPLETED", 1, 0)],   # old not drained yet
+                                [dep("PRIMARY", NEW, "COMPLETED")]])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(calls.count("describe-services --cluster onepeek-preprod --services api --output json"), 3)
-        self.assertIn("Stable (every PRIMARY deployment COMPLETED): api worker.", out.stdout)
+        self.assertIn("Stable (each on its expected revision, rolled out, the only deployment): api worker.", out.stdout)
 
-    def test_a_failed_rollout_fails_at_once_with_its_reason_and_events(self):
-        out, calls = self.wait(["IN_PROGRESS", "FAILED"])
-        self.assertEqual(out.returncode, 1)
-        self.assertEqual(calls.count("--services api --output json"), 2)   # no waiting out the cap
-        self.assertIn("::error::A rollout FAILED (ECS rolloutState FAILED)", out.stdout)
-        self.assertIn("api: onepeek-preprod-api:8 rolloutState FAILED (ECS deployment circuit breaker: tasks failed to start.); running 1, desired 1, pending 0", out.stdout)
+    def test_a_circuit_breaker_rollback_to_the_old_revision_fails_at_once(self):
+        # RV-110 finding 1, the real shape: the new deployment FAILED and moved to ACTIVE, the old revision PRIMARY and
+        # then COMPLETED. Reading only the PRIMARY's rolloutState called this a success.
+        rollback = [[dep("PRIMARY", NEW, "IN_PROGRESS", 0), dep("ACTIVE", OLD, "COMPLETED")],
+                    [dep("PRIMARY", OLD, "IN_PROGRESS"), dep("ACTIVE", NEW, "FAILED", 0, 0)],
+                    [dep("PRIMARY", OLD, "COMPLETED"), dep("ACTIVE", NEW, "FAILED", 0, 0)]]
+        out, calls = self.wait(rollback)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertEqual(calls.count("--services api --output json"), 2)   # at the first sign, not at the cap
+        self.assertIn("::error::api was rolled back by ECS (circuit breaker/alarm): ECS deployment circuit breaker: tasks failed to start.", out.stdout)
+        self.assertIn("ACTIVE onepeek-preprod-api:6 rolloutState FAILED", out.stdout)
         self.assertIn("(service api) event 14", out.stdout)
         self.assertNotIn("(service api) event 15", out.stdout)   # the 15 newest only
+        self.assertNotIn("Stable", out.stdout)
         self.assertNotIn("Timed out", out.stdout)
 
-    def test_the_cap_fails_and_says_it_timed_out_not_that_a_breaker_rolled_back(self):
-        out, calls = self.wait(["IN_PROGRESS"], cap="0")
+    def test_a_rollback_whose_failed_deployment_is_already_gone_still_fails(self):
+        out, _ = self.wait([[dep("PRIMARY", NEW, "IN_PROGRESS", 0), dep("ACTIVE", OLD, "COMPLETED")],
+                            [dep("PRIMARY", OLD, "COMPLETED")]])
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("api was rolled back by ECS (circuit breaker/alarm)", out.stdout)
+
+    def test_a_poll_before_the_new_deployment_is_listed_does_not_pass(self):
+        out, calls = self.wait([[dep("PRIMARY", OLD, "COMPLETED")], [dep("PRIMARY", NEW, "IN_PROGRESS", 0), dep("ACTIVE", OLD, "COMPLETED")],
+                                [dep("PRIMARY", NEW, "COMPLETED")]])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(calls.count("--services api --output json"), 3)
+        out, _ = self.wait([[dep("PRIMARY", OLD, "COMPLETED")]], cap="0")   # never listed: the cap, never success
         self.assertEqual(out.returncode, 1)
-        self.assertIn("::error::Timed out: not every PRIMARY deployment of api worker was COMPLETED after 0 s (no rollout reported FAILED).", out.stdout)
-        self.assertIn("api: onepeek-preprod-api:8 rolloutState IN_PROGRESS (ECS deployment ecs-svc/1 in progress.); running 0, desired 1, pending 1; 2 deployment(s)", out.stdout)
-        self.assertNotIn("FAILED", out.stdout.replace("no rollout reported FAILED", ""))
+        self.assertIn("Timed out", out.stdout)
+
+    def test_a_failed_primary_rollout_fails_at_once(self):
+        out, calls = self.wait([[dep("PRIMARY", NEW, "IN_PROGRESS", 0)], [dep("PRIMARY", NEW, "FAILED", 0)]])
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(calls.count("--services api --output json"), 2)
+        self.assertIn("api was rolled back by ECS (circuit breaker/alarm)", out.stdout)
+
+    def test_the_cap_fails_and_says_it_timed_out_not_that_a_breaker_rolled_back(self):
+        out, _ = self.wait([[dep("PRIMARY", NEW, "IN_PROGRESS", 0), dep("ACTIVE", OLD, "COMPLETED")]], cap="0")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("::error::Timed out: api worker not all on their expected revision, rolled out, after 0 s (no rollback or FAILED rollout seen).", out.stdout)
+        self.assertIn("PRIMARY onepeek-preprod-api:6 rolloutState IN_PROGRESS (ECS deployment in progress.); running 0, desired 1, pending 1", out.stdout)
+        self.assertNotIn("rolled back by ECS", out.stdout)
         self.assertNotIn("circuit breaker", out.stdout)
 
     def test_an_unreadable_answer_is_never_success(self):
@@ -881,13 +919,31 @@ class StableWait(unittest.TestCase):
                 self.assertIn("unreadable 3 times in a row", out.stdout)
                 self.assertNotIn("Stable", out.stdout)
                 self.assertEqual(calls.count("--services api --output json"), 3)
-        out, _ = self.wait(["ERROR", "COMPLETED"])   # one throttle is polled again, not a failure
+        out, _ = self.wait(["ERROR", [dep("PRIMARY", NEW, "COMPLETED")]])   # one throttle is polled again, not a failure
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
-    def test_without_a_rollout_state_one_steady_deployment_is_stable(self):
-        out, _ = self.wait(["TWO", "STEADY"])
+    def test_without_a_rollout_state_only_one_steady_deployment_of_the_revision_is_stable(self):
+        out, _ = self.wait([[dep("PRIMARY", NEW, None), dep("ACTIVE", OLD, None)], [dep("PRIMARY", NEW, None)]])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        out, _ = self.wait(["TWO"], cap="0")
+        # RV-110 finding 2: running = desired on the primary, but the old deployment is still there.
+        out, _ = self.wait([[dep("PRIMARY", NEW, None), dep("ACTIVE", OLD, None)]], cap="0")
+        self.assertEqual(out.returncode, 1)
+        out, _ = self.wait([[dep("PRIMARY", NEW, None, 0, 1)]], cap="0")
+        self.assertEqual(out.returncode, 1)
+
+    def test_a_service_with_no_expected_revision_is_refused_not_waited_on(self):
+        for bad in ("api", "api=", "=x"):
+            with self.subTest(bad):
+                out, calls = self.wait([[dep("PRIMARY", NEW, "COMPLETED")]], services=bad)
+                self.assertEqual(out.returncode, 1, bad)
+                self.assertIn("names no expected revision", out.stdout)
+                self.assertNotIn("describe-services", calls)
+
+    def test_a_service_scaled_to_0_is_done_once_nothing_runs(self):
+        # RV-110 finding 3: a first-deploy service put back to 0 has no revision to go back to; its FAILED deployment is fine.
+        out, _ = self.wait([[dep("PRIMARY", NEW, "FAILED", 0, 0)]], services="api=-")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        out, _ = self.wait([[dep("PRIMARY", NEW, "FAILED", 1, 0)]], services="api=-", cap="0")
         self.assertEqual(out.returncode, 1)
 
     def test_the_step_limits_cover_the_caps(self):
@@ -899,7 +955,7 @@ class StableWait(unittest.TestCase):
         self.assertGreater(deploy["timeout-minutes"], sum(s.get("timeout-minutes", 0) for s in deploy["steps"]))
         rollback = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("id") == "rollback")
         self.assertGreaterEqual(rollback["timeout-minutes"], 21)
-        self.assertIn("rollout_wait 1200 ${services}", rollback["run"])
+        self.assertIn("rollout_wait 1200 ${expect}", rollback["run"])
 
 
 class BaselineReadiness(unittest.TestCase):
