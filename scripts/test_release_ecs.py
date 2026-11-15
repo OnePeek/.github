@@ -994,6 +994,23 @@ class StableWait(unittest.TestCase):
         out, _ = self.wait([[dep("PRIMARY", NEW, "FAILED", 1, 0)]], services="api=-", cap="0")
         self.assertEqual(out.returncode, 1)
 
+    def test_credentials_are_minted_again_right_before_the_rollout_and_the_rollback(self):
+        # F668: the role's sessions last 1 h (the role's maximum: no max_session_duration in infra), but the deploy job's
+        # steps before the rollout may take 59 min and the rollout 45, and verify's checks 37 before a 25-minute rollback:
+        # expired credentials read as "describe-services unreadable 3 times" and fail a healthy rollout. A fresh session
+        # (OIDC, the same role) right before each long step gives it a full hour.
+        for job_id, step_id in (("deploy", "roll"), ("verify", "rollback")):
+            steps = RELEASE["jobs"][job_id]["steps"]
+            first = next(s for s in steps if str(s.get("uses", "")).startswith("aws-actions/configure-aws-credentials@"))
+            i = next(i for i, s in enumerate(steps) if s.get("id") == step_id)
+            again = steps[i - 1]
+            self.assertEqual(again.get("uses"), first["uses"], job_id)
+            self.assertEqual(again["with"], first["with"], job_id)
+            self.assertLessEqual(again["timeout-minutes"], 2, job_id)
+            self.assertEqual(again.get("if"), steps[i].get("if"), job_id)   # it runs exactly when the long step runs
+        self.assertIn("id-token", RELEASE["jobs"]["deploy"]["permissions"])
+        self.assertIn("id-token", RELEASE["jobs"]["verify"]["permissions"])
+
     def test_the_step_limits_cover_the_caps(self):
         roll = next(s for s in RELEASE["jobs"]["deploy"]["steps"] if s.get("id") == "roll")
         self.assertGreaterEqual(roll["timeout-minutes"], 45)
@@ -1180,7 +1197,17 @@ class WatchRetries(unittest.TestCase):
         self.assertEqual(watch["env"]["AWS_RETRY_MODE"], "adaptive")
         self.assertEqual(int(watch["env"]["AWS_MAX_ATTEMPTS"]), 6)
         # Bounded: six attempts of a poll still end inside the step limit, so a hang ends as a failed step (rollback).
-        self.assertEqual(watch["timeout-minutes"], 12)
+        # F658: with the CLI's 60 s connect and read timeouts, one poll of 6 attempts could take 12 minutes, past the step
+        # limit, and a step timeout rolls a healthy release back. Each attempt is now at most 5 + 10 s, so the worst poll
+        # is 6 x 15 s plus 5 adaptive backoffs of at most 20 s = 190 s; the window (600 s) starts before the first poll, so
+        # the window plus one worst poll leaves at least 120 s before the step limit.
+        for line in watch["run"].splitlines():
+            if "aws " in line and not line.strip().startswith("#"):
+                self.assertIn("--cli-connect-timeout 5 --cli-read-timeout 10", line)
+        run = watch["run"]
+        self.assertLess(run.index("end=$((SECONDS + 600))"), run.index("known=$(poll)"))
+        worst_poll = 6 * (5 + 10) + 5 * 20
+        self.assertGreaterEqual(watch["timeout-minutes"] * 60 - 600 - worst_poll, 120)
 
 
 class WatchShell(unittest.TestCase):

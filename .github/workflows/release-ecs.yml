@@ -3325,6 +3325,15 @@ jobs:
           # on finish puts every service back unless verify records an end. A failed write means this run has lost the key.
           if [ "${DRY_RUN}" != "true" ]; then lock_write_phase rolling "$(cat previous.json)" || exit 1; fi
           echo "previous=$(python3 -c 'import json;print(json.dumps(json.load(open("previous.json"))["previous"]))')" >> "$GITHUB_OUTPUT"
+      - name: A fresh role session for the rollout (F668)
+        # The role's sessions last at most 1 h; the steps before the rollout may take 59 minutes and the rollout 45, and
+        # expired credentials would read as "describe-services unreadable" and fail a healthy rollout. Same role, via OIDC.
+        timeout-minutes: 2
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - name: Verify, render, register and update each order's services in parallel, waiting for each order to be stable
         id: roll
         timeout-minutes: 45   # each order's rollout and deploy-alarm bake up to 25 minutes, all orders within 40 (F661)
@@ -3635,7 +3644,7 @@ jobs:
     needs: [prepare, build-image, build-web, deploy]
     if: ${{ !cancelled() && !inputs.dry-run && (needs.deploy.result == 'success' || (needs.deploy.result == 'failure' && needs.deploy.outputs.previous != '')) }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 70   # above the sum of its step limits (10 + 5 + 10 + 12 + 25), so a hang ends as a failed step and the rollback still runs
+    timeout-minutes: 70   # above the sum of its step limits (10 + 5 + 10 + 16 + 2 + 25), so a hang ends as a failed step and the rollback still runs
     permissions:
       contents: read
       id-token: write
@@ -3713,7 +3722,7 @@ jobs:
             -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN bash "${SCRIPT}"
       - name: 10 minutes after stable, poll the rolled services' deploy alarms every 30 s
         id: watch
-        timeout-minutes: 12
+        timeout-minutes: 16   # F658: the 10-minute window, one worst poll (190 s, see poll()) and 120 s to spare
         env:
           SERVICES: ${{ needs.deploy.outputs.services }}
           # F630: adaptive retries, 6 attempts per call (the CLI's default is 3), so an API throttle in one poll does not
@@ -3739,10 +3748,13 @@ jobs:
             echo "::error::The rollout reported no services, so there is nothing to watch."
             exit 1
           fi
+          # F658: each attempt is bounded (connect 5 s, read 10 s; the CLI's default is 60 s each), so a poll of 6 attempts
+          # with adaptive backoff (at most 20 s each) ends within 190 s, and the last poll of the window ends inside the step.
           poll() {  # $@: extra describe-alarms options; prints the matching alarm names on one line
-            aws cloudwatch describe-alarms --alarm-names "${names[@]}" "$@" --query 'MetricAlarms[].AlarmName' --output text \
+            aws cloudwatch describe-alarms --cli-connect-timeout 5 --cli-read-timeout 10 --alarm-names "${names[@]}" "$@" --query 'MetricAlarms[].AlarmName' --output text \
               | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'
           }
+          end=$((SECONDS + 600))   # F658: the window starts before the first poll, so a slow first poll does not lengthen it
           known=$(poll)   # an unreadable alarm list fails the step (and so rolls back); only a readable empty one skips
           if [ -z "${known}" ]; then
             # C11: with no alarm to poll, 10 minutes of polling cannot catch anything, so the watch is skipped, out loud.
@@ -3751,13 +3763,22 @@ jobs:
             exit 0
           fi
           echo "Watching: ${known}"
-          end=$((SECONDS + 600))
           while [ "${SECONDS}" -lt "${end}" ]; do
             alarms=$(poll --state-value ALARM)
             if [ -n "${alarms}" ]; then echo "::error::Deploy alarms firing: ${alarms}"; exit 1; fi
             sleep 30
           done
           echo "No deploy alarm in 10 minutes."
+      - name: A fresh role session for the rollback (F668)
+        # The checks before it may take 37 minutes and the put-back 25: past the role's 1-hour session. Same role, via OIDC;
+        # it runs exactly when the rollback runs, and if it fails the rollback still runs on the first session.
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.creds.outcome == 'success' && steps.watch.outcome != 'success' }}
+        timeout-minutes: 2
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - name: Put every service back on the revision recorded before the rollout (versions stay aligned, E2/E3)
         id: rollback
         # On a failed rollout or ops registration (deploy failed after recording previous), smoke or watch: the
