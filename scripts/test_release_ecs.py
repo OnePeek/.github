@@ -87,9 +87,11 @@ if poll == "GARBLED":
 reasons = {"FAILED": "ECS deployment circuit breaker: tasks failed to start.", "IN_PROGRESS": "ECS deployment in progress.",
            "COMPLETED": "ECS deployment completed."}
 deployments = []
-for status, rev, state, running, desired in poll:
+for status, rev, state, running, desired, *dep_id in poll:
     d = {"status": status, "taskDefinition": "arn:aws:ecs:ap-south-1:111111111111:task-definition/" + rev.replace("SVC", svc),
          "runningCount": running, "desiredCount": desired, "pendingCount": max(desired - running, 0)}
+    if dep_id:
+        d["id"] = dep_id[0]
     if state:
         d["rolloutState"], d["rolloutStateReason"] = state, reasons[state]
     deployments.append(d)
@@ -835,8 +837,8 @@ NEW, OLD = "onepeek-preprod-SVC:6", "onepeek-preprod-SVC:5"
 WANT = "api=arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-api:6 worker=arn:aws:ecs:ap-south-1:111111111111:task-definition/onepeek-preprod-worker:6"
 
 
-def dep(status, rev, state, running=1, desired=1):
-    return [status, rev, state, running, desired]
+def dep(status, rev, state, running=1, desired=1, dep_id=None):
+    return [status, rev, state, running, desired] + ([dep_id] if dep_id else [])
 
 
 class StableWait(unittest.TestCase):
@@ -896,6 +898,52 @@ class StableWait(unittest.TestCase):
         out, _ = self.wait([[dep("PRIMARY", OLD, "COMPLETED")]], cap="0")   # never listed: the cap, never success
         self.assertEqual(out.returncode, 1)
         self.assertIn("Timed out", out.stdout)
+
+    def test_a_stale_describe_right_after_a_put_back_waits_instead_of_reporting_a_rollback(self):
+        # F675: a put-back to :5 from :6; the first describe still shows PRIMARY :6 with the earlier :5 deployment ACTIVE.
+        # Listing :5 anywhere used to count as seen, so PRIMARY :6 read as "rolled back by ECS" at once.
+        out, calls = self.wait([[dep("PRIMARY", NEW, "COMPLETED"), dep("ACTIVE", OLD, "COMPLETED", 1, 0)],
+                                [dep("PRIMARY", OLD, "IN_PROGRESS", 0), dep("ACTIVE", NEW, "COMPLETED")],
+                                [dep("PRIMARY", OLD, "COMPLETED")]], services=WANT.replace(":6", ":5"))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("rolled back by ECS", out.stdout)
+        self.assertEqual(calls.count("--services api --output json"), 3)
+
+    def test_a_put_back_that_ecs_then_rolls_back_still_fails_at_once(self):
+        out, calls = self.wait([[dep("PRIMARY", NEW, "COMPLETED"), dep("ACTIVE", OLD, "COMPLETED", 1, 0)],
+                                [dep("PRIMARY", OLD, "IN_PROGRESS", 0), dep("ACTIVE", NEW, "COMPLETED")],
+                                [dep("PRIMARY", NEW, "IN_PROGRESS"), dep("ACTIVE", OLD, "FAILED", 0, 0)]],
+                               services=WANT.replace(":6", ":5"))
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("api was rolled back by ECS", out.stdout)
+        self.assertEqual(calls.count("--services api --output json"), 3)
+
+    def test_a_redeploy_keyed_on_its_deployment_id_never_passes_on_the_deployment_already_running(self):
+        # F675: a forced redeploy keeps the revision, so a stale describe (only the old deployment, COMPLETED, alone)
+        # looked done. With <service>=<revision>@<deployment id> only that deployment, PRIMARY and rolled out, is done.
+        want = " ".join(w + "@ecs-svc/2" for w in WANT.split())
+        out, calls = self.wait([[dep("PRIMARY", NEW, "COMPLETED", dep_id="ecs-svc/1")],
+                                [dep("PRIMARY", NEW, "IN_PROGRESS", 0, dep_id="ecs-svc/2"), dep("ACTIVE", NEW, "COMPLETED", dep_id="ecs-svc/1")],
+                                [dep("PRIMARY", NEW, "COMPLETED", dep_id="ecs-svc/2")]], services=want)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(calls.count("--services api --output json"), 3)
+        out, _ = self.wait([[dep("PRIMARY", NEW, "COMPLETED", dep_id="ecs-svc/1")]], services=want, cap="0")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("Timed out", out.stdout)
+
+    def test_a_redeploy_rolled_back_by_ecs_fails_at_once(self):
+        # The circuit breaker fails the forced deployment and starts a new one of the same revision: by id, a rollback.
+        want = " ".join(w + "@ecs-svc/2" for w in WANT.split())
+        out, calls = self.wait([[dep("PRIMARY", NEW, "IN_PROGRESS", 0, dep_id="ecs-svc/2"), dep("ACTIVE", NEW, "COMPLETED", dep_id="ecs-svc/1")],
+                                [dep("PRIMARY", NEW, "IN_PROGRESS", 1, dep_id="ecs-svc/3")]], services=want)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("api was rolled back by ECS", out.stdout)
+        self.assertEqual(calls.count("--services api --output json"), 2)
+        out, _ = self.wait([[dep("PRIMARY", NEW, "IN_PROGRESS", 0, dep_id="ecs-svc/2")],
+                            [dep("PRIMARY", NEW, "IN_PROGRESS", 1, dep_id="ecs-svc/3"), dep("ACTIVE", NEW, "FAILED", 0, 0, dep_id="ecs-svc/2")]],
+                           services=want)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("api was rolled back by ECS", out.stdout)
 
     def test_a_failed_primary_rollout_fails_at_once(self):
         out, calls = self.wait([[dep("PRIMARY", NEW, "IN_PROGRESS", 0)], [dep("PRIMARY", NEW, "FAILED", 0)]])
