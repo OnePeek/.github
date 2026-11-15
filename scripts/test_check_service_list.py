@@ -4,9 +4,10 @@ from pathlib import Path
 
 import check_service_list as c
 
-LOCK = "          # --- release-lock begin (x) ---\n          lock_take() { :; }\n          # --- release-lock end ---\n"
+STABLE = "          # --- stable-wait begin (x) ---\n          rollout_wait() { :; }\n          # --- stable-wait end ---\n"
+LOCK = "          # --- release-lock begin (x) ---\n          lock_take() { :; }\n" + STABLE + "          # --- release-lock end ---\n"
 RENDER = "          # --- render-taskdef begin (x) ---\n          render() { :; }\n          # --- render-taskdef end ---\n"
-BLOCK = RENDER + LOCK * 6  # release-ecs.yml: take, migrate, previous, verify's rollback, verify's end, finish
+BLOCK = RENDER + STABLE + LOCK * 6  # release-ecs.yml: the rollout's stable-wait; take, migrate, previous, verify's rollback, verify's end, finish
 OPERATE = "on:\n  options:\n    # service-list begin\n    options: [all, api]\n    # service-list end\n" + RENDER + LOCK * 3
 SERVICES = "services:\n  api: {triggers: [request]}\n  migrate: {triggers: [migration]}\n"
 
@@ -43,6 +44,13 @@ class T(unittest.TestCase):
     def test_the_shared_lock_workflow_must_match(self):
         self.assertEqual(self.run_check(OPERATE, lock=LOCK.replace(":;", "echo;")), 1)
 
+
+    def test_the_stable_wait_copies_must_match_and_the_rollout_keeps_its_own(self):
+        # F661: one stability poll everywhere; the rollout step's copy outside the lock functions is required.
+        self.assertEqual(self.run_check(OPERATE), 0)
+        self.assertEqual(self.run_check(OPERATE, release=BLOCK.replace(STABLE, "", 1)), 1)
+        self.assertEqual(self.run_check(OPERATE, release=BLOCK.replace(STABLE, STABLE.replace(":;", "echo;"), 1)), 1)
+        self.assertEqual(self.run_check(OPERATE, lock=LOCK.replace(STABLE, STABLE.replace(":;", "echo;"))), 1)
 
 if __name__ == "__main__":
     unittest.main()

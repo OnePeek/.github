@@ -695,6 +695,99 @@ jobs:
             echo "${2##*/} is inactive (deregistered since the release recorded it): registered again from its recorded definition as ${arn##*/}."
             LOCK_LIVE_REVISION="${arn}"
           }
+          # --- stable-wait begin (identical in every copy; checked by scripts/check_service_list.py) ---
+          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
+            # ECS's own waiter (`aws ecs wait services-stable`, 40 x 15 s) is shorter than a preprod rollout plus the deploy-alarm bake
+            # time, and it says nothing about why. This polls describe-services every LOCK_STABLE_POLL_SECONDS (15). A service is done
+            # only when its PRIMARY deployment runs the expected revision (the one just registered, or the one put back), its
+            # rolloutState is COMPLETED (without one: running = desired) and it is the only deployment left, so the old one has
+            # drained (what ECS's own waiter asks). `-` instead of a revision: the service was scaled to 0, done once nothing runs.
+            # The services run with circuit-breaker and deploy-alarm rollback: ECS then marks the new deployment FAILED and makes a
+            # deployment of the OLD revision PRIMARY, which completes. So a deployment of the expected revision that is FAILED, or a
+            # PRIMARY on another revision once the expected one was listed, is a rollback by ECS and fails at once. A poll before the
+            # new deployment is listed waits. Any failure, and the cap, print per service every deployment's revision, state and
+            # reason, the running, desired and pending counts and the 15 newest events, and say which happened. An unreadable answer
+            # is never success: it is polled again, and three in a row fail the wait.
+            local cap="$1" end unread=0 arg verdict names=()
+            shift
+            for arg in "$@"; do
+              case "${arg}" in
+                [a-z0-9]*=?*) names+=("${arg%%=*}") ;;
+                *) echo "::error::rollout_wait: '${arg}' names no expected revision, so stability cannot be judged."; return 1 ;;
+              esac
+            done
+            end=$((SECONDS + cap))
+            rm -f lock-stable-*.json lock-stable-seen-*
+            while :; do
+              rm -f lock-stable-*.json
+              for arg in "$@"; do
+                if ! aws ecs describe-services --cluster "${NAME}" --services "${arg%%=*}" --output json > "lock-stable-${arg%%=*}.json"; then
+                  rm -f "lock-stable-${arg%%=*}.json"
+                fi
+              done
+              verdict=$(python3 -c '
+          import json, os, sys
+          out, verdicts = [], []
+          rev = lambda arn: str(arn or "?").split("/")[-1]
+          for arg in sys.argv[1:]:
+              svc, want = arg.split("=", 1)
+              try:
+                  described = json.load(open("lock-stable-%s.json" % svc))
+                  s = [x for x in described["services"] if x["serviceName"] == svc][0]
+                  deployments = s["deployments"]
+                  primary = [d for d in deployments if d["status"] == "PRIMARY"][0]
+              except Exception:
+                  out.append("%s: describe-services unreadable" % svc)
+                  verdicts.append("unreadable")
+                  continue
+              mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
+              if mine:
+                  open("lock-stable-seen-" + svc, "w").close()
+              seen = os.path.exists("lock-stable-seen-" + svc)
+              state = primary.get("rolloutState")
+              failed = [d for d in mine if d.get("rolloutState") == "FAILED"]
+              if want == "-":
+                  verdict = "done" if len(deployments) == 1 and primary.get("desiredCount") == 0 and primary.get("runningCount") == 0 else "waiting"
+              elif failed or (seen and rev(primary.get("taskDefinition")) != rev(want)):
+                  verdict = "rolledback"
+                  reason = (failed or [primary])[0].get("rolloutStateReason") or primary.get("rolloutStateReason") or "no reason given"
+                  out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
+              elif rev(primary.get("taskDefinition")) != rev(want):
+                  verdict = "waiting"   # the new deployment is not listed yet
+              else:
+                  steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
+                  verdict = "done" if steady and len(deployments) == 1 else "waiting"
+              verdicts.append(verdict)
+              out.append("%s (wants %s): %s" % (svc, rev(want) if want != "-" else "scaled to 0", verdict))
+              for d in deployments:
+                  out.append("    %s %s rolloutState %s (%s); running %s, desired %s, pending %s" % (d.get("status"), rev(d.get("taskDefinition")),
+                      d.get("rolloutState") or "none", d.get("rolloutStateReason") or "no reason given", d.get("runningCount"), d.get("desiredCount"), d.get("pendingCount")))
+              for e in (s.get("events") or [])[:15]:
+                  out.append("    %s %s" % (e.get("createdAt", "?"), e.get("message", "")))
+          open("lock-stable-report.txt", "w").write("\n".join(out) + "\n")
+          for v in ("rolledback", "unreadable", "waiting", "done"):
+              if v in verdicts:
+                  print(v)
+                  break' "$@") || verdict=unreadable
+              case "${verdict}" in
+                done) echo "Stable (each on its expected revision, rolled out, the only deployment): ${names[*]}."; return 0 ;;
+                rolledback) echo "::error::Not stable: ECS rolled back or failed a rollout among ${names[*]}."; cat lock-stable-report.txt; return 1 ;;
+                unreadable)
+                  unread=$((unread + 1))
+                  if [ "${unread}" -ge 3 ]; then
+                    echo "::error::describe-services was unreadable 3 times in a row, so the stability of ${names[*]} is unknown: treated as not stable."
+                    cat lock-stable-report.txt 2>/dev/null || true; return 1
+                  fi ;;
+                *) unread=0 ;;
+              esac
+              if [ "${SECONDS}" -ge "${end}" ]; then
+                echo "::error::Timed out: ${names[*]} not all on their expected revision, rolled out, after ${cap} s (no rollback or FAILED rollout seen)."
+                cat lock-stable-report.txt 2>/dev/null || true; return 1
+              fi
+              sleep "${LOCK_STABLE_POLL_SECONDS:-15}"
+            done
+          }
+          # --- stable-wait end ---
           lock_put_back() {  # lock_put_back <record file>: every service in previous back to its revision (first-deploy: to 0), services-stable, the sandbox aliases, an issue
             local kind svc td fn ver stable=""
             if ! python3 -c '
@@ -732,12 +825,12 @@ jobs:
                   echo "Scaled ${svc} to 0: this release deployed it first, so it has no revision to go back to." ;;
                 *) continue ;;
               esac
-              stable="${stable} ${svc}"
+              stable="${stable} ${svc}=${td}"   # the revision put back, or - for one scaled to 0 (rollout_wait)
             done < lock-put-back.txt
             if [ -n "${stable}" ]; then
               # shellcheck disable=SC2086
-              if ! aws ecs wait services-stable --cluster "${NAME}" --services ${stable} && ! aws ecs wait services-stable --cluster "${NAME}" --services ${stable}; then
-                echo "::error::The services put back did not become stable in 20 minutes:${stable}."; return 1
+              if ! rollout_wait 1200 ${stable}; then
+                echo "::error::The services put back did not become stable (see above):${stable}."; return 1
               fi
             fi
             while read -r kind fn ver; do
@@ -1280,7 +1373,7 @@ jobs:
     needs: [prepare, build-image, build-web, db-bootstrap]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.build-image.result == 'success' || needs.build-web.result == 'success') && (!inputs.migrate || inputs.dry-run || needs.db-bootstrap.result == 'success') }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 110   # above the sum of its step limits (99): a hang ends as a failed step, so verify still rolls back (a job timeout is 'cancelled' and it would not)
+    timeout-minutes: 135   # above the sum of its step limits (124): a hang ends as a failed step, so verify still rolls back (a job timeout is 'cancelled' and it would not)
     permissions:
       contents: read
       id-token: write
@@ -1819,6 +1912,99 @@ jobs:
             echo "${2##*/} is inactive (deregistered since the release recorded it): registered again from its recorded definition as ${arn##*/}."
             LOCK_LIVE_REVISION="${arn}"
           }
+          # --- stable-wait begin (identical in every copy; checked by scripts/check_service_list.py) ---
+          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
+            # ECS's own waiter (`aws ecs wait services-stable`, 40 x 15 s) is shorter than a preprod rollout plus the deploy-alarm bake
+            # time, and it says nothing about why. This polls describe-services every LOCK_STABLE_POLL_SECONDS (15). A service is done
+            # only when its PRIMARY deployment runs the expected revision (the one just registered, or the one put back), its
+            # rolloutState is COMPLETED (without one: running = desired) and it is the only deployment left, so the old one has
+            # drained (what ECS's own waiter asks). `-` instead of a revision: the service was scaled to 0, done once nothing runs.
+            # The services run with circuit-breaker and deploy-alarm rollback: ECS then marks the new deployment FAILED and makes a
+            # deployment of the OLD revision PRIMARY, which completes. So a deployment of the expected revision that is FAILED, or a
+            # PRIMARY on another revision once the expected one was listed, is a rollback by ECS and fails at once. A poll before the
+            # new deployment is listed waits. Any failure, and the cap, print per service every deployment's revision, state and
+            # reason, the running, desired and pending counts and the 15 newest events, and say which happened. An unreadable answer
+            # is never success: it is polled again, and three in a row fail the wait.
+            local cap="$1" end unread=0 arg verdict names=()
+            shift
+            for arg in "$@"; do
+              case "${arg}" in
+                [a-z0-9]*=?*) names+=("${arg%%=*}") ;;
+                *) echo "::error::rollout_wait: '${arg}' names no expected revision, so stability cannot be judged."; return 1 ;;
+              esac
+            done
+            end=$((SECONDS + cap))
+            rm -f lock-stable-*.json lock-stable-seen-*
+            while :; do
+              rm -f lock-stable-*.json
+              for arg in "$@"; do
+                if ! aws ecs describe-services --cluster "${NAME}" --services "${arg%%=*}" --output json > "lock-stable-${arg%%=*}.json"; then
+                  rm -f "lock-stable-${arg%%=*}.json"
+                fi
+              done
+              verdict=$(python3 -c '
+          import json, os, sys
+          out, verdicts = [], []
+          rev = lambda arn: str(arn or "?").split("/")[-1]
+          for arg in sys.argv[1:]:
+              svc, want = arg.split("=", 1)
+              try:
+                  described = json.load(open("lock-stable-%s.json" % svc))
+                  s = [x for x in described["services"] if x["serviceName"] == svc][0]
+                  deployments = s["deployments"]
+                  primary = [d for d in deployments if d["status"] == "PRIMARY"][0]
+              except Exception:
+                  out.append("%s: describe-services unreadable" % svc)
+                  verdicts.append("unreadable")
+                  continue
+              mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
+              if mine:
+                  open("lock-stable-seen-" + svc, "w").close()
+              seen = os.path.exists("lock-stable-seen-" + svc)
+              state = primary.get("rolloutState")
+              failed = [d for d in mine if d.get("rolloutState") == "FAILED"]
+              if want == "-":
+                  verdict = "done" if len(deployments) == 1 and primary.get("desiredCount") == 0 and primary.get("runningCount") == 0 else "waiting"
+              elif failed or (seen and rev(primary.get("taskDefinition")) != rev(want)):
+                  verdict = "rolledback"
+                  reason = (failed or [primary])[0].get("rolloutStateReason") or primary.get("rolloutStateReason") or "no reason given"
+                  out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
+              elif rev(primary.get("taskDefinition")) != rev(want):
+                  verdict = "waiting"   # the new deployment is not listed yet
+              else:
+                  steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
+                  verdict = "done" if steady and len(deployments) == 1 else "waiting"
+              verdicts.append(verdict)
+              out.append("%s (wants %s): %s" % (svc, rev(want) if want != "-" else "scaled to 0", verdict))
+              for d in deployments:
+                  out.append("    %s %s rolloutState %s (%s); running %s, desired %s, pending %s" % (d.get("status"), rev(d.get("taskDefinition")),
+                      d.get("rolloutState") or "none", d.get("rolloutStateReason") or "no reason given", d.get("runningCount"), d.get("desiredCount"), d.get("pendingCount")))
+              for e in (s.get("events") or [])[:15]:
+                  out.append("    %s %s" % (e.get("createdAt", "?"), e.get("message", "")))
+          open("lock-stable-report.txt", "w").write("\n".join(out) + "\n")
+          for v in ("rolledback", "unreadable", "waiting", "done"):
+              if v in verdicts:
+                  print(v)
+                  break' "$@") || verdict=unreadable
+              case "${verdict}" in
+                done) echo "Stable (each on its expected revision, rolled out, the only deployment): ${names[*]}."; return 0 ;;
+                rolledback) echo "::error::Not stable: ECS rolled back or failed a rollout among ${names[*]}."; cat lock-stable-report.txt; return 1 ;;
+                unreadable)
+                  unread=$((unread + 1))
+                  if [ "${unread}" -ge 3 ]; then
+                    echo "::error::describe-services was unreadable 3 times in a row, so the stability of ${names[*]} is unknown: treated as not stable."
+                    cat lock-stable-report.txt 2>/dev/null || true; return 1
+                  fi ;;
+                *) unread=0 ;;
+              esac
+              if [ "${SECONDS}" -ge "${end}" ]; then
+                echo "::error::Timed out: ${names[*]} not all on their expected revision, rolled out, after ${cap} s (no rollback or FAILED rollout seen)."
+                cat lock-stable-report.txt 2>/dev/null || true; return 1
+              fi
+              sleep "${LOCK_STABLE_POLL_SECONDS:-15}"
+            done
+          }
+          # --- stable-wait end ---
           lock_put_back() {  # lock_put_back <record file>: every service in previous back to its revision (first-deploy: to 0), services-stable, the sandbox aliases, an issue
             local kind svc td fn ver stable=""
             if ! python3 -c '
@@ -1856,12 +2042,12 @@ jobs:
                   echo "Scaled ${svc} to 0: this release deployed it first, so it has no revision to go back to." ;;
                 *) continue ;;
               esac
-              stable="${stable} ${svc}"
+              stable="${stable} ${svc}=${td}"   # the revision put back, or - for one scaled to 0 (rollout_wait)
             done < lock-put-back.txt
             if [ -n "${stable}" ]; then
               # shellcheck disable=SC2086
-              if ! aws ecs wait services-stable --cluster "${NAME}" --services ${stable} && ! aws ecs wait services-stable --cluster "${NAME}" --services ${stable}; then
-                echo "::error::The services put back did not become stable in 20 minutes:${stable}."; return 1
+              if ! rollout_wait 1200 ${stable}; then
+                echo "::error::The services put back did not become stable (see above):${stable}."; return 1
               fi
             fi
             while read -r kind fn ver; do
@@ -2760,6 +2946,99 @@ jobs:
             echo "${2##*/} is inactive (deregistered since the release recorded it): registered again from its recorded definition as ${arn##*/}."
             LOCK_LIVE_REVISION="${arn}"
           }
+          # --- stable-wait begin (identical in every copy; checked by scripts/check_service_list.py) ---
+          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
+            # ECS's own waiter (`aws ecs wait services-stable`, 40 x 15 s) is shorter than a preprod rollout plus the deploy-alarm bake
+            # time, and it says nothing about why. This polls describe-services every LOCK_STABLE_POLL_SECONDS (15). A service is done
+            # only when its PRIMARY deployment runs the expected revision (the one just registered, or the one put back), its
+            # rolloutState is COMPLETED (without one: running = desired) and it is the only deployment left, so the old one has
+            # drained (what ECS's own waiter asks). `-` instead of a revision: the service was scaled to 0, done once nothing runs.
+            # The services run with circuit-breaker and deploy-alarm rollback: ECS then marks the new deployment FAILED and makes a
+            # deployment of the OLD revision PRIMARY, which completes. So a deployment of the expected revision that is FAILED, or a
+            # PRIMARY on another revision once the expected one was listed, is a rollback by ECS and fails at once. A poll before the
+            # new deployment is listed waits. Any failure, and the cap, print per service every deployment's revision, state and
+            # reason, the running, desired and pending counts and the 15 newest events, and say which happened. An unreadable answer
+            # is never success: it is polled again, and three in a row fail the wait.
+            local cap="$1" end unread=0 arg verdict names=()
+            shift
+            for arg in "$@"; do
+              case "${arg}" in
+                [a-z0-9]*=?*) names+=("${arg%%=*}") ;;
+                *) echo "::error::rollout_wait: '${arg}' names no expected revision, so stability cannot be judged."; return 1 ;;
+              esac
+            done
+            end=$((SECONDS + cap))
+            rm -f lock-stable-*.json lock-stable-seen-*
+            while :; do
+              rm -f lock-stable-*.json
+              for arg in "$@"; do
+                if ! aws ecs describe-services --cluster "${NAME}" --services "${arg%%=*}" --output json > "lock-stable-${arg%%=*}.json"; then
+                  rm -f "lock-stable-${arg%%=*}.json"
+                fi
+              done
+              verdict=$(python3 -c '
+          import json, os, sys
+          out, verdicts = [], []
+          rev = lambda arn: str(arn or "?").split("/")[-1]
+          for arg in sys.argv[1:]:
+              svc, want = arg.split("=", 1)
+              try:
+                  described = json.load(open("lock-stable-%s.json" % svc))
+                  s = [x for x in described["services"] if x["serviceName"] == svc][0]
+                  deployments = s["deployments"]
+                  primary = [d for d in deployments if d["status"] == "PRIMARY"][0]
+              except Exception:
+                  out.append("%s: describe-services unreadable" % svc)
+                  verdicts.append("unreadable")
+                  continue
+              mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
+              if mine:
+                  open("lock-stable-seen-" + svc, "w").close()
+              seen = os.path.exists("lock-stable-seen-" + svc)
+              state = primary.get("rolloutState")
+              failed = [d for d in mine if d.get("rolloutState") == "FAILED"]
+              if want == "-":
+                  verdict = "done" if len(deployments) == 1 and primary.get("desiredCount") == 0 and primary.get("runningCount") == 0 else "waiting"
+              elif failed or (seen and rev(primary.get("taskDefinition")) != rev(want)):
+                  verdict = "rolledback"
+                  reason = (failed or [primary])[0].get("rolloutStateReason") or primary.get("rolloutStateReason") or "no reason given"
+                  out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
+              elif rev(primary.get("taskDefinition")) != rev(want):
+                  verdict = "waiting"   # the new deployment is not listed yet
+              else:
+                  steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
+                  verdict = "done" if steady and len(deployments) == 1 else "waiting"
+              verdicts.append(verdict)
+              out.append("%s (wants %s): %s" % (svc, rev(want) if want != "-" else "scaled to 0", verdict))
+              for d in deployments:
+                  out.append("    %s %s rolloutState %s (%s); running %s, desired %s, pending %s" % (d.get("status"), rev(d.get("taskDefinition")),
+                      d.get("rolloutState") or "none", d.get("rolloutStateReason") or "no reason given", d.get("runningCount"), d.get("desiredCount"), d.get("pendingCount")))
+              for e in (s.get("events") or [])[:15]:
+                  out.append("    %s %s" % (e.get("createdAt", "?"), e.get("message", "")))
+          open("lock-stable-report.txt", "w").write("\n".join(out) + "\n")
+          for v in ("rolledback", "unreadable", "waiting", "done"):
+              if v in verdicts:
+                  print(v)
+                  break' "$@") || verdict=unreadable
+              case "${verdict}" in
+                done) echo "Stable (each on its expected revision, rolled out, the only deployment): ${names[*]}."; return 0 ;;
+                rolledback) echo "::error::Not stable: ECS rolled back or failed a rollout among ${names[*]}."; cat lock-stable-report.txt; return 1 ;;
+                unreadable)
+                  unread=$((unread + 1))
+                  if [ "${unread}" -ge 3 ]; then
+                    echo "::error::describe-services was unreadable 3 times in a row, so the stability of ${names[*]} is unknown: treated as not stable."
+                    cat lock-stable-report.txt 2>/dev/null || true; return 1
+                  fi ;;
+                *) unread=0 ;;
+              esac
+              if [ "${SECONDS}" -ge "${end}" ]; then
+                echo "::error::Timed out: ${names[*]} not all on their expected revision, rolled out, after ${cap} s (no rollback or FAILED rollout seen)."
+                cat lock-stable-report.txt 2>/dev/null || true; return 1
+              fi
+              sleep "${LOCK_STABLE_POLL_SECONDS:-15}"
+            done
+          }
+          # --- stable-wait end ---
           lock_put_back() {  # lock_put_back <record file>: every service in previous back to its revision (first-deploy: to 0), services-stable, the sandbox aliases, an issue
             local kind svc td fn ver stable=""
             if ! python3 -c '
@@ -2797,12 +3076,12 @@ jobs:
                   echo "Scaled ${svc} to 0: this release deployed it first, so it has no revision to go back to." ;;
                 *) continue ;;
               esac
-              stable="${stable} ${svc}"
+              stable="${stable} ${svc}=${td}"   # the revision put back, or - for one scaled to 0 (rollout_wait)
             done < lock-put-back.txt
             if [ -n "${stable}" ]; then
               # shellcheck disable=SC2086
-              if ! aws ecs wait services-stable --cluster "${NAME}" --services ${stable} && ! aws ecs wait services-stable --cluster "${NAME}" --services ${stable}; then
-                echo "::error::The services put back did not become stable in 20 minutes:${stable}."; return 1
+              if ! rollout_wait 1200 ${stable}; then
+                echo "::error::The services put back did not become stable (see above):${stable}."; return 1
               fi
             fi
             while read -r kind fn ver; do
@@ -3011,7 +3290,7 @@ jobs:
           echo "previous=$(python3 -c 'import json;print(json.dumps(json.load(open("previous.json"))["previous"]))')" >> "$GITHUB_OUTPUT"
       - name: Verify, render, register and update each order's services in parallel, waiting for each order to be stable
         id: roll
-        timeout-minutes: 20
+        timeout-minutes: 45   # each order's rollout and deploy-alarm bake up to 25 minutes, all orders within 40 (F661)
         env:
           SIGNING_KEY: ${{ inputs.signing-key }}
           VERSION: "" # the version tag is added only on promotion to prod (playbook §5.2)
@@ -3083,6 +3362,99 @@ jobs:
           # --- render-taskdef end ---
           aws ecr get-login-password | cosign login "${IMAGE_REF%%/*}" --username AWS --password-stdin >/dev/null  # cosign reads the signature from ECR (first live release: 401)
           cosign verify --experimental-oci11 --insecure-ignore-tlog=true --key "${SIGNING_KEY}" "${IMAGE_REF}" >/dev/null
+          # --- stable-wait begin (identical in every copy; checked by scripts/check_service_list.py) ---
+          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
+            # ECS's own waiter (`aws ecs wait services-stable`, 40 x 15 s) is shorter than a preprod rollout plus the deploy-alarm bake
+            # time, and it says nothing about why. This polls describe-services every LOCK_STABLE_POLL_SECONDS (15). A service is done
+            # only when its PRIMARY deployment runs the expected revision (the one just registered, or the one put back), its
+            # rolloutState is COMPLETED (without one: running = desired) and it is the only deployment left, so the old one has
+            # drained (what ECS's own waiter asks). `-` instead of a revision: the service was scaled to 0, done once nothing runs.
+            # The services run with circuit-breaker and deploy-alarm rollback: ECS then marks the new deployment FAILED and makes a
+            # deployment of the OLD revision PRIMARY, which completes. So a deployment of the expected revision that is FAILED, or a
+            # PRIMARY on another revision once the expected one was listed, is a rollback by ECS and fails at once. A poll before the
+            # new deployment is listed waits. Any failure, and the cap, print per service every deployment's revision, state and
+            # reason, the running, desired and pending counts and the 15 newest events, and say which happened. An unreadable answer
+            # is never success: it is polled again, and three in a row fail the wait.
+            local cap="$1" end unread=0 arg verdict names=()
+            shift
+            for arg in "$@"; do
+              case "${arg}" in
+                [a-z0-9]*=?*) names+=("${arg%%=*}") ;;
+                *) echo "::error::rollout_wait: '${arg}' names no expected revision, so stability cannot be judged."; return 1 ;;
+              esac
+            done
+            end=$((SECONDS + cap))
+            rm -f lock-stable-*.json lock-stable-seen-*
+            while :; do
+              rm -f lock-stable-*.json
+              for arg in "$@"; do
+                if ! aws ecs describe-services --cluster "${NAME}" --services "${arg%%=*}" --output json > "lock-stable-${arg%%=*}.json"; then
+                  rm -f "lock-stable-${arg%%=*}.json"
+                fi
+              done
+              verdict=$(python3 -c '
+          import json, os, sys
+          out, verdicts = [], []
+          rev = lambda arn: str(arn or "?").split("/")[-1]
+          for arg in sys.argv[1:]:
+              svc, want = arg.split("=", 1)
+              try:
+                  described = json.load(open("lock-stable-%s.json" % svc))
+                  s = [x for x in described["services"] if x["serviceName"] == svc][0]
+                  deployments = s["deployments"]
+                  primary = [d for d in deployments if d["status"] == "PRIMARY"][0]
+              except Exception:
+                  out.append("%s: describe-services unreadable" % svc)
+                  verdicts.append("unreadable")
+                  continue
+              mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
+              if mine:
+                  open("lock-stable-seen-" + svc, "w").close()
+              seen = os.path.exists("lock-stable-seen-" + svc)
+              state = primary.get("rolloutState")
+              failed = [d for d in mine if d.get("rolloutState") == "FAILED"]
+              if want == "-":
+                  verdict = "done" if len(deployments) == 1 and primary.get("desiredCount") == 0 and primary.get("runningCount") == 0 else "waiting"
+              elif failed or (seen and rev(primary.get("taskDefinition")) != rev(want)):
+                  verdict = "rolledback"
+                  reason = (failed or [primary])[0].get("rolloutStateReason") or primary.get("rolloutStateReason") or "no reason given"
+                  out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
+              elif rev(primary.get("taskDefinition")) != rev(want):
+                  verdict = "waiting"   # the new deployment is not listed yet
+              else:
+                  steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
+                  verdict = "done" if steady and len(deployments) == 1 else "waiting"
+              verdicts.append(verdict)
+              out.append("%s (wants %s): %s" % (svc, rev(want) if want != "-" else "scaled to 0", verdict))
+              for d in deployments:
+                  out.append("    %s %s rolloutState %s (%s); running %s, desired %s, pending %s" % (d.get("status"), rev(d.get("taskDefinition")),
+                      d.get("rolloutState") or "none", d.get("rolloutStateReason") or "no reason given", d.get("runningCount"), d.get("desiredCount"), d.get("pendingCount")))
+              for e in (s.get("events") or [])[:15]:
+                  out.append("    %s %s" % (e.get("createdAt", "?"), e.get("message", "")))
+          open("lock-stable-report.txt", "w").write("\n".join(out) + "\n")
+          for v in ("rolledback", "unreadable", "waiting", "done"):
+              if v in verdicts:
+                  print(v)
+                  break' "$@") || verdict=unreadable
+              case "${verdict}" in
+                done) echo "Stable (each on its expected revision, rolled out, the only deployment): ${names[*]}."; return 0 ;;
+                rolledback) echo "::error::Not stable: ECS rolled back or failed a rollout among ${names[*]}."; cat lock-stable-report.txt; return 1 ;;
+                unreadable)
+                  unread=$((unread + 1))
+                  if [ "${unread}" -ge 3 ]; then
+                    echo "::error::describe-services was unreadable 3 times in a row, so the stability of ${names[*]} is unknown: treated as not stable."
+                    cat lock-stable-report.txt 2>/dev/null || true; return 1
+                  fi ;;
+                *) unread=0 ;;
+              esac
+              if [ "${SECONDS}" -ge "${end}" ]; then
+                echo "::error::Timed out: ${names[*]} not all on their expected revision, rolled out, after ${cap} s (no rollback or FAILED rollout seen)."
+                cat lock-stable-report.txt 2>/dev/null || true; return 1
+              fi
+              sleep "${LOCK_STABLE_POLL_SECONDS:-15}"
+            done
+          }
+          # --- stable-wait end ---
           # One line per order, lowest first: the services of that order, separated by spaces.
           echo "${ORDERS}" | python3 -c "import json,sys;print('\n'.join(' '.join(g) for g in json.load(sys.stdin)))" > groups.txt
           count=0
@@ -3093,15 +3465,19 @@ jobs:
             done
           done 3< groups.txt
           if [ "${DRY_RUN}" = "true" ]; then echo "Dry run: rendered ${count} task definitions; signature verified."; exit 0; fi
+          roll_end=$((SECONDS + 2400))   # every order together within 40 minutes (the step's limit is 45), each at most 25 (F661)
           while read -r group <&3; do
+            expect=""   # <service>=<the revision just registered>, what rollout_wait checks each service runs
             for svc in ${group}; do
               arn=$(aws ecs register-task-definition --cli-input-json "file://td-${svc}.json" --query taskDefinition.taskDefinitionArn --output text)
               aws ecs update-service --cluster "${NAME}" --service "${svc}" --task-definition "${arn}" >/dev/null
               echo "${svc} -> ${arn##*/}"
+              expect="${expect} ${svc}=${arn}"
             done
+            cap=$((roll_end - SECONDS)); if [ "${cap}" -gt 1500 ]; then cap=1500; fi; if [ "${cap}" -lt 60 ]; then cap=60; fi
             # shellcheck disable=SC2086
-            if ! aws ecs wait services-stable --cluster "${NAME}" --services ${group}; then
-              echo "::error::A service of ${group} did not become stable (the ECS circuit breaker has rolled it back)."; exit 1
+            if ! rollout_wait "${cap}" ${expect}; then
+              echo "::error::The order ${group} did not become stable (its rollout state and events are above)."; exit 1
             fi
           done 3< groups.txt
           echo "stable-at=$(date +%s)" >> "$GITHUB_OUTPUT"   # merge-to-running time in the notice (delivery-pipelines §12, §14)
@@ -3210,7 +3586,7 @@ jobs:
     needs: [prepare, build-image, build-web, deploy]
     if: ${{ !cancelled() && !inputs.dry-run && (needs.deploy.result == 'success' || (needs.deploy.result == 'failure' && needs.deploy.outputs.previous != '')) }}
     runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
-    timeout-minutes: 60   # above the sum of its step limits (10 + 5 + 10 + 12 + 20), so a hang ends as a failed step and the rollback still runs
+    timeout-minutes: 70   # above the sum of its step limits (10 + 5 + 10 + 12 + 25), so a hang ends as a failed step and the rollback still runs
     permissions:
       contents: read
       id-token: write
@@ -3338,7 +3714,7 @@ jobs:
         # On a failed rollout or ops registration (deploy failed after recording previous), smoke or watch: the
         # watch is the last check, so anything but its success rolls back. Never after a failed lock check.
         if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.creds.outcome == 'success' && steps.watch.outcome != 'success' }}
-        timeout-minutes: 20
+        timeout-minutes: 25   # its put-back wait 20 (F661), plus the re-registration and the sandbox aliases
         env:
           PREVIOUS: ${{ needs.deploy.outputs.previous }}
           HAS_SANDBOX: ${{ contains(inputs.extra-images, 'sandbox') && 'yes' || '' }}
@@ -3833,6 +4209,99 @@ jobs:
             echo "${2##*/} is inactive (deregistered since the release recorded it): registered again from its recorded definition as ${arn##*/}."
             LOCK_LIVE_REVISION="${arn}"
           }
+          # --- stable-wait begin (identical in every copy; checked by scripts/check_service_list.py) ---
+          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
+            # ECS's own waiter (`aws ecs wait services-stable`, 40 x 15 s) is shorter than a preprod rollout plus the deploy-alarm bake
+            # time, and it says nothing about why. This polls describe-services every LOCK_STABLE_POLL_SECONDS (15). A service is done
+            # only when its PRIMARY deployment runs the expected revision (the one just registered, or the one put back), its
+            # rolloutState is COMPLETED (without one: running = desired) and it is the only deployment left, so the old one has
+            # drained (what ECS's own waiter asks). `-` instead of a revision: the service was scaled to 0, done once nothing runs.
+            # The services run with circuit-breaker and deploy-alarm rollback: ECS then marks the new deployment FAILED and makes a
+            # deployment of the OLD revision PRIMARY, which completes. So a deployment of the expected revision that is FAILED, or a
+            # PRIMARY on another revision once the expected one was listed, is a rollback by ECS and fails at once. A poll before the
+            # new deployment is listed waits. Any failure, and the cap, print per service every deployment's revision, state and
+            # reason, the running, desired and pending counts and the 15 newest events, and say which happened. An unreadable answer
+            # is never success: it is polled again, and three in a row fail the wait.
+            local cap="$1" end unread=0 arg verdict names=()
+            shift
+            for arg in "$@"; do
+              case "${arg}" in
+                [a-z0-9]*=?*) names+=("${arg%%=*}") ;;
+                *) echo "::error::rollout_wait: '${arg}' names no expected revision, so stability cannot be judged."; return 1 ;;
+              esac
+            done
+            end=$((SECONDS + cap))
+            rm -f lock-stable-*.json lock-stable-seen-*
+            while :; do
+              rm -f lock-stable-*.json
+              for arg in "$@"; do
+                if ! aws ecs describe-services --cluster "${NAME}" --services "${arg%%=*}" --output json > "lock-stable-${arg%%=*}.json"; then
+                  rm -f "lock-stable-${arg%%=*}.json"
+                fi
+              done
+              verdict=$(python3 -c '
+          import json, os, sys
+          out, verdicts = [], []
+          rev = lambda arn: str(arn or "?").split("/")[-1]
+          for arg in sys.argv[1:]:
+              svc, want = arg.split("=", 1)
+              try:
+                  described = json.load(open("lock-stable-%s.json" % svc))
+                  s = [x for x in described["services"] if x["serviceName"] == svc][0]
+                  deployments = s["deployments"]
+                  primary = [d for d in deployments if d["status"] == "PRIMARY"][0]
+              except Exception:
+                  out.append("%s: describe-services unreadable" % svc)
+                  verdicts.append("unreadable")
+                  continue
+              mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
+              if mine:
+                  open("lock-stable-seen-" + svc, "w").close()
+              seen = os.path.exists("lock-stable-seen-" + svc)
+              state = primary.get("rolloutState")
+              failed = [d for d in mine if d.get("rolloutState") == "FAILED"]
+              if want == "-":
+                  verdict = "done" if len(deployments) == 1 and primary.get("desiredCount") == 0 and primary.get("runningCount") == 0 else "waiting"
+              elif failed or (seen and rev(primary.get("taskDefinition")) != rev(want)):
+                  verdict = "rolledback"
+                  reason = (failed or [primary])[0].get("rolloutStateReason") or primary.get("rolloutStateReason") or "no reason given"
+                  out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
+              elif rev(primary.get("taskDefinition")) != rev(want):
+                  verdict = "waiting"   # the new deployment is not listed yet
+              else:
+                  steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
+                  verdict = "done" if steady and len(deployments) == 1 else "waiting"
+              verdicts.append(verdict)
+              out.append("%s (wants %s): %s" % (svc, rev(want) if want != "-" else "scaled to 0", verdict))
+              for d in deployments:
+                  out.append("    %s %s rolloutState %s (%s); running %s, desired %s, pending %s" % (d.get("status"), rev(d.get("taskDefinition")),
+                      d.get("rolloutState") or "none", d.get("rolloutStateReason") or "no reason given", d.get("runningCount"), d.get("desiredCount"), d.get("pendingCount")))
+              for e in (s.get("events") or [])[:15]:
+                  out.append("    %s %s" % (e.get("createdAt", "?"), e.get("message", "")))
+          open("lock-stable-report.txt", "w").write("\n".join(out) + "\n")
+          for v in ("rolledback", "unreadable", "waiting", "done"):
+              if v in verdicts:
+                  print(v)
+                  break' "$@") || verdict=unreadable
+              case "${verdict}" in
+                done) echo "Stable (each on its expected revision, rolled out, the only deployment): ${names[*]}."; return 0 ;;
+                rolledback) echo "::error::Not stable: ECS rolled back or failed a rollout among ${names[*]}."; cat lock-stable-report.txt; return 1 ;;
+                unreadable)
+                  unread=$((unread + 1))
+                  if [ "${unread}" -ge 3 ]; then
+                    echo "::error::describe-services was unreadable 3 times in a row, so the stability of ${names[*]} is unknown: treated as not stable."
+                    cat lock-stable-report.txt 2>/dev/null || true; return 1
+                  fi ;;
+                *) unread=0 ;;
+              esac
+              if [ "${SECONDS}" -ge "${end}" ]; then
+                echo "::error::Timed out: ${names[*]} not all on their expected revision, rolled out, after ${cap} s (no rollback or FAILED rollout seen)."
+                cat lock-stable-report.txt 2>/dev/null || true; return 1
+              fi
+              sleep "${LOCK_STABLE_POLL_SECONDS:-15}"
+            done
+          }
+          # --- stable-wait end ---
           lock_put_back() {  # lock_put_back <record file>: every service in previous back to its revision (first-deploy: to 0), services-stable, the sandbox aliases, an issue
             local kind svc td fn ver stable=""
             if ! python3 -c '
@@ -3870,12 +4339,12 @@ jobs:
                   echo "Scaled ${svc} to 0: this release deployed it first, so it has no revision to go back to." ;;
                 *) continue ;;
               esac
-              stable="${stable} ${svc}"
+              stable="${stable} ${svc}=${td}"   # the revision put back, or - for one scaled to 0 (rollout_wait)
             done < lock-put-back.txt
             if [ -n "${stable}" ]; then
               # shellcheck disable=SC2086
-              if ! aws ecs wait services-stable --cluster "${NAME}" --services ${stable} && ! aws ecs wait services-stable --cluster "${NAME}" --services ${stable}; then
-                echo "::error::The services put back did not become stable in 20 minutes:${stable}."; return 1
+              if ! rollout_wait 1200 ${stable}; then
+                echo "::error::The services put back did not become stable (see above):${stable}."; return 1
               fi
             fi
             while read -r kind fn ver; do
@@ -4062,19 +4531,26 @@ jobs:
           # --- release-lock end ---
           if [ -z "${PREVIOUS}" ]; then echo "Nothing was recorded; the rollout never started."; exit 0; fi
           services=$(echo "${PREVIOUS}" | python3 -c "import json,sys;print(' '.join(json.load(sys.stdin)))")
+          expect=""   # <service>=<the revision put back>, or - for one scaled to 0 (rollout_wait)
           for svc in ${services}; do
             td=$(echo "${PREVIOUS}" | python3 -c "import json,sys;print(json.load(sys.stdin)['${svc}'])")
             if [ "${td}" = "first-deploy" ]; then   # no revision before this release: scaled to 0, as the put-back does (playbook §5.4a)
               aws ecs update-service --cluster "${NAME}" --service "${svc}" --desired-count 0 >/dev/null
+              echo "Scaled ${svc} to 0 (first deployed by this release)."
+              expect="${expect} ${svc}=-"
               continue
             fi
             # F621: a recorded revision deregistered since (INACTIVE) is registered again first, as the put-back does (F589);
             # a revision it cannot make active fails the step: the key stays rolling and finish tries the put-back again.
             if ! lock_live_revision "${svc}" "${td}"; then exit 1; fi
             aws ecs update-service --cluster "${NAME}" --service "${svc}" --task-definition "${LOCK_LIVE_REVISION}" >/dev/null
+            echo "Put ${svc} back on ${LOCK_LIVE_REVISION##*/}."
+            expect="${expect} ${svc}=${LOCK_LIVE_REVISION}"
           done
           # shellcheck disable=SC2086
-          aws ecs wait services-stable --cluster "${NAME}" --services ${services}
+          if ! rollout_wait 1200 ${expect}; then
+            echo "::error::The services put back did not become stable (see above): ${services}."; exit 1
+          fi
           if [ -n "${HAS_SANDBOX}" ]; then
             for fn in parse fetch; do
               prev=$(aws lambda list-versions-by-function --function-name "${NAME}-sandbox-${fn}" --query 'Versions[-2].Version' --output text)
@@ -4586,6 +5062,99 @@ jobs:
             echo "${2##*/} is inactive (deregistered since the release recorded it): registered again from its recorded definition as ${arn##*/}."
             LOCK_LIVE_REVISION="${arn}"
           }
+          # --- stable-wait begin (identical in every copy; checked by scripts/check_service_list.py) ---
+          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
+            # ECS's own waiter (`aws ecs wait services-stable`, 40 x 15 s) is shorter than a preprod rollout plus the deploy-alarm bake
+            # time, and it says nothing about why. This polls describe-services every LOCK_STABLE_POLL_SECONDS (15). A service is done
+            # only when its PRIMARY deployment runs the expected revision (the one just registered, or the one put back), its
+            # rolloutState is COMPLETED (without one: running = desired) and it is the only deployment left, so the old one has
+            # drained (what ECS's own waiter asks). `-` instead of a revision: the service was scaled to 0, done once nothing runs.
+            # The services run with circuit-breaker and deploy-alarm rollback: ECS then marks the new deployment FAILED and makes a
+            # deployment of the OLD revision PRIMARY, which completes. So a deployment of the expected revision that is FAILED, or a
+            # PRIMARY on another revision once the expected one was listed, is a rollback by ECS and fails at once. A poll before the
+            # new deployment is listed waits. Any failure, and the cap, print per service every deployment's revision, state and
+            # reason, the running, desired and pending counts and the 15 newest events, and say which happened. An unreadable answer
+            # is never success: it is polled again, and three in a row fail the wait.
+            local cap="$1" end unread=0 arg verdict names=()
+            shift
+            for arg in "$@"; do
+              case "${arg}" in
+                [a-z0-9]*=?*) names+=("${arg%%=*}") ;;
+                *) echo "::error::rollout_wait: '${arg}' names no expected revision, so stability cannot be judged."; return 1 ;;
+              esac
+            done
+            end=$((SECONDS + cap))
+            rm -f lock-stable-*.json lock-stable-seen-*
+            while :; do
+              rm -f lock-stable-*.json
+              for arg in "$@"; do
+                if ! aws ecs describe-services --cluster "${NAME}" --services "${arg%%=*}" --output json > "lock-stable-${arg%%=*}.json"; then
+                  rm -f "lock-stable-${arg%%=*}.json"
+                fi
+              done
+              verdict=$(python3 -c '
+          import json, os, sys
+          out, verdicts = [], []
+          rev = lambda arn: str(arn or "?").split("/")[-1]
+          for arg in sys.argv[1:]:
+              svc, want = arg.split("=", 1)
+              try:
+                  described = json.load(open("lock-stable-%s.json" % svc))
+                  s = [x for x in described["services"] if x["serviceName"] == svc][0]
+                  deployments = s["deployments"]
+                  primary = [d for d in deployments if d["status"] == "PRIMARY"][0]
+              except Exception:
+                  out.append("%s: describe-services unreadable" % svc)
+                  verdicts.append("unreadable")
+                  continue
+              mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
+              if mine:
+                  open("lock-stable-seen-" + svc, "w").close()
+              seen = os.path.exists("lock-stable-seen-" + svc)
+              state = primary.get("rolloutState")
+              failed = [d for d in mine if d.get("rolloutState") == "FAILED"]
+              if want == "-":
+                  verdict = "done" if len(deployments) == 1 and primary.get("desiredCount") == 0 and primary.get("runningCount") == 0 else "waiting"
+              elif failed or (seen and rev(primary.get("taskDefinition")) != rev(want)):
+                  verdict = "rolledback"
+                  reason = (failed or [primary])[0].get("rolloutStateReason") or primary.get("rolloutStateReason") or "no reason given"
+                  out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
+              elif rev(primary.get("taskDefinition")) != rev(want):
+                  verdict = "waiting"   # the new deployment is not listed yet
+              else:
+                  steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
+                  verdict = "done" if steady and len(deployments) == 1 else "waiting"
+              verdicts.append(verdict)
+              out.append("%s (wants %s): %s" % (svc, rev(want) if want != "-" else "scaled to 0", verdict))
+              for d in deployments:
+                  out.append("    %s %s rolloutState %s (%s); running %s, desired %s, pending %s" % (d.get("status"), rev(d.get("taskDefinition")),
+                      d.get("rolloutState") or "none", d.get("rolloutStateReason") or "no reason given", d.get("runningCount"), d.get("desiredCount"), d.get("pendingCount")))
+              for e in (s.get("events") or [])[:15]:
+                  out.append("    %s %s" % (e.get("createdAt", "?"), e.get("message", "")))
+          open("lock-stable-report.txt", "w").write("\n".join(out) + "\n")
+          for v in ("rolledback", "unreadable", "waiting", "done"):
+              if v in verdicts:
+                  print(v)
+                  break' "$@") || verdict=unreadable
+              case "${verdict}" in
+                done) echo "Stable (each on its expected revision, rolled out, the only deployment): ${names[*]}."; return 0 ;;
+                rolledback) echo "::error::Not stable: ECS rolled back or failed a rollout among ${names[*]}."; cat lock-stable-report.txt; return 1 ;;
+                unreadable)
+                  unread=$((unread + 1))
+                  if [ "${unread}" -ge 3 ]; then
+                    echo "::error::describe-services was unreadable 3 times in a row, so the stability of ${names[*]} is unknown: treated as not stable."
+                    cat lock-stable-report.txt 2>/dev/null || true; return 1
+                  fi ;;
+                *) unread=0 ;;
+              esac
+              if [ "${SECONDS}" -ge "${end}" ]; then
+                echo "::error::Timed out: ${names[*]} not all on their expected revision, rolled out, after ${cap} s (no rollback or FAILED rollout seen)."
+                cat lock-stable-report.txt 2>/dev/null || true; return 1
+              fi
+              sleep "${LOCK_STABLE_POLL_SECONDS:-15}"
+            done
+          }
+          # --- stable-wait end ---
           lock_put_back() {  # lock_put_back <record file>: every service in previous back to its revision (first-deploy: to 0), services-stable, the sandbox aliases, an issue
             local kind svc td fn ver stable=""
             if ! python3 -c '
@@ -4623,12 +5192,12 @@ jobs:
                   echo "Scaled ${svc} to 0: this release deployed it first, so it has no revision to go back to." ;;
                 *) continue ;;
               esac
-              stable="${stable} ${svc}"
+              stable="${stable} ${svc}=${td}"   # the revision put back, or - for one scaled to 0 (rollout_wait)
             done < lock-put-back.txt
             if [ -n "${stable}" ]; then
               # shellcheck disable=SC2086
-              if ! aws ecs wait services-stable --cluster "${NAME}" --services ${stable} && ! aws ecs wait services-stable --cluster "${NAME}" --services ${stable}; then
-                echo "::error::The services put back did not become stable in 20 minutes:${stable}."; return 1
+              if ! rollout_wait 1200 ${stable}; then
+                echo "::error::The services put back did not become stable (see above):${stable}."; return 1
               fi
             fi
             while read -r kind fn ver; do
@@ -5402,6 +5971,99 @@ jobs:
             echo "${2##*/} is inactive (deregistered since the release recorded it): registered again from its recorded definition as ${arn##*/}."
             LOCK_LIVE_REVISION="${arn}"
           }
+          # --- stable-wait begin (identical in every copy; checked by scripts/check_service_list.py) ---
+          rollout_wait() {  # rollout_wait <cap seconds> <service>=<expected revision | ->...: 0 once every service runs its expected revision, rolled out; 1 on a rollback, FAILED or the cap (F661)
+            # ECS's own waiter (`aws ecs wait services-stable`, 40 x 15 s) is shorter than a preprod rollout plus the deploy-alarm bake
+            # time, and it says nothing about why. This polls describe-services every LOCK_STABLE_POLL_SECONDS (15). A service is done
+            # only when its PRIMARY deployment runs the expected revision (the one just registered, or the one put back), its
+            # rolloutState is COMPLETED (without one: running = desired) and it is the only deployment left, so the old one has
+            # drained (what ECS's own waiter asks). `-` instead of a revision: the service was scaled to 0, done once nothing runs.
+            # The services run with circuit-breaker and deploy-alarm rollback: ECS then marks the new deployment FAILED and makes a
+            # deployment of the OLD revision PRIMARY, which completes. So a deployment of the expected revision that is FAILED, or a
+            # PRIMARY on another revision once the expected one was listed, is a rollback by ECS and fails at once. A poll before the
+            # new deployment is listed waits. Any failure, and the cap, print per service every deployment's revision, state and
+            # reason, the running, desired and pending counts and the 15 newest events, and say which happened. An unreadable answer
+            # is never success: it is polled again, and three in a row fail the wait.
+            local cap="$1" end unread=0 arg verdict names=()
+            shift
+            for arg in "$@"; do
+              case "${arg}" in
+                [a-z0-9]*=?*) names+=("${arg%%=*}") ;;
+                *) echo "::error::rollout_wait: '${arg}' names no expected revision, so stability cannot be judged."; return 1 ;;
+              esac
+            done
+            end=$((SECONDS + cap))
+            rm -f lock-stable-*.json lock-stable-seen-*
+            while :; do
+              rm -f lock-stable-*.json
+              for arg in "$@"; do
+                if ! aws ecs describe-services --cluster "${NAME}" --services "${arg%%=*}" --output json > "lock-stable-${arg%%=*}.json"; then
+                  rm -f "lock-stable-${arg%%=*}.json"
+                fi
+              done
+              verdict=$(python3 -c '
+          import json, os, sys
+          out, verdicts = [], []
+          rev = lambda arn: str(arn or "?").split("/")[-1]
+          for arg in sys.argv[1:]:
+              svc, want = arg.split("=", 1)
+              try:
+                  described = json.load(open("lock-stable-%s.json" % svc))
+                  s = [x for x in described["services"] if x["serviceName"] == svc][0]
+                  deployments = s["deployments"]
+                  primary = [d for d in deployments if d["status"] == "PRIMARY"][0]
+              except Exception:
+                  out.append("%s: describe-services unreadable" % svc)
+                  verdicts.append("unreadable")
+                  continue
+              mine = [d for d in deployments if want != "-" and rev(d.get("taskDefinition")) == rev(want)]
+              if mine:
+                  open("lock-stable-seen-" + svc, "w").close()
+              seen = os.path.exists("lock-stable-seen-" + svc)
+              state = primary.get("rolloutState")
+              failed = [d for d in mine if d.get("rolloutState") == "FAILED"]
+              if want == "-":
+                  verdict = "done" if len(deployments) == 1 and primary.get("desiredCount") == 0 and primary.get("runningCount") == 0 else "waiting"
+              elif failed or (seen and rev(primary.get("taskDefinition")) != rev(want)):
+                  verdict = "rolledback"
+                  reason = (failed or [primary])[0].get("rolloutStateReason") or primary.get("rolloutStateReason") or "no reason given"
+                  out.append("::error::%s was rolled back by ECS (circuit breaker/alarm): %s" % (svc, reason))
+              elif rev(primary.get("taskDefinition")) != rev(want):
+                  verdict = "waiting"   # the new deployment is not listed yet
+              else:
+                  steady = state == "COMPLETED" if state else primary.get("runningCount") == primary.get("desiredCount")
+                  verdict = "done" if steady and len(deployments) == 1 else "waiting"
+              verdicts.append(verdict)
+              out.append("%s (wants %s): %s" % (svc, rev(want) if want != "-" else "scaled to 0", verdict))
+              for d in deployments:
+                  out.append("    %s %s rolloutState %s (%s); running %s, desired %s, pending %s" % (d.get("status"), rev(d.get("taskDefinition")),
+                      d.get("rolloutState") or "none", d.get("rolloutStateReason") or "no reason given", d.get("runningCount"), d.get("desiredCount"), d.get("pendingCount")))
+              for e in (s.get("events") or [])[:15]:
+                  out.append("    %s %s" % (e.get("createdAt", "?"), e.get("message", "")))
+          open("lock-stable-report.txt", "w").write("\n".join(out) + "\n")
+          for v in ("rolledback", "unreadable", "waiting", "done"):
+              if v in verdicts:
+                  print(v)
+                  break' "$@") || verdict=unreadable
+              case "${verdict}" in
+                done) echo "Stable (each on its expected revision, rolled out, the only deployment): ${names[*]}."; return 0 ;;
+                rolledback) echo "::error::Not stable: ECS rolled back or failed a rollout among ${names[*]}."; cat lock-stable-report.txt; return 1 ;;
+                unreadable)
+                  unread=$((unread + 1))
+                  if [ "${unread}" -ge 3 ]; then
+                    echo "::error::describe-services was unreadable 3 times in a row, so the stability of ${names[*]} is unknown: treated as not stable."
+                    cat lock-stable-report.txt 2>/dev/null || true; return 1
+                  fi ;;
+                *) unread=0 ;;
+              esac
+              if [ "${SECONDS}" -ge "${end}" ]; then
+                echo "::error::Timed out: ${names[*]} not all on their expected revision, rolled out, after ${cap} s (no rollback or FAILED rollout seen)."
+                cat lock-stable-report.txt 2>/dev/null || true; return 1
+              fi
+              sleep "${LOCK_STABLE_POLL_SECONDS:-15}"
+            done
+          }
+          # --- stable-wait end ---
           lock_put_back() {  # lock_put_back <record file>: every service in previous back to its revision (first-deploy: to 0), services-stable, the sandbox aliases, an issue
             local kind svc td fn ver stable=""
             if ! python3 -c '
@@ -5439,12 +6101,12 @@ jobs:
                   echo "Scaled ${svc} to 0: this release deployed it first, so it has no revision to go back to." ;;
                 *) continue ;;
               esac
-              stable="${stable} ${svc}"
+              stable="${stable} ${svc}=${td}"   # the revision put back, or - for one scaled to 0 (rollout_wait)
             done < lock-put-back.txt
             if [ -n "${stable}" ]; then
               # shellcheck disable=SC2086
-              if ! aws ecs wait services-stable --cluster "${NAME}" --services ${stable} && ! aws ecs wait services-stable --cluster "${NAME}" --services ${stable}; then
-                echo "::error::The services put back did not become stable in 20 minutes:${stable}."; return 1
+              if ! rollout_wait 1200 ${stable}; then
+                echo "::error::The services put back did not become stable (see above):${stable}."; return 1
               fi
             fi
             while read -r kind fn ver; do
