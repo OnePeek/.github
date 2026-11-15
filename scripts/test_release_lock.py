@@ -1273,7 +1273,9 @@ class FreezeCheckout(unittest.TestCase):
         conf = yaml.safe_load((WORKFLOWS.parent / "actionlint.yaml").read_text(encoding="utf-8"))
         ignores = [i for entry in conf["paths"].values() for i in entry.get("ignore", [])]
         self.assertEqual(ignores, ['property "workflow_sha" is not defined in object type'])
-        self.assertEqual(set(conf), {"paths"})
+        self.assertEqual(set(conf), {"paths", "self-hosted-runner"})
+        self.assertEqual(conf["self-hosted-runner"], {"labels": ["onepeek-arm64", "onepeek-arm64-small", "onepeek-arm64-od",
+                                                               "onepeek-arm64-canary"]})
 
     def test_freeze_arms_the_same_cap_trap_as_take(self):
         # A freeze at its cap passes its step with capped=true, so the job fails at "Wait cap reached (re-run)" alone.

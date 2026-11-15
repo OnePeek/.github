@@ -19,9 +19,9 @@ on:
   workflow_call:
     inputs:
       runner:
-        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
+        description: "onepeek (the default), canary or public-hosted. Callers pass their repository's RUNNER setting, or github; github, onepeek, unset and any other value mean our runner class (F694, 2026-11-15: never GitHub-hosted). public-hosted is for the public repos' own CI only (scripts/check_runner_labels.py). The job's class and this value choose runs-on (ci-runners.md section 5.3)."
         type: string
-        default: github
+        default: onepeek
       environment:
         description: Environment; the lock is in the onepeek-<environment>-deploy bucket.
         type: string
@@ -71,7 +71,7 @@ env:
 
 jobs:
   lock:
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
+    runs-on: onepeek-arm64-od
     # Waits only for take and freeze (freeze, for a live infra.json holder): the cap (120) plus 15 (playbook §5.4a "Freeze and
     # thaw"; a named TIMEOUT_EXCEPTIONS entry, read as its larger value). release and thaw never wait.
     timeout-minutes: ${{ (inputs.action == 'take' || inputs.action == 'freeze') && 135 || 10 }}

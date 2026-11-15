@@ -1,7 +1,7 @@
 # This repo's own weekly caller of ci-image-bump.yml (the example for every other repo): moves the osv-scanner image pin
 # in osv-scan.yml and every other digest-pinned CI image line in this repo's workflows to the tag's current digest, and
 # opens one pull request when the onepeek-ci-bump App secrets are set. This repo is public, so it runs on GitHub-hosted
-# runners and pins the shared workflow as the repo itself does for spot-rerun-caller.yml (the local path of this commit).
+# runners (`runner: public-hosted`, public repos only) and pins the shared workflow as the repo itself does for spot-rerun-caller.yml (the local path of this commit).
 name: ci-image-bump-caller
 
 on:
@@ -18,7 +18,7 @@ jobs:
     permissions:
       contents: read
     with:
-      runner: github
+      runner: public-hosted
       # The default branch (decision 176). A schedule event carries no repository payload, and runs on the default
       # branch, so ref_name is that branch there.
       base: ${{ github.event.repository.default_branch || github.ref_name }}

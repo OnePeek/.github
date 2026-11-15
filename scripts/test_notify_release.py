@@ -279,14 +279,14 @@ class Workflows(unittest.TestCase):
     def test_the_notify_jobs_are_fail_open_short_and_on_the_callers_runner(self):
         # F680: on both releases of 2026-11-15 the notify job, pinned to ubuntu-latest, was never started ("recent account
         # payments have failed or your spending limit needs to be increased"): a job that never starts is red whatever
-        # continue-on-error says. It runs where every other job of the release runs: the caller's runner, small class.
+        # continue-on-error says. It runs where every other job of the release runs: our small class (F694: prod, an unset
+        # runner and `github` too, so infra's call with no runner input needs no change), canary on canary.
         for name in ("release-ecs.yml", "release-notify.yml"):
             job = load(name)["jobs"]["notify"]
             self.assertIs(job["continue-on-error"], True, name)
             self.assertLessEqual(job["timeout-minutes"], 3, name)
-            self.assertEqual(job["runs-on"], "${{ inputs.environment == 'prod' && 'ubuntu-latest' || "
-                                             "inputs.runner == 'onepeek' && 'onepeek-arm64-small' || "
-                                             "inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}", name)
+            self.assertEqual(job["runs-on"], "${{ inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64-small' }}",
+                             name)
             self.assertEqual(job["permissions"], {"contents": "read", "actions": "read"}, name)
             for step in job["steps"]:
                 self.assertIs(step.get("continue-on-error"), True, (name, step.get("name")))

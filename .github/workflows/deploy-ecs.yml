@@ -10,9 +10,9 @@ on:
   workflow_call:
     inputs:
       runner:
-        description: "onepeek, canary or github. Callers pass their repository's RUNNER setting, or github. The job's class and this value choose runs-on (ci-runners.md section 5.3)."
+        description: "onepeek (the default), canary or public-hosted. Callers pass their repository's RUNNER setting, or github; github, onepeek, unset and any other value mean our runner class (F694, 2026-11-15: never GitHub-hosted). public-hosted is for the public repos' own CI only (scripts/check_runner_labels.py). The job's class and this value choose runs-on (ci-runners.md section 5.3)."
         type: string
-        default: github
+        default: onepeek
       role-to-assume:
         description: The repo's deploy role (onepeek-infra modules/deploy-roles); trusted only from release.
         required: true
@@ -53,9 +53,9 @@ permissions: {}
 
 jobs:
   deploy:
-    # The real prod control is the prod role's trust (runner_environment: github-hosted, ci-runners.md section 11.3);
-    # the prod prefix in runs-on is defence in depth.
-    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-od' || inputs.runner == 'canary' && 'onepeek-arm64-od' || 'ubuntu-latest' }}
+    # Our on-demand class for every environment, prod included (founder ruling 2026-11-15, F694). What keeps prod
+    # credentials apart is the prod role's trust (environment, branch and job_workflow_ref subjects), not the runner.
+    runs-on: onepeek-arm64-od
     timeout-minutes: 45
     permissions:
       contents: read

@@ -112,8 +112,7 @@ jobs:
         if: ${{ always() }}
         run: |
           pip install --quiet pyyaml==6.0.3
-          python scripts/check_runner_labels.py --kind public --repo OnePeek/.github \
-            --list .github/workflow-lint/github-only-jobs.yaml .github/workflows
+          python scripts/check_runner_labels.py --kind public --repo OnePeek/.github .github/workflows
 
       # The shared pin check runs here too (this repo has no pins and no docs-version.txt, so it proves the action runs).
       - name: Pins
@@ -227,6 +226,7 @@ jobs:
     # pull request's. One cheap check is enough to prove the mechanism (checkout, version, actions, results).
     uses: ./.github/workflows/fast-checks.yml
     with:
+      runner: public-hosted  # this repo is public: GitHub-hosted (scripts/check_runner_labels.py rule 1)
       no-prerelease-deps: true
       docs: true
 
@@ -237,7 +237,7 @@ jobs:
     needs: [lint, fast]
     uses: ./.github/workflows/ready.yml
     with:
-      runner: github
+      runner: public-hosted
       needs: ${{ toJSON(needs) }}
       reproduce: |
         lint: vanguard local-ci <worktree> --jobs lint

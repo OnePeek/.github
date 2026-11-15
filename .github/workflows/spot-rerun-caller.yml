@@ -1,7 +1,8 @@
 # This repo's own caller of spot-rerun.yml, and the example for every other repo (the snippets are in spot-rerun.yml's
 # header): every 10 minutes (and on demand), each failed first- or second-attempt run of the listed workflows that finished in the last 20 minutes
 # whose failure a spot reclaim caused gets its failed jobs run once more (scan mode, PIPE-SIMPLE v2 GH-1). This repo is
-# public, so it runs on GitHub-hosted runners (`runner: github`); private repos pass `${{ vars.RUNNER || 'github' }}`
+# public, so it runs on GitHub-hosted runners (`runner: public-hosted`, public repos only); private repos pass
+# `${{ vars.RUNNER || 'github' }}`, which lands on our runners
 # and list their own workflow names.
 name: spot-rerun-caller
 
@@ -25,5 +26,5 @@ jobs:
       checks: read    # the job's annotations (where a lost runner is reported)
       contents: read
     with:
-      runner: github
+      runner: public-hosted
       workflows: workflow-lint
