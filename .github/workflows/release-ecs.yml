@@ -2472,6 +2472,16 @@ jobs:
           uv run --frozen --no-dev app api routes --env "${ENVIRONMENT}" --services-file services.yaml --out gateway-routes.json
           # No encryption flags: the bucket default applies (aws-stack §16). `--sse aws:kms` alone would ask for the AWS-managed key.
           aws s3 cp gateway-routes.json "s3://${NAME}-deploy/gateway-routes.json" --only-show-errors
+      - name: A fresh role session for the record and the rollout (F668)
+        # The role's sessions last at most 1 h; the steps before may take 54 minutes, the record 5 and the rollout 45, and
+        # expired credentials would read as "describe-services unreadable" and fail a healthy rollout. Same role, via OIDC.
+        # Right before the record, so the record stays right before the rollout.
+        timeout-minutes: 2
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - name: Record every service's current task definition and the sandbox live versions, then phase rolling (for the put-back)
         timeout-minutes: 5
         id: previous
@@ -3325,15 +3335,6 @@ jobs:
           # on finish puts every service back unless verify records an end. A failed write means this run has lost the key.
           if [ "${DRY_RUN}" != "true" ]; then lock_write_phase rolling "$(cat previous.json)" || exit 1; fi
           echo "previous=$(python3 -c 'import json;print(json.dumps(json.load(open("previous.json"))["previous"]))')" >> "$GITHUB_OUTPUT"
-      - name: A fresh role session for the rollout (F668)
-        # The role's sessions last at most 1 h; the steps before the rollout may take 59 minutes and the rollout 45, and
-        # expired credentials would read as "describe-services unreadable" and fail a healthy rollout. Same role, via OIDC.
-        timeout-minutes: 2
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ inputs.role-to-assume }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - name: Verify, render, register and update each order's services in parallel, waiting for each order to be stable
         id: roll
         timeout-minutes: 45   # each order's rollout and deploy-alarm bake up to 25 minutes, all orders within 40 (F661)
@@ -6455,7 +6456,7 @@ jobs:
     # once the account's Actions minutes or spending limit run out, and a job never started is red despite continue-on-error.
     needs: [prepare, build-image, build-web, db-bootstrap, deploy, verify, finish, api-client]
     if: ${{ always() && !inputs.dry-run && inputs.environment != 'prod' && needs.prepare.outputs.skip != 'true' }}
-    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 3
     continue-on-error: true
     permissions:

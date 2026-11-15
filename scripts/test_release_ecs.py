@@ -996,10 +996,10 @@ class StableWait(unittest.TestCase):
 
     def test_credentials_are_minted_again_right_before_the_rollout_and_the_rollback(self):
         # F668: the role's sessions last 1 h (the role's maximum: no max_session_duration in infra), but the deploy job's
-        # steps before the rollout may take 59 min and the rollout 45, and verify's checks 37 before a 25-minute rollback:
+        # steps before the record may take 54 min, the record 5 and the rollout 45, and verify's checks 37 before a 25-minute rollback:
         # expired credentials read as "describe-services unreadable 3 times" and fail a healthy rollout. A fresh session
         # (OIDC, the same role) right before each long step gives it a full hour.
-        for job_id, step_id in (("deploy", "roll"), ("verify", "rollback")):
+        for job_id, step_id in (("deploy", "previous"), ("verify", "rollback")):
             steps = RELEASE["jobs"][job_id]["steps"]
             first = next(s for s in steps if str(s.get("uses", "")).startswith("aws-actions/configure-aws-credentials@"))
             i = next(i for i, s in enumerate(steps) if s.get("id") == step_id)
@@ -1575,8 +1575,8 @@ class JobGraph(unittest.TestCase):
         # check (and every earlier step) gates every change.
         for name in ("build-image", "build-web", "deploy", "verify"):
             steps = RELEASE["jobs"][name]["steps"]
-            if name == "verify":
-                steps = steps[:next(i for i, s in enumerate(steps) if s.get("id") == "rollback")]
+            if name == "verify":   # up to the rollback and its own fresh role session (F668), which share its `if`
+                steps = steps[:next(i for i, s in enumerate(steps) if s.get("id") == "rollback") - 1]
             for s in steps:
                 self.assertNotRegex(str(s.get("if", "")), r"always\(\)|cancelled\(\)", f"{name}: {s.get('name') or s.get('uses')}")
 
@@ -1598,7 +1598,8 @@ class JobGraph(unittest.TestCase):
         self.assertEqual(limit("build-image", lambda s: s.get("id") == "push"), 20)
         self.assertEqual(limit("deploy", lambda s: s.get("name", "").startswith("Verify, render, register and run the migrate")), 15)
         self.assertEqual(limit("deploy", lambda s: s.get("id") == "roll"), 45)
-        self.assertEqual(limit("verify", lambda s: s.get("id") == "watch"), 12)
+        # F658: the watch's 10-minute window, one worst bounded poll (190 s) and 120 s to spare: 16, not 12.
+        self.assertEqual(limit("verify", lambda s: s.get("id") == "watch"), 16)
         for name, job in RELEASE["jobs"].items():
             if "steps" in job:
                 total = sum(s.get("timeout-minutes", 0) for s in job["steps"])

@@ -284,7 +284,8 @@ class Workflows(unittest.TestCase):
             job = load(name)["jobs"]["notify"]
             self.assertIs(job["continue-on-error"], True, name)
             self.assertLessEqual(job["timeout-minutes"], 3, name)
-            self.assertEqual(job["runs-on"], "${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || "
+            self.assertEqual(job["runs-on"], "${{ inputs.environment == 'prod' && 'ubuntu-latest' || "
+                                             "inputs.runner == 'onepeek' && 'onepeek-arm64-small' || "
                                              "inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}", name)
             self.assertEqual(job["permissions"], {"contents": "read", "actions": "read"}, name)
             for step in job["steps"]:

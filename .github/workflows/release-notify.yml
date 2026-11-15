@@ -64,7 +64,7 @@ jobs:
     # F680: on the caller's runner, like every other job of its release. A GitHub-hosted job in a private repository is
     # not started at all once the account's Actions minutes or spending limit run out, and a job never started is red
     # whatever continue-on-error says (both releases of 2026-11-15).
-    runs-on: ${{ inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.environment == 'prod' && 'ubuntu-latest' || inputs.runner == 'onepeek' && 'onepeek-arm64-small' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'ubuntu-latest' }}
     timeout-minutes: 3
     continue-on-error: true
     permissions:
