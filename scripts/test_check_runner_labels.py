@@ -311,7 +311,7 @@ class Rule3Timeouts(unittest.TestCase):
 
     def test_the_release_lock_waits_are_named_exceptions(self):
         # foundation-playbook §5.4a "Waits that fit the runners": each waiting job of OnePeek/.github, by name.
-        for name, job, limit in (("release-ecs.yml", "prepare", 135), ("release-ecs.yml", "finish", 60), ("operate.yml", "lock", 135),
+        for name, job, limit in (("release-ecs.yml", "prepare", 135), ("release-ecs.yml", "finish", 120), ("operate.yml", "lock", 135),
                                  ("operate.yml", "unlock", 60), ("release-lock.yml", "lock", 135)):
             self.assertEqual(lint.TIMEOUT_EXCEPTIONS[("OnePeek/.github", name, job)], limit)
             text = reusable(STATEFUL_PUBLIC, timeout=str(limit)).replace("  j:", f"  {job}:")
@@ -513,7 +513,7 @@ class SharedWorkflows(unittest.TestCase):
                 self.assertNotIn("public-hosted", ro, (name, job_id))
                 self.assertNotIn("environment", ro, (name, job_id))
                 self.assertIn(ro, ("onepeek-arm64-od", FAST_PUBLIC, LIGHT_PUBLIC), (name, job_id))
-        self.assertEqual(seen, 14)
+        self.assertEqual(seen, 13)  # REL-FAST-2: verify folded into finish
 
     def test_this_repos_own_ci_passes_public_hosted(self):
         import yaml

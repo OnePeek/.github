@@ -67,7 +67,7 @@ TIMEOUT_EXCEPTIONS = {
     # stateful, each under the on-demand lifetime of 180 less 20. Listed even where the class cap allows more, so the
     # limits test (scripts/check_lock_limits.py) reads the same entries.
     ("OnePeek/.github", "release-ecs.yml", "prepare"): 135,
-    ("OnePeek/.github", "release-ecs.yml", "finish"): 60,
+    ("OnePeek/.github", "release-ecs.yml", "finish"): 120,  # verify and finish in one job since REL-FAST-2
     ("OnePeek/.github", "operate.yml", "lock"): 135,
     ("OnePeek/.github", "operate.yml", "unlock"): 60,
     ("OnePeek/.github", "release-lock.yml", "lock"): 135,

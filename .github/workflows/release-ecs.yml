@@ -6,8 +6,9 @@
 # prepare (the cross-repo release lock and the order check, playbook §5.4; the version), build (build-image, or
 # build-web for web: build, scan, SBOM and sign, read back and verify the recorded digest), db-bootstrap (backend only;
 # a call of infra's reusable workflow under its own role, so it stays a job of its own), deploy (migrate, assets, the
-# rollout, the ops registration), verify (smoke, one deploy-alarm check, and the rollback on a failed rollout, smoke or check) and finish
-# (the deployment record, the unlock, always, and the API client). Nobody deploys from a laptop.
+# rollout, the ops registration), finish (verify: smoke, one deploy-alarm check, and the rollback on a failed rollout, smoke or
+# check; then, always, the deployment record and the unlock; one job since REL-FAST-2), the API client and the notice.
+# Nobody deploys from a laptop.
 # Every preprod artefact is keyed on the commit, sha-<12> (foundation-playbook §5.2, decision 159): the image tag, the
 # web-assets folder, the SSM release record and the task-definition tags. The release-please version is image metadata
 # only; the v<version> tag, the git tag and the GitHub release are made on promotion (promote.yml, UC-DEL-003).
@@ -39,6 +40,11 @@ name: release-ecs
 on:
   workflow_call:
     inputs:
+      alerts-channel:
+        description: "The Slack channel this environment's deploy alarms post to, named in the SUCCESS release notice (onepeek-infra config/<env>.yaml observability.slack_critical_alarms: deploy-*-errors and deploy-*-latency go to #alerts-critical in preprod). Optional; unset, the notice says 'the alerts channel'."
+        type: string
+        required: false
+        default: ""
       runner:
         description: "onepeek (the default), canary or public-hosted. Callers pass their repository's RUNNER setting, or github; github, onepeek, unset and any other value mean our runner class (F694, 2026-11-15: never GitHub-hosted). public-hosted is for the public repos' own CI only (scripts/check_runner_labels.py). The job's class and this value choose runs-on (ci-runners.md section 5.3)."
         type: string
@@ -1381,7 +1387,7 @@ jobs:
     # Rows 5, 6 and 6b (and UC-DEL-005's assets) in one job, each a step with its own time limit: migrate (backend), the
     # web assets (web), the rollout, then the ops registration (backend; migrate is registered by its own step,
     # db-bootstrap by infra's db-bootstrap workflow, 4b, and db-rotate only by ci-apply). A failed step stops every step
-    # after it, as a failed job stopped the jobs after it; the verify job rolls back once `previous` is recorded.
+    # after it, as a failed job stopped the jobs after it; the finish job rolls back once `previous` is recorded.
     needs: [prepare, build-image, build-web, db-bootstrap]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.build-image.result == 'success' || needs.build-web.result == 'success') && (!inputs.migrate || inputs.dry-run || needs.db-bootstrap.result == 'success') }}
     runs-on: onepeek-arm64-od
@@ -3649,20 +3655,32 @@ jobs:
           aws ssm put-parameter --name "/onepeek/${ENVIRONMENT}/release/backend/one_off/ops" --type String --overwrite --value "${arn}" >/dev/null
           echo "Registered ${arn##*/} (not run)."
 
-  verify:
-    # Rows 7 to 9 in one job: smoke, the deploy-alarm check (the bake is ECS's own, in the rollout), and the rollback when the rollout, the ops registration, smoke
-    # or watch failed (E2, E3). It also runs after a deploy job that failed once the rollout had started (`previous`
-    # recorded), and then only rolls back. Outputs: the watch and rollback outcomes, for the notice and the API client.
-    needs: [prepare, build-image, build-web, deploy]
-    if: ${{ !cancelled() && !inputs.dry-run && (needs.deploy.result == 'success' || (needs.deploy.result == 'failure' && needs.deploy.outputs.previous != '')) }}
+  finish:
+    # Rows 7 to 11 and the unlock in one job (REL-FAST-2: verify and finish were two jobs on the same runner class and
+    # role; one job saves a runner pick-up on every release). First the verify steps, only when VERIFY_RUNS (the deploy
+    # job succeeded, or failed once the rollout had started, `previous` recorded; never a dry run): smoke, the
+    # deploy-alarm check (the bake is ECS's own, in the rollout), and the rollback when the rollout, the ops
+    # registration, smoke or the check failed (E2, E3); after a deploy job that failed once the rollout had started, only
+    # the rollback. Then, after every run that took the lock, whatever happened (always()): the deployment record and
+    # notice, and the unlock (only with the token the prepare job took the lock with; it puts every service back while
+    # the record is still rolling, for example after a cancel; if this job itself is lost, the next release that waits
+    # sees this run has finished and takes the lock over). Every long step has its own limit, so a hang ends as a failed
+    # step and the always() steps still run. No packages scope: the API client publish is the api-client job after it.
+    # Outputs: the watch and rollback outcomes and the readiness result, for the notice and the API client.
+    needs: [prepare, build-image, build-web, db-bootstrap, deploy]
+    if: ${{ always() && needs.prepare.result != 'skipped' && inputs.environment != 'prod' }}
     runs-on: onepeek-arm64-od
-    # Above the sum of its step limits (10 + 5 + 10 + 8 + 2 + 25 = 60) with 10 minutes for the short steps that have no
-    # limit of their own (RV-111 N1), so a hang ends as a failed step and the rollback still runs.
-    timeout-minutes: 70
+    # Above the sum of its step limits: the verify steps 10 + 5 + 10 + 8 + 2 + 25 = 60, the deployment record 10 and the
+    # unlock 40 (migrate wait 15, put-back 20), with 10 minutes for the short steps that have no limit of their own
+    # (RV-111 N1). A named TIMEOUT_EXCEPTIONS entry (playbook §5.4a).
+    timeout-minutes: 120
     permissions:
       contents: read
       id-token: write
+      deployments: write
       issues: write
+    env:
+      VERIFY_RUNS: ${{ !inputs.dry-run && (needs.deploy.result == 'success' || (needs.deploy.result == 'failure' && needs.deploy.outputs.previous != '')) }}
     outputs:
       watch: ${{ steps.watch.outcome }}
       rollback: ${{ steps.rollback.outcome }}
@@ -3670,6 +3688,9 @@ jobs:
     steps:
       - name: This run attempt holds the release lock (a re-run of only some jobs does not)
         id: guard
+        # Skipped when prepare never took the lock (for example it failed at a wait cap): nothing to record, and the only
+        # failed job is the one with the re-run message.
+        if: ${{ always() && needs.prepare.outputs.attempt != '' }}
         env:
           LOCKED_ATTEMPT: ${{ needs.prepare.outputs.attempt }}
         run: |
@@ -3678,12 +3699,14 @@ jobs:
             exit 1
           fi
       - id: creds
+        if: ${{ env.VERIFY_RUNS == 'true' }}
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ inputs.role-to-assume }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
       - name: The deploy job finished its rollout (if it failed, only the rollback runs)
+        if: ${{ env.VERIFY_RUNS == 'true' }}
         env:
           DEPLOY_RESULT: ${{ needs.deploy.result }}
         run: |
@@ -3692,10 +3715,12 @@ jobs:
             exit 1
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ env.VERIFY_RUNS == 'true' }}
         with:
           persist-credentials: false
       - name: Baseline readiness through the edge (backend /api/status, web /sign-in), always
         id: ready
+        if: ${{ env.VERIFY_RUNS == 'true' }}
         timeout-minutes: 10
         env:
           DOMAIN: ${{ inputs.domain }}
@@ -3704,6 +3729,7 @@ jobs:
           if [ "${IMAGE}" = "backend" ]; then path="/api/status"; else path="/sign-in"; fi
           curl --fail --silent --show-error --max-time 10 --retry 6 --retry-delay 10 --retry-all-errors "https://${DOMAIN}${path}" >/dev/null
       - name: Every service's task definition carries this release's image digest (describe-services; no ecs:ListTasks)
+        if: ${{ env.VERIFY_RUNS == 'true' }}
         timeout-minutes: 5
         env:
           DIGEST: ${{ needs.build-image.outputs.digest || needs.build-web.outputs.digest }}
@@ -3718,6 +3744,7 @@ jobs:
             fi
           done
       - name: The repo's own smoke checks against the domain, in addition (UC-DEL-001 row 7; @smoke journeys)
+        if: ${{ env.VERIFY_RUNS == 'true' }}
         timeout-minutes: 10
         env:
           SCRIPT: ${{ inputs.smoke-script }}
@@ -3736,6 +3763,7 @@ jobs:
             -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN bash "${SCRIPT}"
       - name: No deploy alarm of the rolled services fires after stable (ECS baked each one during its rollout)
         id: watch
+        if: ${{ env.VERIFY_RUNS == 'true' }}
         timeout-minutes: 8   # F658: two worst polls (190 s each, see poll()) and 100 s to spare
         env:
           SERVICES: ${{ needs.deploy.outputs.services }}
@@ -3786,7 +3814,7 @@ jobs:
       - name: A fresh role session for the rollback (F668)
         # The checks before it may take 29 minutes and the put-back 25: past the role's 1-hour session. Same role, via OIDC;
         # it runs exactly when the rollback runs, and if it fails the rollback still runs on the first session.
-        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.creds.outcome == 'success' && steps.watch.outcome != 'success' }}
+        if: ${{ !cancelled() && env.VERIFY_RUNS == 'true' && steps.guard.outcome == 'success' && steps.creds.outcome == 'success' && steps.watch.outcome != 'success' }}
         timeout-minutes: 2
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
@@ -3797,7 +3825,7 @@ jobs:
         id: rollback
         # On a failed rollout or ops registration (deploy failed after recording previous), smoke or watch: the
         # watch is the last check, so anything but its success rolls back. Never after a failed lock check.
-        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.creds.outcome == 'success' && steps.watch.outcome != 'success' }}
+        if: ${{ !cancelled() && env.VERIFY_RUNS == 'true' && steps.guard.outcome == 'success' && steps.creds.outcome == 'success' && steps.watch.outcome != 'success' }}
         timeout-minutes: 25   # its put-back wait 20 (F661), plus the re-registration and the sandbox aliases
         env:
           PREVIOUS: ${{ needs.deploy.outputs.previous }}
@@ -4663,7 +4691,7 @@ jobs:
             --body "The release failed and every service was put back. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
       - name: Record the end in the release lock (done after a clean watch, locked after a stable rollback)
         # Never in a cancelled run: then the record stays rolling and finish puts every service back (playbook §5.4a).
-        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.creds.outcome == 'success' && (steps.watch.outcome == 'success' || steps.rollback.outcome == 'success') }}
+        if: ${{ !cancelled() && env.VERIFY_RUNS == 'true' && steps.guard.outcome == 'success' && steps.creds.outcome == 'success' && (steps.watch.outcome == 'success' || steps.rollback.outcome == 'success') }}
         env:
           WATCH: ${{ steps.watch.outcome }}
           LOCK_TOKEN: ${{ needs.prepare.outputs.token }}
@@ -5491,36 +5519,6 @@ jobs:
           }
           # --- release-lock end ---
           if [ "${WATCH}" = "success" ]; then lock_write_phase "done" || exit 1; else lock_write_phase locked || exit 1; fi
-
-  finish:
-    # Rows 10 and 11 and the unlock, after every run that took the lock, whatever happened. In order: the deployment
-    # record and notice; the unlock (always, only with the token the prepare job took the lock with; if this job itself
-    # is lost, the next release that waits sees this run has finished and takes the lock over). No packages scope: the
-    # API client publish is the api-client job after it.
-    needs: [prepare, build-image, build-web, db-bootstrap, deploy, verify]
-    if: ${{ always() && needs.prepare.result != 'skipped' && inputs.environment != 'prod' }}
-    runs-on: onepeek-arm64-od
-    # Above the sum of its steps: migrate wait 15, put-back 20, deployment record 10, the unlock (playbook §5.4a; a named
-    # TIMEOUT_EXCEPTIONS entry).
-    timeout-minutes: 60
-    permissions:
-      contents: read
-      id-token: write
-      deployments: write
-      issues: write
-    steps:
-      - name: This run attempt holds the release lock (a re-run of only some jobs does not)
-        id: guard
-        # Skipped when prepare never took the lock (for example it failed at a wait cap): nothing to record, and the only
-        # failed job is the one with the re-run message.
-        if: ${{ always() && needs.prepare.outputs.attempt != '' }}
-        env:
-          LOCKED_ATTEMPT: ${{ needs.prepare.outputs.attempt }}
-        run: |
-          if [ "${LOCKED_ATTEMPT}" != "${GITHUB_RUN_ATTEMPT}" ]; then
-            echo "::error::Attempt ${GITHUB_RUN_ATTEMPT} did not take the release lock (attempt '${LOCKED_ATTEMPT}' did). Re-run all jobs, not only the failed ones."
-            exit 1
-          fi
       - name: Deployment record and the team notice in the run summary (commit, services, result, durations)
         # Row 10, after every run that got past the version, whatever the result (delivery-pipelines §12: every run
         # writes a GitHub deployment). No git tag and no GitHub release in preprod: promote.yml creates v<version>.
@@ -5532,8 +5530,8 @@ jobs:
           NEXT_VERSION: ${{ needs.prepare.outputs.version }}
           DIGESTS: ${{ needs.build-image.outputs.digests || needs.build-web.outputs.digests }}
           SERVICES: ${{ needs.deploy.outputs.services }}
-          WATCH: ${{ needs.verify.outputs.watch }}
-          ROLLBACK: ${{ needs.verify.outputs.rollback }}
+          WATCH: ${{ steps.watch.outcome }}
+          ROLLBACK: ${{ steps.rollback.outcome }}
           STARTED: ${{ needs.prepare.outputs.started }}
           STABLE_AT: ${{ needs.deploy.outputs.stable-at }}
           MERGED_AT: ${{ github.event.head_commit.timestamp }}
@@ -6418,8 +6416,8 @@ jobs:
     # GitHub Packages as the prerelease <next>-dev.<sha7> under the next dist-tag (UC-DEL-001 row 11); promote.yml
     # publishes <version> under latest. Its own job so that only this one holds packages: write (least privilege), and
     # after finish so the unlock never waits for the npm publish. Never for prod, which the prepare job refuses.
-    needs: [prepare, verify, finish]
-    if: ${{ !cancelled() && !inputs.dry-run && inputs.image == 'backend' && needs.verify.outputs.watch == 'success' }}
+    needs: [prepare, finish]
+    if: ${{ !cancelled() && !inputs.dry-run && inputs.image == 'backend' && needs.finish.outputs.watch == 'success' }}
     runs-on: ${{ inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64' }}
     timeout-minutes: 15
     permissions:
@@ -6468,7 +6466,7 @@ jobs:
     # (scripts/test_notify_release.py). F680, F694: never GitHub-hosted, prod and an unset runner included: a private
     # repository's GitHub-hosted job is never started once the account's Actions minutes or spending limit run out, and a
     # job never started is red despite continue-on-error.
-    needs: [prepare, build-image, build-web, db-bootstrap, deploy, verify, finish, api-client]
+    needs: [prepare, build-image, build-web, db-bootstrap, deploy, finish, api-client]
     if: ${{ always() && !inputs.dry-run && inputs.environment != 'prod' && needs.prepare.outputs.skip != 'true' }}
     runs-on: ${{ inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64-small' }}
     timeout-minutes: 3
@@ -6510,10 +6508,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
           RESULTS: ${{ toJSON(needs.*.result) }}
-          ROLLBACK: ${{ needs.verify.outputs.rollback }}
-          WATCH: ${{ needs.verify.outputs.watch }}
-          STATUS: ${{ needs.verify.outputs.ready }}
+          ROLLBACK: ${{ needs.finish.outputs.rollback }}
+          WATCH: ${{ needs.finish.outputs.watch }}
+          STATUS: ${{ needs.finish.outputs.ready }}
           STATUS_PATH: ${{ inputs.image == 'backend' && '/api/status' || '/sign-in' }}
           STARTED: ${{ needs.prepare.outputs.started }}
           HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+          ALERTS_CHANNEL: ${{ inputs.alerts-channel }}
         run: python3 -I _gh/scripts/notify_release.py

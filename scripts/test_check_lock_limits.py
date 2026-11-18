@@ -34,10 +34,11 @@ class Limits(unittest.TestCase):
         self.assertTrue(any("timeout-minutes 130 is below its wait cap and its other steps' limits, 135 in all" in p for p in problems), problems)
 
     def test_the_other_steps_limits_are_read_from_the_workflow(self):
-        # finish: its unlock step (40) and its deployment record (10) fit in 60; a longer deployment record does not.
+        # finish: the verify steps (60), its deployment record (10), its unlock step (40) and 10 untimed fit in 120; a longer
+        # deployment record does not.
         record = "        timeout-minutes: 10\n        env:\n          GH_TOKEN: ${{ github.token }}\n          COMMIT: ${{ needs.prepare.outputs.commit }}\n"
         problems = self.check(("release-ecs.yml", record, record.replace("timeout-minutes: 10", "timeout-minutes: 25")))
-        self.assertTrue(any("release-ecs.yml job finish: timeout-minutes 60 is below its wait cap and its other steps' limits, 65 in all" in p
+        self.assertTrue(any("release-ecs.yml job finish: timeout-minutes 120 is below its wait cap and its other steps' limits, 135 in all" in p
                             for p in problems), problems)
 
     def test_the_unlock_step_has_its_own_limit_holding_the_migrate_wait_and_the_put_back(self):

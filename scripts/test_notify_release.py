@@ -51,7 +51,8 @@ def base_env(**extra) -> dict:
            "GITHUB_SHA": "abcdef1234567890abcdef1234567890abcdef12", "GITHUB_SERVER_URL": "https://github.com",
            "ENVIRONMENT": "preprod", "VERSION": "0.7.0", "RESULTS": '["success","skipped","success"]',
            "ROLLBACK": "skipped", "WATCH": "success", "STATUS": "success", "STATUS_PATH": "/api/status",
-           "STARTED": str(NOW - 723), "HEAD_MESSAGE": "Merge pull request #142 from OnePeek/release-pr\n\nbody"}
+           "STARTED": str(NOW - 723), "HEAD_MESSAGE": "Merge pull request #142 from OnePeek/release-pr\n\nbody",
+           "ALERTS_CHANNEL": "#alerts-critical"}
     env.update(extra)
     return env
 
@@ -71,18 +72,41 @@ class Message(unittest.TestCase):
         self.assertEqual(text.splitlines(), [
             "[backend-service] 0.7.0 -> preprod: SUCCESS",
             "commit abcdef1 | took 12m 03s | /api/status: success",
-            "rolled out, watching: a deploy alarm that fires from now on posts to #alerts",
+            "rolled out; after the bake a deploy alarm only notifies (no automatic rollback): it posts to #alerts-critical",
             "<https://github.com/OnePeek/backend-service/actions/runs/42|run> | "
             "<https://github.com/OnePeek/backend-service/pull/142|PR #142> | "
             "<https://github.com/OnePeek/backend-service/commit/abcdef1234567890abcdef1234567890abcdef12|commit>"])
+
+    def test_the_alerts_channel_comes_from_the_caller_never_a_fixed_one(self):
+        # RV-112 S1/S2: preprod's deploy alarms post to #alerts-critical (onepeek-infra config/preprod.yaml
+        # slack_critical_alarms), not #alerts; the channel is the caller's input, and the line says an alarm after the
+        # bake only notifies.
+        line = lambda **e: nr.build_message(base_env(**e), jobs=[], now=NOW).splitlines()[2]
+        self.assertEqual(line(ALERTS_CHANNEL="#alerts"), "rolled out; after the bake a deploy alarm only notifies "
+                                                         "(no automatic rollback): it posts to #alerts")
+        for unset in ("", "   "):
+            self.assertEqual(line(ALERTS_CHANNEL=unset), "rolled out; after the bake a deploy alarm only notifies "
+                                                         "(no automatic rollback): it posts to the alerts channel")
+        env = base_env()
+        del env["ALERTS_CHANNEL"]
+        self.assertIn("it posts to the alerts channel", nr.build_message(env, jobs=[], now=NOW))
+        self.assertIn("posts to &lt;!channel&gt;", line(ALERTS_CHANNEL="<!channel>"))  # escaped, never a Slack mention
+        self.assertLessEqual(len(line(ALERTS_CHANNEL="#" + "a" * 500)), 200)
+
+    def test_release_ecs_passes_its_alerts_channel_input_to_the_notifier(self):
+        doc = load("release-ecs.yml")
+        self.assertEqual(doc["jobs"]["notify"]["steps"][-1]["env"]["ALERTS_CHANNEL"], "${{ inputs.alerts-channel }}")
+        given = call_of(doc)["inputs"]["alerts-channel"]
+        self.assertIs(given.get("required", False), False)
+        self.assertEqual(given.get("default", ""), "")  # no channel is fixed here: the caller names it per environment
 
     def test_only_a_success_with_a_watch_says_rolled_out_watching(self):
         # REL-FAST: release-ecs.yml (WATCH set) says it keeps watching; the infra release (no WATCH) and failures do not.
         env = base_env()
         del env["WATCH"]
-        self.assertNotIn("watching", nr.build_message(env, jobs=[], now=NOW))
+        self.assertNotIn("rolled out", nr.build_message(env, jobs=[], now=NOW))
         failed = nr.build_message(base_env(RESULTS='["success","failure"]'), jobs=[], now=NOW)
-        self.assertNotIn("watching", failed)
+        self.assertNotIn("rolled out", failed)
 
     def test_failed_names_the_failed_job_and_step(self):
         text = nr.build_message(base_env(RESULTS='["success","failure"]', WATCH="failure"), jobs=FAILED_JOBS, now=NOW)
@@ -314,10 +338,10 @@ class Workflows(unittest.TestCase):
                                     "needs.prepare.outputs.skip != 'true' }}")
         env = job["steps"][-1]["env"]
         self.assertEqual(env["RESULTS"], "${{ toJSON(needs.*.result) }}")
-        self.assertEqual(env["ROLLBACK"], "${{ needs.verify.outputs.rollback }}")
-        self.assertEqual(env["STATUS"], "${{ needs.verify.outputs.ready }}")
-        self.assertEqual(doc["jobs"]["verify"]["outputs"]["ready"], "${{ steps.ready.outcome }}")
-        ready = [s for s in doc["jobs"]["verify"]["steps"] if s.get("id") == "ready"]
+        self.assertEqual(env["ROLLBACK"], "${{ needs.finish.outputs.rollback }}")
+        self.assertEqual(env["STATUS"], "${{ needs.finish.outputs.ready }}")
+        self.assertEqual(doc["jobs"]["finish"]["outputs"]["ready"], "${{ steps.ready.outcome }}")
+        ready = [s for s in doc["jobs"]["finish"]["steps"] if s.get("id") == "ready"]
         self.assertEqual(len(ready), 1)
         self.assertIn("/api/status", ready[0]["run"])
         self.assertNotIn("outputs.token", json.dumps(env))  # never the lock token (a step env is shown in the log)
