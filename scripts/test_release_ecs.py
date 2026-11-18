@@ -1130,7 +1130,7 @@ BASH4 = subprocess.run(["bash", "-c", "mapfile -t x < /dev/null"], capture_outpu
                      "needs bash 4+ (mapfile); this bash is older")
 class Watch(unittest.TestCase):
     def watch(self, known: str, firing: str, seconds: str, services: str = '["api", "worker"]'):
-        script = step("verify", "10 minutes after stable").replace("SECONDS + 600", "SECONDS + " + seconds)
+        script = step("verify", "No deploy alarm of the rolled services")
         # The stub answers like AWS: only the alarms among the requested --alarm-names that exist (or are firing).
         aws = f"""want=" $* "
 pick() {{ for a in $1; do case "$want" in *" $a "*) printf '%s\\t' "$a";; esac; done; echo; }}
@@ -1147,25 +1147,32 @@ esac"""
         self.assertIn("::warning::None of the deploy alarms", out.stdout)
         self.assertIn("could not detect a regression", summary)
 
-    def test_no_deploy_alarm_skips_the_watch_instead_of_waiting_it_out(self):
-        # C11: today's wait of 10 minutes with nothing to poll; the watch window here is 3 s, so a poll would show.
+    def test_no_deploy_alarm_skips_the_check(self):
+        # C11: with nothing to poll, the check is skipped out loud.
         out, calls, summary = self.watch("", "", "3")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertNotIn("--state-value ALARM", calls)
-        self.assertNotIn("sleep", calls)
-        self.assertIn("the 10-minute watch is skipped", out.stdout)
+        self.assertIn("the alarm check is skipped", out.stdout)
         self.assertIn("the watch was skipped", summary)
-        self.assertNotIn("No deploy alarm in 10 minutes", out.stdout)
+        self.assertNotIn("No deploy alarm firing", out.stdout)
 
-    def test_deploy_alarms_that_exist_are_still_watched_for_the_whole_window(self):
+    def test_deploy_alarms_that_exist_are_checked_once_with_no_fixed_bake(self):
+        # REL-FAST: ECS bakes each service on its deploy alarms during the rollout (rollback on), so verify checks once.
         out, calls, _ = self.watch("onepeek-preprod-deploy-api-errors", "", "1")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn("Watching: onepeek-preprod-deploy-api-errors", out.stdout)
-        self.assertIn("--state-value ALARM", calls)
-        self.assertIn("No deploy alarm in 10 minutes", out.stdout)
+        self.assertIn("Checking: onepeek-preprod-deploy-api-errors", out.stdout)
+        self.assertEqual(calls.count("--state-value ALARM"), 1)
+        self.assertNotIn("sleep", calls)
+        self.assertIn("No deploy alarm firing", out.stdout)
+
+    def test_the_rollout_wait_ends_only_after_ecs_s_own_bake(self):
+        # The bake moved into ECS: the rollout's wait must still require rolloutState COMPLETED and fail on an ECS rollback.
+        roll = step("deploy", "Verify, render, register and update each order")
+        self.assertIn('state == "COMPLETED"', roll)
+        self.assertIn("was rolled back by ECS (circuit breaker/alarm)", roll)
 
     def test_an_unreadable_alarm_list_fails_the_watch_and_never_skips_it(self):
-        script = step("verify", "10 minutes after stable").replace("SECONDS + 600", "SECONDS + 3")
+        script = step("verify", "No deploy alarm of the rolled services")
         aws = 'echo "An error occurred (AccessDenied) when calling the DescribeAlarms operation" >&2; exit 254'
         out, calls, _, summary, _ = run_step(script, aws, extra_env={"SERVICES": '["api"]'}, extra_stubs={"sleep": "exit 0"}, with_summary=True)
         self.assertNotEqual(out.returncode, 0)
@@ -1173,7 +1180,7 @@ esac"""
 
     def test_an_unreadable_alarm_list_fails_under_the_runners_own_shell_without_pipefail(self):
         # RV-107 B1: a step with no `shell:` runs as `bash -e {0}` on the runner, without pipefail; the step sets it itself.
-        script = "set +o pipefail\n" + step("verify", "10 minutes after stable").replace("SECONDS + 600", "SECONDS + 3")
+        script = "set +o pipefail\n" + step("verify", "No deploy alarm of the rolled services")
         aws = 'echo "An error occurred (AccessDenied) when calling the DescribeAlarms operation" >&2; exit 254'
         out, _, _, summary, _ = run_step(script, aws, extra_env={"SERVICES": '["api"]'}, extra_stubs={"sleep": "exit 0"}, with_summary=True)
         self.assertNotEqual(out.returncode, 0)
@@ -1221,15 +1228,16 @@ class WatchRetries(unittest.TestCase):
         # Bounded: six attempts of a poll still end inside the step limit, so a hang ends as a failed step (rollback).
         # F658: with the CLI's 60 s connect and read timeouts, one poll of 6 attempts could take 12 minutes, past the step
         # limit, and a step timeout rolls a healthy release back. Each attempt is now at most 5 + 10 s, so the worst poll
-        # is 6 x 15 s plus 5 adaptive backoffs of at most 20 s = 190 s; the window (600 s) starts before the first poll, so
-        # the window plus one worst poll leaves at least 120 s before the step limit.
+        # is 6 x 15 s plus 5 adaptive backoffs of at most 20 s = 190 s. REL-FAST: no window any more, two polls (the
+        # alarm list, then the firing ones), and the two worst polls leave at least 90 s before the step limit.
         for line in watch["run"].splitlines():
             if "aws " in line and not line.strip().startswith("#"):
                 self.assertIn("--cli-connect-timeout 5 --cli-read-timeout 10", line)
         run = watch["run"]
-        self.assertLess(run.index("end=$((SECONDS + 600))"), run.index("known=$(poll)"))
+        self.assertNotIn("SECONDS + 600", run)
+        self.assertEqual(run.count("$(poll"), 2)
         worst_poll = 6 * (5 + 10) + 5 * 20
-        self.assertGreaterEqual(watch["timeout-minutes"] * 60 - 600 - worst_poll, 120)
+        self.assertGreaterEqual(watch["timeout-minutes"] * 60 - 2 * worst_poll, 90)
 
 
 class WatchShell(unittest.TestCase):
@@ -1620,8 +1628,9 @@ class JobGraph(unittest.TestCase):
         self.assertEqual(limit("build-image", lambda s: s.get("id") == "push"), 20)
         self.assertEqual(limit("deploy", lambda s: s.get("name", "").startswith("Verify, render, register and run the migrate")), 15)
         self.assertEqual(limit("deploy", lambda s: s.get("id") == "roll"), 45)
-        # F658: the watch's 10-minute window, one worst bounded poll (190 s) and 120 s to spare: 16, not 12.
-        self.assertEqual(limit("verify", lambda s: s.get("id") == "watch"), 16)
+        # REL-FAST (2026-11-18): the bake is ECS's own, inside the rollout; the watch is one alarm check after the smoke
+        # checks: two worst bounded polls (190 s each, F658) and 100 s to spare.
+        self.assertEqual(limit("verify", lambda s: s.get("id") == "watch"), 8)
         for name, job in RELEASE["jobs"].items():
             if "steps" in job:
                 total = sum(s.get("timeout-minutes", 0) for s in job["steps"])

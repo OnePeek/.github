@@ -71,9 +71,18 @@ class Message(unittest.TestCase):
         self.assertEqual(text.splitlines(), [
             "[backend-service] 0.7.0 -> preprod: SUCCESS",
             "commit abcdef1 | took 12m 03s | /api/status: success",
+            "rolled out, watching: a deploy alarm that fires from now on posts to #alerts",
             "<https://github.com/OnePeek/backend-service/actions/runs/42|run> | "
             "<https://github.com/OnePeek/backend-service/pull/142|PR #142> | "
             "<https://github.com/OnePeek/backend-service/commit/abcdef1234567890abcdef1234567890abcdef12|commit>"])
+
+    def test_only_a_success_with_a_watch_says_rolled_out_watching(self):
+        # REL-FAST: release-ecs.yml (WATCH set) says it keeps watching; the infra release (no WATCH) and failures do not.
+        env = base_env()
+        del env["WATCH"]
+        self.assertNotIn("watching", nr.build_message(env, jobs=[], now=NOW))
+        failed = nr.build_message(base_env(RESULTS='["success","failure"]'), jobs=[], now=NOW)
+        self.assertNotIn("watching", failed)
 
     def test_failed_names_the_failed_job_and_step(self):
         text = nr.build_message(base_env(RESULTS='["success","failure"]', WATCH="failure"), jobs=FAILED_JOBS, now=NOW)
