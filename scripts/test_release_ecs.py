@@ -163,31 +163,157 @@ class BuildReuse(unittest.TestCase):
         self.assertNotIn("docker buildx", calls)
 
 
+TAG_TEXT = (WORKFLOWS / "release-tag.yml").read_text(encoding="utf-8")
+
+
+def next_version_block(text: str) -> list[str]:
+    """The marked next-version lines, without indentation (each copy sits at its own depth)."""
+    m = re.search(r"# --- next-version begin.*?\n(.*?)\n\s*# --- next-version end", text, re.S)
+    assert m, "no next-version block"
+    return [line.strip() for line in m.group(1).splitlines()]
+
+
+def git_repo(root: Path, history: list[tuple[str, str | None]]) -> None:
+    """A real git repository: one commit per (message, tag or None)."""
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    git = lambda *a: subprocess.run(["git", "-c", "init.defaultBranch=release", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *a],
+                                    cwd=root, env=env, check=True, capture_output=True)  # fmt: skip
+    git("init", "-q")
+    for message, tag in history:
+        git("commit", "-q", "--allow-empty", "-m", message)
+        if tag:
+            git("tag", tag)
+
+
 class Version(unittest.TestCase):
+    """REL-AUTOTAG (founder 2026-11-18): no manual bump; the version is the next one after the latest v* tag."""
+
     script = step("prepare", "Record the commit")
+    FIRST = RELEASE["jobs"]["prepare"]["steps"]
 
-    def test_the_commit_is_recorded_and_the_version_is_the_latest_v_tag(self):
-        out, calls, output = run_step(self.script, "", {"EXTRA": ""}, extra_stubs={"git": "echo v1.2.3"})
-        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn(f"commit={COMMIT}", output)
-        self.assertIn("version=1.2.3\n", output)
-        self.assertIn("git describe --tags --abbrev=0 --match v*", calls)
+    def version(self, history: list[tuple[str, str | None]]) -> str:
+        env_first = next(s for s in self.FIRST if s.get("name", "").startswith("Record the commit"))["env"]["FIRST_VERSION"]
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            git_repo(root, history)
+            out = subprocess.run(["bash", "-eo", "pipefail", "-c", self.script], cwd=root, capture_output=True, text=True, stdin=subprocess.DEVNULL, env={
+                **os.environ, **ENV, "EXTRA": "", "FIRST_VERSION": env_first, "GITHUB_OUTPUT": str(root / "output"), "GITHUB_STEP_SUMMARY": str(root / "summary"),
+            })  # fmt: skip
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            output = (root / "output").read_text()
+            self.assertIn(f"commit={COMMIT}", output)
+            return re.search(r"^version=(.*)$", output, re.M).group(1)
 
-    def test_no_v_tag_gives_0_0_0_and_does_not_stop_the_release(self):
-        # F727: no manifest file is read; a repository with no v* tag yet still releases.
-        out, _, output = run_step(self.script, "", {"EXTRA": ""}, extra_stubs={"git": "echo 'fatal: No names found' >&2; exit 128"})
-        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn("version=0.0.0\n", output)
-        self.assertIn(f"commit={COMMIT}", output)
+    def test_a_fix_after_the_tag_is_the_next_patch(self):
+        self.assertEqual(self.version([("feat: a", "v0.1.0"), ("fix: b", None), ("chore: c", None)]), "0.1.1")
+
+    def test_a_feat_after_the_tag_is_the_next_minor(self):
+        self.assertEqual(self.version([("feat: a", "v0.1.0"), ("fix: b", None), ("feat(api): c", None)]), "0.2.0")
+
+    def test_a_breaking_change_stays_a_minor_while_major_is_0(self):
+        self.assertEqual(self.version([("x", "v0.3.4"), ("fix!: b", None)]), "0.4.0")
+        self.assertEqual(self.version([("x", "v0.3.4"), ("fix: b\n\nBREAKING CHANGE: gone", None)]), "0.4.0")
+
+    def test_no_tag_starts_at_0_1_0(self):
+        self.assertEqual(self.version([("feat: a", None), ("fix: b", None)]), "0.1.0")
+
+    def test_the_latest_reachable_tag_is_used_and_the_moving_v1_tag_is_ignored(self):
+        self.assertEqual(self.version([("a", "v0.1.0"), ("b", "v0.2.3"), ("fix: c", "v1")]), "0.2.4")
+
+    def test_only_plain_x_y_z_tags_count(self):
+        # RV-115 N1: a pre-release tag is neither the latest tag nor this commit's version.
+        self.assertEqual(self.version([("a", "v0.2.3"), ("fix: b", "v0.2.4-rc1")]), "0.2.4")
+        self.assertEqual(self.version([("a", "v0.2.3"), ("b", "v0.10.0"), ("fix: c", None)]), "0.10.1")
+
+    def test_a_commit_already_tagged_keeps_its_version_on_a_rerun(self):
+        self.assertEqual(self.version([("a", "v0.1.0"), ("feat: b", "v0.2.0")]), "0.2.0")
+
+    def test_the_rule_is_the_same_lines_as_release_tag(self):
+        self.assertEqual(next_version_block(TEXT), next_version_block(TAG_TEXT))
+        self.assertEqual(TEXT.count("# --- next-version begin"), 1)
 
     def test_no_release_please_manifest_is_read(self):
         self.assertNotIn("release-please", TEXT)
         self.assertNotIn("VERSION_FILE", TEXT)
 
-    def test_no_job_checks_or_creates_a_version_tag(self):
-        self.assertNotIn("refs/tags/v", TEXT)
+    def test_no_github_release_is_made_in_preprod(self):
         self.assertNotIn("gh release", TEXT)
-        self.assertNotIn("tag-notify", RELEASE["jobs"])
+
+
+class Tag(unittest.TestCase):
+    """REL-AUTOTAG: v<version> on the released commit after a successful release only; idempotent; never moved."""
+
+    script = step("tag", "Tag the released commit")
+    SHA = "f" * 40
+
+    def tag(self, gh: str, version: str = "0.2.0"):
+        return run_step(self.script, "", {"VERSION": version, "GITHUB_SHA": self.SHA, "GITHUB_REPOSITORY": "OnePeek/backend-service"},
+                        extra_stubs={"gh": gh}, with_summary=True)  # fmt: skip
+
+    def test_a_new_tag_is_created_on_the_released_commit(self):
+        out, calls, _, summary, _ = self.tag('case "$*" in *"git/ref/tags/"*) exit 1;; esac')
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(f"gh api -X POST repos/OnePeek/backend-service/git/refs -f ref=refs/tags/v0.2.0 -f sha={self.SHA}", calls)
+        self.assertIn("Tagged ffffffffffff v0.2.0.", summary)
+
+    def test_the_tag_already_on_this_commit_is_fine(self):
+        out, calls, _, summary, _ = self.tag(f'case "$*" in *"git/ref/tags/"*) echo "commit {self.SHA}";; esac')
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("-X POST", calls)
+        self.assertIn("already on", summary)
+
+    def test_an_annotated_tag_on_this_commit_is_fine(self):
+        gh = f'case "$*" in *"git/ref/tags/"*) echo "tag {"a" * 40}";; *"git/tags/"*) echo {self.SHA};; esac'
+        out, calls, _, _, _ = self.tag(gh)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("-X POST", calls)
+
+    def test_the_tag_on_another_commit_is_a_warning_and_is_never_moved(self):
+        # RV-115: a release queued behind another computed the same version before the other's tag existed.
+        out, calls, output, _, _ = self.tag(f'case "$*" in *"git/ref/tags/"*) echo "commit {"b" * 40}";; esac')
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("::warning::v0.2.0 was already used by bbbbbbbbbbbb", out.stdout)
+        self.assertIn("note=v0.2.0 was already used by bbbbbbbbbbbb", output)
+        self.assertNotIn("-X POST", calls)
+        self.assertNotIn("DELETE", calls)
+        self.assertNotIn("PATCH", calls)
+
+    def test_a_version_that_is_not_x_y_z_makes_no_tag(self):
+        out, calls, _, _, _ = self.tag("exit 1", version="")
+        self.assertEqual(out.returncode, 1)
+        self.assertNotIn("gh ", calls)
+
+    def test_a_failed_create_fails_the_step_with_a_note(self):
+        out, _, output, _, _ = self.tag('case "$*" in *"git/ref/tags/"*) exit 1;; *POST*) exit 1;; esac')
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("note=the GitHub API refused to create v0.2.0", output)
+
+    def test_notify_gets_the_tag_result_and_note(self):
+        env = RELEASE["jobs"]["notify"]["steps"][-1]["env"]
+        self.assertEqual(env["TAG"], "${{ needs.tag.result }}")
+        self.assertEqual(env["TAG_NOTE"], "${{ needs.tag.outputs.note }}")
+        self.assertEqual(RELEASE["jobs"]["tag"]["outputs"], {"note": "${{ steps.tag.outputs.note }}"})
+
+    def test_it_runs_after_a_successful_release_only_and_holds_contents_write_alone(self):
+        job = RELEASE["jobs"]["tag"]
+        self.assertEqual(needs_of("tag"), ["prepare", "finish"])
+        for part in ("!cancelled()", "!inputs.dry-run", "needs.finish.result == 'success'", "needs.finish.outputs.watch == 'success'",
+                     "needs.finish.outputs.rollback != 'success'"):  # fmt: skip
+            self.assertIn(part, job["if"])
+        self.assertNotIn("always()", job["if"])
+        self.assertEqual(job["permissions"], {"contents": "write"})
+        for name, other in RELEASE["jobs"].items():
+            self.assertEqual((other.get("permissions") or {}).get("contents") == "write", name == "tag", name)
+        self.assertNotIn("continue-on-error", str(job))
+        self.assertIn("tag", needs_of("notify"))
+
+    def test_it_never_runs_after_a_failed_or_rolled_back_finish(self):
+        ran = lambda **o: JobGraph._simulate("web", False, False, finish=o.get("finish", "success"), outputs=o.get("outputs"))
+        self.assertIn("tag", ran())
+        self.assertNotIn("tag", ran(outputs={"watch": "failure", "rollback": "success"}))
+        self.assertNotIn("tag", ran(outputs={"watch": "success", "rollback": "success"}))
+        self.assertNotIn("tag", ran(finish="failure"))
+        self.assertNotIn("tag", JobGraph._simulate("backend", True, True))  # a dry run
 
 
 class SignOnce(unittest.TestCase):
@@ -1504,7 +1630,7 @@ class SkippedBuildBranch(unittest.TestCase):
             return found
 
         below = [j for j in jobs if ancestors(j) & {"build-image", "build-web"}]
-        self.assertEqual(below, ["db-bootstrap", "deploy", "finish", "api-client", "notify"])
+        self.assertEqual(below, ["db-bootstrap", "deploy", "finish", "api-client", "tag", "notify"])
         for job_id in below:
             self.assertRegex(str(jobs[job_id].get("if", "")), self.STATUS,
                              f"release-ecs.yml:{job_id}: below a skipped build job, so it needs !cancelled() or always()")
@@ -1515,21 +1641,23 @@ class JobGraph(unittest.TestCase):
     minutes were waiting). db-bootstrap stays a job (a reusable-workflow call under its own role), the build is two
     exclusive jobs (only the web build's token reads packages) and the API client publish is its own job (only it holds
     packages: write), plus the fail-open Slack notice last (W1-SLACK-GH). REL-FAST-2: verify and finish are one job (the
-    same runner class, role and lock token), so 8 jobs are defined; the backend runs at most 7 and the web image at most 5."""
+    same runner class, role and lock token); REL-AUTOTAG adds the tag job (only it holds contents: write), so 9 jobs are
+    defined; the backend runs at most 8 and the web image at most 6."""
 
-    JOBS = ["prepare", "build-image", "build-web", "db-bootstrap", "deploy", "finish", "api-client", "notify"]
+    JOBS = ["prepare", "build-image", "build-web", "db-bootstrap", "deploy", "finish", "api-client", "tag", "notify"]
 
     def test_the_job_count_is_pinned(self):
         self.assertEqual(list(RELEASE["jobs"]), self.JOBS)
 
     @staticmethod
-    def _simulate(image: str, migrate: bool, dry_run: bool) -> list[str]:
-        """Evaluates every job's needs and `if` the way Actions does, with every job that runs succeeding."""
+    def _simulate(image: str, migrate: bool, dry_run: bool, finish: str = "success", outputs: dict | None = None) -> list[str]:
+        """Evaluates every job's needs and `if` the way Actions does, with every job that runs succeeding (finish: its result)."""
         attempt = 1
         inputs = {"image": image, "migrate": migrate, "dry-run": dry_run, "environment": "preprod"}
         result: dict[str, str] = {}
+        finish_outputs = outputs or {"watch": "skipped" if dry_run else "success", "rollback": "skipped"}
         outputs = {"prepare": {"skip": "false", "attempt": str(attempt)}, "deploy": {"previous": ""},
-                   "finish": {"watch": "success"}}
+                   "finish": finish_outputs}
 
         def evaluate(expr: str) -> bool:
             e = expr.strip()
@@ -1550,23 +1678,23 @@ class JobGraph(unittest.TestCase):
                 go = evaluate(job["if"])
             else:  # the implicit success(): every needed job succeeded
                 go = all(result[n] == "success" for n in needs_of(name))
-            result[name] = "success" if go else "skipped"
+            result[name] = ("success" if name != "finish" else finish) if go else "skipped"
             if go:
                 ran.append(name)
         return ran
 
     def test_the_jobs_that_run_per_image_come_from_evaluating_the_conditions(self):
-        every = ["prepare", "build-image", "db-bootstrap", "deploy", "finish", "api-client", "notify"]
+        every = ["prepare", "build-image", "db-bootstrap", "deploy", "finish", "api-client", "tag", "notify"]
         self.assertEqual(self._simulate("backend", True, False), every)
         self.assertEqual(self._simulate("backend", False, False), [j for j in every if j != "db-bootstrap"])
-        web = ["prepare", "build-web", "db-bootstrap", "deploy", "finish", "notify"]
+        web = ["prepare", "build-web", "db-bootstrap", "deploy", "finish", "tag", "notify"]
         self.assertEqual(self._simulate("web", True, False), web)
         self.assertEqual(self._simulate("web", False, False), [j for j in web if j != "db-bootstrap"])
         # A dry run reads the digests back and deploys nothing live: no migrate, watch or client publish.
         self.assertEqual(self._simulate("backend", True, True), ["prepare", "build-image", "deploy", "finish"])
         self.assertEqual(self._simulate("web", True, True), ["prepare", "build-web", "deploy", "finish"])
-        self.assertEqual(len(self._simulate("backend", True, False)), 7)
-        self.assertEqual(len(self._simulate("web", False, False)), 5)
+        self.assertEqual(len(self._simulate("backend", True, False)), 8)
+        self.assertEqual(len(self._simulate("web", False, False)), 6)
 
     def test_the_stages_run_in_order(self):
         self.assertEqual(needs_of("deploy"), ["prepare", "build-image", "build-web", "db-bootstrap"])

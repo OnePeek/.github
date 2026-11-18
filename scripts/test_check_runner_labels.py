@@ -513,7 +513,7 @@ class SharedWorkflows(unittest.TestCase):
                 self.assertNotIn("public-hosted", ro, (name, job_id))
                 self.assertNotIn("environment", ro, (name, job_id))
                 self.assertIn(ro, ("onepeek-arm64-od", FAST_PUBLIC, LIGHT_PUBLIC), (name, job_id))
-        self.assertEqual(seen, 13)  # REL-FAST-2: verify folded into finish
+        self.assertEqual(seen, 14)  # REL-FAST-2: verify folded into finish; REL-AUTOTAG: the tag job
 
     def test_this_repos_own_ci_passes_public_hosted(self):
         import yaml

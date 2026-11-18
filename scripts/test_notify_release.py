@@ -297,6 +297,38 @@ def call_of(doc: dict) -> dict:
     return doc.get("on", doc.get(True))["workflow_call"]
 
 
+class TagJob(unittest.TestCase):
+    """RV-115: release-ecs.yml's tag job runs after the release is done; it never turns a release into FAILED."""
+
+    def test_a_tag_only_failure_stays_success_with_one_tag_line(self):
+        env = base_env(RESULTS='["success","success","failure"]', TAG="failure", TAG_NOTE="the GitHub API refused to create v0.7.0")
+        text = nr.build_message(env, jobs=[], now=NOW)
+        self.assertTrue(text.startswith("[backend-service] 0.7.0 -> preprod: SUCCESS"), text)
+        self.assertIn("rolled out; after the bake", text)
+        self.assertIn("version tag v0.7.0 not created: the GitHub API refused to create v0.7.0", text)
+        self.assertNotIn("failed step", text)
+
+    def test_a_tag_failure_without_a_note_points_to_the_run(self):
+        text = nr.build_message(base_env(RESULTS='["success","failure"]', TAG="failure"), jobs=[], now=NOW)
+        self.assertIn(": SUCCESS", text)
+        self.assertIn("version tag v0.7.0 not created: see the run", text)
+
+    def test_a_version_already_used_is_a_note_on_a_success(self):
+        env = base_env(RESULTS='["success","success"]', TAG="success", TAG_NOTE="v0.7.0 was already used by bbbbbbbbbbbb")
+        text = nr.build_message(env, jobs=[], now=NOW)
+        self.assertIn(": SUCCESS", text)
+        self.assertIn("version tag v0.7.0 not created: v0.7.0 was already used by bbbbbbbbbbbb", text)
+
+    def test_another_failed_job_still_fails_the_release(self):
+        env = base_env(RESULTS='["failure","failure"]', TAG="failure")
+        self.assertEqual(nr.result_of(env), "FAILED")
+        self.assertEqual(nr.result_of(base_env(RESULTS='["failure","success"]', TAG="success")), "FAILED")
+
+    def test_a_clean_tag_adds_no_line(self):
+        text = nr.build_message(base_env(RESULTS='["success","success"]', TAG="success"), jobs=[], now=NOW)
+        self.assertNotIn("version tag", text)
+
+
 class Workflows(unittest.TestCase):
     def test_both_notify_jobs_run_the_same_steps_but_their_env(self):
         ecs, own = load("release-ecs.yml")["jobs"]["notify"], load("release-notify.yml")["jobs"]["notify"]
