@@ -5,9 +5,9 @@ The one shared notifier: release-ecs.yml's `notify` job and release-notify.yml (
 exact file, checked out from OnePeek/.github at the workflow's own commit. It posts one plain-text message:
 
     [<repo>] <version> -> <env>: <RESULT>
-    commit <sha7> | <duration> | <readiness path>: <outcome>
+    commit <sha7> | <duration> | <readiness path>: <outcome>   (the readiness fact is left out when its step was skipped; RV-113)
     rolled out; after the bake ...: it posts to <channel> (SUCCESS of release-ecs.yml only, WATCH set; REL-FAST, RV-112)
-    version tag v<version> not created: <reason>         (release-ecs.yml's tag job failed or left a note; RV-115)
+    version tag v<version> not created: <reason>         (release-ecs.yml's tag job failed, was cancelled or left a note; RV-115)
     failed step: <job> / <step>                          (FAILED and ROLLED BACK only, when the jobs API says)
     <run> | <PR #n> | <commit>                           (Slack links)
 

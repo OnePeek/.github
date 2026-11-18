@@ -164,6 +164,33 @@ class Select(unittest.TestCase):
             self.assertEqual(t.select(graph, ["docs/a.md"], "pull_request", "dev", CALLER), ALL)
 
 
+    def test_a_read_path_built_by_an_expression_runs_everything(self):
+        forms = {
+            "format": 'x = file(format("%s/../../config/a.yaml", path.module))\n',
+            "join": 'x = file(join("/", [path.module, "..", "..", "config", "a.yaml"]))\n',
+            "abspath": 'x = file("${abspath(path.module)}/../../config/a.yaml")\n',
+            "fileset": 'x = fileset(path.module, "../../config/*.yaml")\n',
+            "fileset literal dir": 'x = fileset("${path.module}/..", "*.yaml")\n',
+            "call in a literal": 'x = templatefile("${pathexpand("~")}/a.tpl", {})\n',
+            "bare path.module": 'x = path.module\n',
+            "path.root in a call": 'x = fileexists(trimsuffix(path.root, "/"))\n',
+        }
+        for name, code in forms.items():
+            with self.subTest(name):
+                build(self.root, {"bootstrap/extra.tf": code})
+                with self.assertRaises(t.Unknown):
+                    t.Graph(self.root)
+                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(t.main(["--event", "pull_request", "--base-ref", "dev", "--diff-against", "HEAD",
+                                             "--caller-workflow", CALLER, "--root", str(self.root)]), 0)
+                self.assertEqual(out.getvalue().split(), ALL)
+
+    def test_the_resolvable_forms_and_comments_still_narrow(self):
+        build(self.root, {"bootstrap/extra.tf": '# format() and path.module in a comment\nx = file("${path.module}/../config/a.yaml")\n'
+                                                'y = file(local.p)\nz = file(var.f)\n'})
+        t.Graph(self.root)  # no Unknown
+
+
 class Tokens(unittest.TestCase):
     def test_kinds_holes_and_heredocs(self):
         text = 'a = "${path.module}/../x/${var.e}.yaml"\nb = <<-EOT\n  python3 ../../s.py --e "${var.e}"\nEOT\n' \
