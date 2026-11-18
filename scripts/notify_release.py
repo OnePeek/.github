@@ -7,11 +7,12 @@ exact file, checked out from OnePeek/.github at the workflow's own commit. It po
     [<repo>] <version> -> <env>: <RESULT>
     commit <sha7> | <duration> | <readiness path>: <outcome>
     rolled out; after the bake ...: it posts to <channel> (SUCCESS of release-ecs.yml only, WATCH set; REL-FAST, RV-112)
+    version tag v<version> not created: <reason>         (release-ecs.yml's tag job failed or left a note; RV-115)
     failed step: <job> / <step>                          (FAILED and ROLLED BACK only, when the jobs API says)
     <run> | <PR #n> | <commit>                           (Slack links)
 
 RESULT is ROLLED BACK (ROLLBACK=success), else CANCELLED (a needed job was cancelled), else FAILED (a needed job failed,
-or WATCH is set and is not success), else SUCCESS. Nothing is posted at the start of a release (the channel stays quiet).
+or WATCH is set and is not success), else SUCCESS; the tag job's result (TAG) never counts. Nothing is posted at the start of a release (the channel stays quiet).
 
 It never fails or slows a release: an unset SLACK_WEBHOOK is one ::warning:: and no post (F680: visible); a Slack error or timeout
 (curl --max-time 10, one retry) or any error of this script is one ::warning::; the exit status is always 0. The webhook
@@ -21,7 +22,8 @@ curl is scrubbed of it before it is shown.
 Environment: SLACK_WEBHOOK, ENVIRONMENT, VERSION, RESULTS (a JSON list of the needed jobs' results, the workflow's
 `toJSON(needs.*.result)`), ROLLBACK, WATCH (optional), STATUS and STATUS_PATH (optional), STARTED (epoch seconds,
 optional), HEAD_MESSAGE (optional), ALERTS_CHANNEL (optional: the Slack channel the environment's deploy alarms post to,
-the caller's input; unset, the line says "the alerts channel"), GH_TOKEN (optional, for the failed step and a missing start), and the runner's
+the caller's input; unset, the line says "the alerts channel"), TAG and TAG_NOTE (optional: the tag job's result and
+note), GH_TOKEN (optional, for the failed step and a missing start), and the runner's
 GITHUB_SERVER_URL, GITHUB_API_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_SHA.
 Standard library only.
 """
@@ -53,6 +55,9 @@ def result_of(env: dict) -> str:
         results = ["unknown"]
     if not isinstance(results, list):
         results = ["unknown"]
+    if env.get("TAG") and env["TAG"] in results:
+        # REL-AUTOTAG, RV-115: the version tag is made after the release is done; its job never decides the result.
+        results.remove(env["TAG"])
     if env.get("ROLLBACK") == "success":
         return "ROLLED BACK"
     if "cancelled" in results:
@@ -147,6 +152,11 @@ def build_message(env: dict, jobs: list | None = None, now: int | None = None) -
         # to the channel infra's config names (aws-stack §10.12; preprod: #alerts-critical, RV-112), the caller's input.
         channel = (env.get("ALERTS_CHANNEL") or "").strip()
         lines.append(ROLLED_OUT % (escape(channel[:80]) if channel else "the alerts channel"))
+
+    tag, note = env.get("TAG", ""), (env.get("TAG_NOTE") or "").strip()
+    if tag == "failure" or note:
+        tag_name = "v" + (env.get("VERSION") or "?")
+        lines.append("version tag %s not created: %s" % (escape(tag_name[:80]), escape(note)[:300] if note else "see the run"))
 
     if result in ("FAILED", "ROLLED BACK"):
         step = failed_step(jobs)
