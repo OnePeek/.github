@@ -6,6 +6,7 @@ exact file, checked out from OnePeek/.github at the workflow's own commit. It po
 
     [<repo>] <version> -> <env>: <RESULT>
     commit <sha7> | <duration> | <readiness path>: <outcome>
+    rolled out, watching: ...                            (SUCCESS of release-ecs.yml only, WATCH set; REL-FAST)
     failed step: <job> / <step>                          (FAILED and ROLLED BACK only, when the jobs API says)
     <run> | <PR #n> | <commit>                           (Slack links)
 
@@ -40,6 +41,7 @@ CURL = ["curl", "--silent", "--show-error", "--fail", "--max-time", "10", "--ret
         "--header", "Content-Type: application/json", "--config", "-"]
 CURL_TIMEOUT = 30  # seconds: two tries of at most 10 each, plus the retry's wait; a hung curl is killed
 API_TIMEOUT = 10
+ROLLED_OUT = "rolled out, watching: a deploy alarm that fires from now on posts to #alerts"
 PR = re.compile(r"Merge pull request #(\d+)|\(#(\d+)\)\s*$")
 
 
@@ -138,6 +140,10 @@ def build_message(env: dict, jobs: list | None = None, now: int | None = None) -
     if env.get("STATUS"):
         facts.append("%s: %s" % (escape(env.get("STATUS_PATH") or "status")[:40], escape(env["STATUS"])[:20]))
     lines.append(" | ".join(facts))
+    if result == "SUCCESS" and "WATCH" in env:
+        # REL-FAST (founder 2026-11-18): the release ends at stable + smoke, with no fixed bake of its own. The deploy alarms
+        # stay on: each one notifies the alerts topic, which the slack-alerts function posts to #alerts (aws-stack §10.12).
+        lines.append(ROLLED_OUT)
 
     if result in ("FAILED", "ROLLED BACK"):
         step = failed_step(jobs)

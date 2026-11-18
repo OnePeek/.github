@@ -6,7 +6,7 @@
 # prepare (the cross-repo release lock and the order check, playbook §5.4; the version), build (build-image, or
 # build-web for web: build, scan, SBOM and sign, read back and verify the recorded digest), db-bootstrap (backend only;
 # a call of infra's reusable workflow under its own role, so it stays a job of its own), deploy (migrate, assets, the
-# rollout, the ops registration), verify (smoke, watch, and the rollback on a failed rollout, smoke or watch) and finish
+# rollout, the ops registration), verify (smoke, one deploy-alarm check, and the rollback on a failed rollout, smoke or check) and finish
 # (the deployment record, the unlock, always, and the API client). Nobody deploys from a laptop.
 # Every preprod artefact is keyed on the commit, sha-<12> (foundation-playbook §5.2, decision 159): the image tag, the
 # web-assets folder, the SSM release record and the task-definition tags. The release-please version is image metadata
@@ -3650,15 +3650,15 @@ jobs:
           echo "Registered ${arn##*/} (not run)."
 
   verify:
-    # Rows 7 to 9 in one job: smoke, the 10-minute watch, and the rollback when the rollout, the ops registration, smoke
+    # Rows 7 to 9 in one job: smoke, the deploy-alarm check (the bake is ECS's own, in the rollout), and the rollback when the rollout, the ops registration, smoke
     # or watch failed (E2, E3). It also runs after a deploy job that failed once the rollout had started (`previous`
     # recorded), and then only rolls back. Outputs: the watch and rollback outcomes, for the notice and the API client.
     needs: [prepare, build-image, build-web, deploy]
     if: ${{ !cancelled() && !inputs.dry-run && (needs.deploy.result == 'success' || (needs.deploy.result == 'failure' && needs.deploy.outputs.previous != '')) }}
     runs-on: onepeek-arm64-od
-    # Above the sum of its step limits (10 + 5 + 10 + 16 + 2 + 25 = 68) with 12 minutes for the short steps that have no
+    # Above the sum of its step limits (10 + 5 + 10 + 8 + 2 + 25 = 60) with 10 minutes for the short steps that have no
     # limit of their own (RV-111 N1), so a hang ends as a failed step and the rollback still runs.
-    timeout-minutes: 80
+    timeout-minutes: 70
     permissions:
       contents: read
       id-token: write
@@ -3734,9 +3734,9 @@ jobs:
           # Without the deploy role's credentials or the means to request them again: black-box probes only.
           env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
             -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN bash "${SCRIPT}"
-      - name: 10 minutes after stable, poll the rolled services' deploy alarms every 30 s
+      - name: No deploy alarm of the rolled services fires after stable (ECS baked each one during its rollout)
         id: watch
-        timeout-minutes: 16   # F658: the 10-minute window, one worst poll (190 s, see poll()) and 120 s to spare
+        timeout-minutes: 8   # F658: two worst polls (190 s each, see poll()) and 100 s to spare
         env:
           SERVICES: ${{ needs.deploy.outputs.services }}
           # F630: adaptive retries, 6 attempts per call (the CLI's default is 3), so an API throttle in one poll does not
@@ -3750,6 +3750,10 @@ jobs:
           # -latency; this release watches only those of the services it rolled (by exact name: a prefix for `api` would
           # also match `api-critical`), so a web release never fails on an api alarm. They may be switched off
           # (deploy_alarms_enabled, off until launch); then the watch cannot catch anything, which the run says out loud.
+          # REL-FAST (founder 2026-11-18): no fixed bake here. Each service rolls back on these alarms itself (ECS deployment
+          # alarms with rollback, aws-stack §10.4): the rollout's wait ends only at rolloutState COMPLETED, after ECS's own
+          # bake, and fails on an ECS rollback, so verify puts every service back. This one check after the smoke checks
+          # covers the minutes since that bake ended.
           mapfile -t names < <(printf '%s' "${SERVICES:-[]}" | NAME="${NAME}" python3 -c '
           import json, os, re, sys
           for s in json.load(sys.stdin):
@@ -3768,23 +3772,19 @@ jobs:
             aws cloudwatch describe-alarms --cli-connect-timeout 5 --cli-read-timeout 10 --alarm-names "${names[@]}" "$@" --query 'MetricAlarms[].AlarmName' --output text \
               | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'
           }
-          end=$((SECONDS + 600))   # F658: the window starts before the first poll, so a slow first poll does not lengthen it
           known=$(poll)   # an unreadable alarm list fails the step (and so rolls back); only a readable empty one skips
           if [ -z "${known}" ]; then
-            # C11: with no alarm to poll, 10 minutes of polling cannot catch anything, so the watch is skipped, out loud.
-            echo "::warning::None of the deploy alarms ${names[*]} exists: the 10-minute watch is skipped, as it could not detect a regression."
+            # C11: with no alarm to poll, the check cannot catch anything, so it is skipped, out loud.
+            echo "::warning::None of the deploy alarms ${names[*]} exists: the alarm check is skipped, as it could not detect a regression."
             echo "Warning: none of the deploy alarms (${names[*]}) exists, so the watch was skipped: it could not detect a regression." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          echo "Watching: ${known}"
-          while [ "${SECONDS}" -lt "${end}" ]; do
-            alarms=$(poll --state-value ALARM)
-            if [ -n "${alarms}" ]; then echo "::error::Deploy alarms firing: ${alarms}"; exit 1; fi
-            sleep 30
-          done
-          echo "No deploy alarm in 10 minutes."
+          echo "Checking: ${known}"
+          alarms=$(poll --state-value ALARM)
+          if [ -n "${alarms}" ]; then echo "::error::Deploy alarms firing: ${alarms}"; exit 1; fi
+          echo "No deploy alarm firing."
       - name: A fresh role session for the rollback (F668)
-        # The checks before it may take 37 minutes and the put-back 25: past the role's 1-hour session. Same role, via OIDC;
+        # The checks before it may take 29 minutes and the put-back 25: past the role's 1-hour session. Same role, via OIDC;
         # it runs exactly when the rollback runs, and if it fails the rollback still runs on the first session.
         if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.creds.outcome == 'success' && steps.watch.outcome != 'success' }}
         timeout-minutes: 2
