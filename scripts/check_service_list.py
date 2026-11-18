@@ -63,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
              "release-lock.yml": blocks(lock_file.read_text(encoding="utf-8"), LOCK) if lock_file.exists() else []}
     wanted_copies = {"release-ecs.yml": 6, "operate.yml": 3, "release-lock.yml": 1}
     if any(len(locks[f]) != n for f, n in wanted_copies.items()):
-        problems.append("release-lock blocks: release-ecs.yml needs six (take, migrate, previous, verify's rollback, verify's end, finish), "
+        problems.append("release-lock blocks: release-ecs.yml needs six (take, migrate, previous, rollback, rollout end record, finish), "
                         "operate.yml three (lock, operate, unlock), release-lock.yml one")
     elif len({b for found in locks.values() for b in found}) != 1:
         problems.append("the release-lock functions differ between release-ecs.yml, operate.yml and release-lock.yml")

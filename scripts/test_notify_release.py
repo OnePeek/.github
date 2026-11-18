@@ -324,6 +324,21 @@ class TagJob(unittest.TestCase):
         self.assertEqual(nr.result_of(env), "FAILED")
         self.assertEqual(nr.result_of(base_env(RESULTS='["failure","success"]', TAG="success")), "FAILED")
 
+    def test_a_cancelled_tag_job_gets_a_tag_line(self):
+        text = nr.build_message(base_env(RESULTS='["success","cancelled"]', TAG="cancelled"), jobs=[], now=NOW)
+        self.assertIn(": SUCCESS", text)
+        self.assertIn("version tag v0.7.0 not created: the tag job was cancelled", text)
+
+    def test_the_failed_step_never_names_the_tag_job(self):
+        jobs = [{"name": "release / tag", "conclusion": "failure", "steps": [{"name": "Tag", "conclusion": "failure"}]},
+                {"name": "release / finish", "conclusion": "failure", "steps": [{"name": "Smoke", "conclusion": "failure"}]}]
+        self.assertEqual(nr.failed_step(jobs), "release / finish / Smoke")
+        self.assertEqual(nr.failed_step(jobs[:1]), "")
+
+    def test_a_skipped_status_is_not_shown(self):
+        text = nr.build_message(base_env(RESULTS='["failure","skipped"]', STATUS="skipped"), jobs=[], now=NOW)
+        self.assertNotIn("/api/status", text)
+
     def test_a_clean_tag_adds_no_line(self):
         text = nr.build_message(base_env(RESULTS='["success","success"]', TAG="success"), jobs=[], now=NOW)
         self.assertNotIn("version tag", text)

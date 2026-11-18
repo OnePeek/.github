@@ -3742,7 +3742,7 @@ jobs:
         if: ${{ env.VERIFY_RUNS == 'true' }}
         with:
           persist-credentials: false
-      - name: Baseline readiness through the edge (backend /api/status, web /sign-in), always
+      - name: Baseline readiness through the edge (backend /api/status, web /sign-in), when verify runs
         id: ready
         if: ${{ env.VERIFY_RUNS == 'true' }}
         timeout-minutes: 10
