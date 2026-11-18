@@ -220,6 +220,11 @@ class Version(unittest.TestCase):
     def test_the_latest_reachable_tag_is_used_and_the_moving_v1_tag_is_ignored(self):
         self.assertEqual(self.version([("a", "v0.1.0"), ("b", "v0.2.3"), ("fix: c", "v1")]), "0.2.4")
 
+    def test_only_plain_x_y_z_tags_count(self):
+        # RV-115 N1: a pre-release tag is neither the latest tag nor this commit's version.
+        self.assertEqual(self.version([("a", "v0.2.3"), ("fix: b", "v0.2.4-rc1")]), "0.2.4")
+        self.assertEqual(self.version([("a", "v0.2.3"), ("b", "v0.10.0"), ("fix: c", None)]), "0.10.1")
+
     def test_a_commit_already_tagged_keeps_its_version_on_a_rerun(self):
         self.assertEqual(self.version([("a", "v0.1.0"), ("feat: b", "v0.2.0")]), "0.2.0")
 
@@ -263,10 +268,12 @@ class Tag(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertNotIn("-X POST", calls)
 
-    def test_the_tag_on_another_commit_fails_this_step_only_and_is_never_moved(self):
-        out, calls, _, _, _ = self.tag(f'case "$*" in *"git/ref/tags/"*) echo "commit {"b" * 40}";; esac')
-        self.assertEqual(out.returncode, 1)
-        self.assertIn("already exists on bbbbbbbbbbbb", out.stdout)
+    def test_the_tag_on_another_commit_is_a_warning_and_is_never_moved(self):
+        # RV-115: a release queued behind another computed the same version before the other's tag existed.
+        out, calls, output, _, _ = self.tag(f'case "$*" in *"git/ref/tags/"*) echo "commit {"b" * 40}";; esac')
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("::warning::v0.2.0 was already used by bbbbbbbbbbbb", out.stdout)
+        self.assertIn("note=v0.2.0 was already used by bbbbbbbbbbbb", output)
         self.assertNotIn("-X POST", calls)
         self.assertNotIn("DELETE", calls)
         self.assertNotIn("PATCH", calls)
@@ -276,9 +283,16 @@ class Tag(unittest.TestCase):
         self.assertEqual(out.returncode, 1)
         self.assertNotIn("gh ", calls)
 
-    def test_a_failed_create_fails_the_step(self):
-        out, _, _, _, _ = self.tag('case "$*" in *"git/ref/tags/"*) exit 1;; *POST*) exit 1;; esac')
+    def test_a_failed_create_fails_the_step_with_a_note(self):
+        out, _, output, _, _ = self.tag('case "$*" in *"git/ref/tags/"*) exit 1;; *POST*) exit 1;; esac')
         self.assertNotEqual(out.returncode, 0)
+        self.assertIn("note=the GitHub API refused to create v0.2.0", output)
+
+    def test_notify_gets_the_tag_result_and_note(self):
+        env = RELEASE["jobs"]["notify"]["steps"][-1]["env"]
+        self.assertEqual(env["TAG"], "${{ needs.tag.result }}")
+        self.assertEqual(env["TAG_NOTE"], "${{ needs.tag.outputs.note }}")
+        self.assertEqual(RELEASE["jobs"]["tag"]["outputs"], {"note": "${{ steps.tag.outputs.note }}"})
 
     def test_it_runs_after_a_successful_release_only_and_holds_contents_write_alone(self):
         job = RELEASE["jobs"]["tag"]
