@@ -10,8 +10,9 @@
 # check; then, always, the deployment record and the unlock; one job since REL-FAST-2), the API client and the notice.
 # Nobody deploys from a laptop.
 # Every preprod artefact is keyed on the commit, sha-<12> (foundation-playbook §5.2, decision 159): the image tag, the
-# web-assets folder, the SSM release record and the task-definition tags. The release-please version is image metadata
-# only; the v<version> tag, the git tag and the GitHub release are made on promotion (promote.yml, UC-DEL-003).
+# web-assets folder, the SSM release record and the task-definition tags. The version (the latest v* tag reachable from
+# the commit, 0.0.0 when none; F727) is image metadata only; the v<version> tag, the git tag and the GitHub release are
+# made on promotion (promote.yml, UC-DEL-003).
 #
 # Provisional (delivery-pipelines §16 "Decided before building"): ARM64 images are built with QEMU on GitHub's
 # standard runners (Q1), natively on ARM64 runners when the runner input picks them (ci-runners.md section 5.3); team notices go to the run summary and the GitHub deployment record (preprod has no release page, playbook §5.2), and one Slack message per release to #deploys (below).
@@ -126,7 +127,6 @@ env:
   SYFT_SHA256_B: 929bd163db2d7cd2255d3bcb8967208079813d7b46b0c952f7b794d8e2c7d304 # arm64
   NAME: onepeek-${{ inputs.environment }}
   ENVIRONMENT: ${{ inputs.environment }}
-  VERSION_FILE: .release-please-manifest.json
   LOCK_SCOPE: ${{ inputs.image }} # the scope is derived from the image, never a free input (playbook §5.4a "Keys")
   LOCK_WAIT_SECONDS: "1800" # an app waits up to 30 minutes for its own key held by a run of its own scope (playbook §5.4)
   LOCK_WAIT_CAP_SECONDS: "7200" # every wait of a job counts towards one cap of 120 minutes (playbook §5.4a "Waits that fit the runners")
@@ -1100,7 +1100,7 @@ jobs:
             echo "::error::db-bootstrap-role is empty. Set the backend repository variable AWS_DB_BOOTSTRAP_ROLE_${upper} to the onepeek-${ENVIRONMENT_NAME}-db-bootstrap role ARN and pass it as db-bootstrap-role."
             exit 1
           fi
-      - name: Record the commit sha-<12>, and read the next version as image metadata only
+      - name: Record the commit sha-<12>, and read the version as image metadata only
         id: v
         if: ${{ steps.order.outputs.skip != 'true' }}
         env:
@@ -1110,11 +1110,14 @@ jobs:
           # No version-tag check here: preprod deploys carry only the commit, and promote.yml refuses a version whose
           # tag exists (delivery-pipelines UC-DEL-001 row 1).
           commit="sha-${GITHUB_SHA::12}"
-          version=$(python3 -c "import json;print(json.load(open('${VERSION_FILE}'))['.'])")
-          if [ -z "${version}" ]; then echo "::error::No version in ${VERSION_FILE}."; exit 1; fi
+          # The version is the latest v* tag reachable from the commit (the checkout above fetches every tag with
+          # fetch-depth 0), 0.0.0 when there is none; metadata only, never a gate (F727: no manifest file).
+          version=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+          version="${version#v}"
+          version="${version:-0.0.0}"
           images=$(python3 -c "import json,os;print(json.dumps([os.environ['IMAGE']]+[x for x in os.environ['EXTRA'].replace(',',' ').split() if x]))")
           { echo "version=${version}"; echo "commit=${commit}"; echo "images=${images}"; echo "started=$(date +%s)"; } >> "$GITHUB_OUTPUT"
-          echo "Release of ${commit} (next version ${version}) to ${ENVIRONMENT} started." >> "$GITHUB_STEP_SUMMARY"
+          echo "Release of ${commit} (version ${version}) to ${ENVIRONMENT} started." >> "$GITHUB_STEP_SUMMARY"
 
   build-image:
     # Rows 2 to 4 and the digest record in one job: build and push sha-<12>, scan, SBOM and sign, then read back the
@@ -1191,7 +1194,7 @@ jobs:
           aws ecr get-login-password | docker login --username AWS --password-stdin "${registry}"
           # Both tags are immutable in ECR. The ':buildcache' tag cannot be written twice in an immutable repository,
           # so the cache is read always and written best effort (ignore-error); see the gap noted in the pull request.
-          # The next version is metadata only, as SemVer build metadata on the commit: <next>+sha-<12> (playbook §5.2).
+          # The version is metadata only, as SemVer build metadata on the commit: <version>+sha-<12> (playbook §5.2).
           label="${VERSION}+${COMMIT}"
           args=(--platform linux/arm64 --provenance=false
             --label "org.opencontainers.image.version=${label}" --label "org.opencontainers.image.revision=${GITHUB_SHA}"
