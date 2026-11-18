@@ -10,9 +10,11 @@
 # check; then, always, the deployment record and the unlock; one job since REL-FAST-2), the API client and the notice.
 # Nobody deploys from a laptop.
 # Every preprod artefact is keyed on the commit, sha-<12> (foundation-playbook §5.2, decision 159): the image tag, the
-# web-assets folder, the SSM release record and the task-definition tags. The version (the latest v* tag reachable from
-# the commit, 0.0.0 when none; F727) is image metadata only; the v<version> tag, the git tag and the GitHub release are
-# made on promotion (promote.yml, UC-DEL-003).
+# web-assets folder, the SSM release record and the task-definition tags. The version (the next version after the latest
+# v* tag reachable from the commit, by release-tag.yml's rule; v0.1.0 when none; REL-AUTOTAG, founder 2026-11-18) is
+# image metadata, the API client prerelease and the notices; after a successful release (clean rollout, smoke and alarm
+# check) the tag job tags the released commit v<version> in the caller repo (contents: write), never after a failed or
+# rolled-back run. The GitHub release and the stable API client stay with promotion (promote.yml, UC-DEL-003).
 #
 # Provisional (delivery-pipelines §16 "Decided before building"): ARM64 images are built with QEMU on GitHub's
 # standard runners (Q1), natively on ARM64 runners when the runner input picks them (ci-runners.md section 5.3); team notices go to the run summary and the GitHub deployment record (preprod has no release page, playbook §5.2), and one Slack message per release to #deploys (below).
@@ -1100,21 +1102,40 @@ jobs:
             echo "::error::db-bootstrap-role is empty. Set the backend repository variable AWS_DB_BOOTSTRAP_ROLE_${upper} to the onepeek-${ENVIRONMENT_NAME}-db-bootstrap role ARN and pass it as db-bootstrap-role."
             exit 1
           fi
-      - name: Record the commit sha-<12>, and read the version as image metadata only
+      - name: Record the commit sha-<12>, and compute the version (the next one after the latest v* tag)
         id: v
         if: ${{ steps.order.outputs.skip != 'true' }}
         env:
           IMAGE: ${{ inputs.image }}
           EXTRA: ${{ inputs.extra-images }}
+          FIRST_VERSION: v0.1.0
         run: |
-          # No version-tag check here: preprod deploys carry only the commit, and promote.yml refuses a version whose
-          # tag exists (delivery-pipelines UC-DEL-001 row 1).
           commit="sha-${GITHUB_SHA::12}"
-          # The version is the latest v* tag reachable from the commit (the checkout above fetches every tag with
-          # fetch-depth 0), 0.0.0 when there is none; metadata only, never a gate (F727: no manifest file).
-          version=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+          # The version (founder 2026-11-18, REL-AUTOTAG; no manual bump): a commit already tagged v<x.y.z> (a re-run of a
+          # released commit) keeps it; otherwise the next version after the latest v* tag reachable from the commit (the
+          # checkout above fetches every tag with fetch-depth 0), by release-tag.yml's rule: a feat or a breaking change
+          # raises the minor (0.x before launch), anything else the patch; v0.1.0 when there is no tag. The tag job
+          # tags the commit v<version> after a successful release only. Never a gate here (F727: no manifest file).
+          version=$(git describe --tags --exact-match --match 'v[0-9]*.[0-9]*.[0-9]*' HEAD 2>/dev/null || true)
+          if [ -z "${version}" ]; then
+            # --- next-version begin (the same lines in release-tag.yml; scripts/test_release_ecs.py NextVersion)
+            last=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || true)  # full semver only; the old moving tag v1 is ignored
+            if [ -z "${last}" ]; then
+              next="${FIRST_VERSION}"
+            else
+              subjects=$(git log --format='%s%n%b' "${last}..HEAD")
+              IFS=. read -r major minor patch <<< "${last#v}"
+              if printf '%s\n' "${subjects}" | grep -Eq '^[a-z]+(\([^)]*\))?!:|BREAKING CHANGE|^feat(\([^)]*\))?:'; then
+                minor=$((minor + 1)); patch=0
+              else
+                patch=$((patch + 1))
+              fi
+              next="v${major}.${minor}.${patch}"
+            fi
+            # --- next-version end
+            version="${next}"
+          fi
           version="${version#v}"
-          version="${version:-0.0.0}"
           images=$(python3 -c "import json,os;print(json.dumps([os.environ['IMAGE']]+[x for x in os.environ['EXTRA'].replace(',',' ').split() if x]))")
           { echo "version=${version}"; echo "commit=${commit}"; echo "images=${images}"; echo "started=$(date +%s)"; } >> "$GITHUB_OUTPUT"
           echo "Release of ${commit} (version ${version}) to ${ENVIRONMENT} started." >> "$GITHUB_STEP_SUMMARY"
@@ -5524,7 +5545,7 @@ jobs:
           if [ "${WATCH}" = "success" ]; then lock_write_phase "done" || exit 1; else lock_write_phase locked || exit 1; fi
       - name: Deployment record and the team notice in the run summary (commit, services, result, durations)
         # Row 10, after every run that got past the version, whatever the result (delivery-pipelines §12: every run
-        # writes a GitHub deployment). No git tag and no GitHub release in preprod: promote.yml creates v<version>.
+        # writes a GitHub deployment). The git tag v<version> is the tag job's, after a successful run; no GitHub release.
         if: ${{ always() && steps.guard.outcome == 'success' && !inputs.dry-run && needs.prepare.outputs.commit != '' }}
         timeout-minutes: 10
         env:
@@ -6461,6 +6482,41 @@ jobs:
           npm pkg set version="${version}"
           pnpm publish --tag next --no-git-checks --access restricted
 
+  tag:
+    # REL-AUTOTAG (founder 2026-11-18): after a successful release only (the finish job succeeded with a clean alarm
+    # check, so the rollout, smoke and check passed and nothing was rolled back), tag the released commit v<version> in
+    # the caller repo, so the next release continues from it. Never for a dry run, a failed, cancelled or rolled-back
+    # run, or a run the order check skipped. Its own job so that only it holds contents: write (the caller's release
+    # job grants it). Idempotent: the tag already on this commit is fine (a re-run); on another commit only this job
+    # fails (the notice names it), the deploy is untouched. It never moves or deletes a tag.
+    needs: [prepare, finish]
+    if: ${{ !cancelled() && !inputs.dry-run && needs.finish.result == 'success' && needs.finish.outputs.watch == 'success' && needs.finish.outputs.rollback != 'success' }}
+    runs-on: ${{ inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64-small' }}
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    steps:
+      - name: Tag the released commit v<version> (idempotent; never moves a tag)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The version '${VERSION}' is not x.y.z: no tag is made (the release itself is done)."; exit 1
+          fi
+          tag="v${VERSION}"
+          if found=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq '.object.type + " " + .object.sha' 2>/dev/null); then
+            read -r type sha <<< "${found}"
+            if [ "${type}" = "tag" ]; then sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${sha}" --jq '.object.sha'); fi
+            if [ "${sha}" = "${GITHUB_SHA}" ]; then
+              echo "${tag} is already on ${GITHUB_SHA::12} (a re-run): nothing to do." >> "$GITHUB_STEP_SUMMARY"; exit 0
+            fi
+            echo "::error::${tag} already exists on ${sha::12}, not on the released commit ${GITHUB_SHA::12}: the tag is left as it is and the deploy is not affected. Tag this commit by hand with the next free version."
+            exit 1
+          fi
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${tag}" -f sha="${GITHUB_SHA}" >/dev/null
+          echo "Tagged ${GITHUB_SHA::12} ${tag}." >> "$GITHUB_STEP_SUMMARY"
+
   notify:
     # Last, after every other job, whatever happened: one Slack message to #deploys with the release's result (see the
     # header: Release notices to Slack). Never for a dry run, prod, or a run the order check skipped. Fail-open by
@@ -6469,7 +6525,7 @@ jobs:
     # (scripts/test_notify_release.py). F680, F694: never GitHub-hosted, prod and an unset runner included: a private
     # repository's GitHub-hosted job is never started once the account's Actions minutes or spending limit run out, and a
     # job never started is red despite continue-on-error.
-    needs: [prepare, build-image, build-web, db-bootstrap, deploy, finish, api-client]
+    needs: [prepare, build-image, build-web, db-bootstrap, deploy, finish, api-client, tag]
     if: ${{ always() && !inputs.dry-run && inputs.environment != 'prod' && needs.prepare.outputs.skip != 'true' }}
     runs-on: ${{ inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64-small' }}
     timeout-minutes: 3
