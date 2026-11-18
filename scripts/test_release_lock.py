@@ -649,11 +649,16 @@ class Finish(unittest.TestCase):
     def test_finish_never_reads_cancelled_and_verify_never_starts_in_a_cancelled_run(self):
         finish = RELEASE["jobs"]["finish"]
         self.assertEqual(finish["if"], "${{ always() && needs.prepare.result != 'skipped' && inputs.environment != 'prod' }}")
-        self.assertNotIn("cancelled()", json.dumps(finish))
-        self.assertIn("!cancelled()", RELEASE["jobs"]["verify"]["if"])
+        # REL-FAST-2: verify's steps are the first steps of finish; each skips in a cancelled run (its implicit success()
+        # or its own !cancelled()); the guard, the deployment record and the unlock never read cancelled().
+        steps = finish["steps"]
+        end = next(i for i, s in enumerate(steps) if s.get("name", "").startswith("Record the end in the release lock"))
+        for s in [steps[0]] + steps[end + 1:]:
+            self.assertNotIn("cancelled()", json.dumps(s), s.get("name") or s.get("uses"))
+        for s in steps[1:end + 1]:
+            self.assertNotIn("always()", str(s.get("if", "")), s.get("name") or s.get("uses"))
         self.assertNotIn("cancelled()", json.dumps(OPERATE["jobs"]["unlock"]))
-        end = step_of(RELEASE, "verify", "Record the end in the release lock")
-        self.assertIn("!cancelled()", end["if"])
+        self.assertIn("!cancelled()", steps[end]["if"])
 
 
 class SharedLockWorkflow(unittest.TestCase):
@@ -750,8 +755,8 @@ def needs(doc: dict, job: str) -> list[str]:
 
 
 # The jobs that change something: build (signs and records the digest), deploy (migrate, assets, rollout, ops),
-# verify (rollback) and finish (the deployment record). build-web shares build-image's steps.
-GUARDED = ["build-image", "build-web", "deploy", "verify", "finish"]
+# and finish (verify's rollback, the deployment record; one job since REL-FAST-2). build-web shares build-image's steps.
+GUARDED = ["build-image", "build-web", "deploy", "finish"]
 
 
 class Wiring(unittest.TestCase):
@@ -796,7 +801,7 @@ class Wiring(unittest.TestCase):
     def test_the_lock_token_reaches_only_the_steps_that_write_or_end_the_record(self):
         uses = sorted((job, s["name"]) for job, j in RELEASE["jobs"].items() for s in j.get("steps", [])
                       if "needs.prepare.outputs.token" in json.dumps(s.get("env", {})))
-        self.assertEqual([j for j, _ in uses], ["deploy", "deploy", "finish", "verify"])
+        self.assertEqual([j for j, _ in uses], ["deploy", "deploy", "finish", "finish"])
         self.assertEqual(RELEASE_TEXT.count("needs.prepare.outputs.token"), 4)
 
     def test_operate_takes_and_ends_the_lock_around_its_one_job(self):
@@ -819,7 +824,7 @@ class Wiring(unittest.TestCase):
             self.assertEqual((env["LOCK_WAIT_SECONDS"], env["LOCK_WAIT_CAP_SECONDS"], env["LOCK_QUEUED_WAIT_SECONDS"], env["LOCK_MIGRATE_WAIT_SECONDS"],
                               env["LOCK_POLL_SECONDS"]), ("1800", "7200", "3600", "900", "30"))
         self.assertEqual(RELEASE["jobs"]["prepare"]["timeout-minutes"], 135)
-        self.assertEqual(RELEASE["jobs"]["finish"]["timeout-minutes"], 60)
+        self.assertEqual(RELEASE["jobs"]["finish"]["timeout-minutes"], 120)   # verify's steps too since REL-FAST-2
         self.assertEqual(OPERATE["jobs"]["lock"]["timeout-minutes"], 135)
         self.assertEqual(OPERATE["jobs"]["unlock"]["timeout-minutes"], 60)
 
@@ -884,7 +889,7 @@ class PartialReRun(unittest.TestCase):
     def test_the_deployment_record_and_the_rollback_run_only_after_the_lock_check(self):
         notify = next(s for s in RELEASE["jobs"]["finish"]["steps"] if s.get("name", "").startswith("Deployment record"))
         self.assertIn("steps.guard.outcome == 'success'", notify["if"])
-        rollback = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("id") == "rollback")
+        rollback = next(s for s in RELEASE["jobs"]["finish"]["steps"] if s.get("id") == "rollback")
         self.assertIn("steps.guard.outcome == 'success'", rollback["if"])
 
     def test_the_reusable_db_bootstrap_call_is_skipped_outside_the_locking_attempt(self):
@@ -1383,7 +1388,7 @@ class ConflictETag(unittest.TestCase):
 
 API_TD = PREV["api"]
 RECORD_PREVIOUS = step_of(RELEASE, "deploy", "Record every service's current task definition")
-ROLLBACK = step_of(RELEASE, "verify", "Put every service back on the revision recorded")
+ROLLBACK = step_of(RELEASE, "finish", "Put every service back on the revision recorded")
 
 
 class FirstDeploy(unittest.TestCase):

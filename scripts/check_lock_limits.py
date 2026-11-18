@@ -38,7 +38,7 @@ WAITING = ("lock_take", "lock_finish", "lock_freeze")  # lock_freeze waits for a
 # no `timeout-minutes` may take. Every other step limit is read from the workflow.
 TABLE: dict[tuple[str, str], dict] = {
     ("release-ecs.yml", "prepare"): {"cap": 120, "cap_env": "LOCK_WAIT_CAP_SECONDS", "inner": 0, "untimed": 15},  # order check, take, version
-    ("release-ecs.yml", "finish"): {"cap": 15, "cap_env": "LOCK_MIGRATE_WAIT_SECONDS", "inner": 20, "untimed": 0},
+    ("release-ecs.yml", "finish"): {"cap": 15, "cap_env": "LOCK_MIGRATE_WAIT_SECONDS", "inner": 20, "untimed": 10},  # the verify steps with no limit (RV-111 N1)
     ("operate.yml", "lock"): {"cap": 120, "cap_env": "LOCK_WAIT_CAP_SECONDS", "inner": 0, "untimed": 15},
     ("operate.yml", "unlock"): {"cap": 15, "cap_env": "LOCK_MIGRATE_WAIT_SECONDS", "inner": 20, "untimed": 0},
     ("release-lock.yml", "lock"): {"cap": 120, "cap_env": "LOCK_WAIT_CAP_SECONDS", "inner": 0, "untimed": 15},

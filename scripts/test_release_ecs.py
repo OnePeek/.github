@@ -402,8 +402,7 @@ class PackageRead(unittest.TestCase):
         for job in ("db-bootstrap", "deploy"):
             self.assertEqual(needs_of(job)[1:3], ["build-image", "build-web"], job)
             self.assertIn("(needs.build-image.result == 'success' || needs.build-web.result == 'success')", self.jobs[job]["if"], job)
-        for job in ("verify", "finish"):
-            self.assertTrue({"build-image", "build-web", "deploy"} <= set(needs_of(job)), job)
+        self.assertTrue({"build-image", "build-web", "deploy"} <= set(needs_of("finish")))
 
     def test_npm_read_token_is_ignored_and_optional(self):
         self.assertFalse(RELEASE[True]["workflow_call"]["secrets"]["NPM_READ_TOKEN"]["required"])
@@ -505,7 +504,7 @@ class Rolling(unittest.TestCase):
         self.assertLess(rec, roll)
 
     def test_verify_writes_done_after_a_clean_watch_and_locked_after_a_stable_rollback(self):
-        end = step("verify", "Record the end in the release lock")
+        end = step("finish", "Record the end in the release lock")
         for watch, phase in (("success", "done"), ("failure", "locked")):
             held = L.mine("rolling", previous=L.PREV)
             out = L.run(end, keys={L.LEGACY: held, L.BACKEND: held}, LOCK_TOKEN=L.TOKEN, WATCH=watch)
@@ -513,9 +512,9 @@ class Rolling(unittest.TestCase):
             rec = json.loads(out.keys[L.BACKEND])
             self.assertEqual(rec["phase"], phase)
             self.assertNotIn("previous", rec)
-        st = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("name", "").startswith("Record the end"))
-        self.assertEqual(st["if"], "${{ !cancelled() && steps.guard.outcome == 'success' && steps.creds.outcome == 'success' && "
-                                   "(steps.watch.outcome == 'success' || steps.rollback.outcome == 'success') }}")
+        st = next(s for s in RELEASE["jobs"]["finish"]["steps"] if s.get("name", "").startswith("Record the end"))
+        self.assertEqual(st["if"], "${{ !cancelled() && env.VERIFY_RUNS == 'true' && steps.guard.outcome == 'success' && "
+                                   "steps.creds.outcome == 'success' && (steps.watch.outcome == 'success' || steps.rollback.outcome == 'success') }}")
 
 
 class DeployBucketWrites(unittest.TestCase):
@@ -999,7 +998,7 @@ class StableWait(unittest.TestCase):
         # steps before the record may take 54 min, the record 5 and the rollout 45, and verify's checks 37 before a 25-minute rollback:
         # expired credentials read as "describe-services unreadable 3 times" and fail a healthy rollout. A fresh session
         # (OIDC, the same role) right before each long step gives it a full hour.
-        for job_id, step_id in (("deploy", "previous"), ("verify", "rollback")):
+        for job_id, step_id in (("deploy", "previous"), ("finish", "rollback")):
             steps = RELEASE["jobs"][job_id]["steps"]
             first = next(s for s in steps if str(s.get("uses", "")).startswith("aws-actions/configure-aws-credentials@"))
             i = next(i for i, s in enumerate(steps) if s.get("id") == step_id)
@@ -1009,12 +1008,12 @@ class StableWait(unittest.TestCase):
             self.assertLessEqual(again["timeout-minutes"], 2, job_id)
             self.assertEqual(again.get("if"), steps[i].get("if"), job_id)   # it runs exactly when the long step runs
         self.assertIn("id-token", RELEASE["jobs"]["deploy"]["permissions"])
-        self.assertIn("id-token", RELEASE["jobs"]["verify"]["permissions"])
+        self.assertIn("id-token", RELEASE["jobs"]["finish"]["permissions"])
 
     def test_no_stretch_between_role_sessions_outlasts_one(self):
         # F668, RV-111 S3: from each credentials step to the next (or the job's end), the step limits sum to under the role's
         # 1-hour session, so no step can meet expired credentials. The steps with no limit of their own are short checks.
-        for job_id in ("deploy", "verify"):
+        for job_id in ("deploy", "finish"):
             steps = RELEASE["jobs"][job_id]["steps"]
             mints = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("aws-actions/configure-aws-credentials@")]
             self.assertTrue(mints, job_id)
@@ -1037,17 +1036,17 @@ class StableWait(unittest.TestCase):
         self.assertIn('if [ "${cap}" -gt 1500 ]; then cap=1500; fi', roll["run"])
         deploy = RELEASE["jobs"]["deploy"]
         self.assertGreater(deploy["timeout-minutes"], sum(s.get("timeout-minutes", 0) for s in deploy["steps"]))
-        verify = RELEASE["jobs"]["verify"]
+        verify = RELEASE["jobs"]["finish"]
         # RV-111 N1: at least 10 minutes over the step limits, for the steps with no limit of their own.
         self.assertGreaterEqual(verify["timeout-minutes"], sum(s.get("timeout-minutes", 0) for s in verify["steps"]) + 10)
-        rollback = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("id") == "rollback")
+        rollback = next(s for s in RELEASE["jobs"]["finish"]["steps"] if s.get("id") == "rollback")
         self.assertGreaterEqual(rollback["timeout-minutes"], 21)
         self.assertIn("rollout_wait 1200 ${expect}", rollback["run"])
 
 
 class BaselineReadiness(unittest.TestCase):
     """UC-DEL-001 row 7: the shared readiness check always runs, whatever the caller's smoke script does."""
-    script = step("verify", "Baseline readiness")
+    script = step("finish", "Baseline readiness")
 
     def test_each_image_checks_its_path_and_a_failure_fails_the_job(self):
         for image, path in (("backend", "/api/status"), ("web", "/sign-in")):
@@ -1058,8 +1057,8 @@ class BaselineReadiness(unittest.TestCase):
             self.assertEqual(out.returncode, 22)
 
     def test_it_is_not_conditional(self):
-        st = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("name", "").startswith("Baseline readiness"))
-        self.assertNotIn("if", st)
+        st = next(s for s in RELEASE["jobs"]["finish"]["steps"] if s.get("name", "").startswith("Baseline readiness"))
+        self.assertEqual(st["if"], "${{ env.VERIFY_RUNS == 'true' }}")   # REL-FAST-2: only verify's own gate
 
 
 class Smoke(unittest.TestCase):
@@ -1068,7 +1067,7 @@ class Smoke(unittest.TestCase):
 *describe-services*) echo {svc_td};;
 *describe-task-definition*) echo '{json.dumps(images)}';;
 esac"""
-        return run_step(step("verify", "Every service's task definition"), aws, {"DOMAIN": "d", "IMAGE": "backend", "DIGEST": DIGEST, "SERVICES": services})[0]
+        return run_step(step("finish", "Every service's task definition"), aws, {"DOMAIN": "d", "IMAGE": "backend", "DIGEST": DIGEST, "SERVICES": services})[0]
 
     def test_a_daemon_passes_when_its_sidecar_runs_the_digest_whatever_the_order(self):
         sidecar, main = f"x/backend@{DIGEST}", "x/pgbouncer@sha256:" + "e" * 64
@@ -1085,14 +1084,14 @@ esac"""
 
 class SmokeScript(unittest.TestCase):
     """UC-DEL-001 row 7: the caller's smoke-script checks the domain without AWS credentials; absent = a warning."""
-    script = step("verify", "The repo's own smoke checks")
+    script = step("finish", "The repo's own smoke checks")
 
     def run_smoke(self, path: str, files: dict[str, str] | None = None):
         out, _, _, summary, _ = run_step(self.script, "", {"SCRIPT": path, "DOMAIN": "preprod.example", "AWS_SESSION_TOKEN": "secret-token"}, files, with_summary=True)
         return out, summary
 
     def test_it_runs_after_the_shared_checks_in_the_same_job(self):
-        names = [s.get("name", "") for s in RELEASE["jobs"]["verify"]["steps"]]
+        names = [s.get("name", "") for s in RELEASE["jobs"]["finish"]["steps"]]
         self.assertTrue(any(n.startswith("Every service's task definition") for n in names))
         self.assertTrue(any(n.startswith("The repo's own") for n in names))
         self.assertLess(names.index(next(n for n in names if n.startswith("Baseline readiness"))), names.index(next(n for n in names if n.startswith("The repo's own"))))
@@ -1106,7 +1105,7 @@ class SmokeScript(unittest.TestCase):
 
     def test_a_failing_script_fails_the_smoke_and_so_rolls_back(self):
         self.assertEqual(self.run_smoke("smoke.sh", {"smoke.sh": "exit 3\n"})[0].returncode, 3)
-        steps = RELEASE["jobs"]["verify"]["steps"]
+        steps = RELEASE["jobs"]["finish"]["steps"]
         ids = [s.get("id") or s.get("name", "") for s in steps]
         self.assertLess(ids.index(next(i for i in ids if i.startswith("The repo's own"))), ids.index("watch"))
         self.assertIn("steps.watch.outcome != 'success'", steps[ids.index("rollback")]["if"])
@@ -1130,7 +1129,7 @@ BASH4 = subprocess.run(["bash", "-c", "mapfile -t x < /dev/null"], capture_outpu
                      "needs bash 4+ (mapfile); this bash is older")
 class Watch(unittest.TestCase):
     def watch(self, known: str, firing: str, seconds: str, services: str = '["api", "worker"]'):
-        script = step("verify", "No deploy alarm of the rolled services")
+        script = step("finish", "No deploy alarm of the rolled services")
         # The stub answers like AWS: only the alarms among the requested --alarm-names that exist (or are firing).
         aws = f"""want=" $* "
 pick() {{ for a in $1; do case "$want" in *" $a "*) printf '%s\\t' "$a";; esac; done; echo; }}
@@ -1172,7 +1171,7 @@ esac"""
         self.assertIn("was rolled back by ECS (circuit breaker/alarm)", roll)
 
     def test_an_unreadable_alarm_list_fails_the_watch_and_never_skips_it(self):
-        script = step("verify", "No deploy alarm of the rolled services")
+        script = step("finish", "No deploy alarm of the rolled services")
         aws = 'echo "An error occurred (AccessDenied) when calling the DescribeAlarms operation" >&2; exit 254'
         out, calls, _, summary, _ = run_step(script, aws, extra_env={"SERVICES": '["api"]'}, extra_stubs={"sleep": "exit 0"}, with_summary=True)
         self.assertNotEqual(out.returncode, 0)
@@ -1180,7 +1179,7 @@ esac"""
 
     def test_an_unreadable_alarm_list_fails_under_the_runners_own_shell_without_pipefail(self):
         # RV-107 B1: a step with no `shell:` runs as `bash -e {0}` on the runner, without pipefail; the step sets it itself.
-        script = "set +o pipefail\n" + step("verify", "No deploy alarm of the rolled services")
+        script = "set +o pipefail\n" + step("finish", "No deploy alarm of the rolled services")
         aws = 'echo "An error occurred (AccessDenied) when calling the DescribeAlarms operation" >&2; exit 254'
         out, _, _, summary, _ = run_step(script, aws, extra_env={"SERVICES": '["api"]'}, extra_stubs={"sleep": "exit 0"}, with_summary=True)
         self.assertNotEqual(out.returncode, 0)
@@ -1222,7 +1221,7 @@ esac"""
 class WatchRetries(unittest.TestCase):
     def test_the_watch_polls_with_adaptive_retries_so_a_throttle_does_not_roll_back_a_healthy_release(self):
         # F630: the AWS CLI's default is 3 attempts (legacy/standard); a throttled describe-alarms failed the watch.
-        watch = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("id") == "watch")
+        watch = next(s for s in RELEASE["jobs"]["finish"]["steps"] if s.get("id") == "watch")
         self.assertEqual(watch["env"]["AWS_RETRY_MODE"], "adaptive")
         self.assertEqual(int(watch["env"]["AWS_MAX_ATTEMPTS"]), 6)
         # Bounded: six attempts of a poll still end inside the step limit, so a hang ends as a failed step (rollback).
@@ -1243,9 +1242,9 @@ class WatchRetries(unittest.TestCase):
 class WatchShell(unittest.TestCase):
     def test_the_watch_step_sets_pipefail_itself_as_the_runner_gives_it_none(self):
         # The step has no `shell:`, so the runner runs `bash -e {0}`: poll() is a pipeline whose aws failure must fail it.
-        watch = next(s for s in RELEASE["jobs"]["verify"]["steps"] if s.get("id") == "watch")
+        watch = next(s for s in RELEASE["jobs"]["finish"]["steps"] if s.get("id") == "watch")
         self.assertNotIn("shell", watch)
-        self.assertNotIn("shell", RELEASE["jobs"]["verify"].get("defaults", {}).get("run", {}))
+        self.assertNotIn("shell", RELEASE["jobs"]["finish"].get("defaults", {}).get("run", {}))
         self.assertEqual(watch["run"].splitlines()[0], "set -o pipefail   # the runner's `bash -e {0}` has none (RV-107 B1)")
 
 
@@ -1260,7 +1259,7 @@ class Assets(unittest.TestCase):
 
 class RollbackIssue(unittest.TestCase):
     def test_the_issue_title_names_the_commit(self):
-        self.assertIn('--title "Release ${COMMIT} to ${ENVIRONMENT} rolled back"', step("verify", "Open an issue"))
+        self.assertIn('--title "Release ${COMMIT} to ${ENVIRONMENT} rolled back"', step("finish", "Open an issue"))
 
 
 class Notify(unittest.TestCase):
@@ -1307,10 +1306,11 @@ class Notify(unittest.TestCase):
         self.assertIn("always()", st["if"])
         self.assertIn("!inputs.dry-run", st["if"])
         self.assertIn("needs.prepare.outputs.commit != ''", st["if"])  # after every run that got past the version
-        self.assertIn("verify", job["needs"])
-        self.assertEqual(st["env"]["WATCH"], "${{ needs.verify.outputs.watch }}")
-        self.assertEqual(st["env"]["ROLLBACK"], "${{ needs.verify.outputs.rollback }}")
-        self.assertEqual(RELEASE["jobs"]["verify"]["outputs"], {"watch": "${{ steps.watch.outcome }}", "rollback": "${{ steps.rollback.outcome }}",
+        self.assertIn("deploy", job["needs"])
+        # REL-FAST-2: verify's steps are this job's own, so the record reads their outcomes directly.
+        self.assertEqual(st["env"]["WATCH"], "${{ steps.watch.outcome }}")
+        self.assertEqual(st["env"]["ROLLBACK"], "${{ steps.rollback.outcome }}")
+        self.assertEqual(RELEASE["jobs"]["finish"]["outputs"], {"watch": "${{ steps.watch.outcome }}", "rollback": "${{ steps.rollback.outcome }}",
                                                           "ready": "${{ steps.ready.outcome }}"})  # ready: the Slack notice (W1-SLACK-GH)
         # issues: write for the put-back's issue (playbook §5.4a "Rollback on cancel").
         self.assertEqual(job["permissions"], {"contents": "read", "id-token": "write", "deployments": "write", "issues": "write"})
@@ -1336,8 +1336,8 @@ class ApiClient(unittest.TestCase):
 
     def test_it_is_its_own_job_after_finish_for_a_clean_backend_watch_only(self):
         job = RELEASE["jobs"]["api-client"]
-        self.assertEqual(needs_of("api-client"), ["prepare", "verify", "finish"])
-        for part in ("!cancelled()", "!inputs.dry-run", "inputs.image == 'backend'", "needs.verify.outputs.watch == 'success'"):
+        self.assertEqual(needs_of("api-client"), ["prepare", "finish"])
+        for part in ("!cancelled()", "!inputs.dry-run", "inputs.image == 'backend'", "needs.finish.outputs.watch == 'success'"):
             self.assertIn(part, job["if"])
         self.assertEqual(job["permissions"], {"contents": "read", "packages": "write"})
         self.assertEqual(job["defaults"]["run"]["working-directory"], "clients/typescript")
@@ -1493,7 +1493,7 @@ class SkippedBuildBranch(unittest.TestCase):
             return found
 
         below = [j for j in jobs if ancestors(j) & {"build-image", "build-web"}]
-        self.assertEqual(below, ["db-bootstrap", "deploy", "verify", "finish", "api-client", "notify"])
+        self.assertEqual(below, ["db-bootstrap", "deploy", "finish", "api-client", "notify"])
         for job_id in below:
             self.assertRegex(str(jobs[job_id].get("if", "")), self.STATUS,
                              f"release-ecs.yml:{job_id}: below a skipped build job, so it needs !cancelled() or always()")
@@ -1503,10 +1503,10 @@ class JobGraph(unittest.TestCase):
     """Foundation-reset W2.1: five stages, because each job waits about a minute for a runner (2026-11-05: 11.9 of 19.1
     minutes were waiting). db-bootstrap stays a job (a reusable-workflow call under its own role), the build is two
     exclusive jobs (only the web build's token reads packages) and the API client publish is its own job (only it holds
-    packages: write), plus the fail-open Slack notice last (W1-SLACK-GH), so 9 jobs are defined; the backend runs at most
-    8 and the web image at most 6."""
+    packages: write), plus the fail-open Slack notice last (W1-SLACK-GH). REL-FAST-2: verify and finish are one job (the
+    same runner class, role and lock token), so 8 jobs are defined; the backend runs at most 7 and the web image at most 5."""
 
-    JOBS = ["prepare", "build-image", "build-web", "db-bootstrap", "deploy", "verify", "finish", "api-client", "notify"]
+    JOBS = ["prepare", "build-image", "build-web", "db-bootstrap", "deploy", "finish", "api-client", "notify"]
 
     def test_the_job_count_is_pinned(self):
         self.assertEqual(list(RELEASE["jobs"]), self.JOBS)
@@ -1518,7 +1518,7 @@ class JobGraph(unittest.TestCase):
         inputs = {"image": image, "migrate": migrate, "dry-run": dry_run, "environment": "preprod"}
         result: dict[str, str] = {}
         outputs = {"prepare": {"skip": "false", "attempt": str(attempt)}, "deploy": {"previous": ""},
-                   "verify": {"watch": "success"}}
+                   "finish": {"watch": "success"}}
 
         def evaluate(expr: str) -> bool:
             e = expr.strip()
@@ -1545,23 +1545,22 @@ class JobGraph(unittest.TestCase):
         return ran
 
     def test_the_jobs_that_run_per_image_come_from_evaluating_the_conditions(self):
-        every = ["prepare", "build-image", "db-bootstrap", "deploy", "verify", "finish", "api-client", "notify"]
+        every = ["prepare", "build-image", "db-bootstrap", "deploy", "finish", "api-client", "notify"]
         self.assertEqual(self._simulate("backend", True, False), every)
         self.assertEqual(self._simulate("backend", False, False), [j for j in every if j != "db-bootstrap"])
-        web = ["prepare", "build-web", "db-bootstrap", "deploy", "verify", "finish", "notify"]
+        web = ["prepare", "build-web", "db-bootstrap", "deploy", "finish", "notify"]
         self.assertEqual(self._simulate("web", True, False), web)
         self.assertEqual(self._simulate("web", False, False), [j for j in web if j != "db-bootstrap"])
         # A dry run reads the digests back and deploys nothing live: no migrate, watch or client publish.
         self.assertEqual(self._simulate("backend", True, True), ["prepare", "build-image", "deploy", "finish"])
         self.assertEqual(self._simulate("web", True, True), ["prepare", "build-web", "deploy", "finish"])
-        self.assertEqual(len(self._simulate("backend", True, False)), 8)
-        self.assertEqual(len(self._simulate("web", False, False)), 6)
+        self.assertEqual(len(self._simulate("backend", True, False)), 7)
+        self.assertEqual(len(self._simulate("web", False, False)), 5)
 
     def test_the_stages_run_in_order(self):
         self.assertEqual(needs_of("deploy"), ["prepare", "build-image", "build-web", "db-bootstrap"])
-        self.assertEqual(needs_of("verify"), ["prepare", "build-image", "build-web", "deploy"])
-        self.assertEqual(needs_of("finish"), ["prepare", "build-image", "build-web", "db-bootstrap", "deploy", "verify"])
-        self.assertEqual(needs_of("api-client"), ["prepare", "verify", "finish"])
+        self.assertEqual(needs_of("finish"), ["prepare", "build-image", "build-web", "db-bootstrap", "deploy"])
+        self.assertEqual(needs_of("api-client"), ["prepare", "finish"])
 
     def test_only_api_client_has_packages_write_and_build_web_keeps_packages_read(self):
         for name, job in RELEASE["jobs"].items():
@@ -1580,7 +1579,7 @@ class JobGraph(unittest.TestCase):
 
     def test_every_verify_step_before_the_rollback_has_a_limit_and_the_job_limit_exceeds_them_all(self):
         # A job timeout cancels the job, so the rollback would never run: a hang must end as a failed step.
-        job = RELEASE["jobs"]["verify"]
+        job = RELEASE["jobs"]["finish"]
         steps = job["steps"]
         rollback = next(i for i, s in enumerate(steps) if s.get("id") == "rollback")
         trivial = ("This run attempt holds", "The deploy job finished its rollout")
@@ -1603,10 +1602,11 @@ class JobGraph(unittest.TestCase):
     def test_no_step_gating_a_change_runs_after_a_failure(self):
         # No always() or cancelled() in the build, deploy or verify steps before the rollback, so the lock-attempt
         # check (and every earlier step) gates every change.
-        for name in ("build-image", "build-web", "deploy", "verify"):
+        for name in ("build-image", "build-web", "deploy", "finish"):
             steps = RELEASE["jobs"][name]["steps"]
-            if name == "verify":   # up to the rollback and its own fresh role session (F668), which share its `if`
-                steps = steps[:next(i for i, s in enumerate(steps) if s.get("id") == "rollback") - 1]
+            if name == "finish":   # up to the rollback and its own fresh role session (F668), which share its `if`; the
+                # guard is its first step (always(): it also gates the record), so nothing runs before it either way
+                steps = steps[1:next(i for i, s in enumerate(steps) if s.get("id") == "rollback") - 1]
             for s in steps:
                 self.assertNotRegex(str(s.get("if", "")), r"always\(\)|cancelled\(\)", f"{name}: {s.get('name') or s.get('uses')}")
 
@@ -1630,7 +1630,7 @@ class JobGraph(unittest.TestCase):
         self.assertEqual(limit("deploy", lambda s: s.get("id") == "roll"), 45)
         # REL-FAST (2026-11-18): the bake is ECS's own, inside the rollout; the watch is one alarm check after the smoke
         # checks: two worst bounded polls (190 s each, F658) and 100 s to spare.
-        self.assertEqual(limit("verify", lambda s: s.get("id") == "watch"), 8)
+        self.assertEqual(limit("finish", lambda s: s.get("id") == "watch"), 8)
         for name, job in RELEASE["jobs"].items():
             if "steps" in job:
                 total = sum(s.get("timeout-minutes", 0) for s in job["steps"])
@@ -1658,11 +1658,13 @@ class JobGraph(unittest.TestCase):
 
 class VerifyRollsBack(unittest.TestCase):
     """UC-DEL-001 row 9, E2, E3: a failed rollout, ops registration, smoke or watch puts every service back."""
-    job = RELEASE["jobs"]["verify"]
+    job = RELEASE["jobs"]["finish"]
 
     def test_it_runs_after_a_deploy_that_failed_once_the_rollout_had_started(self):
-        self.assertEqual(self.job["if"], "${{ !cancelled() && !inputs.dry-run && (needs.deploy.result == 'success' || "
-                                         "(needs.deploy.result == 'failure' && needs.deploy.outputs.previous != '')) }}")
+        # REL-FAST-2: the verify steps' condition is the job's VERIFY_RUNS (the old verify job's `if`, less !cancelled(),
+        # which every verify step still carries through its implicit success() or its own !cancelled()).
+        self.assertEqual(self.job["env"]["VERIFY_RUNS"], "${{ !inputs.dry-run && (needs.deploy.result == 'success' || "
+                                                         "(needs.deploy.result == 'failure' && needs.deploy.outputs.previous != '')) }}")
         # previous is recorded right before the rollout: a failed migrate, assets or E7 never rolls back.
         names = [s.get("id") or s.get("name", "") for s in RELEASE["jobs"]["deploy"]["steps"]]
         self.assertEqual(names.index("previous") + 1, names.index("roll"))
@@ -1685,15 +1687,30 @@ class VerifyRollsBack(unittest.TestCase):
 
     def test_the_rollback_runs_unless_the_watch_passed_and_never_after_a_failed_lock_check(self):
         steps = {s.get("id"): s for s in self.job["steps"] if s.get("id")}
-        self.assertEqual(steps["rollback"]["if"], "${{ !cancelled() && steps.guard.outcome == 'success' && "
+        self.assertEqual(steps["rollback"]["if"], "${{ !cancelled() && env.VERIFY_RUNS == 'true' && steps.guard.outcome == 'success' && "
                                                   "steps.creds.outcome == 'success' && steps.watch.outcome != 'success' }}")
         self.assertEqual(steps["rollback"]["env"]["PREVIOUS"], "${{ needs.deploy.outputs.previous }}")
         names = [s.get("id") or s.get("name", "") for s in self.job["steps"]]
-        self.assertEqual(names[-3:], ["rollback", "Open an issue naming the failure",
-                                      "Record the end in the release lock (done after a clean watch, locked after a stable rollback)"])
+        end = names.index("Record the end in the release lock (done after a clean watch, locked after a stable rollback)")
+        self.assertEqual(names[end - 2:end + 1], ["rollback", "Open an issue naming the failure", names[end]])
         self.assertEqual(names[:2], ["guard", "creds"])
-        issue = self.job["steps"][-2]
+        issue = self.job["steps"][end - 1]
         self.assertEqual(issue["if"], "${{ !cancelled() && steps.rollback.outcome == 'success' }}")
+
+    def test_every_verify_step_runs_only_when_verify_runs_and_the_finish_steps_always_after_them(self):
+        # REL-FAST-2: verify's steps, then the deployment record and the unlock (always()), in one job.
+        steps = self.job["steps"]
+        names = [s.get("id") or s.get("name", "") for s in steps]
+        end = names.index(next(n for n in names if n.startswith("Record the end in the release lock")))
+        for s in steps[1:end + 1]:
+            if s.get("name", "") != "Open an issue naming the failure":   # runs only after the rollback, itself gated
+                self.assertIn("env.VERIFY_RUNS == 'true'", s["if"], s.get("name") or s.get("id"))
+        after = [s.get("name") or s.get("uses") for s in steps[end + 1:]]
+        self.assertTrue(after[0].startswith("Deployment record"), after)
+        self.assertTrue(after[-1].startswith("Release the release lock"), after)
+        for s in steps[end + 1:]:
+            self.assertIn("always()", s["if"], s.get("name") or s.get("uses"))
+        self.assertIn("always()", self.job["if"])
 
 
 if __name__ == "__main__":
