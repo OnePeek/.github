@@ -166,12 +166,23 @@ class BuildReuse(unittest.TestCase):
 class Version(unittest.TestCase):
     script = step("prepare", "Record the commit")
 
-    def test_the_commit_is_recorded_and_an_existing_version_tag_does_not_stop_preprod(self):
-        out, calls, output = run_step(self.script, "", {"VERSION_FILE": "m.json", "EXTRA": ""}, files={"m.json": '{".": "1.2.3"}'}, extra_stubs={"git": "exit 0"})
+    def test_the_commit_is_recorded_and_the_version_is_the_latest_v_tag(self):
+        out, calls, output = run_step(self.script, "", {"EXTRA": ""}, extra_stubs={"git": "echo v1.2.3"})
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn(f"commit={COMMIT}", output)
-        self.assertIn("version=1.2.3", output)
-        self.assertNotIn("git", calls)
+        self.assertIn("version=1.2.3\n", output)
+        self.assertIn("git describe --tags --abbrev=0 --match v*", calls)
+
+    def test_no_v_tag_gives_0_0_0_and_does_not_stop_the_release(self):
+        # F727: no manifest file is read; a repository with no v* tag yet still releases.
+        out, _, output = run_step(self.script, "", {"EXTRA": ""}, extra_stubs={"git": "echo 'fatal: No names found' >&2; exit 128"})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("version=0.0.0\n", output)
+        self.assertIn(f"commit={COMMIT}", output)
+
+    def test_no_release_please_manifest_is_read(self):
+        self.assertNotIn("release-please", TEXT)
+        self.assertNotIn("VERSION_FILE", TEXT)
 
     def test_no_job_checks_or_creates_a_version_tag(self):
         self.assertNotIn("refs/tags/v", TEXT)
