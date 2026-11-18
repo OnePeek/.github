@@ -354,7 +354,9 @@ jobs:
               counts only when some use of it is not `${local.X}/...`); a referenced `.py` file adds the sibling modules it imports.
           Every suite runs (fail closed) when the caller's own workflow file changed, when a Terraform-like file (`.tf`, `.hcl`,
           `.tfvars`, `.terraform-version`, ...) or a `tests/` file changed outside every unit, when a local module source does not
-          resolve to a unit, when a path ends in `${...}/..`, or when the diff or any file cannot be read.
+          resolve to a unit, when a path ends in `${...}/..`, when a Terraform read builds its path in a way this cannot resolve
+          to a literal (`format()`, `join()`, `abspath()`, `fileset()`, a `var.` or any other expression, or `path.module`,
+          `path.root`, `path.cwd` used other than as `${path.x}/`), or when the diff or any file cannot be read.
 
             python3 tf_test_selection.py --event pull_request --base-ref dev --diff-against origin/dev \
                 --caller-workflow OWNER/REPO/.github/workflows/checks.yml@refs/pull/1/merge      # one suite per line
@@ -379,11 +381,30 @@ jobs:
           MARKERS = (("${path.module}/", "module"), ("${path.root}/", "cwd"), ("${path.cwd}/", "cwd"))
           STOP = set("\"'()[],\n\r\t ")
           HOLE = "\x00"
+          PATH_REF = re.compile(r"\bpath\.(?:module|root|cwd)\b")
+          READ_CALL = re.compile(r"\b(file|templatefile|fileexists|filebase64|filebase64sha256|filebase64sha512|filemd5|filesha1|"
+                                 r"filesha256|filesha512|fileset)\s*\(\s*")
+          BUILT = re.compile(r'[A-Za-z_]\w*\s*\(|"(?:[^"\\]|\\.)*?\$\{\s*[A-Za-z_]\w*\s*\(')  # a call as the path, or one inside the literal
           PY_IMPORT = re.compile(r"^\s*(?:from\s+([A-Za-z_][\w]*)|import\s+([A-Za-z_][\w]*))", re.M)
 
 
           class Unknown(Exception):
               """Something this selection cannot classify: every suite runs."""
+
+
+          def check_reads(name: str, text: str) -> None:
+              """Unknown when a read's path is built in a way this selection cannot resolve to a literal path (full-line comments
+              are not code and are skipped)."""
+              code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith(("#", "//")))
+              rest = code
+              for marker, _ in MARKERS:
+                  rest = rest.replace(marker, "")
+              if PATH_REF.search(rest):
+                  raise Unknown(f"{name}: path.module/root/cwd is used other than as an interpolated path prefix")
+              for m in READ_CALL.finditer(code):
+                  func = m.group(1)
+                  if func == "fileset" or BUILT.match(code, m.end()):
+                      raise Unknown(f"{name}: {func}() reads a path this cannot resolve to a literal")
 
 
           def suite_dir(path: str) -> str:
@@ -512,6 +533,7 @@ jobs:
                           raise Unknown(f"{f} is in no Terraform folder")
                       text = (root / f).read_text(encoding="utf-8")
                       fdir = posixpath.dirname(f) or "."
+                      check_reads(f, text)
                       srcs = SOURCE.findall(text)
                       for src in srcs:
                           cands = {resolve(fdir, src), resolve(u, src)}
