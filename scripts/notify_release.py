@@ -104,7 +104,8 @@ def api_jobs(env: dict) -> list:
 
 def failed_step(jobs: list) -> str:
     for job in jobs:
-        if isinstance(job, dict) and job.get("conclusion") == "failure":
+        # RV-115 r2: the tag job runs after the release and never decides the notice, so it is never the failed step.
+        if isinstance(job, dict) and job.get("conclusion") == "failure" and str(job.get("name", "")).split(" / ")[-1] != "tag":
             for step in job.get("steps") or []:
                 if isinstance(step, dict) and step.get("conclusion") == "failure":
                     return "%s / %s" % (job.get("name", "?"), step.get("name", "?"))
@@ -143,7 +144,7 @@ def build_message(env: dict, jobs: list | None = None, now: int | None = None) -
     start = int(started) if started.isdigit() else first_start(jobs)
     if start is not None:
         facts.append("took %s" % minutes(now - start))
-    if env.get("STATUS"):
+    if env.get("STATUS") and env["STATUS"] != "skipped":  # RV-113: a failed or cancelled run never reached the check
         facts.append("%s: %s" % (escape(env.get("STATUS_PATH") or "status")[:40], escape(env["STATUS"])[:20]))
     lines.append(" | ".join(facts))
     if result == "SUCCESS" and "WATCH" in env:
@@ -154,9 +155,10 @@ def build_message(env: dict, jobs: list | None = None, now: int | None = None) -
         lines.append(ROLLED_OUT % (escape(channel[:80]) if channel else "the alerts channel"))
 
     tag, note = env.get("TAG", ""), (env.get("TAG_NOTE") or "").strip()
-    if tag == "failure" or note:
+    if tag in ("failure", "cancelled") or note:
         tag_name = "v" + (env.get("VERSION") or "?")
-        lines.append("version tag %s not created: %s" % (escape(tag_name[:80]), escape(note)[:300] if note else "see the run"))
+        fallback = "the tag job was cancelled" if tag == "cancelled" else "see the run"  # RV-115 r2
+        lines.append("version tag %s not created: %s" % (escape(tag_name[:80]), escape(note)[:300] if note else fallback))
 
     if result in ("FAILED", "ROLLED BACK"):
         step = failed_step(jobs)

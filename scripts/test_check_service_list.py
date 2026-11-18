@@ -7,7 +7,7 @@ import check_service_list as c
 STABLE = "          # --- stable-wait begin (x) ---\n          rollout_wait() { :; }\n          # --- stable-wait end ---\n"
 LOCK = "          # --- release-lock begin (x) ---\n          lock_take() { :; }\n" + STABLE + "          # --- release-lock end ---\n"
 RENDER = "          # --- render-taskdef begin (x) ---\n          render() { :; }\n          # --- render-taskdef end ---\n"
-BLOCK = RENDER + STABLE + LOCK * 6  # release-ecs.yml: the rollout's stable-wait; take, migrate, previous, verify's rollback, verify's end, finish
+BLOCK = RENDER + STABLE + LOCK * 6  # release-ecs.yml: the rollout's stable-wait; take, migrate, previous, rollback, rollout end record, finish
 OPERATE = "on:\n  options:\n    # service-list begin\n    options: [all, api]\n    # service-list end\n" + RENDER + LOCK * 3
 SERVICES = "services:\n  api: {triggers: [request]}\n  migrate: {triggers: [migration]}\n"
 
