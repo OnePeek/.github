@@ -20,7 +20,10 @@ class PublicRunnerStep(unittest.TestCase):
 
     def test_it_runs_only_in_a_public_repo_after_the_venv_exists(self) -> None:
         steps = yaml.safe_load(ACTION.read_text())["runs"]["steps"]
-        self.assertEqual(self.step()["if"], "${{ github.event.repository.private == false }}")
+        self.assertEqual(self.step()["if"], "${{ github.event.repository.visibility == 'public' }}")
+        # Fail closed toward private: a payload without `repository` (schedule) or a private one must never match.
+        self.assertNotIn("private", self.step()["if"])
+        self.assertNotIn("== false", self.step()["if"])
         venv = next(i for i, s in enumerate(steps) if "-m venv" in str(s.get("run")))
         self.assertGreater(steps.index(self.step()), venv)
         self.assertIn("--kind public", self.step()["run"])
