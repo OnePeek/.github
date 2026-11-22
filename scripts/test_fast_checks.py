@@ -389,7 +389,7 @@ class Actions(unittest.TestCase):
 
     def test_the_pins_action_has_no_docs_rule_step(self):  # DOC-1
         pins = yaml.safe_load((ACTIONS / "pins/action.yml").read_text())["runs"]["steps"]
-        self.assertEqual(len(pins), 2)
+        self.assertEqual(len(pins), 3)  # caller inputs, public runner lint (FU-PUBLIC-RUNNER), pins
         self.assertTrue(all("docs" not in str(s.get("id", "")) and "app" != s.get("id") for s in pins))
 
 
