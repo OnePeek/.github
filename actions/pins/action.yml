@@ -31,6 +31,19 @@ runs:
         "${RUNNER_TEMP}/cci/bin/pip" install --quiet pyyaml==6.0.3
         "${RUNNER_TEMP}/cci/bin/python" "${shared}/scripts/check_caller_inputs.py" . --shared "${shared}"
 
+    # A public repo's own CI never gets one of our runners (ci-runners.md section 11.6): a call of a shared workflow that
+    # leaves `runner` unset would queue 24 hours and be cancelled (plugin-owl#62, FU-PUBLIC-RUNNER). So in a public repo
+    # every call must pass `runner: public-hosted` (rule 1 of scripts/check_runner_labels.py, the same lint .github runs
+    # on itself). Runs only when the event says the repository is public: a private repo's jobs are not this rule's.
+    - name: A public repo's calls pass runner public-hosted
+      if: ${{ github.event.repository.private == false }}
+      shell: bash
+      env:
+        REPO: ${{ github.repository }}
+      run: |
+        shared="$(cd "${GITHUB_ACTION_PATH}/../.." && pwd)"
+        "${RUNNER_TEMP}/cci/bin/python" "${shared}/scripts/check_runner_labels.py" --kind public --repo "${REPO}" .github/workflows
+
     - name: Pins are one tagged version
       shell: bash
       run: python3 "$(cd "${GITHUB_ACTION_PATH}/../.." && pwd)/scripts/check_pins.py" .
