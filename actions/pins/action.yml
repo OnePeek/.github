@@ -34,9 +34,9 @@ runs:
     # A public repo's own CI never gets one of our runners (ci-runners.md section 11.6): a call of a shared workflow that
     # leaves `runner` unset would queue 24 hours and be cancelled (plugin-owl#62, FU-PUBLIC-RUNNER). So in a public repo
     # every call must pass `runner: public-hosted` (rule 1 of scripts/check_runner_labels.py, the same lint .github runs
-    # on itself). Runs only when the event says the repository is public: a private repo's jobs are not this rule's.
+    # on itself). Runs only when the event says the repository is public (visibility == 'public', never true for a payload without `repository`, e.g. a schedule event: `null == false` is true in expressions): a private repo's jobs are not this rule's.
     - name: A public repo's calls pass runner public-hosted
-      if: ${{ github.event.repository.private == false }}
+      if: ${{ github.event.repository.visibility == 'public' }}
       shell: bash
       env:
         REPO: ${{ github.repository }}
