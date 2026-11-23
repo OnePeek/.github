@@ -204,6 +204,61 @@ class Main(Case):
         self.assertIn("::error::not ready", out.stdout)
 
 
+DRAFT_CALLER = CALLER.replace("on: pull_request", "on:\n  pull_request:\n    types: {types}").replace(
+    "  tests:\n    runs-on: x", "  tests:\n    if: ${{{{ !github.event.pull_request.draft }}}}\n    runs-on: x")
+FULL = "[opened, reopened, synchronize, ready_for_review]"
+
+
+class DraftSkip(Case):
+    """Rule 4 (DEV-SPEED-1): with SKIP_DRAFT true, a workflow that skips on a draft must re-run on ready_for_review."""
+
+    def draft(self, types: str = FULL, **env: str) -> tuple[int, str]:
+        text = DRAFT_CALLER.format(sha="a" * 40, needs=ALL, types=types)
+        return self.run_ready(needs(fast="success", tests="success", build="success"), text, **env)
+
+    def test_the_full_trigger_passes(self) -> None:
+        code, text = self.draft(SKIP_DRAFT="true")
+        self.assertEqual(code, 0, text)
+
+    def test_a_draft_skip_without_ready_for_review_fails(self) -> None:  # failure mode: skipped job never re-runs
+        for types in ("[opened, reopened, synchronize]", "[ready_for_review]", "[]"):
+            code, text = self.draft(types, SKIP_DRAFT="true")
+            self.assertEqual(code, 1, types)
+            self.assertIn("skip_draft", text)
+
+    def test_default_types_count_as_lacking_ready_for_review(self) -> None:
+        text = DRAFT_CALLER.format(sha="a" * 40, needs=ALL, types=FULL).replace(f"    types: {FULL}\n", "")
+        code, out = self.run_ready(needs(fast="success", tests="success", build="success"), text, SKIP_DRAFT="true")
+        self.assertEqual(code, 1, out)
+        self.assertIn("ready_for_review", out)
+
+    def test_another_workflow_that_skips_on_a_draft_is_checked_too(self) -> None:  # e.g. infra tooling-plans
+        root = self.caller(DRAFT_CALLER.format(sha="a" * 40, needs=ALL, types=FULL))
+        other = root / ".github/workflows/e2e.yml"
+        other.write_text("on:\n  pull_request:\n    branches: [dev]\njobs:\n  e2e:\n"
+                         "    if: ${{ !github.event.pull_request.draft }}\n    runs-on: x\n    steps: [{run: 'true'}]\n")
+        env = {"NEEDS": needs(fast="success", tests="success", build="success"), "WORKFLOW_REF": REF, "SKIP_DRAFT": "true"}
+        code, text = ready.run(env, root)
+        self.assertEqual(code, 1, text)
+        self.assertIn("e2e.yml", text)
+        other.write_text(other.read_text().replace("branches: [dev]", f"branches: [dev]\n    types: {FULL}"))
+        self.assertEqual(ready.run(env, root)[0], 0)
+        (root / ".github/workflows/push-only.yml").write_text(  # reads the flag, never on a pull request: nothing to re-run
+            "on: push\njobs:\n  x:\n    if: ${{ !github.event.pull_request.draft }}\n    runs-on: x\n    steps: [{run: 'true'}]\n")
+        self.assertEqual(ready.run(env, root)[0], 0)
+        (root / ".github/workflows/broken.yml").write_text("on: [\n# github.event.pull_request.draft\n")
+        code, text = ready.run(env, root)
+        self.assertEqual(code, 1)
+        self.assertIn("cannot parse", text)
+
+    def test_off_or_unset_does_not_check_and_an_odd_value_fails(self) -> None:
+        self.assertEqual(self.draft("[opened]")[0], 0)
+        self.assertEqual(self.draft("[opened]", SKIP_DRAFT="false")[0], 0)
+        code, text = self.draft(FULL, SKIP_DRAFT="yes")
+        self.assertEqual(code, 1)
+        self.assertIn("SKIP_DRAFT", text)
+
+
 class ReadyWorkflow(unittest.TestCase):
     DOC = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
 
@@ -213,8 +268,15 @@ class ReadyWorkflow(unittest.TestCase):
         self.assertEqual(runs_on, "${{ inputs.runner == 'public-hosted' && 'ubuntu-latest' || inputs.runner == "
                                   "'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64-small' }}")
         inputs = self.DOC[True]["workflow_call"]["inputs"]
-        self.assertEqual(sorted(inputs), ["needs", "reproduce", "runner", "skippable"])
+        self.assertEqual(sorted(inputs), ["needs", "reproduce", "runner", "skip_draft", "skippable"])
         self.assertTrue(inputs["needs"]["required"])
+
+    def test_skip_draft_skips_the_job_only_on_a_draft_and_defaults_off(self) -> None:  # DEV-SPEED-1
+        inputs = self.DOC[True]["workflow_call"]["inputs"]
+        self.assertEqual((inputs["skip_draft"]["type"], inputs["skip_draft"]["default"]), ("boolean", False))
+        self.assertEqual(self.DOC["jobs"]["ready"]["if"], "${{ !(inputs.skip_draft && github.event.pull_request.draft) }}")
+        last = next(s for s in self.DOC["jobs"]["ready"]["steps"] if "ready.py" in s.get("run", ""))
+        self.assertEqual(last["env"]["SKIP_DRAFT"], "${{ inputs.skip_draft }}")
 
     def test_values_come_in_through_env_and_the_script_runs_at_the_pin(self) -> None:
         steps = self.DOC["jobs"]["ready"]["steps"]
@@ -234,7 +296,10 @@ class ReadyWorkflow(unittest.TestCase):
         self.assertEqual(job["if"], "${{ always() }}")
         self.assertEqual(sorted(job["needs"]), sorted(set(lint["jobs"]) - {"ready"}))
         self.assertEqual(job["with"]["needs"], "${{ toJSON(needs) }}")
-        code, text = ready.run({"NEEDS": needs(**{j: "success" for j in job["needs"]}),
+        self.assertIs(job["with"]["skip_draft"], True)  # DEV-SPEED-1: no CI on a draft
+        for other in set(lint["jobs"]) - {"ready"}:
+            self.assertEqual(lint["jobs"][other]["if"], "${{ !github.event.pull_request.draft }}", other)
+        code, text = ready.run({"NEEDS": needs(**{j: "success" for j in job["needs"]}), "SKIP_DRAFT": "true",
                                 "WORKFLOW_REF": "OnePeek/.github/.github/workflows/workflow-lint.yml@refs/pull/1/merge"}, ROOT)
         self.assertEqual(code, 0, text)
 
