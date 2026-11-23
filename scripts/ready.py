@@ -19,6 +19,13 @@ Rules (fail closed: anything not known good is a failure):
    skips, such as a path filter); a job skipped because a job it needs failed or was cancelled fails anyway, since that
    job is needed here too (rule 2). `failure`, `cancelled`, a missing or any other result fails. A SKIPPABLE name that is
    not a needed job fails (a typo would otherwise excuse nothing and hide the mistake).
+4. SKIP_DRAFT `true` (ready.yml's skip_draft input, DEV-SPEED-1, founder 2026-11-23: draft pull requests run no CI):
+   ready.yml skips this job on a draft, so the row reads skipped there (the merge tool holds a draft and reads a skipped
+   summary as red, vanguard F421). A job skipped on a draft must run once the pull request leaves draft, so every
+   workflow file of the caller that reads `github.event.pull_request.draft`, and the caller's own workflow, must
+   trigger on pull_request with `types` naming ready_for_review, opened, reopened and synchronize. A file it cannot
+   read or parse fails. Without it a path that skipped on the draft would stay skipped, and a skipped row the merge tool
+   lets pass (a when_run check) would merge with no CI run on the head.
 REPRODUCE lines `<job>: <command>` fill the third column; a job without one reads DEFAULT_REPRODUCE.
 Needs PyYAML (the workflow installs pyyaml==6.0.3 in a venv, as actions/pins does).
 """
@@ -38,6 +45,8 @@ WORKFLOW_REF = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/(\.github/workflows/
 READY_USES = re.compile(r"(?:^\./|^onepeek/\.github/)\.github/workflows/ready\.yml(?:@|$)", re.I)
 ALWAYS = re.compile(r"\s*(?:always\(\)|\$\{\{\s*always\(\)\s*\}\})\s*")
 DEFAULT_REPRODUCE = "vanguard local-ci <worktree> --jobs <job>"
+DRAFT_READ = re.compile(r"github\.event\.pull_request\.draft\b")
+DRAFT_TYPES = ("opened", "reopened", "synchronize", "ready_for_review")  # rule 4
 
 
 class NotReady(Exception):
@@ -98,6 +107,49 @@ def check_workflow(ref: str, root: pathlib.Path, needed: set[str]) -> None:
                        "pass needs: ${{ toJSON(needs) }}")
 
 
+def pr_types(doc) -> list[str] | None:
+    """The pull_request trigger's types of a parsed workflow (PyYAML reads `on:` as True), GitHub's default
+    (opened, reopened, synchronize) when it lists none, or None when the workflow has no pull_request trigger."""
+    on = doc.get("on", doc.get(True)) if isinstance(doc, dict) else None
+    default = ["opened", "reopened", "synchronize"]
+    if on == "pull_request" or (isinstance(on, list) and "pull_request" in on):
+        return default
+    if not isinstance(on, dict) or "pull_request" not in on:
+        return None
+    pr = on["pull_request"]
+    if not isinstance(pr, dict) or pr.get("types") is None:
+        return default
+    types = pr["types"]
+    types = [types] if isinstance(types, str) else types
+    return [str(t) for t in types] if isinstance(types, list) else []
+
+
+def check_draft_triggers(ref: str, root: pathlib.Path) -> None:
+    """Rule 4: every workflow that skips work on a draft runs again when the pull request leaves draft."""
+    m = WORKFLOW_REF.fullmatch(ref or "")
+    own = m.group(1) if m else ""
+    folder = root / ".github/workflows"
+    files = sorted(p for p in folder.glob("*.y*ml") if p.suffix in (".yml", ".yaml")) if folder.is_dir() else []
+    for path in files:
+        rel = path.relative_to(root).as_posix()
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            raise NotReady(f"skip_draft: cannot read {rel}: {type(e).__name__}") from None
+        if rel != own and not DRAFT_READ.search(text):
+            continue
+        try:
+            types = pr_types(yaml.safe_load(text))
+        except yaml.YAMLError as e:
+            raise NotReady(f"skip_draft: cannot parse {rel}: {type(e).__name__}") from None
+        if types is None and rel != own:
+            continue  # reads the draft flag but never runs on a pull request: nothing skipped there to re-run
+        missing = [t for t in DRAFT_TYPES if t not in (types or [])]
+        if missing:
+            raise NotReady(f"skip_draft: {rel} skips work on a draft but its pull_request types lack {missing}: "
+                           "a job skipped on the draft would never run once it is ready")
+
+
 def reproduce_map(text: str) -> dict[str, str]:
     out = {}
     for line in (text or "").splitlines():
@@ -138,6 +190,11 @@ def run(env: dict, root: pathlib.Path) -> tuple[int, str]:
     try:
         needs = parse_needs(env.get("NEEDS", ""))
         check_workflow(env.get("WORKFLOW_REF", ""), root, set(needs))
+        flag = env.get("SKIP_DRAFT", "").strip().lower()
+        if flag not in ("", "true", "false"):
+            raise NotReady(f"SKIP_DRAFT is {cell(flag)!r}, not true or false")
+        if flag == "true":
+            check_draft_triggers(env.get("WORKFLOW_REF", ""), root)
         skippable = set(env.get("SKIPPABLE", "").split())
         bad = [s for s in skippable if not JOB_ID.fullmatch(s)]
         if bad:

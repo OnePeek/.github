@@ -14,7 +14,9 @@ on:
     branches: [dev]
   pull_request:
     branches: [dev]
-    types: [opened, reopened, synchronize]  # never edited: a body edit is not a code change
+    # never edited: a body edit is not a code change. A draft runs nothing (DEV-SPEED-1, founder 2026-11-23): every job
+    # skips on a draft and ready_for_review runs them once it leaves draft (ready.py rule 4 checks this trigger).
+    types: [opened, reopened, synchronize, ready_for_review]
 
 # Cancel a superseded run only for a pull request, never a push to dev (decision 180; delivery-pipelines.md §9.1
 # "Cancel only pull-request runs", orchestrator ruling R-S2i-3).
@@ -34,6 +36,7 @@ jobs:
   lint:
     # GitHub-hosted (this repo is public). The limit: actionlint 10 (its install may retry for up to 5 minutes, F125),
     # gitleaks 10 (the same), zizmor, runner labels, pins and the service list 5 each, less the boots they no longer pay.
+    if: ${{ !github.event.pull_request.draft }}  # DEV-SPEED-1: no CI on a draft
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -224,6 +227,7 @@ jobs:
   fast:
     # The shared merged job, called locally: its version step takes this run's commit, so the actions it runs are this
     # pull request's. One cheap check is enough to prove the mechanism (checkout, version, actions, results).
+    if: ${{ !github.event.pull_request.draft }}  # DEV-SPEED-1: no CI on a draft
     uses: ./.github/workflows/fast-checks.yml
     with:
       runner: public-hosted  # this repo is public: GitHub-hosted (scripts/check_runner_labels.py rule 1)
@@ -239,6 +243,7 @@ jobs:
     with:
       runner: public-hosted
       needs: ${{ toJSON(needs) }}
+      skip_draft: true  # DEV-SPEED-1: the row reads skipped on a draft (red to the merge tool)
       reproduce: |
         lint: vanguard local-ci <worktree> --jobs lint
         fast: vanguard local-ci <worktree> --jobs fast

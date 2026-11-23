@@ -6,6 +6,11 @@
 # exactly `${{ always() }}` (a longer condition could skip this job, and a skipped row is no failure to the merge tool).
 # It prints a table, job | result | how to reproduce locally, to the log and the job summary. Logic:
 # scripts/ready.py at the caller's pin (rules and failure messages in its header).
+# skip_draft: true (DEV-SPEED-1, founder 2026-11-23: a draft pull request runs no CI): the job is skipped on a draft, so
+# the row reads skipped (never green to the merge tool, which holds a draft and reads a skipped summary as red, vanguard
+# F421) and no runner starts. The caller skips its own jobs on a draft (`!github.event.pull_request.draft` in each
+# job's `if:`) and triggers on ready_for_review, so CI runs once the pull request leaves draft; ready.py rule 4 fails
+# any caller workflow that skips on a draft without that trigger.
 #
 # Caller (the last job of the workflow; list every other job under `needs`):
 #
@@ -18,6 +23,7 @@
 #       runner: ${{ vars.RUNNER || 'github' }}
 #       needs: ${{ toJSON(needs) }}
 #       skippable: build             # optional: jobs a path filter may skip (space-separated)
+#       skip_draft: true             # optional: no run on a draft pull request (see above)
 #       reproduce: |                 # optional: <job>: <command>, shown for a job that did not pass
 #         tests: uv run pytest
 name: ready
@@ -41,12 +47,18 @@ on:
         description: "Lines `<job>: <command>`: how to reproduce a job locally, shown for a job that did not pass."
         type: string
         default: ""
+      skip_draft:
+        description: "true: skip this job on a draft pull request (no runner, a skipped row) and check that every caller workflow skipping on a draft re-runs on ready_for_review (ready.py rule 4)."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   ready:
+    # skip_draft: a draft pull request runs nothing here (the row reads skipped: red to the merge tool, F421).
+    if: ${{ !(inputs.skip_draft && github.event.pull_request.draft) }}
     runs-on: ${{ inputs.runner == 'public-hosted' && 'ubuntu-latest' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64-small' }}
     timeout-minutes: 5
     steps:
@@ -92,6 +104,7 @@ jobs:
         env:
           NEEDS: ${{ inputs.needs }}
           SKIPPABLE: ${{ inputs.skippable }}
+          SKIP_DRAFT: ${{ inputs.skip_draft }}
           REPRODUCE: ${{ inputs.reproduce }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
