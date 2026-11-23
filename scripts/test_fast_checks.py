@@ -428,7 +428,8 @@ class WorkflowLint(unittest.TestCase):
         self.assertNotIn("needs", jobs["lint"])
         self.assertNotIn("needs", jobs["fast"])
         self.assertEqual(wf[True]["push"]["branches"], ["dev"])
-        self.assertEqual(wf[True]["pull_request"]["types"], ["opened", "reopened", "synchronize"])
+        # DEV-SPEED-1: ready_for_review too, so a pull request that left draft runs the jobs it skipped as a draft.
+        self.assertEqual(wf[True]["pull_request"]["types"], ["opened", "reopened", "synchronize", "ready_for_review"])
 
     def test_the_depends_on_workflow_and_script_are_gone_and_nothing_calls_them(self):  # DOC-3 (A2b)
         self.assertFalse((WORKFLOWS / "depends-on.yml").exists())
