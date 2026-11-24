@@ -1,0 +1,110 @@
+# Shared: change scope (PROC-CI-SCOPE, founder 2026-11-24: "only what changed reruns"). One small job a caller's workflow
+# starts with; the heavy jobs gate on its outputs, so a docs-only pull request runs the minimal set (the caller's fast
+# job) instead of lint, tests and the image build; a `.env.example`-only one runs the tests (one reads it) but not the image build. Logic: scripts/change_scope.py at the caller's
+# pin (rules and fail-safe cases in its header: any doubt says run everything). Outputs: `code` and `image`, `true` or `false`.
+#
+# Caller:
+#
+#   scope:
+#     permissions: {contents: read, pull-requests: read}
+#     uses: <this workflow, pinned to the commit of a v* tag, like every other shared workflow>
+#     with:
+#       runner: ${{ vars.RUNNER || 'onepeek' }}
+#       full: ${{ github.base_ref == 'release' }}
+#       image: |
+#         app/**
+#         Dockerfile
+#   architecture:
+#     needs: scope
+#     if: needs.scope.outputs.code == 'true'      # list `scope` under ready's needs; architecture under skippable
+name: change-scope
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "onepeek (the default), canary or public-hosted; see ready.yml."
+        type: string
+        default: onepeek
+      full:
+        description: "true runs everything (a release pull request): both outputs true."
+        type: string
+        default: "false"
+      light:
+        description: "Globs (one per line, path_detection.py rules) of files that need no code checks. A change touching only these has code=false. Empty means everything runs."
+        type: string
+        default: |
+          **/*.md
+          docs/**
+          LICENSE
+      image:
+        description: "Globs of files that change the image (Dockerfile, dependency files, shipped code). A change touching one has image=true. Empty means the image is always built (fail safe)."
+        type: string
+        default: ""
+    outputs:
+      code:
+        description: "true when a changed file is not light, or on any doubt."
+        value: ${{ jobs.scope.outputs.code }}
+      image:
+        description: "true when a changed file matches image, or on any doubt."
+        value: ${{ jobs.scope.outputs.image }}
+
+permissions:
+  contents: read
+
+jobs:
+  scope:
+    runs-on: ${{ inputs.runner == 'public-hosted' && 'ubuntu-latest' || inputs.runner == 'canary' && 'onepeek-arm64-canary' || 'onepeek-arm64-small' }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.scope.outputs.code }}
+      image: ${{ steps.scope.outputs.image }}
+    steps:
+      # The caller's workflow files at the run's commit, to read this workflow's pin (ready.yml's way).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows
+
+      - name: This workflow's version (the caller's pin of change-scope.yml)
+        id: version
+        env:
+          FILE: change-scope.yml
+          REPO: ${{ github.repository }}
+          RUN_SHA: ${{ github.sha }}
+        run: |
+          sha=$(grep -rhoiE "OnePeek/\.github/\.github/workflows/${FILE//./\\.}@[0-9a-f]{40}" .github/workflows 2>/dev/null | head -n 1 | cut -d@ -f2 || true)
+          if [ -z "${sha}" ]; then
+            if [ "$(printf '%s' "${REPO}" | tr '[:upper:]' '[:lower:]')" != "onepeek/.github" ]; then
+              echo "::error::No pin of OnePeek/.github/.github/workflows/${FILE}@<commit SHA> in .github/workflows: call ${FILE} pinned by commit SHA."
+              exit 1
+            fi
+            sha="${RUN_SHA}"
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: OnePeek/.github at that version (its scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: OnePeek/.github
+          ref: ${{ steps.version.outputs.sha }}
+          path: _shared
+          persist-credentials: false
+          sparse-checkout: |
+            scripts
+
+      - name: Classify the change
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FULL: ${{ inputs.full }}
+          LIGHT: ${{ inputs.light }}
+          IMAGE: ${{ inputs.image }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I _shared/scripts/change_scope.py
