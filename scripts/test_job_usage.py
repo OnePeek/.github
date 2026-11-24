@@ -22,7 +22,7 @@ WORKFLOWS = ROOT / ".github/workflows"
 # Jobs on our runners that do not measure: pins.yml, the release paths (release-*, deploy-ecs, operate: the stateful
 # on-demand class, not sized by S0) and spot-rerun (a workflow_run follow-up).
 NOT_MEASURED = {"pins.yml", "release-ecs.yml", "release-lock.yml", "release-notify.yml", "release-tag.yml", "deploy-ecs.yml", "operate.yml",
-                "spot-rerun.yml"}
+                "spot-rerun.yml", "change-scope.yml"}  # change-scope: one classifier step, seconds (PROC-CI-SCOPE)
 STEP_IF = "${{ always() && runner.environment != 'github-hosted' }}"
 # The step's run: a verbatim copy of scripts/job_usage.py, written to the runner's temp folder and run isolated.
 RUN = "cat > \"$RUNNER_TEMP/job_usage.py\" <<'PY'\n{source}PY\npython3 -I \"$RUNNER_TEMP/job_usage.py\"\n"
