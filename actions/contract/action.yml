@@ -142,7 +142,7 @@ runs:
       shell: bash
       if: ${{ inputs.role == 'infra' }}
       working-directory: _infra
-      run: uvx --with pyyaml==6.0.3 python -m unittest scripts/test_contract.py
+      run: uvx --with pyyaml==6.0.3 python -m unittest scripts.test_contract
 
     - name: The contract between repos
       shell: bash
