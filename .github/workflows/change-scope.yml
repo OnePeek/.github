@@ -7,7 +7,7 @@
 #
 #   scope:
 #     permissions: {contents: read, pull-requests: read}
-#     uses: OnePeek/.github/.github/workflows/change-scope.yml@<sha> # v*
+#     uses: <this workflow, pinned to the commit of a v* tag, like every other shared workflow>
 #     with:
 #       runner: ${{ vars.RUNNER || 'onepeek' }}
 #       full: ${{ github.base_ref == 'release' }}
