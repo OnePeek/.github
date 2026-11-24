@@ -34,8 +34,14 @@ def broken(b, h):
 
 
 class Classify(unittest.TestCase):
-    def test_env_example_only_runs_the_minimal_set(self):
-        self.assertEqual(run(".env.example"), (False, False))
+    def test_env_example_only_runs_the_tests_not_the_image(self):
+        # backend-service's tests/platform/config/test_config_env_example.py reads .env.example (it caught #214)
+        self.assertEqual(run(".env.example"), (True, False))
+
+    def test_an_omitted_image_input_always_builds_the_image(self):
+        self.assertEqual(run("docs/a.md", image=""), (False, True))
+        self.assertEqual(run("tests/x.py", image=""), (True, True))
+        self.assertTrue(yaml.safe_load(WORKFLOW.read_text())[True]["workflow_call"]["inputs"]["image"]["default"] == "")
 
     def test_docs_only_runs_the_minimal_set(self):
         self.assertEqual(run("docs/lld/x.md", "CHANGELOG.md"), (False, False))
@@ -90,14 +96,14 @@ class FailSafe(unittest.TestCase):
         self.assertEqual(run(*[f"docs/{i}.md" for i in range(300)]), self.ALL)
 
     def test_empty_light_runs_everything(self):
-        self.assertEqual(run(".env.example", light=""), self.ALL)
+        self.assertEqual(run("docs/a.md", light=""), self.ALL)
 
     def test_malformed_glob_runs_everything(self):
-        self.assertEqual(run(".env.example", light="[x]"), self.ALL)
-        self.assertEqual(run(".env.example", image="{a,b}"), self.ALL)
+        self.assertEqual(run("docs/a.md", light="[x]"), self.ALL)
+        self.assertEqual(run("docs/a.md", image="{a,b}"), self.ALL)
 
     def test_missing_sha_runs_everything(self):
-        code, img, _, warning = cs.classify("pull_request", "false", LIGHT, IMAGE, "", HEAD, lambda b, h: answer(".env.example"))
+        code, img, _, warning = cs.classify("pull_request", "false", LIGHT, IMAGE, "", HEAD, lambda b, h: answer("docs/a.md"))
         self.assertEqual((code, img), self.ALL)
         self.assertTrue(warning)
 
@@ -126,7 +132,7 @@ class Workflow(unittest.TestCase):
         self.assertEqual(set(self.doc[True]["workflow_call"]["outputs"]), {"code", "image"})
 
     def test_defaults_are_light(self):
-        self.assertIn(".env.example", LIGHT.split())
+        self.assertNotIn(".env.example", LIGHT.split())
         self.assertIn("**/*.md", LIGHT.split())
         self.assertNotIn("app/**", LIGHT)
 

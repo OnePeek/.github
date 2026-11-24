@@ -2,12 +2,13 @@
 
 change-scope.yml runs this once per pull request, before the heavy jobs; the caller gates them on its two outputs:
 
-  code   `true` when the change touches any file that is not "light" (docs, markdown, *.example); architecture-style
-         checks (lint, type, tests) run only then.
-  image  `true` when the change touches a file the `image` globs name (Dockerfile, dependency files, shipped app code);
+  code   `true` when the change touches any file that is not "light" (markdown, docs/**, LICENSE); architecture-style
+         checks (lint, type, tests) run only then. `.env.example` is code: a test reads it (backend-service#214).
+  image  `true` when the change touches a file the `image` globs name (Dockerfile, dependency files, shipped app code; empty `image` means the image is always built: fail safe);
          the image build and boot run only then.
 
-A docs-only or `.env.example`-only change therefore runs the minimal set (the caller's fast job: secret scan, pins).
+A docs-only change therefore runs the minimal set (the caller's fast job: secret scan, pins); a `.env.example`-only change
+runs the tests but not the image build.
 Fail safe, like path_detection.py (whose glob rules and compare call it reuses): any other event than `pull_request`,
 `full` true (a release pull request), empty `light`, malformed globs, missing shas, an API failure, an empty change or a
 change of 300 files or more says `code=true image=true`; an unknown path is not light, so it counts as code. It never
@@ -44,7 +45,7 @@ def classify(event, full, light, image, base, head, fetch):
     if count >= pd.FILE_CAP:
         return (*everything, f"the change lists {count} files (the API lists at most {pd.FILE_CAP}), so everything runs", None)
     code = any(not any(pd.matches(g, n) for g in light_globs) for n in names)
-    img = any(any(pd.matches(g, n) for g in image_globs) for n in names)
+    img = not image_globs or any(any(pd.matches(g, n) for g in image_globs) for n in names)  # no image globs: always build
     return code, img, f"{count} changed files: code={'true' if code else 'false'}, image={'true' if img else 'false'}", None
 
 

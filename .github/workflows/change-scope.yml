@@ -1,6 +1,6 @@
 # Shared: change scope (PROC-CI-SCOPE, founder 2026-11-24: "only what changed reruns"). One small job a caller's workflow
-# starts with; the heavy jobs gate on its outputs, so a docs-only or `.env.example`-only pull request runs the minimal
-# set (the caller's fast job) instead of lint, tests and the image build. Logic: scripts/change_scope.py at the caller's
+# starts with; the heavy jobs gate on its outputs, so a docs-only pull request runs the minimal set (the caller's fast
+# job) instead of lint, tests and the image build; a `.env.example`-only one runs the tests (one reads it) but not the image build. Logic: scripts/change_scope.py at the caller's
 # pin (rules and fail-safe cases in its header: any doubt says run everything). Outputs: `code` and `image`, `true` or `false`.
 #
 # Caller:
@@ -36,11 +36,9 @@ on:
         default: |
           **/*.md
           docs/**
-          .env.example
-          **/*.example
           LICENSE
       image:
-        description: "Globs of files that change the image (Dockerfile, dependency files, shipped code). A change touching one has image=true. Empty means image=false on a change."
+        description: "Globs of files that change the image (Dockerfile, dependency files, shipped code). A change touching one has image=true. Empty means the image is always built (fail safe)."
         type: string
         default: ""
     outputs:
